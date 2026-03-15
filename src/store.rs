@@ -58,7 +58,7 @@ impl ChittaField {
             content: content.to_vec(),
             embedding_model,
             embedding: embedding.to_vec(),
-            artifact_refs,
+            artifact_refs: artifact_refs.clone(),
             source_session,
             source_tool,
         };
@@ -91,11 +91,7 @@ impl ChittaField {
         {
             let artifact_paths = self.artifact_paths.read();
             let mut artifact_idx = self.artifact_idx.write();
-            for art_ref in op_enum
-                .as_put_payload()
-                .map(|p| p.artifact_refs.as_slice())
-                .unwrap_or(&[])
-            {
+            for art_ref in &artifact_refs {
                 if let Some(path) = artifact_paths.get(&art_ref.artifact_id) {
                     artifact_idx.associate(memory_id, art_ref.artifact_id, path, 1.0);
                 }
@@ -218,6 +214,16 @@ impl ChittaField {
             }
         }
         self.semantic_idx.write().remove(memory_id);
+
+        // Remove from temporal index (need authored_at_ms from payload).
+        {
+            let payloads = self.payloads.read();
+            if let Some(payload) = payloads.get(&memory_id) {
+                self.time_idx.write().remove(memory_id, payload.authored_at_ms);
+            }
+        }
+        self.artifact_idx.write().remove_memory(memory_id);
+
         self.manifest.write().last_seqno = seqno;
 
         Ok(())
@@ -475,10 +481,17 @@ impl ChittaField {
         let seqno = self.log.write().append(&op)?;
 
         // Double-checked insert: another thread may have raced past the read guard.
-        let mut artifacts = self.artifacts.write();
-        let id = *artifacts
-            .entry(normalized_path.to_string())
-            .or_insert(artifact_id);
+        let id = {
+            let mut artifacts = self.artifacts.write();
+            *artifacts
+                .entry(normalized_path.to_string())
+                .or_insert(artifact_id)
+        };
+        // Keep reverse map in sync.
+        self.artifact_paths
+            .write()
+            .entry(id)
+            .or_insert_with(|| normalized_path.to_string());
 
         {
             let mut manifest = self.manifest.write();
@@ -487,6 +500,80 @@ impl ChittaField {
         }
 
         Ok(id)
+    }
+
+    /// Recall memories within a time range [start_ms, end_ms].
+    pub fn recall_temporal(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        realm: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RecallHit>> {
+        let entries = self.time_idx.read().range_query(start_ms, end_ms, realm, limit);
+        let now = now_ms();
+        let states = self.states.read();
+        let payloads = self.payloads.read();
+
+        let hits = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let state = states.get(&entry.memory_id)?;
+                if state.deleted {
+                    return None;
+                }
+                let payload = payloads.get(&entry.memory_id)?;
+                let eff_strength = state.effective_strength(now);
+                Some(RecallHit {
+                    memory_id: entry.memory_id,
+                    score: eff_strength * state.confidence,
+                    semantic_score: 0.0,
+                    ts_ms: payload.authored_at_ms,
+                    kind: payload.kind.clone(),
+                    realm: payload.realm.clone(),
+                    strength: eff_strength,
+                    confidence: state.confidence,
+                })
+            })
+            .collect();
+
+        Ok(hits)
+    }
+
+    /// Recall memories associated with a file path (exact match).
+    pub fn recall_artifact(
+        &self,
+        path: &str,
+        limit: usize,
+    ) -> Result<Vec<RecallHit>> {
+        let entries = self.artifact_idx.read().query_path(path, limit);
+        let now = now_ms();
+        let states = self.states.read();
+        let payloads = self.payloads.read();
+
+        let hits = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let state = states.get(&entry.memory_id)?;
+                if state.deleted {
+                    return None;
+                }
+                let payload = payloads.get(&entry.memory_id)?;
+                let eff_strength = state.effective_strength(now);
+                Some(RecallHit {
+                    memory_id: entry.memory_id,
+                    score: entry.strength * eff_strength * state.confidence,
+                    semantic_score: 0.0,
+                    ts_ms: payload.authored_at_ms,
+                    kind: payload.kind.clone(),
+                    realm: payload.realm.clone(),
+                    strength: eff_strength,
+                    confidence: state.confidence,
+                })
+            })
+            .collect();
+
+        Ok(hits)
     }
 }
 
