@@ -11,6 +11,7 @@ pub mod ffi;
 pub mod store;
 pub mod organ;
 pub mod recall;
+pub mod learner;
 
 pub use error::FieldError;
 pub use ids::{MemoryId, SeqNo, ChunkHash, ArtifactId};

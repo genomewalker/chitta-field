@@ -74,6 +74,28 @@ int cf_get_kind(CfHandle* h, uint64_t memory_id,
 int cf_get_realm(CfHandle* h, uint64_t memory_id,
     uint8_t* buf, size_t buf_cap);
 
+/* Triplets */
+int cf_add_triplet(CfHandle* h,
+    const char* subject, const char* predicate, const char* object,
+    float weight,
+    uint64_t source_memory_id,
+    uint64_t* out_triplet_id);
+
+int cf_invalidate_triplet(CfHandle* h, uint64_t triplet_id);
+
+int cf_query_subject(CfHandle* h, const char* subject,
+    char* buf, size_t buf_cap, size_t* written);
+
+int cf_query_object(CfHandle* h, const char* object,
+    char* buf, size_t buf_cap, size_t* written);
+
+int cf_query_entity(CfHandle* h, const char* entity,
+    char* buf, size_t buf_cap, size_t* written);
+
+/* Learner */
+int    cf_feedback(CfHandle* h, uint64_t episode_id, float reward);
+size_t cf_recommended_window(CfHandle* h, const char* session_type);
+
 /* Maintenance */
 int    cf_flush(CfHandle* h);
 size_t cf_memory_count(const CfHandle* h);

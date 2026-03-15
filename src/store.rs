@@ -12,6 +12,7 @@ use crate::payload::MemoryPayload;
 use crate::state::MemoryState;
 use crate::ops::EMBED_DIM;
 use crate::recall::RecallHit;
+use crate::learner::route::{Route, QueryIntent, RouteLearner};
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -120,18 +121,35 @@ impl ChittaField {
             }
         }
 
+        let ts = now_ms();
+
+        // Record access in plasticity learner and get recommended decay rate.
+        let recommended_decay = self.learners.write().plasticity.record_access(memory_id, ts);
+
+        // Check if current decay rate differs significantly; if so, update it.
+        let new_decay_rate = {
+            let states = self.states.read();
+            states.get(&memory_id).and_then(|state| {
+                let diff = (state.decay_rate - recommended_decay).abs();
+                if diff > 0.0001 {
+                    Some(recommended_decay)
+                } else {
+                    None
+                }
+            })
+        };
+
         // Touch: append UpdateState op then apply to in-memory state.
         let delta = StateDeltaOp {
             memory_id,
             strength_delta: None,
             confidence_delta: None,
-            decay_rate: None,
+            decay_rate: new_decay_rate,
             touch: true,
             pin: None,
         };
         let seqno = self.log.write().append(&Op::UpdateState(delta.clone()))?;
 
-        let ts = now_ms();
         {
             let mut states = self.states.write();
             if let Some(state) = states.get_mut(&memory_id) {
@@ -700,6 +718,29 @@ impl ChittaField {
         let at_ms = now_ms();
         let store = self.triplet_store.read();
         Ok(store.query_entity(entity, at_ms).into_iter().cloned().collect())
+    }
+
+    /// Apply feedback for a recall episode (route learning).
+    pub fn feedback(&self, episode_id: u64, reward: f32) -> Result<()> {
+        self.learners.write().route.feedback(episode_id, reward);
+        Ok(())
+    }
+
+    /// Get recommended window size for a session type.
+    pub fn recommended_window(&self, session_type: &str) -> usize {
+        self.learners.read().context.recommended_window(session_type)
+    }
+
+    /// Record context outcome for a session type and window size.
+    pub fn record_context_outcome(&self, session_type: &str, size: usize, outcome: f32) {
+        self.learners.write().context.record_outcome(session_type, size, outcome);
+    }
+
+    /// Select a retrieval route using Thompson sampling. Returns (episode_id, route).
+    pub fn select_route(&self, query: &str) -> (u64, Route) {
+        let intent = RouteLearner::detect_intent(query);
+        let now_ms = now_ms() as u64;
+        self.learners.write().route.select_route(intent, now_ms)
     }
 }
 

@@ -14,6 +14,7 @@ use crate::organ::temporal::{TemporalIndex, TemporalEntry};
 use crate::organ::artifact::ArtifactIndex;
 use crate::organ::keyword::KeywordIndex;
 use crate::organ::triplet::TripletStore;
+use crate::learner::LearnerSet;
 
 /// A single directed association edge stored in memory.
 #[derive(Debug, Clone)]
@@ -42,6 +43,7 @@ pub struct ChittaField {
     pub(crate) keyword_idx: RwLock<KeywordIndex>,
     pub(crate) triplet_store: RwLock<TripletStore>,
     pub(crate) triplet_id_alloc: Arc<TripletIdAllocator>,
+    pub(crate) learners: RwLock<LearnerSet>,
 }
 
 impl ChittaField {
@@ -119,6 +121,7 @@ impl ChittaField {
             keyword_idx: RwLock::new(keyword_idx),
             triplet_store: RwLock::new(triplet_store),
             triplet_id_alloc,
+            learners: RwLock::new(LearnerSet::new()),
         })
     }
 }

@@ -699,6 +699,41 @@ pub extern "C" fn cf_query_entity(
     }
 }
 
+// ── Learner operations ────────────────────────────────────────────────────────
+
+/// Apply feedback reward to a pending recall episode (route learning).
+/// episode_id: returned by cf_select_route. reward: 0.0 = bad, 1.0 = perfect.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_feedback(h: *mut CfHandle, episode_id: u64, reward: f32) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    match handle.field.feedback(episode_id, reward) {
+        Ok(()) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Get recommended context window size for a session type.
+/// session_type: null-terminated string (e.g., "code", "general").
+/// Returns the recommended window size, or 10 on error.
+#[no_mangle]
+pub extern "C" fn cf_recommended_window(h: *mut CfHandle, session_type: *const c_char) -> usize {
+    if h.is_null() || session_type.is_null() {
+        return 10;
+    }
+    let handle = unsafe { &*h };
+    let session_str = unsafe {
+        match CStr::from_ptr(session_type).to_str() {
+            Ok(s) => s,
+            Err(_) => return 10,
+        }
+    };
+    handle.field.recommended_window(session_str)
+}
+
 // ── Maintenance ───────────────────────────────────────────────────────────────
 
 /// Flush manifest to disk.
