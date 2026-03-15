@@ -514,6 +514,191 @@ pub extern "C" fn cf_recall_keyword(
     }
 }
 
+// ── Triplet operations ────────────────────────────────────────────────────────
+
+/// Add a triplet fact. Returns triplet_id via out_triplet_id.
+/// source_memory_id: pass 0 for no source memory.
+#[no_mangle]
+pub extern "C" fn cf_add_triplet(
+    h: *mut CfHandle,
+    subject: *const c_char,
+    predicate: *const c_char,
+    object: *const c_char,
+    weight: f32,
+    source_memory_id: u64,
+    out_triplet_id: *mut u64,
+) -> c_int {
+    if h.is_null() || subject.is_null() || predicate.is_null() || object.is_null() || out_triplet_id.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+
+    let subject_str = unsafe {
+        match CStr::from_ptr(subject).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let predicate_str = unsafe {
+        match CStr::from_ptr(predicate).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let object_str = unsafe {
+        match CStr::from_ptr(object).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let src_mem = if source_memory_id == 0 { None } else { Some(source_memory_id) };
+
+    match handle.field.add_triplet(
+        subject_str.to_string(),
+        predicate_str.to_string(),
+        object_str.to_string(),
+        weight,
+        src_mem,
+        None,
+    ) {
+        Ok(triplet_id) => {
+            unsafe { *out_triplet_id = triplet_id; }
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Invalidate a triplet.
+#[no_mangle]
+pub extern "C" fn cf_invalidate_triplet(h: *mut CfHandle, triplet_id: u64) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    match handle.field.invalidate_triplet(triplet_id) {
+        Ok(()) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
+fn write_triplets_json(
+    entries: Vec<crate::organ::triplet::TripletEntry>,
+    buf: *mut c_char,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    use serde_json::json;
+
+    let json_val: Vec<_> = entries.iter().map(|e| json!({
+        "id": e.id,
+        "subject": e.subject,
+        "predicate": e.predicate,
+        "object": e.object,
+        "weight": e.weight,
+    })).collect();
+
+    let s = match serde_json::to_string(&json_val) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+
+    let bytes = s.as_bytes();
+    // +1 for null terminator
+    if bytes.len() + 1 > buf_cap {
+        return -2;
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+        *(buf as *mut u8).add(bytes.len()) = 0;
+        *written = bytes.len();
+    }
+
+    0
+}
+
+/// Query by subject. Writes results as null-terminated JSON into buf.
+/// JSON format: [{"id":1,"subject":"...","predicate":"...","object":"...","weight":0.9}]
+/// Returns 0 on success, -1 on error, -2 if buf too small.
+#[no_mangle]
+pub extern "C" fn cf_query_subject(
+    h: *mut CfHandle,
+    subject: *const c_char,
+    buf: *mut c_char,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || subject.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let subject_str = unsafe {
+        match CStr::from_ptr(subject).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    match handle.field.query_subject(subject_str) {
+        Ok(entries) => write_triplets_json(entries, buf, buf_cap, written),
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Query by object. Writes results as null-terminated JSON into buf.
+#[no_mangle]
+pub extern "C" fn cf_query_object(
+    h: *mut CfHandle,
+    object: *const c_char,
+    buf: *mut c_char,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || object.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let object_str = unsafe {
+        match CStr::from_ptr(object).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    match handle.field.query_object(object_str) {
+        Ok(entries) => write_triplets_json(entries, buf, buf_cap, written),
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Query by entity (subject OR object). Writes results as null-terminated JSON into buf.
+#[no_mangle]
+pub extern "C" fn cf_query_entity(
+    h: *mut CfHandle,
+    entity: *const c_char,
+    buf: *mut c_char,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || entity.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let entity_str = unsafe {
+        match CStr::from_ptr(entity).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    match handle.field.query_entity(entity_str) {
+        Ok(entries) => write_triplets_json(entries, buf, buf_cap, written),
+        Err(e) => handle.err(e),
+    }
+}
+
 // ── Maintenance ───────────────────────────────────────────────────────────────
 
 /// Flush manifest to disk.
