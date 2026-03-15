@@ -35,6 +35,10 @@ impl MemoryIdAllocator {
     pub fn current(&self) -> u64 {
         self.next.load(Ordering::Relaxed)
     }
+
+    pub fn reset_to(&self, val: u64) {
+        self.next.store(val, Ordering::Relaxed);
+    }
 }
 
 pub struct ArtifactIdAllocator {
@@ -52,6 +56,10 @@ impl ArtifactIdAllocator {
 
     pub fn current(&self) -> u64 {
         self.next.load(Ordering::Relaxed)
+    }
+
+    pub fn reset_to(&self, val: u64) {
+        self.next.store(val, Ordering::Relaxed);
     }
 }
 

@@ -46,7 +46,19 @@ pub struct ChittaField {
     pub(crate) learners: RwLock<LearnerSet>,
 }
 
+impl Drop for ChittaField {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
 impl ChittaField {
+    /// Persist the manifest to disk. Called automatically on drop.
+    pub fn flush(&self) -> Result<()> {
+        let manifest = self.manifest.read();
+        manifest.save(&self.data_dir)
+    }
+
     pub fn open(data_dir: PathBuf, lock_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
         std::fs::create_dir_all(&lock_dir)?;
@@ -99,6 +111,16 @@ impl ChittaField {
             );
             Ok(())
         })?;
+
+        // If the manifest was absent or stale, sync allocators from replayed state.
+        let max_memory_id = payloads.keys().copied().max().unwrap_or(0);
+        if max_memory_id >= id_alloc.current() {
+            id_alloc.reset_to(max_memory_id + 1);
+        }
+        let max_artifact_id = artifacts.values().copied().max().unwrap_or(0);
+        if max_artifact_id >= artifact_id_alloc.current() {
+            artifact_id_alloc.reset_to(max_artifact_id + 1);
+        }
 
         // Restore the triplet ID allocator from the replayed store state.
         let triplet_id_alloc = Arc::new(TripletIdAllocator::new(triplet_store.next_id()));
