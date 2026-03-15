@@ -54,3 +54,21 @@ impl ArtifactIdAllocator {
         self.next.load(Ordering::Relaxed)
     }
 }
+
+pub struct TripletIdAllocator {
+    next: AtomicU64,
+}
+
+impl TripletIdAllocator {
+    pub fn new(start: u64) -> Self {
+        Self { next: AtomicU64::new(start) }
+    }
+
+    pub fn next_id(&self) -> u64 {
+        self.next.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn current(&self) -> u64 {
+        self.next.load(Ordering::Relaxed)
+    }
+}

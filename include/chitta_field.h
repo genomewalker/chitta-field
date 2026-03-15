@@ -61,6 +61,10 @@ int cf_expand_associations(CfHandle* h,
     size_t max_hops, size_t limit,
     CfRecallHit* hits_buf, size_t hits_cap, size_t* hits_written);
 
+int cf_recall_keyword(CfHandle* h,
+    const char* query, size_t k,
+    CfRecallHit* hits_buf, size_t hits_cap, size_t* hits_written);
+
 int cf_get_content(CfHandle* h, uint64_t memory_id,
     uint8_t* buf, size_t buf_cap, size_t* written);
 

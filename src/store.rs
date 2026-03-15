@@ -5,8 +5,9 @@ use crate::field::{AssocEdge, ChittaField};
 use crate::ids::{ArtifactId, ChunkHash, MemoryId, compute_chunk_hash};
 use crate::ops::{
     AddAssocEdgeOp, DeleteMemoryOp, EdgeType, Op, PutPayloadOp, StateDeltaOp,
-    UpsertArtifactOp, ArtifactRef,
+    UpsertArtifactOp, ArtifactRef, AddTripletOp, InvalidateTripletOp,
 };
+use crate::organ::triplet::TripletEntry;
 use crate::payload::MemoryPayload;
 use crate::state::MemoryState;
 use crate::ops::EMBED_DIM;
@@ -74,6 +75,8 @@ impl ChittaField {
         self.payloads.write().insert(memory_id, payload);
         self.states.write().insert(memory_id, state);
         self.semantic_idx.write().upsert(memory_id, embedding.to_vec());
+        let content_str = std::str::from_utf8(content).unwrap_or("").to_string();
+        self.keyword_idx.write().index(memory_id, &content_str);
 
         // Update temporal index.
         {
@@ -214,6 +217,7 @@ impl ChittaField {
             }
         }
         self.semantic_idx.write().remove(memory_id);
+        self.keyword_idx.write().remove(memory_id);
 
         // Remove from temporal index (need authored_at_ms from payload).
         {
@@ -347,6 +351,7 @@ impl ChittaField {
                     realm: payload.realm.clone(),
                     strength: eff_strength,
                     confidence: state.confidence,
+                    content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
                 })
             })
             .collect();
@@ -449,6 +454,7 @@ impl ChittaField {
                     realm: payload.realm.clone(),
                     strength: eff_strength,
                     confidence: state.confidence,
+                    content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
                 })
             })
             .collect();
@@ -533,9 +539,50 @@ impl ChittaField {
                     realm: payload.realm.clone(),
                     strength: eff_strength,
                     confidence: state.confidence,
+                    content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
                 })
             })
             .collect();
+
+        Ok(hits)
+    }
+
+    /// Keyword (BM25) recall.
+    pub fn recall_keyword(&self, query: &str, k: usize) -> Result<Vec<RecallHit>> {
+        let keyword_hits = self.keyword_idx.read().search(query, k * 3);
+
+        let now = now_ms();
+        let states = self.states.read();
+        let payloads = self.payloads.read();
+
+        let mut hits: Vec<RecallHit> = keyword_hits
+            .into_iter()
+            .filter_map(|hit| {
+                let state = states.get(&hit.memory_id)?;
+                if state.deleted {
+                    return None;
+                }
+                let payload = payloads.get(&hit.memory_id)?;
+                let eff_strength = state.effective_strength(now);
+                let score = hit.bm25_score * (0.5 + 0.5 * eff_strength) * state.confidence;
+                Some(RecallHit {
+                    memory_id: hit.memory_id,
+                    score,
+                    semantic_score: 0.0,
+                    ts_ms: payload.authored_at_ms,
+                    kind: payload.kind.clone(),
+                    realm: payload.realm.clone(),
+                    strength: eff_strength,
+                    confidence: state.confidence,
+                    content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
+                })
+            })
+            .collect();
+
+        hits.sort_unstable_by(|a, b| {
+            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(k);
 
         Ok(hits)
     }
@@ -569,11 +616,90 @@ impl ChittaField {
                     realm: payload.realm.clone(),
                     strength: eff_strength,
                     confidence: state.confidence,
+                    content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
                 })
             })
             .collect();
 
         Ok(hits)
+    }
+
+    /// Add a triplet fact. Returns the triplet ID.
+    pub fn add_triplet(
+        &self,
+        subject: String,
+        predicate: String,
+        object: String,
+        weight: f32,
+        source_memory_id: Option<MemoryId>,
+        source_file: Option<String>,
+    ) -> Result<u64> {
+        let triplet_id = self.triplet_id_alloc.next_id();
+        let valid_from_ms = now_ms();
+
+        let op = Op::AddTriplet(AddTripletOp {
+            triplet_id,
+            subject: subject.clone(),
+            predicate: predicate.clone(),
+            object: object.clone(),
+            weight,
+            valid_from_ms,
+            source_memory_id,
+            source_file: source_file.clone(),
+        });
+        let seqno = self.log.write().append(&op)?;
+
+        self.triplet_store.write().replay_add(
+            triplet_id,
+            subject,
+            predicate,
+            object,
+            weight,
+            valid_from_ms,
+            source_memory_id,
+            source_file,
+        );
+
+        self.manifest.write().last_seqno = seqno;
+
+        Ok(triplet_id)
+    }
+
+    /// Invalidate a triplet (marks it as expired at the current time).
+    pub fn invalidate_triplet(&self, triplet_id: u64) -> Result<()> {
+        let now = now_ms();
+        let op = Op::InvalidateTriplet(InvalidateTripletOp {
+            triplet_id,
+            invalidated_at_ms: now,
+        });
+        let seqno = self.log.write().append(&op)?;
+
+        self.triplet_store.write().invalidate(triplet_id, now);
+
+        self.manifest.write().last_seqno = seqno;
+
+        Ok(())
+    }
+
+    /// Query all currently-valid triplets with the given subject.
+    pub fn query_subject(&self, subject: &str) -> Result<Vec<TripletEntry>> {
+        let at_ms = now_ms();
+        let store = self.triplet_store.read();
+        Ok(store.query_subject(subject, at_ms).into_iter().cloned().collect())
+    }
+
+    /// Query all currently-valid triplets with the given object.
+    pub fn query_object(&self, object: &str) -> Result<Vec<TripletEntry>> {
+        let at_ms = now_ms();
+        let store = self.triplet_store.read();
+        Ok(store.query_object(object, at_ms).into_iter().cloned().collect())
+    }
+
+    /// Query all currently-valid triplets where subject OR object matches.
+    pub fn query_entity(&self, entity: &str) -> Result<Vec<TripletEntry>> {
+        let at_ms = now_ms();
+        let store = self.triplet_store.read();
+        Ok(store.query_entity(entity, at_ms).into_iter().cloned().collect())
     }
 }
 
@@ -649,5 +775,88 @@ mod tests {
         let neighbors = field.list_neighbors(id1).unwrap();
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].dst, id2);
+    }
+
+    #[test]
+    fn test_integration_add_triplet() {
+        let tmp = TempDir::new().unwrap();
+        let field = ChittaField::open(tmp.path().join("data"), tmp.path().join("lock")).unwrap();
+
+        let id = field.add_triplet(
+            "chitta".into(), "replaces".into(), "duckdb".into(),
+            1.0, None, None,
+        ).unwrap();
+        assert!(id > 0);
+
+        let results = field.query_subject("chitta").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].object, "duckdb");
+    }
+
+    #[test]
+    fn test_replay_triplets() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let lock_dir = tmp.path().join("lock");
+
+        {
+            let field = ChittaField::open(data_dir.clone(), lock_dir.clone()).unwrap();
+            field.add_triplet("a".into(), "b".into(), "c".into(), 1.0, None, None).unwrap();
+        }
+
+        let field2 = ChittaField::open(data_dir, lock_dir).unwrap();
+        let results = field2.query_subject("a").unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_integration_invalidate_triplet() {
+        let tmp = TempDir::new().unwrap();
+        let field = ChittaField::open(tmp.path().join("data"), tmp.path().join("lock")).unwrap();
+
+        let id = field.add_triplet(
+            "chitta".into(), "uses".into(), "duckdb".into(),
+            1.0, None, None,
+        ).unwrap();
+
+        let before = field.query_subject("chitta").unwrap();
+        assert_eq!(before.len(), 1);
+
+        field.invalidate_triplet(id).unwrap();
+
+        let after = field.query_subject("chitta").unwrap();
+        assert_eq!(after.len(), 0);
+    }
+
+    #[test]
+    fn test_integration_query_entity() {
+        let tmp = TempDir::new().unwrap();
+        let field = ChittaField::open(tmp.path().join("data"), tmp.path().join("lock")).unwrap();
+
+        field.add_triplet("alice".into(), "knows".into(), "bob".into(), 1.0, None, None).unwrap();
+        field.add_triplet("charlie".into(), "knows".into(), "alice".into(), 1.0, None, None).unwrap();
+        field.add_triplet("alice".into(), "works_at".into(), "anthropic".into(), 1.0, None, None).unwrap();
+
+        let results = field.query_entity("alice").unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_integration_recall_keyword() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.1f32; 768];
+
+        field.put_memory("wisdom", "test",
+            b"rust ownership model prevents memory leaks automatically",
+            &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+        field.put_memory("wisdom", "test",
+            b"python garbage collector handles memory management",
+            &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+
+        let hits = field.recall_keyword("rust ownership", 5).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].kind, "wisdom");
+        // "rust" and "ownership" only in doc 1
+        assert!(hits[0].content.contains("rust"));
     }
 }

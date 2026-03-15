@@ -485,6 +485,35 @@ pub extern "C" fn cf_get_realm(
     }
 }
 
+#[no_mangle]
+pub extern "C" fn cf_recall_keyword(
+    h: *mut CfHandle,
+    query: *const c_char,
+    k: usize,
+    hits_buf: *mut CfRecallHit,
+    hits_cap: usize,
+    hits_written: *mut usize,
+) -> c_int {
+    if h.is_null() || query.is_null() || hits_buf.is_null() || hits_written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let query_str = unsafe {
+        match CStr::from_ptr(query).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    match handle.field.recall_keyword(query_str, k) {
+        Ok(hits) => {
+            write_hits(hits, hits_buf, hits_cap, hits_written);
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
 // ── Maintenance ───────────────────────────────────────────────────────────────
 
 /// Flush manifest to disk.

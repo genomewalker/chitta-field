@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use crate::error::Result;
-use crate::ids::{MemoryId, ArtifactId, MemoryIdAllocator, ArtifactIdAllocator};
+use crate::ids::{MemoryId, ArtifactId, MemoryIdAllocator, ArtifactIdAllocator, TripletIdAllocator};
 use crate::log::OpLog;
 use crate::manifest::Manifest;
 use crate::ops::{Op, EdgeType};
@@ -12,6 +12,8 @@ use crate::state::MemoryState;
 use crate::hnsw::SemanticIndex;
 use crate::organ::temporal::{TemporalIndex, TemporalEntry};
 use crate::organ::artifact::ArtifactIndex;
+use crate::organ::keyword::KeywordIndex;
+use crate::organ::triplet::TripletStore;
 
 /// A single directed association edge stored in memory.
 #[derive(Debug, Clone)]
@@ -37,6 +39,9 @@ pub struct ChittaField {
     pub(crate) semantic_idx: RwLock<SemanticIndex>,
     pub(crate) time_idx: RwLock<TemporalIndex>,
     pub(crate) artifact_idx: RwLock<ArtifactIndex>,
+    pub(crate) keyword_idx: RwLock<KeywordIndex>,
+    pub(crate) triplet_store: RwLock<TripletStore>,
+    pub(crate) triplet_id_alloc: Arc<TripletIdAllocator>,
 }
 
 impl ChittaField {
@@ -72,6 +77,8 @@ impl ChittaField {
         let mut semantic_idx = SemanticIndex::new();
         let mut time_idx = TemporalIndex::new();
         let mut artifact_idx = ArtifactIndex::new();
+        let mut keyword_idx = KeywordIndex::new();
+        let mut triplet_store = TripletStore::new();
 
         // Replay ops from the log into in-memory projections.
         log.replay(replay_from, |_seqno, op| {
@@ -85,9 +92,14 @@ impl ChittaField {
                 &mut semantic_idx,
                 &mut time_idx,
                 &mut artifact_idx,
+                &mut keyword_idx,
+                &mut triplet_store,
             );
             Ok(())
         })?;
+
+        // Restore the triplet ID allocator from the replayed store state.
+        let triplet_id_alloc = Arc::new(TripletIdAllocator::new(triplet_store.next_id()));
 
         Ok(Self {
             data_dir,
@@ -104,6 +116,9 @@ impl ChittaField {
             semantic_idx: RwLock::new(semantic_idx),
             time_idx: RwLock::new(time_idx),
             artifact_idx: RwLock::new(artifact_idx),
+            keyword_idx: RwLock::new(keyword_idx),
+            triplet_store: RwLock::new(triplet_store),
+            triplet_id_alloc,
         })
     }
 }
@@ -119,6 +134,8 @@ pub(crate) fn apply_op(
     semantic_idx: &mut SemanticIndex,
     time_idx: &mut TemporalIndex,
     artifact_idx: &mut ArtifactIndex,
+    keyword_idx: &mut KeywordIndex,
+    triplet_store: &mut TripletStore,
 ) {
     match op {
         Op::PutPayload(put) => {
@@ -131,6 +148,7 @@ pub(crate) fn apply_op(
             let realm = put.realm.clone();
             let embedding = put.embedding.clone();
             let artifact_refs = put.artifact_refs.clone();
+            let content_str = String::from_utf8(put.content.clone()).unwrap_or_default();
 
             // Insert or replace state if this is a newer version.
             let state = states.entry(memory_id).or_insert_with(|| {
@@ -142,6 +160,7 @@ pub(crate) fn apply_op(
 
             payloads.insert(memory_id, MemoryPayload::from(put));
             semantic_idx.upsert(memory_id, embedding);
+            keyword_idx.index(memory_id, &content_str);
 
             // Update temporal index.
             time_idx.upsert(TemporalEntry {
@@ -173,6 +192,7 @@ pub(crate) fn apply_op(
                 state.deleted = true;
             }
             semantic_idx.remove(memory_id);
+            keyword_idx.remove(memory_id);
             // Remove from temporal index using the authored_at_ms stored in the payload.
             if let Some(payload) = payloads.get(&memory_id) {
                 time_idx.remove(memory_id, payload.authored_at_ms);
@@ -191,6 +211,21 @@ pub(crate) fn apply_op(
             // Maintain both forward (path->id) and reverse (id->path) maps.
             artifacts.entry(art_op.normalized_path.clone()).or_insert(art_op.artifact_id);
             artifact_paths.entry(art_op.artifact_id).or_insert(art_op.normalized_path);
+        }
+        Op::AddTriplet(t) => {
+            triplet_store.replay_add(
+                t.triplet_id,
+                t.subject,
+                t.predicate,
+                t.object,
+                t.weight,
+                t.valid_from_ms,
+                t.source_memory_id,
+                t.source_file,
+            );
+        }
+        Op::InvalidateTriplet(inv) => {
+            triplet_store.invalidate(inv.triplet_id, inv.invalidated_at_ms);
         }
     }
 }

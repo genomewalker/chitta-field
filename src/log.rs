@@ -14,6 +14,8 @@ const OP_UPDATE_STATE: u8 = 1;
 const OP_DELETE_MEMORY: u8 = 2;
 const OP_ADD_ASSOC_EDGE: u8 = 3;
 const OP_UPSERT_ARTIFACT: u8 = 4;
+const OP_ADD_TRIPLET: u8 = 5;
+const OP_INVALIDATE_TRIPLET: u8 = 6;
 
 fn op_type_byte(op: &Op) -> u8 {
     match op {
@@ -22,6 +24,8 @@ fn op_type_byte(op: &Op) -> u8 {
         Op::DeleteMemory(_) => OP_DELETE_MEMORY,
         Op::AddAssocEdge(_) => OP_ADD_ASSOC_EDGE,
         Op::UpsertArtifact(_) => OP_UPSERT_ARTIFACT,
+        Op::AddTriplet(_) => OP_ADD_TRIPLET,
+        Op::InvalidateTriplet(_) => OP_INVALIDATE_TRIPLET,
     }
 }
 

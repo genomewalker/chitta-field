@@ -10,6 +10,26 @@ pub enum Op {
     DeleteMemory(DeleteMemoryOp),
     AddAssocEdge(AddAssocEdgeOp),
     UpsertArtifact(UpsertArtifactOp),
+    AddTriplet(AddTripletOp),
+    InvalidateTriplet(InvalidateTripletOp),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddTripletOp {
+    pub triplet_id: u64,
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub weight: f32,
+    pub valid_from_ms: i64,
+    pub source_memory_id: Option<u64>,
+    pub source_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvalidateTripletOp {
+    pub triplet_id: u64,
+    pub invalidated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
