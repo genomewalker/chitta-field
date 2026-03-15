@@ -1065,6 +1065,31 @@ pub extern "C" fn cf_code_file_count(h: *const CfHandle) -> usize {
     unsafe { (*h).field.code_file_count() }
 }
 
+/// Encode all unindexed memories into sparse codes. Returns count encoded.
+#[no_mangle]
+pub extern "C" fn cf_encode_all(h: *mut CfHandle) -> usize {
+    if h.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &mut *h };
+    match handle.field.encode_all_unindexed() {
+        Ok(n) => n,
+        Err(e) => {
+            handle.err(e);
+            0
+        }
+    }
+}
+
+/// Get cortical index size (how many memories have sparse codes).
+#[no_mangle]
+pub extern "C" fn cf_cortical_count(h: *const CfHandle) -> usize {
+    if h.is_null() {
+        return 0;
+    }
+    unsafe { (*h).field.cortical_count() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

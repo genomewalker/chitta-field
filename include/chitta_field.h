@@ -150,6 +150,10 @@ int cf_upsert_code_file(CfHandle* h,
 size_t cf_symbol_count(const CfHandle* h);
 size_t cf_code_file_count(const CfHandle* h);
 
+/* Sparse Predictive Associative Field (SPAF) */
+size_t cf_encode_all(CfHandle* h);
+size_t cf_cortical_count(const CfHandle* h);
+
 #ifdef __cplusplus
 }
 #endif

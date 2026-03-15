@@ -17,6 +17,7 @@ pub enum Op {
     AddSymCallEdge(AddSymCallEdgeOp),
     RemoveSymCallEdge(RemoveSymCallEdgeOp),
     UpsertCodeFile(UpsertCodeFileOp),
+    UpdateSparseCode(UpdateSparseCodeOp),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +134,14 @@ pub struct UpsertCodeFileOp {
     pub path: String,
     pub project: String,
     pub mtime: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSparseCodeOp {
+    pub memory_id: u64,
+    pub feature_ids: Vec<u32>,
+    pub activations: Vec<f32>,
+    pub ts_ms: i64,  // when encoded
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

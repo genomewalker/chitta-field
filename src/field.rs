@@ -16,6 +16,7 @@ use crate::organ::triplet::TripletStore;
 use crate::organ::symbol::{SymbolIndex, SymbolEntry};
 use crate::organ::callgraph::CallGraph;
 use crate::organ::codefile::CodeFileIndex;
+use crate::organ::cortex::{SparseEncoder, CorticalIndex, SparseCode};
 use crate::learner::LearnerSet;
 
 /// A single directed association edge stored in memory.
@@ -49,6 +50,8 @@ pub struct ChittaField {
     pub(crate) symbol_id_alloc: Arc<TripletIdAllocator>,
     pub(crate) code_file_id_alloc: Arc<TripletIdAllocator>,
     pub(crate) learners: RwLock<LearnerSet>,
+    pub(crate) sparse_encoder: RwLock<SparseEncoder>,
+    pub(crate) cortical_idx: RwLock<CorticalIndex>,
 }
 
 impl Drop for ChittaField {
@@ -90,13 +93,14 @@ impl ChittaField {
         let mut symbol_idx = SymbolIndex::new();
         let mut call_graph = CallGraph::new();
         let mut code_files = CodeFileIndex::new();
+        let mut cortical_idx = CorticalIndex::new();
 
         // Replay ALL segment files to rebuild in-memory state.
         log.replay(0, |_seqno, op| {
             apply_op(op, &mut payloads, &mut states, &mut assoc_edges,
                      &mut artifacts, &mut artifact_paths, &mut semantic_idx,
                      &mut time_idx, &mut artifact_idx, &mut keyword_idx, &mut triplet_store,
-                     &mut symbol_idx, &mut call_graph, &mut code_files);
+                     &mut symbol_idx, &mut call_graph, &mut code_files, &mut cortical_idx);
             Ok(())
         })?;
 
@@ -127,6 +131,8 @@ impl ChittaField {
             symbol_id_alloc,
             code_file_id_alloc,
             learners: RwLock::new(LearnerSet::new()),
+            sparse_encoder: RwLock::new(SparseEncoder::new()),
+            cortical_idx: RwLock::new(cortical_idx),
         })
     }
 }
@@ -147,6 +153,7 @@ pub(crate) fn apply_op(
     symbol_idx: &mut SymbolIndex,
     call_graph: &mut CallGraph,
     code_files: &mut CodeFileIndex,
+    cortical_idx: &mut CorticalIndex,
 ) {
     match op {
         Op::PutPayload(put) => {
@@ -268,6 +275,17 @@ pub(crate) fn apply_op(
         }
         Op::UpsertCodeFile(f) => {
             code_files.upsert(&f.path, &f.project, f.mtime, || f.file_id);
+        }
+        Op::UpdateSparseCode(op) => {
+            let code = SparseCode {
+                feature_ids: op.feature_ids.clone(),
+                activations: op.activations.clone(),
+            };
+            let strength = states.get(&op.memory_id).map(|s| s.strength).unwrap_or(0.5);
+            let (kind, ts_ms) = payloads.get(&op.memory_id)
+                .map(|p| (p.kind.as_str(), p.authored_at_ms))
+                .unwrap_or(("unknown", op.ts_ms));
+            cortical_idx.index(op.memory_id, &code, strength, ts_ms, kind);
         }
     }
 }

@@ -22,3 +22,4 @@ pub use organ::triplet::{TripletStore, TripletEntry};
 pub use field::{ChittaField, AssocEdge};
 pub use hnsw::{SemanticIndex, SemanticHit};
 pub use recall::RecallHit;
+pub use organ::cortex::{SparseEncoder, CorticalIndex, SparseCode};

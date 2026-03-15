@@ -21,6 +21,7 @@ const OP_REMOVE_SYMBOL: u8 = 8;
 const OP_ADD_SYM_CALL_EDGE: u8 = 9;
 const OP_REMOVE_SYM_CALL_EDGE: u8 = 10;
 const OP_UPSERT_CODE_FILE: u8 = 11;
+const OP_UPDATE_SPARSE_CODE: u8 = 12;
 
 fn op_type_byte(op: &Op) -> u8 {
     match op {
@@ -36,6 +37,7 @@ fn op_type_byte(op: &Op) -> u8 {
         Op::AddSymCallEdge(_) => OP_ADD_SYM_CALL_EDGE,
         Op::RemoveSymCallEdge(_) => OP_REMOVE_SYM_CALL_EDGE,
         Op::UpsertCodeFile(_) => OP_UPSERT_CODE_FILE,
+        Op::UpdateSparseCode(_) => OP_UPDATE_SPARSE_CODE,
     }
 }
 

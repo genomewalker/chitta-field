@@ -6,7 +6,7 @@ use crate::ids::{ArtifactId, ChunkHash, MemoryId, compute_chunk_hash};
 use crate::ops::{
     AddAssocEdgeOp, DeleteMemoryOp, EdgeType, Op, PutPayloadOp, StateDeltaOp,
     UpsertArtifactOp, ArtifactRef, AddTripletOp, InvalidateTripletOp,
-    UpsertSymbolOp, RemoveSymbolOp, AddSymCallEdgeOp, UpsertCodeFileOp,
+    UpsertSymbolOp, RemoveSymbolOp, AddSymCallEdgeOp, UpsertCodeFileOp, UpdateSparseCodeOp,
 };
 use crate::organ::triplet::TripletEntry;
 use crate::organ::symbol::SymbolEntry;
@@ -14,7 +14,7 @@ use crate::payload::MemoryPayload;
 use crate::state::MemoryState;
 use crate::ops::EMBED_DIM;
 use crate::recall::RecallHit;
-use crate::learner::route::{Route, QueryIntent, RouteLearner};
+use crate::learner::route::{Route, RouteLearner};
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -101,6 +101,9 @@ impl ChittaField {
                 }
             }
         }
+
+        // Auto-encode into cortical sparse index (non-fatal if fails)
+        let _ = self.encode_memory(memory_id);
 
         Ok((memory_id, chunk_hash))
     }
@@ -228,6 +231,7 @@ impl ChittaField {
         }
         self.semantic_idx.write().remove(memory_id);
         self.keyword_idx.write().remove(memory_id);
+        self.cortical_idx.write().remove(memory_id);
 
         // Remove from temporal index (need authored_at_ms from payload).
         {
@@ -331,27 +335,76 @@ impl ChittaField {
                 .collect()
         };
 
-        let candidates = self.semantic_idx.read().search(
-            query_embedding,
-            k * 3,
-            Some(&allowed),
-        );
+        // Encode query into sparse code
+        let query_code = self.sparse_encoder.read().encode(query_embedding);
 
         let now = now_ms();
+
+        // Merge cortical and semantic results
+        let mut seen: std::collections::HashMap<MemoryId, f32> = std::collections::HashMap::new();
+
+        let cortical_empty = self.cortical_idx.read().is_empty();
+
+        if cortical_empty {
+            // Pure brute-force fallback: no cortical index yet
+            let candidates = self.semantic_idx.read().search(
+                query_embedding,
+                k * 3,
+                Some(&allowed),
+            );
+            let states_r = self.states.read();
+            for hit in candidates {
+                let eff = states_r.get(&hit.memory_id).map(|s| 0.5 + 0.5 * s.effective_strength(now)).unwrap_or(0.5);
+                let conf = states_r.get(&hit.memory_id).map(|s| s.confidence).unwrap_or(1.0);
+                seen.insert(hit.memory_id, hit.cosine_similarity * eff * conf);
+            }
+        } else {
+            // Cortical index hits (fast path for indexed memories)
+            {
+                let cortical = self.cortical_idx.read();
+                for (mem_id, score) in cortical.search(&query_code, k * 3, Some(&allowed)) {
+                    seen.insert(mem_id, score);
+                }
+            }
+
+            // Semantic (HNSW) fallback for memories not yet in cortical index
+            let cortical_mem_ids: std::collections::HashSet<MemoryId> = {
+                self.cortical_idx.read().mem_codes.keys().copied().collect()
+            };
+            let semantic_allowed: std::collections::HashSet<MemoryId> = allowed
+                .iter()
+                .filter(|id| !cortical_mem_ids.contains(id))
+                .copied()
+                .collect();
+
+            if !semantic_allowed.is_empty() {
+                let candidates = self.semantic_idx.read().search(
+                    query_embedding,
+                    k * 3,
+                    Some(&semantic_allowed),
+                );
+                let states_r = self.states.read();
+                for hit in candidates {
+                    let eff = states_r.get(&hit.memory_id).map(|s| 0.5 + 0.5 * s.effective_strength(now)).unwrap_or(0.5);
+                    let conf = states_r.get(&hit.memory_id).map(|s| s.confidence).unwrap_or(1.0);
+                    seen.entry(hit.memory_id).or_insert(hit.cosine_similarity * eff * conf);
+                }
+            }
+        }
+
         let states = self.states.read();
         let payloads = self.payloads.read();
 
-        let mut hits: Vec<RecallHit> = candidates
+        let mut hits: Vec<RecallHit> = seen
             .into_iter()
-            .filter_map(|hit| {
-                let state = states.get(&hit.memory_id)?;
-                let payload = payloads.get(&hit.memory_id)?;
+            .filter_map(|(memory_id, score)| {
+                let state = states.get(&memory_id)?;
+                let payload = payloads.get(&memory_id)?;
                 let eff_strength = state.effective_strength(now);
-                let score = hit.cosine_similarity * (0.5 + 0.5 * eff_strength) * state.confidence;
                 Some(RecallHit {
-                    memory_id: hit.memory_id,
+                    memory_id,
                     score,
-                    semantic_score: hit.cosine_similarity,
+                    semantic_score: score,
                     ts_ms: payload.created_at_ms,
                     kind: payload.kind.clone(),
                     realm: payload.realm.clone(),
@@ -366,6 +419,24 @@ impl ChittaField {
             b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
         });
         hits.truncate(k);
+
+        // Reconsolidation: mini-strengthen each returned memory
+        let hit_ids: Vec<MemoryId> = hits.iter().map(|h| h.memory_id).collect();
+        drop(states);
+        drop(payloads);
+        for &id in &hit_ids {
+            let _ = self.update_state(id, Some(0.01), None, None, true, None);
+            let new_strength = self.states.read().get(&id).map(|s| s.strength);
+            if let Some(s) = new_strength {
+                self.cortical_idx.write().update_strength(id, s);
+            }
+        }
+        // Add co-retrieval edges for top results
+        for i in 0..hit_ids.len().min(5) {
+            for j in (i + 1)..hit_ids.len().min(5) {
+                let _ = self.add_assoc_edge(hit_ids[i], hit_ids[j], EdgeType::CoRetrieved, 0.05);
+            }
+        }
 
         Ok(hits)
     }
@@ -583,6 +654,24 @@ impl ChittaField {
             b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
         });
         hits.truncate(k);
+
+        // Reconsolidation: mini-strengthen each returned memory
+        let hit_ids: Vec<MemoryId> = hits.iter().map(|h| h.memory_id).collect();
+        drop(states);
+        drop(payloads);
+        for &id in &hit_ids {
+            let _ = self.update_state(id, Some(0.01), None, None, true, None);
+            let new_strength = self.states.read().get(&id).map(|s| s.strength);
+            if let Some(s) = new_strength {
+                self.cortical_idx.write().update_strength(id, s);
+            }
+        }
+        // Add co-retrieval edges for top results
+        for i in 0..hit_ids.len().min(5) {
+            for j in (i + 1)..hit_ids.len().min(5) {
+                let _ = self.add_assoc_edge(hit_ids[i], hit_ids[j], EdgeType::CoRetrieved, 0.05);
+            }
+        }
 
         Ok(hits)
     }
@@ -849,6 +938,61 @@ impl ChittaField {
 
     pub fn code_file_count(&self) -> usize {
         self.code_files.read().count()
+    }
+
+    pub fn cortical_count(&self) -> usize {
+        self.cortical_idx.read().len()
+    }
+
+    /// Encode a memory's embedding into sparse codes and index into the cortical index.
+    /// Persists via UpdateSparseCode op.
+    pub fn encode_memory(&self, memory_id: MemoryId) -> Result<()> {
+        let embedding = {
+            let payloads = self.payloads.read();
+            payloads.get(&memory_id).map(|p| p.embedding.clone())
+        };
+        let Some(embedding) = embedding else { return Ok(()); };
+        if embedding.len() != EMBED_DIM { return Ok(()); }
+
+        let code = self.sparse_encoder.read().encode(&embedding);
+        if code.is_empty() { return Ok(()); }
+
+        // Hebbian update
+        self.sparse_encoder.write().update(&embedding, &code);
+
+        let ts_ms = now_ms();
+        let op = Op::UpdateSparseCode(UpdateSparseCodeOp {
+            memory_id,
+            feature_ids: code.feature_ids.clone(),
+            activations: code.activations.clone(),
+            ts_ms,
+        });
+        self.log.write().append(&op)?;
+
+        // Index in cortical index
+        let strength = self.states.read().get(&memory_id).map(|s| s.strength).unwrap_or(0.5);
+        let kind = self.payloads.read().get(&memory_id).map(|p| p.kind.clone()).unwrap_or_default();
+        let authored_at = self.payloads.read().get(&memory_id).map(|p| p.authored_at_ms).unwrap_or(ts_ms);
+        self.cortical_idx.write().index(memory_id, &code, strength, authored_at, &kind);
+
+        Ok(())
+    }
+
+    /// Encode all memories that don't yet have a sparse code.
+    pub fn encode_all_unindexed(&self) -> Result<usize> {
+        let ids: Vec<MemoryId> = {
+            let payloads = self.payloads.read();
+            let cortical = self.cortical_idx.read();
+            payloads.keys()
+                .filter(|id| !cortical.mem_codes.contains_key(id))
+                .copied()
+                .collect()
+        };
+        let count = ids.len();
+        for id in ids {
+            self.encode_memory(id)?;
+        }
+        Ok(count)
     }
 }
 
