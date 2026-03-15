@@ -3,9 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use crate::error::Result;
-use crate::ids::{MemoryId, ArtifactId, MemoryIdAllocator, ArtifactIdAllocator, TripletIdAllocator};
+use crate::ids::{MemoryId, ArtifactId, InstanceId, MemoryIdAllocator, ArtifactIdAllocator, TripletIdAllocator, new_instance_id};
 use crate::log::OpLog;
-use crate::manifest::Manifest;
 use crate::ops::{Op, EdgeType};
 use crate::payload::MemoryPayload;
 use crate::state::MemoryState;
@@ -26,8 +25,7 @@ pub struct AssocEdge {
 
 pub struct ChittaField {
     pub(crate) data_dir: PathBuf,
-    pub(crate) lock_dir: PathBuf,
-    pub(crate) manifest: RwLock<Manifest>,
+    pub(crate) instance_id: InstanceId,
     pub(crate) log: RwLock<OpLog>,
     pub(crate) id_alloc: Arc<MemoryIdAllocator>,
     pub(crate) artifact_id_alloc: Arc<ArtifactIdAllocator>,
@@ -35,7 +33,6 @@ pub struct ChittaField {
     pub(crate) states: RwLock<HashMap<MemoryId, MemoryState>>,
     pub(crate) assoc_edges: RwLock<HashMap<MemoryId, Vec<AssocEdge>>>,
     pub(crate) artifacts: RwLock<HashMap<String, ArtifactId>>,
-    /// Reverse map: artifact_id -> normalized_path, for wiring artifact index during PutPayload.
     pub(crate) artifact_paths: RwLock<HashMap<ArtifactId, String>>,
     pub(crate) semantic_idx: RwLock<SemanticIndex>,
     pub(crate) time_idx: RwLock<TemporalIndex>,
@@ -53,35 +50,24 @@ impl Drop for ChittaField {
 }
 
 impl ChittaField {
-    /// Persist the manifest to disk. Called automatically on drop.
+    /// Flush the write buffer to the OS.
     pub fn flush(&self) -> Result<()> {
-        let manifest = self.manifest.read();
-        manifest.save(&self.data_dir)
+        self.log.write().flush_buf()
     }
 
-    pub fn open(data_dir: PathBuf, lock_dir: PathBuf) -> Result<Self> {
+    pub fn open(data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
-        std::fs::create_dir_all(&lock_dir)?;
         std::fs::create_dir_all(data_dir.join("segments"))?;
 
-        // Load or create manifest.
-        let manifest = Manifest::load(&data_dir)?.unwrap_or_else(|| {
-            Manifest::new_empty("bge-base-en-v1.5", 768)
-        });
+        // Each open() generates a fresh InstanceId — no coordination needed.
+        let instance_id = new_instance_id();
 
-        // Determine replay start: one past the last checkpointed payload seqno.
-        let replay_from = manifest
-            .checkpoints
-            .payload
-            .as_ref()
-            .map(|c| c.max_seqno + 1)
-            .unwrap_or(1);
+        // Open this instance's write log.
+        let log = OpLog::open(&data_dir, instance_id, 1)?;
 
-        // Open log positioned for new appends at last_seqno + 1.
-        let log = OpLog::open(&data_dir, manifest.last_seqno + 1)?;
-
-        let id_alloc = Arc::new(MemoryIdAllocator::new(manifest.next_memory_id.max(1)));
-        let artifact_id_alloc = Arc::new(ArtifactIdAllocator::new(manifest.next_artifact_id.max(1)));
+        // Allocators are partitioned by instance_id — no collision with other instances.
+        let id_alloc = Arc::new(MemoryIdAllocator::with_instance(instance_id));
+        let artifact_id_alloc = Arc::new(ArtifactIdAllocator::with_instance(instance_id));
 
         let mut payloads: HashMap<MemoryId, MemoryPayload> = HashMap::new();
         let mut states: HashMap<MemoryId, MemoryState> = HashMap::new();
@@ -94,41 +80,19 @@ impl ChittaField {
         let mut keyword_idx = KeywordIndex::new();
         let mut triplet_store = TripletStore::new();
 
-        // Replay ops from the log into in-memory projections.
-        log.replay(replay_from, |_seqno, op| {
-            apply_op(
-                op,
-                &mut payloads,
-                &mut states,
-                &mut assoc_edges,
-                &mut artifacts,
-                &mut artifact_paths,
-                &mut semantic_idx,
-                &mut time_idx,
-                &mut artifact_idx,
-                &mut keyword_idx,
-                &mut triplet_store,
-            );
+        // Replay ALL segment files to rebuild in-memory state.
+        log.replay(0, |_seqno, op| {
+            apply_op(op, &mut payloads, &mut states, &mut assoc_edges,
+                     &mut artifacts, &mut artifact_paths, &mut semantic_idx,
+                     &mut time_idx, &mut artifact_idx, &mut keyword_idx, &mut triplet_store);
             Ok(())
         })?;
 
-        // If the manifest was absent or stale, sync allocators from replayed state.
-        let max_memory_id = payloads.keys().copied().max().unwrap_or(0);
-        if max_memory_id >= id_alloc.current() {
-            id_alloc.reset_to(max_memory_id + 1);
-        }
-        let max_artifact_id = artifacts.values().copied().max().unwrap_or(0);
-        if max_artifact_id >= artifact_id_alloc.current() {
-            artifact_id_alloc.reset_to(max_artifact_id + 1);
-        }
-
-        // Restore the triplet ID allocator from the replayed store state.
         let triplet_id_alloc = Arc::new(TripletIdAllocator::new(triplet_store.next_id()));
 
         Ok(Self {
             data_dir,
-            lock_dir,
-            manifest: RwLock::new(manifest),
+            instance_id,
             log: RwLock::new(log),
             id_alloc,
             artifact_id_alloc,
@@ -175,7 +139,6 @@ pub(crate) fn apply_op(
             let artifact_refs = put.artifact_refs.clone();
             let content_str = String::from_utf8(put.content.clone()).unwrap_or_default();
 
-            // Insert or replace state if this is a newer version.
             let state = states.entry(memory_id).or_insert_with(|| {
                 MemoryState::new(memory_id, chunk_hash, created_at_ms)
             });
@@ -187,7 +150,6 @@ pub(crate) fn apply_op(
             semantic_idx.upsert(memory_id, embedding);
             keyword_idx.index(memory_id, &content_str);
 
-            // Update temporal index.
             time_idx.upsert(TemporalEntry {
                 memory_id,
                 ts_ms: authored_at_ms,
@@ -196,7 +158,6 @@ pub(crate) fn apply_op(
                 strength,
             });
 
-            // Update artifact index for each artifact ref, using the reverse path map.
             for art_ref in &artifact_refs {
                 if let Some(path) = artifact_paths.get(&art_ref.artifact_id) {
                     artifact_idx.associate(memory_id, art_ref.artifact_id, path, strength);
@@ -205,8 +166,6 @@ pub(crate) fn apply_op(
         }
         Op::UpdateState(delta) => {
             let memory_id = delta.memory_id;
-            // Use a wall-clock substitute of 0 during replay; callers with real
-            // time-awareness should supply now_ms via a higher-level interface.
             if let Some(state) = states.get_mut(&memory_id) {
                 state.apply_delta(&delta, 0);
             }
@@ -218,7 +177,6 @@ pub(crate) fn apply_op(
             }
             semantic_idx.remove(memory_id);
             keyword_idx.remove(memory_id);
-            // Remove from temporal index using the authored_at_ms stored in the payload.
             if let Some(payload) = payloads.get(&memory_id) {
                 time_idx.remove(memory_id, payload.authored_at_ms);
             }
@@ -233,7 +191,6 @@ pub(crate) fn apply_op(
             });
         }
         Op::UpsertArtifact(art_op) => {
-            // Maintain both forward (path->id) and reverse (id->path) maps.
             artifacts.entry(art_op.normalized_path.clone()).or_insert(art_op.artifact_id);
             artifact_paths.entry(art_op.artifact_id).or_insert(art_op.normalized_path);
         }

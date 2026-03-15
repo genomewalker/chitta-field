@@ -34,7 +34,6 @@ fn main() {
     let mut memories_path: Option<PathBuf> = None;
     let mut triplets_path: Option<PathBuf> = None;
     let mut field_dir = expand_home("~/.claude/mind/chitta-field");
-    let mut lock_dir = std::env::temp_dir().join("chitta-field-migrate");
     let mut batch_report = 500usize;
 
     let mut i = 1;
@@ -43,7 +42,7 @@ fn main() {
             "--memories"   => { i += 1; memories_path = Some(expand_home(&args[i])); }
             "--triplets"   => { i += 1; triplets_path = Some(expand_home(&args[i])); }
             "--field-dir"  => { i += 1; field_dir = expand_home(&args[i]); }
-            "--lock-dir"   => { i += 1; lock_dir = expand_home(&args[i]); }
+            "--lock-dir"   => { i += 1; } // ignored — Upanishads model needs no locks
             "--batch"      => { i += 1; batch_report = args[i].parse().unwrap_or(500); }
             _ => {}
         }
@@ -60,7 +59,7 @@ fn main() {
     }
     println!();
 
-    let field = ChittaField::open(field_dir, lock_dir).expect("Failed to open ChittaField");
+    let field = ChittaField::open(field_dir).expect("Failed to open ChittaField");
 
     // --- Ingest memories ---
     let t0 = Instant::now();

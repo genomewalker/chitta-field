@@ -47,8 +47,6 @@ impl ChittaField {
         let memory_id = self.id_alloc.next_id();
         let ts = now_ms();
 
-        let embedding_model = self.manifest.read().embedding_model.clone();
-
         let op = PutPayloadOp {
             memory_id,
             version: 0,
@@ -58,7 +56,7 @@ impl ChittaField {
             kind: kind.to_string(),
             realm: realm.to_string(),
             content: content.to_vec(),
-            embedding_model,
+            embedding_model: "bge-base-en-v1.5".to_string(),
             embedding: embedding.to_vec(),
             artifact_refs: artifact_refs.clone(),
             source_session,
@@ -102,12 +100,6 @@ impl ChittaField {
             }
         }
 
-        {
-            let mut manifest = self.manifest.write();
-            manifest.next_memory_id = self.id_alloc.current();
-            manifest.last_seqno = seqno;
-        }
-
         Ok((memory_id, chunk_hash))
     }
 
@@ -148,7 +140,7 @@ impl ChittaField {
             touch: true,
             pin: None,
         };
-        let seqno = self.log.write().append(&Op::UpdateState(delta.clone()))?;
+        let _seqno = self.log.write().append(&Op::UpdateState(delta.clone()))?;
 
         {
             let mut states = self.states.write();
@@ -156,7 +148,6 @@ impl ChittaField {
                 state.apply_delta(&delta, ts);
             }
         }
-        self.manifest.write().last_seqno = seqno;
 
         let payloads = self.payloads.read();
         payloads
@@ -200,7 +191,7 @@ impl ChittaField {
             touch,
             pin,
         };
-        let seqno = self.log.write().append(&Op::UpdateState(delta.clone()))?;
+        let _seqno = self.log.write().append(&Op::UpdateState(delta.clone()))?;
 
         let ts = now_ms();
         {
@@ -209,7 +200,6 @@ impl ChittaField {
                 state.apply_delta(&delta, ts);
             }
         }
-        self.manifest.write().last_seqno = seqno;
 
         Ok(())
     }
@@ -226,7 +216,7 @@ impl ChittaField {
             memory_id,
             deleted_at_ms: ts,
         });
-        let seqno = self.log.write().append(&op)?;
+        let _seqno = self.log.write().append(&op)?;
 
         {
             let mut states = self.states.write();
@@ -245,8 +235,6 @@ impl ChittaField {
             }
         }
         self.artifact_idx.write().remove_memory(memory_id);
-
-        self.manifest.write().last_seqno = seqno;
 
         Ok(())
     }
@@ -277,15 +265,13 @@ impl ChittaField {
             edge_type: edge_type.clone(),
             weight,
         });
-        let seqno = self.log.write().append(&op)?;
+        let _seqno = self.log.write().append(&op)?;
 
         self.assoc_edges
             .write()
             .entry(src)
             .or_insert_with(Vec::new)
             .push(AssocEdge { dst, edge_type, weight });
-
-        self.manifest.write().last_seqno = seqno;
 
         Ok(())
     }
@@ -502,7 +488,7 @@ impl ChittaField {
             normalized_path: normalized_path.to_string(),
             repo_root,
         });
-        let seqno = self.log.write().append(&op)?;
+        let _seqno = self.log.write().append(&op)?;
 
         // Double-checked insert: another thread may have raced past the read guard.
         let id = {
@@ -516,12 +502,6 @@ impl ChittaField {
             .write()
             .entry(id)
             .or_insert_with(|| normalized_path.to_string());
-
-        {
-            let mut manifest = self.manifest.write();
-            manifest.next_artifact_id = self.artifact_id_alloc.current();
-            manifest.last_seqno = seqno;
-        }
 
         Ok(id)
     }
@@ -665,7 +645,7 @@ impl ChittaField {
             source_memory_id,
             source_file: source_file.clone(),
         });
-        let seqno = self.log.write().append(&op)?;
+        let _seqno = self.log.write().append(&op)?;
 
         self.triplet_store.write().replay_add(
             triplet_id,
@@ -678,8 +658,6 @@ impl ChittaField {
             source_file,
         );
 
-        self.manifest.write().last_seqno = seqno;
-
         Ok(triplet_id)
     }
 
@@ -690,11 +668,9 @@ impl ChittaField {
             triplet_id,
             invalidated_at_ms: now,
         });
-        let seqno = self.log.write().append(&op)?;
+        let _seqno = self.log.write().append(&op)?;
 
         self.triplet_store.write().invalidate(triplet_id, now);
-
-        self.manifest.write().last_seqno = seqno;
 
         Ok(())
     }
@@ -752,8 +728,7 @@ mod tests {
     fn open_test_field() -> (ChittaField, TempDir) {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
-        let lock_dir = tmp.path().join("lock");
-        let field = ChittaField::open(data_dir, lock_dir).unwrap();
+        let field = ChittaField::open(data_dir).unwrap();
         (field, tmp)
     }
 
@@ -788,10 +763,9 @@ mod tests {
     fn test_replay_on_reopen() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
-        let lock_dir = tmp.path().join("lock");
 
         let id = {
-            let field = ChittaField::open(data_dir.clone(), lock_dir.clone()).unwrap();
+            let field = ChittaField::open(data_dir.clone()).unwrap();
             let embedding = vec![0.5f32; 768];
             let (id, _) = field.put_memory(
                 "episode", "test", b"persisted", &embedding,
@@ -801,7 +775,7 @@ mod tests {
         };
 
         // Reopen and verify data survived.
-        let field2 = ChittaField::open(data_dir, lock_dir).unwrap();
+        let field2 = ChittaField::open(data_dir).unwrap();
         let payload = field2.get_memory(id).unwrap();
         assert_eq!(payload.content, b"persisted");
     }
@@ -821,7 +795,7 @@ mod tests {
     #[test]
     fn test_integration_add_triplet() {
         let tmp = TempDir::new().unwrap();
-        let field = ChittaField::open(tmp.path().join("data"), tmp.path().join("lock")).unwrap();
+        let field = ChittaField::open(tmp.path().join("data")).unwrap();
 
         let id = field.add_triplet(
             "chitta".into(), "replaces".into(), "duckdb".into(),
@@ -838,14 +812,13 @@ mod tests {
     fn test_replay_triplets() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
-        let lock_dir = tmp.path().join("lock");
 
         {
-            let field = ChittaField::open(data_dir.clone(), lock_dir.clone()).unwrap();
+            let field = ChittaField::open(data_dir.clone()).unwrap();
             field.add_triplet("a".into(), "b".into(), "c".into(), 1.0, None, None).unwrap();
         }
 
-        let field2 = ChittaField::open(data_dir, lock_dir).unwrap();
+        let field2 = ChittaField::open(data_dir).unwrap();
         let results = field2.query_subject("a").unwrap();
         assert_eq!(results.len(), 1);
     }
@@ -853,7 +826,7 @@ mod tests {
     #[test]
     fn test_integration_invalidate_triplet() {
         let tmp = TempDir::new().unwrap();
-        let field = ChittaField::open(tmp.path().join("data"), tmp.path().join("lock")).unwrap();
+        let field = ChittaField::open(tmp.path().join("data")).unwrap();
 
         let id = field.add_triplet(
             "chitta".into(), "uses".into(), "duckdb".into(),
@@ -872,7 +845,7 @@ mod tests {
     #[test]
     fn test_integration_query_entity() {
         let tmp = TempDir::new().unwrap();
-        let field = ChittaField::open(tmp.path().join("data"), tmp.path().join("lock")).unwrap();
+        let field = ChittaField::open(tmp.path().join("data")).unwrap();
 
         field.add_triplet("alice".into(), "knows".into(), "bob".into(), 1.0, None, None).unwrap();
         field.add_triplet("charlie".into(), "knows".into(), "alice".into(), 1.0, None, None).unwrap();

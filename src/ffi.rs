@@ -62,21 +62,16 @@ fn write_hits(hits: Vec<RecallHit>, buf: *mut CfRecallHit, cap: usize, written: 
 #[no_mangle]
 pub extern "C" fn cf_open(
     data_dir: *const c_char,
-    lock_dir: *const c_char,
+    _lock_dir: *const c_char,
 ) -> *mut CfHandle {
+    // lock_dir is ignored — the Upanishads model needs no locks.
     let data_dir = unsafe {
         match CStr::from_ptr(data_dir).to_str() {
             Ok(s) => PathBuf::from(s),
             Err(_) => return std::ptr::null_mut(),
         }
     };
-    let lock_dir = unsafe {
-        match CStr::from_ptr(lock_dir).to_str() {
-            Ok(s) => PathBuf::from(s),
-            Err(_) => return std::ptr::null_mut(),
-        }
-    };
-    match ChittaField::open(data_dir, lock_dir) {
+    match ChittaField::open(data_dir) {
         Ok(field) => Box::into_raw(Box::new(CfHandle { field, last_error: None })),
         Err(_) => std::ptr::null_mut(),
     }
@@ -736,15 +731,14 @@ pub extern "C" fn cf_recommended_window(h: *mut CfHandle, session_type: *const c
 
 // ── Maintenance ───────────────────────────────────────────────────────────────
 
-/// Flush manifest to disk.
+/// Flush write buffer to OS.
 #[no_mangle]
 pub extern "C" fn cf_flush(h: *mut CfHandle) -> c_int {
     if h.is_null() {
         return -1;
     }
     let handle = unsafe { &mut *h };
-    let manifest = handle.field.manifest.read().clone();
-    match manifest.save(&handle.field.data_dir) {
+    match handle.field.flush() {
         Ok(()) => handle.ok(),
         Err(e) => handle.err(e),
     }

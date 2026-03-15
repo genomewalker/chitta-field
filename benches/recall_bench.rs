@@ -19,10 +19,9 @@ use chitta_field::ops::EMBED_DIM;
 fn tmp_field(tag: &str) -> (ChittaField, PathBuf) {
     let base = std::env::temp_dir().join(format!("chitta-bench-{tag}"));
     let data = base.join("data");
-    let lock = base.join("lock");
     // Start fresh
     let _ = std::fs::remove_dir_all(&base);
-    let field = ChittaField::open(data, lock).expect("open");
+    let field = ChittaField::open(data).expect("open");
     (field, base)
 }
 
