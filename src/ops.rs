@@ -12,6 +12,11 @@ pub enum Op {
     UpsertArtifact(UpsertArtifactOp),
     AddTriplet(AddTripletOp),
     InvalidateTriplet(InvalidateTripletOp),
+    UpsertSymbol(UpsertSymbolOp),
+    RemoveSymbol(RemoveSymbolOp),
+    AddSymCallEdge(AddSymCallEdgeOp),
+    RemoveSymCallEdge(RemoveSymCallEdgeOp),
+    UpsertCodeFile(UpsertCodeFileOp),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +93,46 @@ pub struct UpsertArtifactOp {
     pub artifact_id: ArtifactId,
     pub normalized_path: String,
     pub repo_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertSymbolOp {
+    pub symbol_id: u64,
+    pub kind: String,
+    pub name: String,
+    pub signature: String,
+    pub file_path: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub repo_id: u64,
+    pub embedding: Vec<f32>,
+    pub description: Option<String>,
+    pub memory_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveSymbolOp {
+    pub symbol_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddSymCallEdgeOp {
+    pub caller_id: u64,
+    pub callee_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveSymCallEdgeOp {
+    pub caller_id: u64,
+    pub callee_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertCodeFileOp {
+    pub file_id: u64,
+    pub path: String,
+    pub project: String,
+    pub mtime: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

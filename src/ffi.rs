@@ -753,6 +753,318 @@ pub extern "C" fn cf_memory_count(h: *const CfHandle) -> usize {
     unsafe { (*h).field.memory_count() }
 }
 
+// ── Code Intelligence ─────────────────────────────────────────────────────────
+
+/// A single symbol search result. Fixed-size POD struct for C interop.
+#[repr(C)]
+#[derive(Clone)]
+pub struct CfSymbolHit {
+    pub symbol_id: u64,
+    pub score: f32,
+    pub kind: [u8; 64],
+    pub name: [u8; 256],
+    pub signature: [u8; 512],
+    pub file_path: [u8; 1024],
+    pub line_start: u32,
+    pub line_end: u32,
+    pub repo_id: u64,
+}
+
+impl CfSymbolHit {
+    fn from_entry(entry: &crate::organ::symbol::SymbolEntry, score: f32) -> Self {
+        fn copy_str(dst: &mut [u8], src: &str) {
+            let bytes = src.as_bytes();
+            let n = bytes.len().min(dst.len() - 1);
+            dst[..n].copy_from_slice(&bytes[..n]);
+            dst[n] = 0;
+        }
+        let mut hit = CfSymbolHit {
+            symbol_id: entry.id,
+            score,
+            kind: [0u8; 64],
+            name: [0u8; 256],
+            signature: [0u8; 512],
+            file_path: [0u8; 1024],
+            line_start: entry.line_start,
+            line_end: entry.line_end,
+            repo_id: entry.repo_id,
+        };
+        copy_str(&mut hit.kind, &entry.kind);
+        copy_str(&mut hit.name, &entry.name);
+        copy_str(&mut hit.signature, &entry.signature);
+        copy_str(&mut hit.file_path, &entry.file_path);
+        hit
+    }
+}
+
+fn write_symbol_hits(
+    entries: &[crate::organ::symbol::SymbolEntry],
+    score: f32,
+    buf: *mut CfSymbolHit,
+    cap: usize,
+    written: *mut usize,
+) {
+    let n = entries.len().min(cap);
+    for (i, e) in entries.iter().take(n).enumerate() {
+        unsafe { *buf.add(i) = CfSymbolHit::from_entry(e, score); }
+    }
+    unsafe { *written = n; }
+}
+
+/// Upsert a symbol. Returns 0 on success, -1 on error. Writes symbol_id to out_id.
+#[no_mangle]
+pub extern "C" fn cf_upsert_symbol(
+    h: *mut CfHandle,
+    kind: *const c_char,
+    name: *const c_char,
+    signature: *const c_char,
+    file_path: *const c_char,
+    line_start: u32,
+    line_end: u32,
+    repo_id: u64,
+    embedding: *const f32,
+    embed_len: usize,
+    description: *const c_char,
+    memory_id: u64,
+    out_id: *mut u64,
+) -> c_int {
+    if h.is_null() || out_id.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+
+    macro_rules! parse_str {
+        ($ptr:expr) => {
+            match unsafe { CStr::from_ptr($ptr).to_str() } {
+                Ok(s) => s,
+                Err(e) => return handle.err(e),
+            }
+        };
+    }
+
+    let kind_str = parse_str!(kind);
+    let name_str = parse_str!(name);
+    let sig_str = parse_str!(signature);
+    let path_str = parse_str!(file_path);
+    let desc = if description.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(description).to_str() } {
+            Ok(s) if !s.is_empty() => Some(s.to_string()),
+            _ => None,
+        }
+    };
+    let mem_id = if memory_id == 0 { None } else { Some(memory_id) };
+    let emb = unsafe { std::slice::from_raw_parts(embedding, embed_len) };
+
+    match handle.field.upsert_symbol(
+        kind_str, name_str, sig_str, path_str,
+        line_start, line_end, repo_id, emb, desc, mem_id,
+    ) {
+        Ok(id) => {
+            unsafe { *out_id = id; }
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Remove a symbol.
+#[no_mangle]
+pub extern "C" fn cf_remove_symbol(h: *mut CfHandle, symbol_id: u64) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    match handle.field.remove_symbol(symbol_id) {
+        Ok(()) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Search symbols by name (exact or prefix). Returns number written via *written.
+#[no_mangle]
+pub extern "C" fn cf_search_symbols_by_name(
+    h: *mut CfHandle,
+    query: *const c_char,
+    limit: usize,
+    buf: *mut CfSymbolHit,
+    buf_len: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || query.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let query_str = match unsafe { CStr::from_ptr(query).to_str() } {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+
+    let results = handle.field.search_symbols_by_name(query_str, limit);
+    write_symbol_hits(&results, 1.0, buf, buf_len, written);
+    handle.ok()
+}
+
+/// Semantic symbol search. Returns number written via *written.
+#[no_mangle]
+pub extern "C" fn cf_search_symbols_semantic(
+    h: *mut CfHandle,
+    query: *const f32,
+    embed_len: usize,
+    k: usize,
+    buf: *mut CfSymbolHit,
+    buf_len: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || query.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let emb = unsafe { std::slice::from_raw_parts(query, embed_len) };
+
+    let scored = handle.field.search_symbols_semantic(emb, k);
+    let n = scored.len().min(buf_len);
+    for (i, (sym_id, score)) in scored.iter().take(n).enumerate() {
+        if let Ok(Some(entry)) = handle.field.get_symbol(*sym_id) {
+            unsafe { *buf.add(i) = CfSymbolHit::from_entry(&entry, *score); }
+        }
+    }
+    unsafe { *written = n; }
+    handle.ok()
+}
+
+/// Get all symbols in a file.
+#[no_mangle]
+pub extern "C" fn cf_symbols_in_file(
+    h: *mut CfHandle,
+    file_path: *const c_char,
+    buf: *mut CfSymbolHit,
+    buf_len: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || file_path.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let path_str = match unsafe { CStr::from_ptr(file_path).to_str() } {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+
+    let results = handle.field.symbols_in_file(path_str);
+    write_symbol_hits(&results, 1.0, buf, buf_len, written);
+    handle.ok()
+}
+
+/// Add a call edge between two symbols.
+#[no_mangle]
+pub extern "C" fn cf_add_sym_call_edge(
+    h: *mut CfHandle,
+    caller_id: u64,
+    callee_id: u64,
+) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    match handle.field.add_call_edge(caller_id, callee_id) {
+        Ok(()) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Get symbols called by caller_id. Returns count via *written.
+#[no_mangle]
+pub extern "C" fn cf_get_callees(
+    h: *mut CfHandle,
+    symbol_id: u64,
+    buf: *mut u64,
+    buf_len: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let ids = handle.field.get_callees(symbol_id);
+    let n = ids.len().min(buf_len);
+    for (i, &id) in ids.iter().take(n).enumerate() {
+        unsafe { *buf.add(i) = id; }
+    }
+    unsafe { *written = n; }
+    handle.ok()
+}
+
+/// Get symbols that call symbol_id. Returns count via *written.
+#[no_mangle]
+pub extern "C" fn cf_get_callers(
+    h: *mut CfHandle,
+    symbol_id: u64,
+    buf: *mut u64,
+    buf_len: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let ids = handle.field.get_callers(symbol_id);
+    let n = ids.len().min(buf_len);
+    for (i, &id) in ids.iter().take(n).enumerate() {
+        unsafe { *buf.add(i) = id; }
+    }
+    unsafe { *written = n; }
+    handle.ok()
+}
+
+/// Upsert a code file. Returns its file_id via *out_id.
+#[no_mangle]
+pub extern "C" fn cf_upsert_code_file(
+    h: *mut CfHandle,
+    path: *const c_char,
+    project: *const c_char,
+    mtime: i64,
+    out_id: *mut u64,
+) -> c_int {
+    if h.is_null() || path.is_null() || project.is_null() || out_id.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let path_str = match unsafe { CStr::from_ptr(path).to_str() } {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    let project_str = match unsafe { CStr::from_ptr(project).to_str() } {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+
+    match handle.field.upsert_code_file(path_str, project_str, mtime) {
+        Ok(id) => {
+            unsafe { *out_id = id; }
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_symbol_count(h: *const CfHandle) -> usize {
+    if h.is_null() {
+        return 0;
+    }
+    unsafe { (*h).field.symbol_count() }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_code_file_count(h: *const CfHandle) -> usize {
+    if h.is_null() {
+        return 0;
+    }
+    unsafe { (*h).field.code_file_count() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

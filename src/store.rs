@@ -6,8 +6,10 @@ use crate::ids::{ArtifactId, ChunkHash, MemoryId, compute_chunk_hash};
 use crate::ops::{
     AddAssocEdgeOp, DeleteMemoryOp, EdgeType, Op, PutPayloadOp, StateDeltaOp,
     UpsertArtifactOp, ArtifactRef, AddTripletOp, InvalidateTripletOp,
+    UpsertSymbolOp, RemoveSymbolOp, AddSymCallEdgeOp, UpsertCodeFileOp,
 };
 use crate::organ::triplet::TripletEntry;
+use crate::organ::symbol::SymbolEntry;
 use crate::payload::MemoryPayload;
 use crate::state::MemoryState;
 use crate::ops::EMBED_DIM;
@@ -717,6 +719,136 @@ impl ChittaField {
         let intent = RouteLearner::detect_intent(query);
         let now_ms = now_ms() as u64;
         self.learners.write().route.select_route(intent, now_ms)
+    }
+
+    // ── Code Intelligence ────────────────────────────────────────────────────
+
+    /// Upsert a symbol. Deduplicates by (kind, name, file_path, line_start).
+    /// Returns the SymbolId.
+    pub fn upsert_symbol(
+        &self,
+        kind: &str,
+        name: &str,
+        signature: &str,
+        file_path: &str,
+        line_start: u32,
+        line_end: u32,
+        repo_id: u64,
+        embedding: &[f32],
+        description: Option<String>,
+        memory_id: Option<MemoryId>,
+    ) -> Result<u64> {
+        let symbol_id = self.symbol_id_alloc.next_id();
+        let op = Op::UpsertSymbol(UpsertSymbolOp {
+            symbol_id,
+            kind: kind.to_string(),
+            name: name.to_string(),
+            signature: signature.to_string(),
+            file_path: file_path.to_string(),
+            line_start,
+            line_end,
+            repo_id,
+            embedding: embedding.to_vec(),
+            description: description.clone(),
+            memory_id,
+        });
+        let _seqno = self.log.write().append(&op)?;
+
+        let entry = SymbolEntry {
+            id: symbol_id,
+            kind: kind.to_string(),
+            name: name.to_string(),
+            signature: signature.to_string(),
+            file_path: file_path.to_string(),
+            line_start,
+            line_end,
+            repo_id,
+            embedding: embedding.to_vec(),
+            description,
+            memory_id,
+        };
+        let actual_id = self.symbol_idx.write().upsert(entry);
+        Ok(actual_id)
+    }
+
+    /// Remove a symbol and all its call edges.
+    pub fn remove_symbol(&self, symbol_id: u64) -> Result<()> {
+        let op = Op::RemoveSymbol(RemoveSymbolOp { symbol_id });
+        let _seqno = self.log.write().append(&op)?;
+
+        self.symbol_idx.write().remove(symbol_id);
+        self.call_graph.write().remove_symbol(symbol_id);
+        Ok(())
+    }
+
+    /// Get a symbol by ID.
+    pub fn get_symbol(&self, symbol_id: u64) -> Result<Option<SymbolEntry>> {
+        Ok(self.symbol_idx.read().get(symbol_id).cloned())
+    }
+
+    /// Search symbols by name (exact or prefix match).
+    pub fn search_symbols_by_name(&self, query: &str, limit: usize) -> Vec<SymbolEntry> {
+        self.symbol_idx
+            .read()
+            .search_by_name(query, limit)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Semantic symbol search: find k nearest by cosine similarity.
+    pub fn search_symbols_semantic(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        self.symbol_idx.read().search_semantic(query, k)
+    }
+
+    /// Get all symbols in a file.
+    pub fn symbols_in_file(&self, file_path: &str) -> Vec<SymbolEntry> {
+        self.symbol_idx
+            .read()
+            .by_file(file_path)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Add a call edge between two symbols (idempotent).
+    pub fn add_call_edge(&self, caller_id: u64, callee_id: u64) -> Result<()> {
+        let op = Op::AddSymCallEdge(AddSymCallEdgeOp { caller_id, callee_id });
+        let _seqno = self.log.write().append(&op)?;
+        self.call_graph.write().add_edge(caller_id, callee_id);
+        Ok(())
+    }
+
+    /// Get symbols called by the given symbol.
+    pub fn get_callees(&self, symbol_id: u64) -> Vec<u64> {
+        self.call_graph.read().get_callees(symbol_id)
+    }
+
+    /// Get symbols that call the given symbol.
+    pub fn get_callers(&self, symbol_id: u64) -> Vec<u64> {
+        self.call_graph.read().get_callers(symbol_id)
+    }
+
+    /// Upsert a code file record. Returns its CodeFileId.
+    pub fn upsert_code_file(&self, path: &str, project: &str, mtime: i64) -> Result<u64> {
+        let next_id_fn = || self.code_file_id_alloc.next_id();
+        let (file_id, _was_updated) = self.code_files.write().upsert(path, project, mtime, next_id_fn);
+        let op = Op::UpsertCodeFile(UpsertCodeFileOp {
+            file_id,
+            path: path.to_string(),
+            project: project.to_string(),
+            mtime,
+        });
+        let _seqno = self.log.write().append(&op)?;
+        Ok(file_id)
+    }
+
+    pub fn symbol_count(&self) -> usize {
+        self.symbol_idx.read().count()
+    }
+
+    pub fn code_file_count(&self) -> usize {
+        self.code_files.read().count()
     }
 }
 

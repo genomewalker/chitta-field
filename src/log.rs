@@ -16,6 +16,11 @@ const OP_ADD_ASSOC_EDGE: u8 = 3;
 const OP_UPSERT_ARTIFACT: u8 = 4;
 const OP_ADD_TRIPLET: u8 = 5;
 const OP_INVALIDATE_TRIPLET: u8 = 6;
+const OP_UPSERT_SYMBOL: u8 = 7;
+const OP_REMOVE_SYMBOL: u8 = 8;
+const OP_ADD_SYM_CALL_EDGE: u8 = 9;
+const OP_REMOVE_SYM_CALL_EDGE: u8 = 10;
+const OP_UPSERT_CODE_FILE: u8 = 11;
 
 fn op_type_byte(op: &Op) -> u8 {
     match op {
@@ -26,6 +31,11 @@ fn op_type_byte(op: &Op) -> u8 {
         Op::UpsertArtifact(_) => OP_UPSERT_ARTIFACT,
         Op::AddTriplet(_) => OP_ADD_TRIPLET,
         Op::InvalidateTriplet(_) => OP_INVALIDATE_TRIPLET,
+        Op::UpsertSymbol(_) => OP_UPSERT_SYMBOL,
+        Op::RemoveSymbol(_) => OP_REMOVE_SYMBOL,
+        Op::AddSymCallEdge(_) => OP_ADD_SYM_CALL_EDGE,
+        Op::RemoveSymCallEdge(_) => OP_REMOVE_SYM_CALL_EDGE,
+        Op::UpsertCodeFile(_) => OP_UPSERT_CODE_FILE,
     }
 }
 
@@ -157,7 +167,14 @@ fn create_segment(path: &Path, first_seqno: u64) -> Result<File> {
     Ok(f)
 }
 
-/// All .seg files in directory, sorted (gives consistent global order across instances).
+fn is_valid_segment_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".seg") else { return false; };
+    let Some((instance_hex, seqno)) = stem.split_once('_') else { return false; };
+    instance_hex.len() == 8 && instance_hex.chars().all(|c| c.is_ascii_hexdigit())
+        && seqno.len() == 12 && seqno.chars().all(|c| c.is_ascii_digit())
+}
+
+/// All .seg files in directory matching the canonical naming pattern, sorted.
 fn collect_all_segments(seg_dir: &Path) -> Result<Vec<PathBuf>> {
     if !seg_dir.exists() {
         return Ok(Vec::new());
@@ -166,7 +183,8 @@ fn collect_all_segments(seg_dir: &Path) -> Result<Vec<PathBuf>> {
         .filter_map(|e| {
             let e = e.ok()?;
             let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("seg") { Some(p) } else { None }
+            let name = p.file_name().and_then(|n| n.to_str())?;
+            if is_valid_segment_name(name) { Some(p) } else { None }
         })
         .collect();
     paths.sort();

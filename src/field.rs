@@ -13,6 +13,9 @@ use crate::organ::temporal::{TemporalIndex, TemporalEntry};
 use crate::organ::artifact::ArtifactIndex;
 use crate::organ::keyword::KeywordIndex;
 use crate::organ::triplet::TripletStore;
+use crate::organ::symbol::{SymbolIndex, SymbolEntry};
+use crate::organ::callgraph::CallGraph;
+use crate::organ::codefile::CodeFileIndex;
 use crate::learner::LearnerSet;
 
 /// A single directed association edge stored in memory.
@@ -40,6 +43,11 @@ pub struct ChittaField {
     pub(crate) keyword_idx: RwLock<KeywordIndex>,
     pub(crate) triplet_store: RwLock<TripletStore>,
     pub(crate) triplet_id_alloc: Arc<TripletIdAllocator>,
+    pub(crate) symbol_idx: RwLock<SymbolIndex>,
+    pub(crate) call_graph: RwLock<CallGraph>,
+    pub(crate) code_files: RwLock<CodeFileIndex>,
+    pub(crate) symbol_id_alloc: Arc<TripletIdAllocator>,
+    pub(crate) code_file_id_alloc: Arc<TripletIdAllocator>,
     pub(crate) learners: RwLock<LearnerSet>,
 }
 
@@ -79,16 +87,22 @@ impl ChittaField {
         let mut artifact_idx = ArtifactIndex::new();
         let mut keyword_idx = KeywordIndex::new();
         let mut triplet_store = TripletStore::new();
+        let mut symbol_idx = SymbolIndex::new();
+        let mut call_graph = CallGraph::new();
+        let mut code_files = CodeFileIndex::new();
 
         // Replay ALL segment files to rebuild in-memory state.
         log.replay(0, |_seqno, op| {
             apply_op(op, &mut payloads, &mut states, &mut assoc_edges,
                      &mut artifacts, &mut artifact_paths, &mut semantic_idx,
-                     &mut time_idx, &mut artifact_idx, &mut keyword_idx, &mut triplet_store);
+                     &mut time_idx, &mut artifact_idx, &mut keyword_idx, &mut triplet_store,
+                     &mut symbol_idx, &mut call_graph, &mut code_files);
             Ok(())
         })?;
 
         let triplet_id_alloc = Arc::new(TripletIdAllocator::new(triplet_store.next_id()));
+        let symbol_id_alloc = Arc::new(TripletIdAllocator::new(1));
+        let code_file_id_alloc = Arc::new(TripletIdAllocator::new(1));
 
         Ok(Self {
             data_dir,
@@ -107,6 +121,11 @@ impl ChittaField {
             keyword_idx: RwLock::new(keyword_idx),
             triplet_store: RwLock::new(triplet_store),
             triplet_id_alloc,
+            symbol_idx: RwLock::new(symbol_idx),
+            call_graph: RwLock::new(call_graph),
+            code_files: RwLock::new(code_files),
+            symbol_id_alloc,
+            code_file_id_alloc,
             learners: RwLock::new(LearnerSet::new()),
         })
     }
@@ -125,6 +144,9 @@ pub(crate) fn apply_op(
     artifact_idx: &mut ArtifactIndex,
     keyword_idx: &mut KeywordIndex,
     triplet_store: &mut TripletStore,
+    symbol_idx: &mut SymbolIndex,
+    call_graph: &mut CallGraph,
+    code_files: &mut CodeFileIndex,
 ) {
     match op {
         Op::PutPayload(put) => {
@@ -208,6 +230,44 @@ pub(crate) fn apply_op(
         }
         Op::InvalidateTriplet(inv) => {
             triplet_store.invalidate(inv.triplet_id, inv.invalidated_at_ms);
+        }
+        Op::UpsertSymbol(s) => {
+            let entry = SymbolEntry {
+                id: s.symbol_id,
+                kind: s.kind,
+                name: s.name,
+                signature: s.signature,
+                file_path: s.file_path,
+                line_start: s.line_start,
+                line_end: s.line_end,
+                repo_id: s.repo_id,
+                embedding: s.embedding,
+                description: s.description,
+                memory_id: s.memory_id,
+            };
+            symbol_idx.upsert(entry);
+        }
+        Op::RemoveSymbol(r) => {
+            symbol_idx.remove(r.symbol_id);
+            call_graph.remove_symbol(r.symbol_id);
+        }
+        Op::AddSymCallEdge(e) => {
+            call_graph.add_edge(e.caller_id, e.callee_id);
+        }
+        Op::RemoveSymCallEdge(e) => {
+            // Edges are stored in the bidirectional maps; remove individually.
+            let callees = call_graph.get_callees(e.caller_id);
+            if callees.contains(&e.callee_id) {
+                // Reconstruct by removing and re-adding remaining edges for caller.
+                let remaining: Vec<u64> = callees.into_iter().filter(|&c| c != e.callee_id).collect();
+                call_graph.remove_symbol(e.caller_id);
+                for callee in remaining {
+                    call_graph.add_edge(e.caller_id, callee);
+                }
+            }
+        }
+        Op::UpsertCodeFile(f) => {
+            code_files.upsert(&f.path, &f.project, f.mtime, || f.file_id);
         }
     }
 }

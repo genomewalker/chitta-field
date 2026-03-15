@@ -100,6 +100,56 @@ size_t cf_recommended_window(CfHandle* h, const char* session_type);
 int    cf_flush(CfHandle* h);
 size_t cf_memory_count(const CfHandle* h);
 
+/* Code Intelligence */
+
+typedef struct {
+    uint64_t symbol_id;
+    float    score;
+    uint8_t  kind[64];
+    uint8_t  name[256];
+    uint8_t  signature[512];
+    uint8_t  file_path[1024];
+    uint32_t line_start;
+    uint32_t line_end;
+    uint64_t repo_id;
+} CfSymbolHit;
+
+int cf_upsert_symbol(CfHandle* h,
+    const char* kind, const char* name,
+    const char* signature, const char* file_path,
+    uint32_t line_start, uint32_t line_end, uint64_t repo_id,
+    const float* embedding, size_t embed_len,
+    const char* description,
+    uint64_t memory_id,
+    uint64_t* out_id);
+
+int cf_remove_symbol(CfHandle* h, uint64_t symbol_id);
+
+int cf_search_symbols_by_name(CfHandle* h,
+    const char* query, size_t limit,
+    CfSymbolHit* buf, size_t buf_len, size_t* written);
+
+int cf_search_symbols_semantic(CfHandle* h,
+    const float* query, size_t embed_len, size_t k,
+    CfSymbolHit* buf, size_t buf_len, size_t* written);
+
+int cf_symbols_in_file(CfHandle* h, const char* file_path,
+    CfSymbolHit* buf, size_t buf_len, size_t* written);
+
+int cf_add_sym_call_edge(CfHandle* h, uint64_t caller_id, uint64_t callee_id);
+
+int cf_get_callees(CfHandle* h, uint64_t symbol_id,
+    uint64_t* buf, size_t buf_len, size_t* written);
+
+int cf_get_callers(CfHandle* h, uint64_t symbol_id,
+    uint64_t* buf, size_t buf_len, size_t* written);
+
+int cf_upsert_code_file(CfHandle* h,
+    const char* path, const char* project, int64_t mtime, uint64_t* out_id);
+
+size_t cf_symbol_count(const CfHandle* h);
+size_t cf_code_file_count(const CfHandle* h);
+
 #ifdef __cplusplus
 }
 #endif
