@@ -44,6 +44,9 @@ impl TemporalIndex {
         realm: Option<&str>,
         limit: usize,
     ) -> Vec<TemporalEntry> {
+        if start_ms > end_ms {
+            return vec![];
+        }
         self.inner
             .range((start_ms, 0)..=(end_ms, u64::MAX))
             .rev()
@@ -126,6 +129,21 @@ mod tests {
         assert_eq!(idx.len(), 1);
         idx.remove(1, 1000);
         assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn test_inverted_range_returns_empty() {
+        let mut idx = TemporalIndex::new();
+        idx.upsert(TemporalEntry {
+            memory_id: 1,
+            ts_ms: 1000,
+            kind: "w".into(),
+            realm: "test".into(),
+            strength: 1.0,
+        });
+        // start > end: must not panic, must return empty
+        let results = idx.range_query(5000, 0, None, 100);
+        assert!(results.is_empty());
     }
 
     #[test]
