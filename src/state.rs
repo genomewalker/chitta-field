@@ -21,6 +21,8 @@ pub struct MemoryState {
 
     pub pinned: bool,
     pub tier: u8,  // 0=L1 (hippocampus), 1=L2 (cortex), 2=L3 (archive)
+    #[serde(default)]
+    pub last_state_op_ts_ms: i64,
 }
 
 impl MemoryState {
@@ -39,10 +41,17 @@ impl MemoryState {
             created_at_ms,
             pinned: false,
             tier: 0,
+            last_state_op_ts_ms: 0,
         }
     }
 
     pub fn apply_delta(&mut self, delta: &StateDeltaOp, now_ms: i64) {
+        if delta.op_ts_ms > 0 && delta.op_ts_ms <= self.last_state_op_ts_ms {
+            return;
+        }
+        if delta.op_ts_ms > 0 {
+            self.last_state_op_ts_ms = delta.op_ts_ms;
+        }
         if let Some(d) = delta.strength_delta {
             self.strength = (self.strength + d).clamp(0.0, 1.0);
             if d > 0.0 {

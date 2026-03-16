@@ -14,6 +14,7 @@ pub struct SemanticHit {
 /// Holds all embeddings in memory. At 50K memories × 768 dims this is ~148 MB
 /// and a full scan takes ~300ms — acceptable for a daemon. Real HNSW can be
 /// swapped in later by replacing this struct without changing the call sites.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SemanticIndex {
     /// memory_id -> embedding (flat Vec for cache efficiency)
     embeddings: HashMap<MemoryId, Vec<f32>>,

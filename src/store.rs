@@ -48,6 +48,16 @@ impl ChittaField {
         }
 
         let chunk_hash = compute_chunk_hash(kind, realm, content, embedding);
+
+        {
+            let idx = self.chunk_hash_idx.read();
+            if let Some(&existing_id) = idx.get(&chunk_hash) {
+                drop(idx);
+                let _ = self.update_state(existing_id, Some(0.0), None, None, true, None);
+                return Ok((existing_id, chunk_hash));
+            }
+        }
+
         let memory_id = self.id_alloc.next_id();
         let ts = now_ms();
 
@@ -77,6 +87,7 @@ impl ChittaField {
 
         self.payloads.write().insert(memory_id, payload);
         self.states.write().insert(memory_id, state);
+        self.chunk_hash_idx.write().entry(chunk_hash).or_insert(memory_id);
         self.semantic_idx.write().upsert(memory_id, embedding.to_vec());
         let content_str = std::str::from_utf8(content).unwrap_or("").to_string();
         self.keyword_idx.write().index(memory_id, &content_str);
@@ -976,7 +987,7 @@ impl ChittaField {
     /// up to the current log position, so those ops can be skipped in replay.
     pub fn save_snapshot(&self) -> Result<()> {
         let seqno = self.log.read().last_seqno();
-        let path = self.data_dir.join("cortex.snapshot");
+        let path = self.data_dir.join(format!("cortex.{:08x}.snapshot", self.instance_id));
         self.cortical_idx.read().save_snapshot(&path, seqno)
     }
 
@@ -999,8 +1010,9 @@ impl ChittaField {
             symbol_idx: self.symbol_idx.read().clone(),
             call_graph: self.call_graph.read().clone(),
             code_files: self.code_files.read().clone(),
+            semantic_idx: self.semantic_idx.read().clone(),
         };
-        let path = self.data_dir.join("chitta.snapshot");
+        let path = self.data_dir.join(format!("chitta.{:08x}.snapshot", self.instance_id));
         snap.save(&path)
     }
 
