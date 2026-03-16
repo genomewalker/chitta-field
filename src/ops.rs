@@ -85,6 +85,8 @@ pub struct StateDeltaOp {
     pub decay_rate: Option<f32>,
     pub touch: bool, // update last_accessed_ms
     pub pin: Option<bool>,
+    #[serde(default)]
+    pub op_ts_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -6,6 +6,7 @@ use crate::ids::{MemoryId, ArtifactId};
 use crate::payload::MemoryPayload;
 use crate::state::MemoryState;
 use crate::field::AssocEdge;
+use crate::hnsw::SemanticIndex;
 use crate::organ::temporal::TemporalIndex;
 use crate::organ::keyword::KeywordIndex;
 use crate::organ::artifact::ArtifactIndex;
@@ -15,7 +16,7 @@ use crate::organ::callgraph::CallGraph;
 use crate::organ::codefile::CodeFileIndex;
 use crate::error::{FieldError, Result};
 
-const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_0002;
+const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_0003;
 
 #[derive(Serialize, Deserialize)]
 pub struct FullSnapshot {
@@ -32,6 +33,7 @@ pub struct FullSnapshot {
     pub symbol_idx: SymbolIndex,
     pub call_graph: CallGraph,
     pub code_files: CodeFileIndex,
+    pub semantic_idx: SemanticIndex,
 }
 
 impl FullSnapshot {

@@ -74,6 +74,7 @@ pub struct ChittaField {
     pub(crate) lite_encoder: RwLock<Option<LiteEncoder>>,
     /// Byte offsets for each foreign segment file, used by sync_foreign().
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
+    pub(crate) chunk_hash_idx: RwLock<HashMap<crate::ids::ChunkHash, MemoryId>>,
 }
 
 impl Drop for ChittaField {
@@ -122,56 +123,57 @@ impl ChittaField {
         let mut user_model_registry = UserModelRegistry::new();
         let mut theme_organ = ThemeOrgan::new();
         let mut analytics_registry = AnalyticsRegistry::new();
+        let mut chunk_hash_idx: HashMap<crate::ids::ChunkHash, MemoryId> = HashMap::new();
 
-        // Load cortical snapshot if available; snapshot covers UpdateSparseCode ops
-        // up to snapshot_seqno so we can skip them during replay.
+        // Load best cortical snapshot across all instances
         let mut snapshot_seqno: u64 = 0;
-        let snapshot_path = data_dir.join("cortex.snapshot");
-        if snapshot_path.exists() {
-            match CorticalIndex::load_snapshot(&snapshot_path) {
-                Ok((loaded, seqno)) => {
-                    cortical_idx = loaded;
-                    snapshot_seqno = seqno;
-                    eprintln!("[chitta-field] loaded cortical snapshot seqno={}", seqno);
-                }
-                Err(e) => {
-                    eprintln!("[chitta-field] snapshot load failed ({}), rebuilding from log", e);
+        if let Ok(entries) = std::fs::read_dir(&data_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("cortex.") && name_str.ends_with(".snapshot") {
+                    match CorticalIndex::load_snapshot(&entry.path()) {
+                        Ok((loaded, seqno)) if seqno > snapshot_seqno => {
+                            cortical_idx = loaded;
+                            snapshot_seqno = seqno;
+                            eprintln!("[chitta-field] loaded cortical snapshot seqno={} from {:?}", seqno, entry.path());
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[chitta-field] skipping corrupt cortical snapshot {:?}: {}", entry.path(), e),
+                    }
                 }
             }
         }
 
-        // Load full state snapshot if available; covers all non-cortical state up to
-        // full_snapshot_seqno so we only replay ops after that point.
+        // Load best full snapshot across all instances
         let mut full_snapshot_seqno: u64 = 0;
-        let full_snapshot_path = data_dir.join("chitta.snapshot");
-        if full_snapshot_path.exists() {
-            match FullSnapshot::load(&full_snapshot_path) {
-                Ok(snap) => {
-                    full_snapshot_seqno = snap.snapshot_seqno;
-                    payloads = snap.payloads;
-                    states = snap.states;
-                    assoc_edges = snap.assoc_edges;
-                    artifacts = snap.artifacts;
-                    artifact_paths = snap.artifact_paths;
-                    time_idx = snap.time_idx;
-                    keyword_idx = snap.keyword_idx;
-                    artifact_idx = snap.artifact_idx;
-                    triplet_store = snap.triplet_store;
-                    symbol_idx = snap.symbol_idx;
-                    call_graph = snap.call_graph;
-                    code_files = snap.code_files;
-                    eprintln!("[chitta-field] loaded full snapshot seqno={}", full_snapshot_seqno);
+        if let Ok(entries) = std::fs::read_dir(&data_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("chitta.") && name_str.ends_with(".snapshot") {
+                    match FullSnapshot::load(&entry.path()) {
+                        Ok(snap) if snap.snapshot_seqno > full_snapshot_seqno => {
+                            full_snapshot_seqno = snap.snapshot_seqno;
+                            payloads = snap.payloads;
+                            states = snap.states;
+                            assoc_edges = snap.assoc_edges;
+                            artifacts = snap.artifacts;
+                            artifact_paths = snap.artifact_paths;
+                            time_idx = snap.time_idx;
+                            keyword_idx = snap.keyword_idx;
+                            artifact_idx = snap.artifact_idx;
+                            triplet_store = snap.triplet_store;
+                            symbol_idx = snap.symbol_idx;
+                            call_graph = snap.call_graph;
+                            code_files = snap.code_files;
+                            semantic_idx = snap.semantic_idx;
+                            eprintln!("[chitta-field] loaded full snapshot seqno={} from {:?}", full_snapshot_seqno, entry.path());
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[chitta-field] skipping corrupt full snapshot {:?}: {}", entry.path(), e),
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[chitta-field] full snapshot load failed ({}), rebuilding from log", e);
-                }
-            }
-        }
-
-        // Rebuild SemanticIndex from loaded payloads (not stored in snapshot).
-        if full_snapshot_seqno > 0 {
-            for (&mid, payload) in &payloads {
-                semantic_idx.upsert(mid, payload.embedding.clone());
             }
         }
 
@@ -201,7 +203,8 @@ impl ChittaField {
                      &mut time_idx, &mut artifact_idx, &mut keyword_idx, &mut triplet_store,
                      &mut symbol_idx, &mut call_graph, &mut code_files, &mut cortical_idx,
                      &mut session_registry, &mut transcript_registry, &mut task_registry,
-                     &mut user_model_registry, &mut theme_organ, &mut analytics_registry);
+                     &mut user_model_registry, &mut theme_organ, &mut analytics_registry,
+                     &mut chunk_hash_idx);
             Ok(())
         })?;
 
@@ -214,6 +217,7 @@ impl ChittaField {
         let code_file_id_alloc = Arc::new(TripletIdAllocator::new(max_code_file_id + 1));
 
         let loaded_lite_encoder = Self::load_lite_encoder(&data_dir);
+        let loaded_seen_offsets = Self::load_seen_offsets(&data_dir, instance_id);
 
         Ok(Self {
             data_dir,
@@ -248,7 +252,8 @@ impl ChittaField {
             theme_organ: RwLock::new(theme_organ),
             analytics_registry: RwLock::new(analytics_registry),
             lite_encoder: RwLock::new(loaded_lite_encoder),
-            seen_offsets: RwLock::new(HashMap::new()),
+            seen_offsets: RwLock::new(loaded_seen_offsets),
+            chunk_hash_idx: RwLock::new(chunk_hash_idx),
         })
     }
 }
@@ -309,6 +314,7 @@ impl ChittaField {
         let mut user_model_reg  = self.user_model_registry.write();
         let mut theme_organ     = self.theme_organ.write();
         let mut analytics_reg   = self.analytics_registry.write();
+        let mut chunk_hash_idx  = self.chunk_hash_idx.write();
 
         for op in ops {
             apply_op(
@@ -320,7 +326,12 @@ impl ChittaField {
                 &mut *code_files, &mut *cortical_idx,
                 &mut *session_reg, &mut *transcript_reg, &mut *task_reg,
                 &mut *user_model_reg, &mut *theme_organ, &mut *analytics_reg,
+                &mut *chunk_hash_idx,
             );
+        }
+
+        if count > 0 {
+            self.persist_seen_offsets();
         }
 
         Ok(count)
@@ -328,6 +339,28 @@ impl ChittaField {
 }
 
 impl ChittaField {
+    fn seen_offsets_path(data_dir: &std::path::Path, instance_id: crate::ids::InstanceId) -> std::path::PathBuf {
+        data_dir.join(format!("seen_offsets.{:08x}.json", instance_id))
+    }
+
+    fn load_seen_offsets(data_dir: &std::path::Path, instance_id: crate::ids::InstanceId) -> HashMap<PathBuf, u64> {
+        let path = Self::seen_offsets_path(data_dir, instance_id);
+        std::fs::read_to_string(&path).ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn persist_seen_offsets(&self) {
+        let path = Self::seen_offsets_path(&self.data_dir, self.instance_id);
+        let offsets = self.seen_offsets.read();
+        if let Ok(json) = serde_json::to_string(&*offsets) {
+            let tmp = path.with_extension("tmp");
+            if std::fs::write(&tmp, &json).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+
     fn load_lite_encoder(data_dir: &std::path::Path) -> Option<LiteEncoder> {
         let path = data_dir.join("lite_encoder.bin");
         if !path.exists() {
@@ -425,6 +458,7 @@ pub(crate) fn apply_op(
     user_model_registry: &mut UserModelRegistry,
     theme_organ: &mut ThemeOrgan,
     analytics_registry: &mut AnalyticsRegistry,
+    chunk_hash_idx: &mut HashMap<crate::ids::ChunkHash, MemoryId>,
 ) {
     match op {
         Op::PutPayload(put) => {
@@ -447,6 +481,7 @@ pub(crate) fn apply_op(
             let strength = state.strength;
 
             payloads.insert(memory_id, MemoryPayload::from(put));
+            chunk_hash_idx.entry(chunk_hash).or_insert(memory_id);
             semantic_idx.upsert(memory_id, embedding);
             keyword_idx.index(memory_id, &content_str);
 
