@@ -741,6 +741,21 @@ pub extern "C" fn cf_recommended_window(h: *mut CfHandle, session_type: *const c
 
 // ── Maintenance ───────────────────────────────────────────────────────────────
 
+/// Ingest new ops from all foreign-instance segment files.
+/// Reads bytes appended since the last call, applies ops to in-memory state.
+/// Returns the count of ops applied, or -1 on error (see cf_last_error).
+#[no_mangle]
+pub extern "C" fn cf_sync_foreign(h: *mut CfHandle) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    match handle.field.sync_foreign() {
+        Ok(count) => count as c_int,
+        Err(e) => handle.err(e),
+    }
+}
+
 /// Flush write buffer to OS.
 #[no_mangle]
 pub extern "C" fn cf_flush(h: *mut CfHandle) -> c_int {
