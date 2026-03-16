@@ -3333,6 +3333,8 @@ pub extern "C" fn cf_update_memory_content(
     }
     let content_str = String::from_utf8_lossy(&new_content).to_string();
     handle.field.keyword_idx.write().index(id, &content_str);
+    // Re-encode cortical sparse code for updated content/embedding
+    let _ = handle.field.encode_memory(id);
     handle.ok()
 }
 

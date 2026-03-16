@@ -146,6 +146,7 @@ impl ChittaField {
             decay_rate: new_decay_rate,
             touch: true,
             pin: None,
+            op_ts_ms: ts,
         };
         let _seqno = self.log.write().append(&Op::UpdateState(delta.clone()))?;
 
@@ -190,6 +191,7 @@ impl ChittaField {
             }
         }
 
+        let ts = now_ms();
         let delta = StateDeltaOp {
             memory_id,
             strength_delta,
@@ -197,10 +199,10 @@ impl ChittaField {
             decay_rate,
             touch,
             pin,
+            op_ts_ms: ts,
         };
         let _seqno = self.log.write().append(&Op::UpdateState(delta.clone()))?;
 
-        let ts = now_ms();
         {
             let mut states = self.states.write();
             if let Some(state) = states.get_mut(&memory_id) {
