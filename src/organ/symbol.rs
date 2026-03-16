@@ -152,4 +152,20 @@ impl SymbolIndex {
     pub fn max_id(&self) -> Option<u64> {
         self.by_id.keys().copied().max()
     }
+
+    /// Get mutable reference to a symbol by ID.
+    pub fn get_mut(&mut self, id: SymbolId) -> Option<&mut SymbolEntry> {
+        self.by_id.get_mut(&id)
+    }
+
+    /// Remove all symbols whose file_path matches any of the given paths.
+    pub fn remove_by_file_paths(&mut self, paths: &[String]) {
+        let ids_to_remove: Vec<SymbolId> = self.by_id.iter()
+            .filter(|(_, e)| paths.iter().any(|p| e.file_path == *p))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids_to_remove {
+            self.remove(id);
+        }
+    }
 }

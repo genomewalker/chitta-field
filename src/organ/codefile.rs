@@ -79,4 +79,25 @@ impl CodeFileIndex {
     pub fn max_id(&self) -> Option<u64> {
         self.by_id.keys().copied().max()
     }
+
+    /// Iterate all code files.
+    pub fn iter(&self) -> impl Iterator<Item = &CodeFile> {
+        self.by_id.values()
+    }
+
+    /// Remove all code files belonging to a project. Returns removed file paths.
+    pub fn remove_by_project(&mut self, project: &str) -> Vec<String> {
+        let ids_to_remove: Vec<CodeFileId> = self.by_id.iter()
+            .filter(|(_, f)| f.project == project)
+            .map(|(&id, _)| id)
+            .collect();
+        let mut paths = Vec::new();
+        for id in ids_to_remove {
+            if let Some(file) = self.by_id.remove(&id) {
+                self.by_path.remove(&file.path);
+                paths.push(file.path);
+            }
+        }
+        paths
+    }
 }

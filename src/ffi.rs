@@ -3164,6 +3164,205 @@ pub extern "C" fn cf_list_triplets_for_entity(
     write_triplets_json(entries, buf, buf_cap, written)
 }
 
+// ── Additional FFI for DuckDB removal migration ──────────────────────────────
+
+/// List code files, optionally filtered by project. Returns JSON array.
+/// Returns 0 on success, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_list_code_files(
+    h: *mut CfHandle,
+    project_filter: *const c_char,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let project = if project_filter.is_null() { None } else {
+        unsafe { match CStr::from_ptr(project_filter).to_str() {
+            Ok(s) if !s.is_empty() => Some(s.to_string()),
+            Ok(_) => None,
+            Err(e) => return handle.err(e),
+        }}
+    };
+    let files = handle.field.code_files.read();
+    let result: Vec<serde_json::Value> = files.iter()
+        .filter(|f| project.as_ref().map(|p| f.project == *p).unwrap_or(true))
+        .map(|f| serde_json::json!({
+            "id": f.id,
+            "path": f.path,
+            "project": f.project,
+            "mtime": f.mtime,
+        }))
+        .collect();
+    drop(files);
+    let json_str = match serde_json::to_string(&result) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    write_json_buf(&json_str, buf, buf_cap, written)
+}
+
+/// Remove all code files and their associated symbols for a project.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_clear_project(
+    h: *mut CfHandle,
+    project: *const c_char,
+) -> c_int {
+    if h.is_null() || project.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let project_str = unsafe { match CStr::from_ptr(project).to_str() {
+        Ok(s) => s.to_string(),
+        Err(e) => return handle.err(e),
+    }};
+    // Remove matching code files, collect their paths
+    let mut files = handle.field.code_files.write();
+    let removed_paths = files.remove_by_project(&project_str);
+    drop(files);
+    // Remove symbols in those files
+    let mut syms = handle.field.symbol_idx.write();
+    syms.remove_by_file_paths(&removed_paths);
+    drop(syms);
+    handle.ok()
+}
+
+/// Update description for a symbol by ID.
+/// Returns 0 on success, 1 if not found, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_set_symbol_description(
+    h: *mut CfHandle,
+    symbol_id: u64,
+    description: *const c_char,
+    description_len: usize,
+) -> c_int {
+    if h.is_null() || description.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let desc = unsafe {
+        std::str::from_utf8(std::slice::from_raw_parts(description as *const u8, description_len))
+    }.unwrap_or("").to_string();
+    let mut syms = handle.field.symbol_idx.write();
+    if let Some(sym) = syms.get_mut(symbol_id) {
+        sym.description = Some(desc);
+        drop(syms);
+        handle.ok()
+    } else {
+        drop(syms);
+        1 // not found
+    }
+}
+
+/// Update content + embedding for an existing memory.
+/// Returns 0 on success, 1 if not found, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_update_memory_content(
+    h: *mut CfHandle,
+    id: u64,
+    content: *const u8,
+    content_len: usize,
+    embedding: *const f32,
+    embedding_len: usize,
+) -> c_int {
+    if h.is_null() || content.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let new_content = unsafe { std::slice::from_raw_parts(content, content_len) }.to_vec();
+    let new_embedding: Vec<f32> = if embedding.is_null() || embedding_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(embedding, embedding_len) }.to_vec()
+    };
+    let mut payloads = handle.field.payloads.write();
+    if let Some(payload) = payloads.get_mut(&id) {
+        payload.content = new_content;
+        if !new_embedding.is_empty() {
+            payload.embedding = new_embedding;
+        }
+        drop(payloads);
+        handle.ok()
+    } else {
+        drop(payloads);
+        1 // not found
+    }
+}
+
+/// List distinct realm names from non-deleted memories. Returns JSON string array.
+/// Returns 0 on success, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_realm_list(
+    h: *mut CfHandle,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let payloads = handle.field.payloads.read();
+    let states = handle.field.states.read();
+    let mut realms: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (mid, payload) in payloads.iter() {
+        if let Some(state) = states.get(mid) {
+            if !state.deleted {
+                realms.insert(payload.realm.clone());
+            }
+        }
+    }
+    drop(payloads);
+    drop(states);
+    let list: Vec<&str> = realms.iter().map(|s| s.as_str()).collect();
+    let json_str = match serde_json::to_string(&list) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    write_json_buf(&json_str, buf, buf_cap, written)
+}
+
+/// Recall memories filtered by kind, sorted by confidence descending.
+/// Returns 0 on success, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_recall_by_kind(
+    h: *mut CfHandle,
+    kind: *const c_char,
+    limit: usize,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || kind.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let kind_str = unsafe { match CStr::from_ptr(kind).to_str() {
+        Ok(s) => s.to_string(),
+        Err(e) => return handle.err(e),
+    }};
+    let payloads = handle.field.payloads.read();
+    let states = handle.field.states.read();
+    let mut entries: Vec<(u64, f32, &[u8])> = payloads.iter()
+        .filter(|(mid, payload)| {
+            payload.kind == kind_str &&
+            states.get(mid).map(|s| !s.deleted).unwrap_or(false)
+        })
+        .map(|(mid, payload)| {
+            let conf = states.get(mid).map(|s| s.confidence).unwrap_or(0.0);
+            (*mid, conf, payload.content.as_slice())
+        })
+        .collect();
+    entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let page: Vec<serde_json::Value> = entries.iter()
+        .take(limit)
+        .map(|(mid, conf, content)| serde_json::json!({
+            "id": mid,
+            "confidence": conf,
+            "content": String::from_utf8_lossy(content),
+        }))
+        .collect();
+    drop(payloads);
+    drop(states);
+    let json_str = match serde_json::to_string(&page) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    write_json_buf(&json_str, buf, buf_cap, written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
