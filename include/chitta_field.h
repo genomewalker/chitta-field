@@ -320,6 +320,30 @@ int32_t cf_update_memory_kind(CfHandle* h, uint64_t memory_id, const char* new_k
 int cf_list_triplets_for_entity(CfHandle* h, const char* entity, size_t limit,
     char* buf, size_t buf_cap, size_t* written);
 
+/* Code file listing (JSON array) */
+int cf_list_code_files(CfHandle* h, const char* project_filter,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+/* Clear all code files + symbols for a project */
+int cf_clear_project(CfHandle* h, const char* project);
+
+/* Update symbol description */
+int cf_set_symbol_description(CfHandle* h, uint64_t symbol_id,
+    const char* description, size_t description_len);
+
+/* Update memory content + embedding */
+int cf_update_memory_content(CfHandle* h, uint64_t id,
+    const uint8_t* content, size_t content_len,
+    const float* embedding, size_t embedding_len);
+
+/* List distinct realm names (JSON string array) */
+int cf_realm_list(CfHandle* h,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+/* Recall memories by kind, sorted by confidence (JSON array) */
+int cf_recall_by_kind(CfHandle* h, const char* kind, size_t limit,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
 /* Analytics */
 int cf_analytics_append(CfHandle* h,
     const char* kind, const char* entity_id,
