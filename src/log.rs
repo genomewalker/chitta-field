@@ -226,6 +226,93 @@ fn collect_instance_segments(seg_dir: &Path, instance_id: InstanceId) -> Result<
     }).collect())
 }
 
+/// Collect all segment files in `data_dir/segments/` not owned by `own_instance_id`.
+pub fn collect_foreign_segments(data_dir: &Path, own_instance_id: InstanceId) -> Result<Vec<PathBuf>> {
+    let seg_dir = data_dir.join("segments");
+    let own_prefix = format!("{:08x}_", own_instance_id);
+    let all = collect_all_segments(&seg_dir)?;
+    Ok(all.into_iter()
+        .filter(|p| p.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| !n.starts_with(&own_prefix))
+            .unwrap_or(false))
+        .collect())
+}
+
+/// Replay a single segment file starting from `byte_offset`.
+/// `byte_offset=0` reads from the start (parses the 16-byte header).
+/// Non-zero offset seeks directly to that position (header already consumed).
+/// Returns the byte offset past the last successfully decoded entry.
+/// CRC mismatches or truncated reads at end-of-file are treated as
+/// in-progress writes by a concurrent peer and simply stop the scan.
+pub fn replay_from_offset<F>(path: &Path, byte_offset: u64, mut f: F) -> Result<u64>
+where
+    F: FnMut(u64, Op) -> Result<()>,
+{
+    use std::io::Seek;
+
+    let mut file = std::fs::File::open(path)?;
+    let header_len: u64 = (SEGMENT_MAGIC.len() + 8) as u64;
+
+    let mut cursor = if byte_offset == 0 {
+        let mut magic = [0u8; 8];
+        if file.read_exact(&mut magic).is_err() { return Ok(0); }
+        if &magic != SEGMENT_MAGIC {
+            return Err(FieldError::Manifest(format!("bad segment magic in {}", path.display())));
+        }
+        let mut _buf = [0u8; 8];
+        let _ = file.read_exact(&mut _buf);
+        header_len
+    } else {
+        file.seek(std::io::SeekFrom::Start(byte_offset))?;
+        byte_offset
+    };
+
+    loop {
+        let mut len_buf = [0u8; 4];
+        match file.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(FieldError::Io(e)),
+        }
+        let payload_len = u32::from_be_bytes(len_buf) as usize;
+        let entry_size = 4u64 + 8 + 1 + payload_len as u64 + 4;
+
+        let mut seqno_buf = [0u8; 8];
+        if file.read_exact(&mut seqno_buf).is_err() { break; }
+        let seqno = u64::from_be_bytes(seqno_buf);
+
+        let mut op_type_buf = [0u8; 1];
+        if file.read_exact(&mut op_type_buf).is_err() { break; }
+
+        let mut payload = vec![0u8; payload_len];
+        if file.read_exact(&mut payload).is_err() { break; }
+
+        let mut crc_buf = [0u8; 4];
+        if file.read_exact(&mut crc_buf).is_err() { break; }
+        let stored_crc = u32::from_be_bytes(crc_buf);
+
+        let mut hasher = CrcHasher::new();
+        hasher.update(&seqno_buf);
+        hasher.update(&op_type_buf);
+        hasher.update(&payload);
+        if hasher.finalize() != stored_crc {
+            // Partial write from a concurrent peer — stop here.
+            break;
+        }
+
+        let op: Op = match rmp_serde::from_slice(&payload) {
+            Ok(op) => op,
+            Err(_) => break,
+        };
+
+        cursor += entry_size;
+        f(seqno, op)?;
+    }
+
+    Ok(cursor)
+}
+
 fn replay_segment<F>(path: &Path, start_seqno: u64, f: &mut F) -> Result<()>
 where
     F: FnMut(u64, Op) -> Result<()>,

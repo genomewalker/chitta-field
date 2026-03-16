@@ -72,6 +72,8 @@ pub struct ChittaField {
     pub(crate) theme_organ: RwLock<ThemeOrgan>,
     pub(crate) analytics_registry: RwLock<AnalyticsRegistry>,
     pub(crate) lite_encoder: RwLock<Option<LiteEncoder>>,
+    /// Byte offsets for each foreign segment file, used by sync_foreign().
+    pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
 }
 
 impl Drop for ChittaField {
@@ -246,7 +248,82 @@ impl ChittaField {
             theme_organ: RwLock::new(theme_organ),
             analytics_registry: RwLock::new(analytics_registry),
             lite_encoder: RwLock::new(loaded_lite_encoder),
+            seen_offsets: RwLock::new(HashMap::new()),
         })
+    }
+}
+
+impl ChittaField {
+    /// Ingest new ops from all foreign-instance segment files.
+    ///
+    /// Scans `data_dir/segments/` for files not belonging to this instance, reads
+    /// any bytes appended since the last call, and applies those ops to the in-memory
+    /// state without writing to this instance's own WAL.  CRC mismatches or truncated
+    /// reads at the tail of a file are treated as in-progress writes from a concurrent
+    /// peer and are silently skipped.
+    ///
+    /// Returns the count of ops applied.
+    pub fn sync_foreign(&self) -> crate::error::Result<usize> {
+        use crate::log::{collect_foreign_segments, replay_from_offset};
+
+        let foreign_segs = collect_foreign_segments(&self.data_dir, self.instance_id)?;
+        let mut ops = Vec::new();
+
+        {
+            let mut seen = self.seen_offsets.write();
+            for seg_path in &foreign_segs {
+                let offset = *seen.get(seg_path).unwrap_or(&0);
+                let new_offset = replay_from_offset(seg_path, offset, |_seqno, op| {
+                    ops.push(op);
+                    Ok(())
+                })?;
+                seen.insert(seg_path.clone(), new_offset);
+            }
+        }
+
+        if ops.is_empty() {
+            return Ok(0);
+        }
+
+        let count = ops.len();
+
+        // Acquire all write locks and apply every foreign op in one pass,
+        // reusing the same apply_op path used during startup replay.
+        let mut payloads        = self.payloads.write();
+        let mut states          = self.states.write();
+        let mut assoc_edges     = self.assoc_edges.write();
+        let mut artifacts       = self.artifacts.write();
+        let mut artifact_paths  = self.artifact_paths.write();
+        let mut semantic_idx    = self.semantic_idx.write();
+        let mut time_idx        = self.time_idx.write();
+        let mut artifact_idx    = self.artifact_idx.write();
+        let mut keyword_idx     = self.keyword_idx.write();
+        let mut triplet_store   = self.triplet_store.write();
+        let mut symbol_idx      = self.symbol_idx.write();
+        let mut call_graph      = self.call_graph.write();
+        let mut code_files      = self.code_files.write();
+        let mut cortical_idx    = self.cortical_idx.write();
+        let mut session_reg     = self.session_registry.write();
+        let mut transcript_reg  = self.transcript_registry.write();
+        let mut task_reg        = self.task_registry.write();
+        let mut user_model_reg  = self.user_model_registry.write();
+        let mut theme_organ     = self.theme_organ.write();
+        let mut analytics_reg   = self.analytics_registry.write();
+
+        for op in ops {
+            apply_op(
+                op,
+                &mut *payloads, &mut *states, &mut *assoc_edges,
+                &mut *artifacts, &mut *artifact_paths, &mut *semantic_idx,
+                &mut *time_idx, &mut *artifact_idx, &mut *keyword_idx,
+                &mut *triplet_store, &mut *symbol_idx, &mut *call_graph,
+                &mut *code_files, &mut *cortical_idx,
+                &mut *session_reg, &mut *transcript_reg, &mut *task_reg,
+                &mut *user_model_reg, &mut *theme_organ, &mut *analytics_reg,
+            );
+        }
+
+        Ok(count)
     }
 }
 
