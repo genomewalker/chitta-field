@@ -424,6 +424,22 @@ impl CorticalIndex {
         Ok(())
     }
 
+    /// Read only the magic and snapshot_seqno without deserializing the full cortical index.
+    pub fn peek_snapshot_seqno(path: &Path) -> Result<u64> {
+        let file = std::fs::File::open(path)?;
+        let mut reader = BufReader::new(file);
+        let mut buf = [0u8; 16];
+        reader.read_exact(&mut buf).map_err(FieldError::Io)?;
+        let magic = u64::from_be_bytes(buf[0..8].try_into().unwrap());
+        if magic != SNAPSHOT_MAGIC {
+            return Err(FieldError::Manifest(format!(
+                "cortex snapshot magic mismatch: expected {:#x}, got {:#x}",
+                SNAPSHOT_MAGIC, magic
+            )));
+        }
+        Ok(u64::from_be_bytes(buf[8..16].try_into().unwrap()))
+    }
+
     /// Load a cortical snapshot from disk.
     /// Returns `(CorticalIndex, snapshot_seqno)`.
     pub fn load_snapshot(path: &Path) -> Result<(Self, u64)> {

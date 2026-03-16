@@ -125,56 +125,94 @@ impl ChittaField {
         let mut analytics_registry = AnalyticsRegistry::new();
         let mut chunk_hash_idx: HashMap<crate::ids::ChunkHash, MemoryId> = HashMap::new();
 
-        // Load best cortical snapshot across all instances
+        // Find best cortical snapshot by peeking seqno (16-byte read per file), then load only that one.
         let mut snapshot_seqno: u64 = 0;
+        let mut best_cortex_path: Option<std::path::PathBuf> = None;
+        let mut stale_cortex_paths: Vec<std::path::PathBuf> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&data_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
                 if name_str.starts_with("cortex.") && name_str.ends_with(".snapshot") {
-                    match CorticalIndex::load_snapshot(&entry.path()) {
-                        Ok((loaded, seqno)) if seqno > snapshot_seqno => {
-                            cortical_idx = loaded;
+                    match CorticalIndex::peek_snapshot_seqno(&entry.path()) {
+                        Ok(seqno) if seqno > snapshot_seqno => {
+                            if let Some(prev) = best_cortex_path.replace(entry.path()) {
+                                stale_cortex_paths.push(prev);
+                            }
                             snapshot_seqno = seqno;
-                            eprintln!("[chitta-field] loaded cortical snapshot seqno={} from {:?}", seqno, entry.path());
                         }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("[chitta-field] skipping corrupt cortical snapshot {:?}: {}", entry.path(), e),
+                        Ok(_) => stale_cortex_paths.push(entry.path()),
+                        Err(e) => {
+                            eprintln!("[chitta-field] skipping corrupt cortical snapshot {:?}: {}", entry.path(), e);
+                            stale_cortex_paths.push(entry.path());
+                        }
                     }
                 }
             }
         }
+        if let Some(ref path) = best_cortex_path {
+            match CorticalIndex::load_snapshot(path) {
+                Ok((loaded, seqno)) => {
+                    cortical_idx = loaded;
+                    snapshot_seqno = seqno;
+                    eprintln!("[chitta-field] loaded cortical snapshot seqno={} from {:?}", seqno, path);
+                }
+                Err(e) => eprintln!("[chitta-field] failed to load cortical snapshot {:?}: {}", path, e),
+            }
+        }
+        for path in &stale_cortex_paths {
+            let _ = std::fs::remove_file(path);
+        }
 
-        // Load best full snapshot across all instances
+        // Find best full snapshot by peeking seqno (16-byte read per file), then load only that one.
         let mut full_snapshot_seqno: u64 = 0;
+        let mut best_full_path: Option<std::path::PathBuf> = None;
+        let mut stale_full_paths: Vec<std::path::PathBuf> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&data_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
                 if name_str.starts_with("chitta.") && name_str.ends_with(".snapshot") {
-                    match FullSnapshot::load(&entry.path()) {
-                        Ok(snap) if snap.snapshot_seqno > full_snapshot_seqno => {
-                            full_snapshot_seqno = snap.snapshot_seqno;
-                            payloads = snap.payloads;
-                            states = snap.states;
-                            assoc_edges = snap.assoc_edges;
-                            artifacts = snap.artifacts;
-                            artifact_paths = snap.artifact_paths;
-                            time_idx = snap.time_idx;
-                            keyword_idx = snap.keyword_idx;
-                            artifact_idx = snap.artifact_idx;
-                            triplet_store = snap.triplet_store;
-                            symbol_idx = snap.symbol_idx;
-                            call_graph = snap.call_graph;
-                            code_files = snap.code_files;
-                            semantic_idx = snap.semantic_idx;
-                            eprintln!("[chitta-field] loaded full snapshot seqno={} from {:?}", full_snapshot_seqno, entry.path());
+                    match FullSnapshot::peek_seqno(&entry.path()) {
+                        Ok(seqno) if seqno > full_snapshot_seqno => {
+                            if let Some(prev) = best_full_path.replace(entry.path()) {
+                                stale_full_paths.push(prev);
+                            }
+                            full_snapshot_seqno = seqno;
                         }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("[chitta-field] skipping corrupt full snapshot {:?}: {}", entry.path(), e),
+                        Ok(_) => stale_full_paths.push(entry.path()),
+                        Err(e) => {
+                            eprintln!("[chitta-field] skipping corrupt full snapshot {:?}: {}", entry.path(), e);
+                            stale_full_paths.push(entry.path());
+                        }
                     }
                 }
             }
+        }
+        if let Some(ref path) = best_full_path {
+            match FullSnapshot::load(path) {
+                Ok(snap) => {
+                    full_snapshot_seqno = snap.snapshot_seqno;
+                    payloads = snap.payloads;
+                    states = snap.states;
+                    assoc_edges = snap.assoc_edges;
+                    artifacts = snap.artifacts;
+                    artifact_paths = snap.artifact_paths;
+                    time_idx = snap.time_idx;
+                    keyword_idx = snap.keyword_idx;
+                    artifact_idx = snap.artifact_idx;
+                    triplet_store = snap.triplet_store;
+                    symbol_idx = snap.symbol_idx;
+                    call_graph = snap.call_graph;
+                    code_files = snap.code_files;
+                    semantic_idx = snap.semantic_idx;
+                    eprintln!("[chitta-field] loaded full snapshot seqno={} from {:?}", full_snapshot_seqno, path);
+                }
+                Err(e) => eprintln!("[chitta-field] failed to load full snapshot {:?}: {}", path, e),
+            }
+        }
+        for path in &stale_full_paths {
+            let _ = std::fs::remove_file(path);
         }
 
         // Replay ALL segment files to rebuild in-memory state.
@@ -653,6 +691,10 @@ pub(crate) fn apply_op(
             }
         }
         Op::TranscriptEvent(ev) => {
+            // Always store the raw payload for cf_get_latest_event("transcript", kind, session_id)
+            let payload_str = String::from_utf8(ev.payload_json.clone()).unwrap_or_default();
+            transcript_registry.set_session_event(&ev.session_id, &ev.kind, payload_str);
+
             match ev.kind.as_str() {
                 "register" => {
                     let payload = serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
