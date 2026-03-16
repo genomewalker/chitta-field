@@ -27,6 +27,9 @@ pub enum Op {
     UserModelEvent(UserModelEventOp),
     ThemeEvent(ThemeEventOp),
     AnalyticsEvent(AnalyticsEventOp),
+    ClearProject(ClearProjectOp),
+    UpdateSymbolDescription(UpdateSymbolDescriptionOp),
+    UpdateMemoryContent(UpdateMemoryContentOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -35,6 +38,9 @@ pub const OP_TASK_EVENT: u8 = 18;
 pub const OP_USER_MODEL_EVENT: u8 = 19;
 pub const OP_THEME_EVENT: u8 = 20;
 pub const OP_ANALYTICS_EVENT: u8 = 21;
+pub const OP_CLEAR_PROJECT: u8 = 22;
+pub const OP_UPDATE_SYMBOL_DESCRIPTION: u8 = 23;
+pub const OP_UPDATE_MEMORY_CONTENT: u8 = 24;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -258,6 +264,27 @@ pub struct ThemeEventOp {
     pub theme_id: u64,
     pub payload_json: Vec<u8>,
     pub ts_ms: i64,
+}
+
+/// Remove all code files and associated symbols for a project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClearProjectOp {
+    pub project: String,
+}
+
+/// Update the description string for a symbol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSymbolDescriptionOp {
+    pub symbol_id: u64,
+    pub description: String,
+}
+
+/// Update the content and/or embedding for an existing memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateMemoryContentOp {
+    pub memory_id: MemoryId,
+    pub content: Vec<u8>,
+    pub embedding: Vec<f32>,  // empty = no embedding change
 }
 
 /// Domain event envelope for analytics events.
