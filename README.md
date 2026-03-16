@@ -2,45 +2,45 @@
 
 Organic associative memory substrate for cognitive AI companions.
 
-chitta-field replaces a relational database (DuckDB) as the backing store for the [cc-soul](https://github.com/fernandezguerra/cc-soul) daemon. It is designed around the constraints of shared NFS storage, multiple concurrent writers, and sub-millisecond in-process recall — none of which DuckDB satisfies well.
+chitta-field is the backing store for the [cc-soul](https://github.com/genomewalker/cc-soul) daemon. It is designed around the constraints of shared NFS storage, multiple concurrent writers, and sub-millisecond in-process recall.
 
 ## What it is
 
 A persistent cognitive memory system built on three layers:
 
 1. **Append-only op log** — durable write path, one segment file per process
-2. **In-RAM indexes** — HNSW semantic index, BM25 keyword index, cortical sparse index, triplet store, symbol/call graph, temporal index
+2. **In-RAM indexes** — semantic index, BM25 keyword index, cortical sparse index, triplet store, symbol/call graph, temporal index
 3. **Snapshots** — periodic binary dumps that accelerate startup by avoiding full log replay
 
-Memories decay over time. High-value memories can be pinned (zero decay). The cortical index encodes memories as Sparse Distributed Representations (SDR) — 64 active bits out of 16,384 — enabling sub-millisecond associative recall without HNSW traversal for the hot path.
+Memories decay over time. High-value memories can be pinned (zero decay). The cortical index encodes memories as Sparse Distributed Representations (SDR, 64 active bits out of 16,384), enabling sub-millisecond associative recall without a learned ANN index for the hot path.
 
 ## Architecture
 
 ```
 chitta-field/
 ├── Op Log (append-only)
-│   └── {instance_id}_{first_seqno}.seg    — one file per writer process
+│   └── {instance_id}_{first_seqno}.seg    (one file per writer process)
 │
 ├── Snapshots (binary, periodic)
-│   ├── chitta.snapshot                    — full state (payloads + states + indexes)
-│   └── cortex.snapshot                    — cortical sparse codes only
+│   ├── chitta.snapshot                    (full state: payloads + states + indexes)
+│   └── cortex.snapshot                    (cortical sparse codes only)
 │
 └── In-RAM (rebuilt from log on open)
-    ├── SemanticIndex (HNSW, 768-dim BGE embeddings)
-    ├── KeywordIndex  (BM25)
-    ├── CorticalIndex (SDR, 64-of-16384 active bits)
-    ├── TemporalIndex (time-ordered, range queries)
-    ├── TripletStore  (subject/predicate/object graph)
+    ├── SemanticIndex  (brute-force cosine, 768-dim BGE embeddings)
+    ├── KeywordIndex   (BM25)
+    ├── CorticalIndex  (SDR, 64-of-16384 active bits)
+    ├── TemporalIndex  (time-ordered, range queries)
+    ├── TripletStore   (subject/predicate/object graph)
     ├── SymbolIndex + CallGraph (code intelligence)
-    ├── ArtifactIndex (file path → memory mapping)
-    ├── ThemeOrgan    (cluster centroids)
+    ├── ArtifactIndex  (file path to memory mapping)
+    ├── ThemeOrgan     (cluster centroids)
     ├── SessionRegistry / TranscriptRegistry / TaskRegistry
-    └── LearnerSet    (resonance / route learners)
+    └── LearnerSet     (resonance / route learners)
 ```
 
 ### Multi-writer design (Upanishads model)
 
-Each process that opens a `ChittaField` is assigned a unique `InstanceId` at startup. All writes go to `{instance_id}_{first_seqno}.seg` — a segment file owned exclusively by that process. No cross-process locking is needed or used.
+Each process that opens a `ChittaField` is assigned a unique `InstanceId` at startup. All writes go to `{instance_id}_{first_seqno}.seg`, a segment file owned exclusively by that process. No cross-process locking is needed or used.
 
 On `ChittaField::open`, the library scans `data_dir` for all `*.seg` files and replays them in sequence-number order to reconstruct the full in-RAM state. New writers append to their own segment; readers pick up changes by periodically re-opening or through the snapshot path.
 
@@ -48,15 +48,15 @@ This makes chitta-field safe on NFS without lock managers or fencing beyond the 
 
 ### Cortical index (SPAF)
 
-The Sparse Predictive Associative Field encodes each memory's 768-dim embedding into a 64-of-16384 sparse code via a `SparseEncoder`. Recall against the cortical index is a bitset intersection operation — O(active_bits) per candidate — giving sub-millisecond latency even at tens of thousands of memories.
+The Sparse Predictive Associative Field encodes each memory's 768-dim embedding into a 64-of-16384 sparse code via a `SparseEncoder`. Recall against the cortical index is a bitset intersection operation, O(active_bits) per candidate, giving sub-millisecond latency even at tens of thousands of memories.
 
-A `ProductQuantizer` compresses residual embeddings for approximate recall at scale. A `LiteEncoder` (bag-of-words → sparse code, no ONNX dependency) provides a fallback encoding path that works without a runtime embedder.
+A `ProductQuantizer` compresses residual embeddings for approximate recall at scale. A `LiteEncoder` (bag-of-words to sparse code, no ONNX dependency) provides a fallback encoding path that works without a runtime embedder.
 
 ## Key features
 
 - **Multi-writer NFS** — no cross-process locks; per-instance segment files
 - **Sub-millisecond cortical recall** — SDR bitset intersection
-- **Semantic recall** — HNSW over BGE-base-en-v1.5 768-dim embeddings
+- **Semantic recall** — cosine similarity over BGE-base-en-v1.5 768-dim embeddings
 - **Keyword recall** — BM25 over memory content
 - **Temporal recall** — time-range queries with kind/realm filters
 - **Association graph** — directed weighted edges between memories (DerivedFrom, SameSession, SameArtifact, CoRetrieved, Supports, Contradicts)
@@ -80,7 +80,7 @@ Each memory carries:
 | `realm` | `String` | Namespace / project scope |
 | `content` | `Vec<u8>` | Raw bytes (typically UTF-8 text) |
 | `embedding` | `Vec<f32>` | 768-dim BGE embedding |
-| `confidence` | `f32` | 0.0–1.0, updated by feedback |
+| `confidence` | `f32` | 0.0-1.0, updated by feedback |
 | `decay_rate` | `f32` | Strength loss per time unit; 0.0 = pinned |
 | `strength` | `f32` | Current salience (decays over time) |
 | `sparse_code` | `Option<SparseCode>` | 64 active bit indices into 16,384-dim cortex |
@@ -167,7 +167,7 @@ uint64_t demoted = cf_run_demotion(h, now_ms);
 
 ## Building
 
-Requires Rust 1.92.0 (pinned via `rust-toolchain.toml`). If using conda, unset any conda-injected linker overrides before building — `build.sh` handles this automatically.
+Requires Rust 1.92.0 (pinned via `rust-toolchain.toml`). If using conda, unset any conda-injected linker overrides before building; `build.sh` handles this automatically.
 
 ```bash
 # Build static lib + binaries
@@ -198,7 +198,7 @@ Index all unencoded memories into the cortical sparse index and optionally save 
 
 ### migrate
 
-Import memories and triplets from a JSONL export (produced by `migrate_from_duckdb.py`).
+Import memories and triplets from a JSONL export.
 
 ```bash
 ./build.sh run --bin migrate --release -- \
@@ -222,9 +222,9 @@ Train the bag-of-words lite encoder from existing memories and save it to disk. 
 
 ```
 ~/.claude/mind/chitta-field/
-├── {instance_id}_{seqno}.seg    — op log segment(s), one per writer process
-├── chitta.snapshot              — full state snapshot (optional, speeds startup)
-└── cortex.snapshot              — cortical index snapshot (optional)
+├── {instance_id}_{seqno}.seg    (op log segment, one per writer process)
+├── chitta.snapshot              (full state snapshot, optional, speeds startup)
+└── cortex.snapshot              (cortical index snapshot, optional)
 ```
 
 ## Theoretical foundations
@@ -233,7 +233,7 @@ chitta-field's design is grounded in computational neuroscience and information 
 
 ### Sparse Distributed Representations (SDR)
 
-The cortical index encodes each memory as a **sparse distributed representation**: exactly K=64 active features out of N=16,384 (`K_ACTIVE=64`, `N_ATOMS=16384` in `cortex.rs`). SDRs were developed at Numenta as a model of neocortical computation. Their key properties — high capacity, fault tolerance, and fast overlap-based matching — are the reason cortical recall is sub-millisecond without a learned index structure.
+The cortical index encodes each memory as a sparse distributed representation: exactly K=64 active features out of N=16,384 (`K_ACTIVE=64`, `N_ATOMS=16384` in `cortex.rs`). SDRs were developed at Numenta as a model of neocortical computation. Their key properties (high capacity, fault tolerance, and fast overlap-based matching) are the reason cortical recall is sub-millisecond without a learned index structure.
 
 > Ahmad, S., & Hawkins, J. (2016). How do neurons operate on sparse distributed representations? A mathematical theory of sparsity, neurons and active dendrites. *arXiv:1601.00720*.
 >
@@ -241,57 +241,57 @@ The cortical index encodes each memory as a **sparse distributed representation*
 
 ### Product-key sparse encoding
 
-Computing the top-K atoms over N=16,384 full-dimensional atoms would be O(N·d). `SparseEncoder` in `cortex.rs` instead uses the **product-key** decomposition: the 768-dim embedding is split into two 384-dim halves, each scored against 128-centroid sub-dictionaries, and the top-K atoms are selected from the 256-candidate shortlist. This reduces the cost to O(√N · d) — the same trick introduced for large memory layers.
+Computing the top-K atoms over N=16,384 full-dimensional atoms would be O(N·d). `SparseEncoder` in `cortex.rs` instead uses the product-key decomposition: the 768-dim embedding is split into two 384-dim halves, each scored against 128-centroid sub-dictionaries, and the top-K atoms are selected from the 256-candidate shortlist. This reduces the cost to O(sqrt(N) · d), the same approach introduced for large memory layers.
 
-> Lample, G., Sablayrolges, A., Ranzato, M. A., Denoyer, L., & Jégou, H. (2019). Large memory layers with product keys. *Advances in Neural Information Processing Systems 32 (NeurIPS 2019)*. https://arxiv.org/abs/1907.05242
+> Lample, G., Sablayrolles, A., Ranzato, M. A., Denoyer, L., & Jégou, H. (2019). Large memory layers with product keys. *Advances in Neural Information Processing Systems 32 (NeurIPS 2019)*. https://arxiv.org/abs/1907.05242
 
 ### Product quantization for residual compression
 
-`ProductQuantizer` in `pq.rs` compresses residual embeddings (768-dim, 32 subvectors of 24 dims each, 256 centroids per subspace) to 32 bytes. This is standard **product quantization** as described in:
+`ProductQuantizer` in `pq.rs` compresses residual embeddings (768-dim, 32 subvectors of 24 dims each, 256 centroids per subspace) to 32 bytes using standard product quantization.
 
-> Jégou, H., Douze, M., & Schmid, C. (2011). Product quantization for nearest neighbor search. *IEEE Transactions on Pattern Analysis and Machine Intelligence*, 33(1), 117–128. https://doi.org/10.1109/TPAMI.2010.57
+> Jégou, H., Douze, M., & Schmid, C. (2011). Product quantization for nearest neighbor search. *IEEE Transactions on Pattern Analysis and Machine Intelligence*, 33(1), 117-128. https://doi.org/10.1109/TPAMI.2010.57
 
 ### ART-inspired prototype learning
 
-`PrototypeIndex` in `prototype.rs` assigns memories to prototype clusters using a **vigilance** threshold (`VIGILANCE=0.003`). New memories are committed to a new prototype if no existing prototype exceeds the vigilance criterion — a direct implementation of the Adaptive Resonance Theory commitment rule.
+`PrototypeIndex` in `prototype.rs` assigns memories to prototype clusters using a vigilance threshold (`VIGILANCE=0.003`). New memories are committed to a new prototype if no existing prototype exceeds the vigilance criterion, a direct implementation of the Adaptive Resonance Theory commitment rule.
 
-> Carpenter, G. A., & Grossberg, S. (1987). A massively parallel architecture for a self-organizing neural pattern recognition machine. *Computer Vision, Graphics, and Image Processing*, 37(1), 54–115. https://doi.org/10.1016/S0734-189X(87)80014-2
+> Carpenter, G. A., & Grossberg, S. (1987). A massively parallel architecture for a self-organizing neural pattern recognition machine. *Computer Vision, Graphics, and Image Processing*, 37(1), 54-115. https://doi.org/10.1016/S0734-189X(87)80014-2
 >
-> Grossberg, S. (1987). Competitive learning: From interactive activation to adaptive resonance. *Cognitive Science*, 11(1), 23–63. https://doi.org/10.1111/j.1551-6708.1987.tb00862.x
+> Grossberg, S. (1987). Competitive learning: From interactive activation to adaptive resonance. *Cognitive Science*, 11(1), 23-63. https://doi.org/10.1111/j.1551-6708.1987.tb00862.x
 
 ### Complementary learning systems
 
-chitta-field separates fast episodic storage (op log, segment files — analogous to hippocampus) from slow cortical consolidation (snapshot, prototype index, cortical SDR codes — analogous to neocortex). This two-speed architecture directly reflects the CLS theory of memory consolidation.
+chitta-field separates fast episodic storage (op log, segment files, analogous to hippocampus) from slow cortical consolidation (snapshot, prototype index, cortical SDR codes, analogous to neocortex). This two-speed architecture reflects the CLS theory of memory consolidation.
 
-> McClelland, J. L., McNaughton, B. L., & O'Reilly, R. C. (1995). Why there are complementary learning systems in the hippocampus and neocortex: Insights from the successes and failures of connectionist models of learning and memory. *Psychological Review*, 102(3), 419–457. https://doi.org/10.1037/0033-295X.102.3.419
+> McClelland, J. L., McNaughton, B. L., & O'Reilly, R. C. (1995). Why there are complementary learning systems in the hippocampus and neocortex: Insights from the successes and failures of connectionist models of learning and memory. *Psychological Review*, 102(3), 419-457. https://doi.org/10.1037/0033-295X.102.3.419
 
 ### Decay and the spacing effect
 
-Each memory has a per-instance `decay_rate` (strength loss per unit time). `PlasticityLearner` in `plasticity.rs` adjusts this rate using an exponentially weighted moving average of inter-access intervals: frequently accessed memories earn lower decay rates. This models the **spacing effect** — that repeated retrieval at spaced intervals strengthens retention.
+Each memory has a per-instance `decay_rate` (strength loss per unit time). `PlasticityLearner` in `plasticity.rs` adjusts this rate using an exponentially weighted moving average of inter-access intervals: frequently accessed memories earn lower decay rates. This models the spacing effect, where repeated retrieval at spaced intervals strengthens retention.
 
 > Ebbinghaus, H. (1885). *Über das Gedächtnis: Untersuchungen zur experimentellen Psychologie*. Duncker & Humblot. (English translation: Memory: A Contribution to Experimental Psychology, 1913.)
 
 ### Thompson sampling for retrieval route selection
 
-`RouteLearner` in `route.rs` uses `BetaPrior` (Thompson sampling) to select among retrieval routes (Semantic, Keyword, Temporal, Hybrid, Full) based on observed recall quality. Beta-distributed priors are updated per route per query intent; sampling is used for exploration–exploitation balance.
+`RouteLearner` in `route.rs` uses `BetaPrior` (Thompson sampling) to select among retrieval routes (Semantic, Keyword, Temporal, Hybrid, Full) based on observed recall quality. Beta-distributed priors are updated per route per query intent; sampling provides exploration-exploitation balance.
 
-> Thompson, W. R. (1933). On the likelihood that one unknown probability exceeds another in view of the evidence of two samples. *Biometrika*, 25(3–4), 285–294. https://doi.org/10.1093/biomet/25.3-4.285
+> Thompson, W. R. (1933). On the likelihood that one unknown probability exceeds another in view of the evidence of two samples. *Biometrika*, 25(3-4), 285-294. https://doi.org/10.1093/biomet/25.3-4.285
 >
 > Chapelle, O., & Li, L. (2011). An empirical evaluation of Thompson sampling. *Advances in Neural Information Processing Systems 24 (NIPS 2011)*. https://papers.nips.cc/paper/2011/hash/e53a0a2978c28872a4505bdb51db06dc-Abstract.html
 
 ### BM25 keyword index
 
-The keyword index in `keyword.rs` uses **BM25** with standard parameters (k1=1.2, b=0.75), a probabilistic term-weighting model that remains state-of-the-art for sparse keyword retrieval.
+The keyword index in `keyword.rs` uses BM25 with standard parameters (k1=1.2, b=0.75), a probabilistic term-weighting model that remains state-of-the-art for sparse keyword retrieval.
 
-> Robertson, S., & Zaragoza, H. (2009). The probabilistic relevance framework: BM25 and beyond. *Foundations and Trends in Information Retrieval*, 3(4), 333–389. https://doi.org/10.1561/1500000019
+> Robertson, S., & Zaragoza, H. (2009). The probabilistic relevance framework: BM25 and beyond. *Foundations and Trends in Information Retrieval*, 3(4), 333-389. https://doi.org/10.1561/1500000019
 
 ### Embeddings
 
-Semantic recall uses **BGE-base-en-v1.5** embeddings (768-dim, from BAAI), provided via the VakYantra ONNX embedder in the cc-soul daemon.
+Semantic recall uses BGE-base-en-v1.5 embeddings (768-dim, from BAAI), provided via the VakYantra ONNX embedder in the cc-soul daemon.
 
 > Xiao, S., Liu, Z., Zhang, P., & Muennighoff, N. (2023). C-Pack: Packaged resources to advance general Chinese embedding. *arXiv:2309.07597*. https://arxiv.org/abs/2309.07597
 
-The semantic index (`hnsw.rs`) currently uses brute-force cosine similarity — adequate for tens of thousands of memories (~300 ms at 50K entries). A true HNSW implementation is planned as the memory corpus grows.
+The semantic index currently uses brute-force cosine similarity, adequate for tens of thousands of memories (~300 ms at 50K entries). A true HNSW implementation is planned as the memory corpus grows.
 
 ## Dependencies
 
