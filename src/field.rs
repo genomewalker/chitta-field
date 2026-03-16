@@ -465,7 +465,7 @@ pub(crate) fn apply_op(
             let memory_id = put.memory_id;
             let chunk_hash = put.chunk_hash;
             let created_at_ms = put.created_at_ms;
-            let authored_at_ms = put.authored_at_ms;
+            let authored_at_ms = if put.authored_at_ms == 0 { created_at_ms } else { put.authored_at_ms };
             let version = put.version;
             let kind = put.kind.clone();
             let realm = put.realm.clone();
