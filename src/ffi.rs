@@ -3200,7 +3200,9 @@ pub extern "C" fn cf_list_code_files(
         Ok(s) => s,
         Err(e) => return handle.err(e),
     };
-    write_json_buf(&json_str, buf, buf_cap, written)
+    let rc = write_json_buf(&json_str, buf, buf_cap, written);
+    if rc == 0 { handle.ok(); }
+    rc
 }
 
 /// Remove all code files and their associated symbols for a project.
@@ -3220,10 +3222,16 @@ pub extern "C" fn cf_clear_project(
     let mut files = handle.field.code_files.write();
     let removed_paths = files.remove_by_project(&project_str);
     drop(files);
-    // Remove symbols in those files
+    // Remove symbols and collect IDs so call_graph can be cleaned up
     let mut syms = handle.field.symbol_idx.write();
-    syms.remove_by_file_paths(&removed_paths);
+    let removed_ids = syms.remove_by_file_paths(&removed_paths);
     drop(syms);
+    // Remove dangling call-graph edges for every removed symbol
+    let mut cg = handle.field.call_graph.write();
+    for id in removed_ids {
+        cg.remove_symbol(id);
+    }
+    drop(cg);
     handle.ok()
 }
 
@@ -3238,9 +3246,12 @@ pub extern "C" fn cf_set_symbol_description(
 ) -> c_int {
     if h.is_null() || description.is_null() { return -1; }
     let handle = unsafe { &mut *h };
-    let desc = unsafe {
+    let desc = match unsafe {
         std::str::from_utf8(std::slice::from_raw_parts(description as *const u8, description_len))
-    }.unwrap_or("").to_string();
+    } {
+        Ok(s) => s.to_string(),
+        Err(e) => return handle.err(e),
+    };
     let mut syms = handle.field.symbol_idx.write();
     if let Some(sym) = syms.get_mut(symbol_id) {
         sym.description = Some(desc);
@@ -3271,18 +3282,32 @@ pub extern "C" fn cf_update_memory_content(
     } else {
         unsafe { std::slice::from_raw_parts(embedding, embedding_len) }.to_vec()
     };
-    let mut payloads = handle.field.payloads.write();
-    if let Some(payload) = payloads.get_mut(&id) {
-        payload.content = new_content;
-        if !new_embedding.is_empty() {
-            payload.embedding = new_embedding;
-        }
-        drop(payloads);
-        handle.ok()
-    } else {
-        drop(payloads);
-        1 // not found
+    if !new_embedding.is_empty() && new_embedding.len() != crate::ops::EMBED_DIM {
+        return handle.err(format!(
+            "embedding length {} != EMBED_DIM {}",
+            new_embedding.len(), crate::ops::EMBED_DIM
+        ));
     }
+    let found = {
+        let mut payloads = handle.field.payloads.write();
+        if let Some(payload) = payloads.get_mut(&id) {
+            payload.content = new_content.clone();
+            if !new_embedding.is_empty() {
+                payload.embedding = new_embedding.clone();
+            }
+            true
+        } else {
+            false
+        }
+    };
+    if !found { return 1; }
+    // Keep derived indexes consistent with updated payload
+    if !new_embedding.is_empty() {
+        handle.field.semantic_idx.write().upsert(id, new_embedding);
+    }
+    let content_str = String::from_utf8_lossy(&new_content).to_string();
+    handle.field.keyword_idx.write().index(id, &content_str);
+    handle.ok()
 }
 
 /// List distinct realm names from non-deleted memories. Returns JSON string array.
@@ -3308,7 +3333,8 @@ pub extern "C" fn cf_realm_list(
     }
     drop(payloads);
     drop(states);
-    let list: Vec<&str> = realms.iter().map(|s| s.as_str()).collect();
+    let mut list: Vec<String> = realms.into_iter().collect();
+    list.sort_unstable();
     let json_str = match serde_json::to_string(&list) {
         Ok(s) => s,
         Err(e) => return handle.err(e),
