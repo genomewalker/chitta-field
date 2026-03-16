@@ -1361,6 +1361,9 @@ pub extern "C" fn cf_emit_event(
         unsafe { std::slice::from_raw_parts(payload_json, payload_len) }.to_vec()
     };
 
+    // Capture payload as string before it is moved into the op (for immediate in-memory apply).
+    let payload_str_for_apply = String::from_utf8(payload.clone()).unwrap_or_default();
+
     let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
 
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1424,6 +1427,12 @@ pub extern "C" fn cf_emit_event(
     let result = handle.field.log.write().append(&op);
     match result {
         Ok(_seqno) => {
+            // Immediately apply to in-memory state for same-instance reads.
+            // (WAL replay only fires for foreign ops from other instances.)
+            if domain_str == "transcript" {
+                handle.field.transcript_registry.write()
+                    .set_session_event(entity_id_str, kind_str, payload_str_for_apply);
+            }
             unsafe { *out_event_id = event_id; }
             handle.ok()
         }
@@ -1469,14 +1478,24 @@ pub extern "C" fn cf_get_latest_event(
         }
     };
 
-    if domain_str != "user_model" {
-        return handle.err(format!("cf_get_latest_event: unsupported domain '{}'", domain_str));
-    }
+    let payload: Option<String> = match domain_str {
+        "user_model" => {
+            let registry = handle.field.user_model_registry.read();
+            match registry.get(entity_id_str) {
+                Some(entry) if entry.entity_type == kind_str => Some(entry.payload_json.clone()),
+                _ => None,
+            }
+        }
+        "transcript" => {
+            let registry = handle.field.transcript_registry.read();
+            registry.get_session_event(entity_id_str, kind_str).map(|s| s.to_string())
+        }
+        _ => return handle.err(format!("cf_get_latest_event: unsupported domain '{}'", domain_str)),
+    };
 
-    let registry = handle.field.user_model_registry.read();
-    match registry.get(entity_id_str) {
-        Some(entry) if entry.entity_type == kind_str => {
-            let bytes = entry.payload_json.as_bytes();
+    match payload {
+        Some(p) => {
+            let bytes = p.as_bytes();
             let n = bytes.len().min(buf_cap);
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
@@ -1484,7 +1503,6 @@ pub extern "C" fn cf_get_latest_event(
             }
             0
         }
-        Some(_) => 1, // entity_id found but entity_type doesn't match kind
         None => 1,
     }
 }

@@ -20,11 +20,29 @@ pub struct TranscriptRecord {
 pub struct TranscriptRegistry {
     transcripts: HashMap<String, TranscriptRecord>,
     next_turn_id: u64,
+    /// Latest event payload per (session_id, kind) — for cf_get_latest_event("transcript", ...)
+    session_events: HashMap<String, HashMap<String, String>>,
 }
 
 impl TranscriptRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Store the latest event payload for a session+kind pair.
+    pub fn set_session_event(&mut self, session_id: &str, kind: &str, payload_json: String) {
+        self.session_events
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(kind.to_string(), payload_json);
+    }
+
+    /// Retrieve the latest stored payload for a session+kind pair.
+    pub fn get_session_event(&self, session_id: &str, kind: &str) -> Option<&str> {
+        self.session_events
+            .get(session_id)
+            .and_then(|m| m.get(kind))
+            .map(|s| s.as_str())
     }
 
     pub fn register(&mut self, transcript_id: String, session_id: String) {
