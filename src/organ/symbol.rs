@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use crate::ids::MemoryId;
+use serde::{Serialize, Deserialize};
 
 pub type SymbolId = u64;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolEntry {
     pub id: SymbolId,
     pub kind: String,
@@ -18,6 +19,7 @@ pub struct SymbolEntry {
     pub memory_id: Option<MemoryId>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolIndex {
     by_id: HashMap<SymbolId, SymbolEntry>,
     by_name: HashMap<String, Vec<SymbolId>>,
@@ -144,5 +146,10 @@ impl SymbolIndex {
 
     pub fn count(&self) -> usize {
         self.by_id.len()
+    }
+
+    /// Return the maximum symbol ID present, or None if empty.
+    pub fn max_id(&self) -> Option<u64> {
+        self.by_id.keys().copied().max()
     }
 }

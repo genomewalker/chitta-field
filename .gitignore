@@ -3,3 +3,12 @@
 *.a
 *.so
 Cargo.lock
+
+# Migration exports — contain personal memory data, never commit
+migration/export/
+migration/soul_export.json
+*.jsonl
+
+# Instance-specific binary data
+*.seg
+*.snapshot

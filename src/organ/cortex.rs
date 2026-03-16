@@ -1,10 +1,18 @@
 use std::collections::{HashMap, HashSet};
+use std::io::{BufReader, BufWriter, Read as IoRead, Write};
+use std::path::Path;
+use serde::{Deserialize, Serialize};
+use crate::error::{FieldError, Result};
 use crate::ids::MemoryId;
+use super::prototype::{ProtoId, PrototypeIndex};
+use super::pq::{ProductQuantizer, PQ_BYTES};
+
+const SNAPSHOT_MAGIC: u64 = 0xC417745F3A7_0001;
 
 // ── Sparse Code ──────────────────────────────────────────────────────────────
 
 /// Sparse representation of a memory: K=64 active features out of N=16,384.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SparseCode {
     pub feature_ids: Vec<u32>,   // exactly K entries, sorted ascending
     pub activations: Vec<f32>,   // parallel to feature_ids, normalized
@@ -28,6 +36,7 @@ pub const SHORTLIST_PER_HALF: usize = 16; // top-16 from each half → 256 candi
 /// Online product-key sparse encoder.
 /// Dictionary: N_LEFT × N_RIGHT = 16,384 atoms, each EMBED_DIM-dimensional.
 /// Represented as two half-dictionaries for O(√N) top-K selection.
+#[derive(Serialize, Deserialize)]
 pub struct SparseEncoder {
     left_atoms: Vec<Vec<f32>>,    // N_LEFT × HALF_DIM
     right_atoms: Vec<Vec<f32>>,   // N_RIGHT × HALF_DIM
@@ -66,8 +75,8 @@ impl SparseEncoder {
             .collect();
 
         // Partial sort: top SHORTLIST_PER_HALF from each half
-        left_scores.select_nth_unstable_by(SHORTLIST_PER_HALF, |a, b| b.0.partial_cmp(&a.0).unwrap());
-        right_scores.select_nth_unstable_by(SHORTLIST_PER_HALF, |a, b| b.0.partial_cmp(&a.0).unwrap());
+        left_scores.select_nth_unstable_by(SHORTLIST_PER_HALF, |a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        right_scores.select_nth_unstable_by(SHORTLIST_PER_HALF, |a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         // Build shortlist of SHORTLIST_PER_HALF² = 256 candidates
         let mut candidates: Vec<(f32, u32)> = Vec::with_capacity(SHORTLIST_PER_HALF * SHORTLIST_PER_HALF);
@@ -80,18 +89,39 @@ impl SparseEncoder {
 
         // Top-K from candidates
         let k = K_ACTIVE.min(candidates.len());
-        candidates.select_nth_unstable_by(k, |a, b| b.0.partial_cmp(&a.0).unwrap());
+        candidates.select_nth_unstable_by(k, |a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         candidates.truncate(k);
         candidates.sort_by(|a, b| a.1.cmp(&b.1)); // sort by feature_id ascending
 
         // Normalize activations (relu + L1 norm)
         let sum: f32 = candidates.iter().map(|(s, _)| s.max(0.0)).sum();
-        let norm = if sum > 1e-9 { sum } else { 1.0 };
+        if sum < 1e-9 {
+            return SparseCode::default();
+        }
 
         let feature_ids: Vec<u32> = candidates.iter().map(|(_, id)| *id).collect();
-        let activations: Vec<f32> = candidates.iter().map(|(s, _)| s.max(0.0) / norm).collect();
+        let activations: Vec<f32> = candidates.iter().map(|(s, _)| s.max(0.0) / sum).collect();
 
         SparseCode { feature_ids, activations }
+    }
+
+    /// Reconstruct a dense 768-dim embedding from a sparse code.
+    /// atom_id = left_idx * N_RIGHT + right_idx
+    /// reconstructed[0..384] += activation * left_atoms[left_idx]
+    /// reconstructed[384..768] += activation * right_atoms[right_idx]
+    pub fn decode(&self, code: &SparseCode) -> Vec<f32> {
+        let mut out = vec![0.0f32; EMBED_DIM];
+        for (&feat_id, &act) in code.feature_ids.iter().zip(code.activations.iter()) {
+            let left_idx = feat_id as usize / N_RIGHT;
+            let right_idx = feat_id as usize % N_RIGHT;
+            for (o, &a) in out[..HALF_DIM].iter_mut().zip(self.left_atoms[left_idx].iter()) {
+                *o += act * a;
+            }
+            for (o, &a) in out[HALF_DIM..].iter_mut().zip(self.right_atoms[right_idx].iter()) {
+                *o += act * a;
+            }
+        }
+        out
     }
 
     /// Online Hebbian update: adjust atoms toward the encoded memory.
@@ -123,14 +153,16 @@ impl SparseEncoder {
 
 // ── Cortical Posting Index ────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostingEntry {
     pub mem_id: MemoryId,
     pub activation_q: u8,    // activation quantized to u8 (0.0-1.0 → 0-255)
     pub strength_q: u8,      // strength quantized to u8
+    pub proto_id: ProtoId,   // prototype cluster assignment
 }
 
 /// Inverted posting index over sparse codes. O(K) posting lookups per query.
+#[derive(Serialize, Deserialize)]
 pub struct CorticalIndex {
     /// feature_id → posting list (sorted by mem_id for merge efficiency)
     postings: HashMap<u32, Vec<PostingEntry>>,
@@ -144,6 +176,12 @@ pub struct CorticalIndex {
     mem_ts: HashMap<MemoryId, i64>,
     /// mem_id → kind (for recency weighting: only "episode" kind gets decay)
     mem_kind: HashMap<MemoryId, String>,
+    /// ART-like online prototype clustering
+    prototype_idx: PrototypeIndex,
+    /// Trained product quantizer for residual compression (optional until trained)
+    pub pq: Option<ProductQuantizer>,
+    /// mem_id → PQ codes for its residual
+    pub mem_pq: HashMap<MemoryId, [u8; PQ_BYTES]>,
 }
 
 impl Default for CorticalIndex {
@@ -159,6 +197,9 @@ impl CorticalIndex {
             mem_codes: HashMap::new(),
             mem_ts: HashMap::new(),
             mem_kind: HashMap::new(),
+            prototype_idx: PrototypeIndex::new(),
+            pq: None,
+            mem_pq: HashMap::new(),
         }
     }
 
@@ -170,12 +211,14 @@ impl CorticalIndex {
         }
 
         let strength_q = (strength.clamp(0.0, 1.0) * 255.0) as u8;
+        let proto_id = self.prototype_idx.assign(mem_id, code);
 
         for (&fid, &act) in code.feature_ids.iter().zip(code.activations.iter()) {
             let entry = PostingEntry {
                 mem_id,
                 activation_q: (act * 255.0) as u8,
                 strength_q,
+                proto_id,
             };
             self.postings.entry(fid).or_default().push(entry);
             *self.df.entry(fid).or_insert(0) += 1;
@@ -201,6 +244,7 @@ impl CorticalIndex {
         }
         self.mem_ts.remove(&mem_id);
         self.mem_kind.remove(&mem_id);
+        self.prototype_idx.remove_memory(mem_id);
     }
 
     /// Update strength for a memory (called on reconsolidation).
@@ -217,7 +261,7 @@ impl CorticalIndex {
         }
     }
 
-    /// Search: IDF-weighted sparse overlap scoring.
+    /// Search: IDF-weighted sparse overlap scoring with prototype bonus.
     /// Returns up to k results as (mem_id, score), sorted by score descending.
     pub fn search(
         &self,
@@ -233,8 +277,13 @@ impl CorticalIndex {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
+        // Find query's nearest prototype
+        let query_proto: Option<ProtoId> = self.prototype_idx.nearest_proto(query_code);
+
         // Accumulate scores per candidate memory
         let mut scores: HashMap<MemoryId, f32> = HashMap::new();
+        // Also track proto_id per candidate for proto_bonus computation
+        let mut candidate_protos: HashMap<MemoryId, ProtoId> = HashMap::new();
         let mut query_norm = 0.0f32;
 
         for (&fid, &q_act) in query_code.feature_ids.iter().zip(query_code.activations.iter()) {
@@ -249,14 +298,15 @@ impl CorticalIndex {
                     if !allowed_set.contains(&entry.mem_id) { continue; }
                 }
                 let c_act = entry.activation_q as f32 / 255.0;
-                let term = idf * (q_act * c_act).sqrt();
+                let term = idf * q_act.min(c_act);
                 *scores.entry(entry.mem_id).or_insert(0.0) += term;
+                candidate_protos.entry(entry.mem_id).or_insert(entry.proto_id);
             }
         }
 
         if query_norm < 1e-9 { query_norm = 1.0; }
 
-        // Finalize scores with strength + recency
+        // Finalize scores with strength + recency + proto_bonus
         let mut results: Vec<(MemoryId, f32)> = scores.into_iter().map(|(mem_id, sparse_raw)| {
             let sparse = sparse_raw / query_norm;
 
@@ -278,7 +328,21 @@ impl CorticalIndex {
                 (-age_days / 30.0).exp()
             } else { 0.0 };
 
-            let score = 0.85 * sparse + 0.10 * strength + 0.05 * recency;
+            // Proto bonus
+            let proto_bonus = match (query_proto, candidate_protos.get(&mem_id).copied()) {
+                (Some(qp), Some(cp)) => {
+                    if qp == cp {
+                        1.0f32
+                    } else {
+                        // transitions scale 0→0.5 for non-same-proto candidates
+                        let t = self.prototype_idx.transition(qp, cp);
+                        (t / 0.5).min(1.0) * 0.5
+                    }
+                }
+                _ => 0.0,
+            };
+
+            let score = 0.70 * sparse + 0.15 * proto_bonus + 0.10 * strength + 0.05 * recency;
             (mem_id, score)
         }).collect();
 
@@ -290,6 +354,107 @@ impl CorticalIndex {
 
     pub fn len(&self) -> usize { self.n_memories as usize }
     pub fn is_empty(&self) -> bool { self.n_memories == 0 }
+
+    pub fn prototype_count(&self) -> usize {
+        self.prototype_idx.count()
+    }
+
+    pub fn set_pq(&mut self, pq: ProductQuantizer) {
+        self.pq = Some(pq);
+    }
+
+    pub fn index_pq(&mut self, memory_id: MemoryId, codes: [u8; PQ_BYTES]) {
+        self.mem_pq.insert(memory_id, codes);
+    }
+
+    pub fn get_pq(&self, memory_id: MemoryId) -> Option<&[u8; PQ_BYTES]> {
+        self.mem_pq.get(&memory_id)
+    }
+
+    pub fn pq_count(&self) -> usize {
+        self.mem_pq.len()
+    }
+
+    pub fn is_pq_trained(&self) -> bool {
+        self.pq.is_some()
+    }
+
+    /// Strengthen prototype transitions for a set of co-retrieved memory IDs.
+    /// Called after recall reconsolidation.
+    pub fn strengthen_proto_transitions(&mut self, ids: &[MemoryId]) {
+        // Collect proto_ids for all provided memory IDs
+        let proto_ids: Vec<(usize, ProtoId)> = ids.iter()
+            .enumerate()
+            .filter_map(|(i, &id)| self.prototype_idx.get_proto(id).map(|pid| (i, pid)))
+            .collect();
+
+        for i in 0..proto_ids.len() {
+            for j in (i + 1)..proto_ids.len() {
+                let (_, pa) = proto_ids[i];
+                let (_, pb) = proto_ids[j];
+                self.prototype_idx.strengthen_transition(pa, pb, 0.02);
+            }
+        }
+    }
+
+    /// Save the full cortical index to a binary snapshot file.
+    /// Writes atomically: first to a `.tmp` file, then renames into place.
+    /// The `snapshot_seqno` marks the last log op included in this snapshot.
+    pub fn save_snapshot(&self, path: &Path, snapshot_seqno: u64) -> Result<()> {
+        let tmp_path = path.with_extension("tmp");
+
+        {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            let mut writer = BufWriter::new(file);
+
+            writer.write_all(&SNAPSHOT_MAGIC.to_be_bytes())?;
+            writer.write_all(&snapshot_seqno.to_be_bytes())?;
+
+            let encoded = bincode::serialize(self)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            writer.write_all(&encoded)?;
+            writer.flush()?;
+        }
+
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+
+    /// Load a cortical snapshot from disk.
+    /// Returns `(CorticalIndex, snapshot_seqno)`.
+    pub fn load_snapshot(path: &Path) -> Result<(Self, u64)> {
+        let file = std::fs::File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        let mut magic_buf = [0u8; 8];
+        reader.read_exact(&mut magic_buf)
+            .map_err(|e| FieldError::Io(e))?;
+        let magic = u64::from_be_bytes(magic_buf);
+        if magic != SNAPSHOT_MAGIC {
+            return Err(FieldError::Manifest(format!(
+                "cortex snapshot magic mismatch: expected {:#x}, got {:#x}",
+                SNAPSHOT_MAGIC, magic
+            )));
+        }
+
+        let mut seqno_buf = [0u8; 8];
+        reader.read_exact(&mut seqno_buf)
+            .map_err(|e| FieldError::Io(e))?;
+        let snapshot_seqno = u64::from_be_bytes(seqno_buf);
+
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data)
+            .map_err(|e| FieldError::Io(e))?;
+
+        let index: CorticalIndex = bincode::deserialize(&data)
+            .map_err(|e| FieldError::Serialization(e.to_string()))?;
+
+        Ok((index, snapshot_seqno))
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

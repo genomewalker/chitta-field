@@ -16,6 +16,7 @@ pub struct TripletEntry {
     pub source_file: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TripletStore {
     next_id: u64,
     entries: Vec<TripletEntry>,

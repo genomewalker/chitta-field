@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use crate::ids::MemoryId;
+use serde::{Serialize, Deserialize};
 
 /// Entry in the temporal index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemporalEntry {
     pub memory_id: MemoryId,
     pub ts_ms: i64,
@@ -12,6 +13,7 @@ pub struct TemporalEntry {
 }
 
 /// Temporal index: sorted by (ts_ms, memory_id) for range queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemporalIndex {
     inner: BTreeMap<(i64, MemoryId), TemporalEntry>,
 }

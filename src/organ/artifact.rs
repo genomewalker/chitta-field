@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use crate::ids::{MemoryId, ArtifactId};
+use serde::{Serialize, Deserialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactEntry {
     pub memory_id: MemoryId,
     pub artifact_id: ArtifactId,
@@ -9,6 +10,7 @@ pub struct ArtifactEntry {
     pub strength: f32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactIndex {
     /// path -> list of entries
     by_path: HashMap<String, Vec<ArtifactEntry>>,

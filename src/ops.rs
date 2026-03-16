@@ -18,7 +18,23 @@ pub enum Op {
     RemoveSymCallEdge(RemoveSymCallEdgeOp),
     UpsertCodeFile(UpsertCodeFileOp),
     UpdateSparseCode(UpdateSparseCodeOp),
+    DemoteMemory(DemoteMemoryOp),
+    TrainPQ(TrainPQOp),
+    UpdateResidualPQ(UpdateResidualPQOp),
+    SessionEvent(SessionEventOp),
+    TranscriptEvent(TranscriptEventOp),
+    TaskEvent(TaskEventOp),
+    UserModelEvent(UserModelEventOp),
+    ThemeEvent(ThemeEventOp),
+    AnalyticsEvent(AnalyticsEventOp),
 }
+
+pub const OP_SESSION_EVENT: u8 = 16;
+pub const OP_TRANSCRIPT_EVENT: u8 = 17;
+pub const OP_TASK_EVENT: u8 = 18;
+pub const OP_USER_MODEL_EVENT: u8 = 19;
+pub const OP_THEME_EVENT: u8 = 20;
+pub const OP_ANALYTICS_EVENT: u8 = 21;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -145,6 +161,12 @@ pub struct UpdateSparseCodeOp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DemoteMemoryOp {
+    pub memory_id: MemoryId,
+    pub new_tier: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRef {
     pub artifact_id: ArtifactId,
     pub relation: ArtifactRelation,
@@ -159,4 +181,92 @@ pub enum ArtifactRelation {
     Created,
     Read,
     Mentioned,
+}
+
+/// Persists a trained ProductQuantizer (bincode-serialized codebooks).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainPQOp {
+    pub codebook_bytes: Vec<u8>,
+}
+
+/// Persists PQ codes for the residual of a single memory.
+/// pq_bytes stored as Vec<u8> (length 32) for serde compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateResidualPQOp {
+    pub memory_id: MemoryId,
+    pub pq_bytes: Vec<u8>,
+}
+
+/// Domain event envelope for session lifecycle events.
+/// kind: "register", "heartbeat", "deregister", "message_send", "message_ack"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEventOp {
+    pub event_id: u64,
+    pub session_id: String,
+    pub kind: String,
+    pub payload_json: Vec<u8>,
+    pub realm: String,
+    pub ts_ms: i64,
+}
+
+/// Domain event envelope for transcript lifecycle events.
+/// kind: "register", "update_progress", "add_turn", "create_episode"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptEventOp {
+    pub event_id: u64,
+    pub session_id: String,
+    pub kind: String,
+    pub payload_json: Vec<u8>,
+    pub realm: String,
+    pub ts_ms: i64,
+}
+
+/// Domain event envelope for task lifecycle events.
+/// task_type: "sadhana", "long_task", "dream", "background"
+/// kind: "create", "start", "pause", "resume", "complete", "fail"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskEventOp {
+    pub event_id: u64,
+    pub task_type: String,
+    pub task_id: String,
+    pub kind: String,
+    pub payload_json: Vec<u8>,
+    pub realm: String,
+    pub ts_ms: i64,
+    pub fencing_token: u64,
+}
+
+/// Domain event envelope for user model entity events.
+/// entity_type: "profile", "goal", "habit", "anticipation", "calibration"
+/// kind: "upsert", "observe", "progress", "complete"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserModelEventOp {
+    pub event_id: u64,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub kind: String,
+    pub payload_json: Vec<u8>,
+    pub ts_ms: i64,
+}
+
+/// Domain event envelope for theme graph events.
+/// kind: "create", "update_centroid", "assign_member", "remove_member"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThemeEventOp {
+    pub event_id: u64,
+    pub kind: String,
+    pub theme_id: u64,
+    pub payload_json: Vec<u8>,
+    pub ts_ms: i64,
+}
+
+/// Domain event envelope for analytics events.
+/// kind: "exposure", "recall_query", "correction", "usage_outcome"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticsEventOp {
+    pub event_id: u64,
+    pub kind: String,
+    pub session_id: String,
+    pub payload_json: Vec<u8>,
+    pub ts_ms: i64,
 }

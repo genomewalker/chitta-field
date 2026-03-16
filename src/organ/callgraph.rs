@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use super::symbol::SymbolId;
+use serde::{Serialize, Deserialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallGraph {
     callees: HashMap<SymbolId, HashSet<SymbolId>>,
     callers: HashMap<SymbolId, HashSet<SymbolId>>,

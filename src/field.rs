@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use parking_lot::RwLock;
 use crate::error::Result;
 use crate::ids::{MemoryId, ArtifactId, InstanceId, MemoryIdAllocator, ArtifactIdAllocator, TripletIdAllocator, new_instance_id};
@@ -17,10 +18,19 @@ use crate::organ::symbol::{SymbolIndex, SymbolEntry};
 use crate::organ::callgraph::CallGraph;
 use crate::organ::codefile::CodeFileIndex;
 use crate::organ::cortex::{SparseEncoder, CorticalIndex, SparseCode};
+use crate::organ::session::SessionRegistry;
+use crate::organ::transcript::TranscriptRegistry;
+use crate::organ::task::TaskRegistry;
+use crate::organ::user_model::UserModelRegistry;
+use crate::organ::theme_organ::ThemeOrgan;
+use crate::organ::analytics::AnalyticsRegistry;
+use crate::organ::pq::ProductQuantizer;
+use crate::organ::lite_encoder::LiteEncoder;
 use crate::learner::LearnerSet;
+use crate::snapshot::FullSnapshot;
 
 /// A single directed association edge stored in memory.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssocEdge {
     pub dst: MemoryId,
     pub edge_type: EdgeType,
@@ -28,7 +38,9 @@ pub struct AssocEdge {
 }
 
 pub struct ChittaField {
+    #[allow(dead_code)]
     pub(crate) data_dir: PathBuf,
+    #[allow(dead_code)]
     pub(crate) instance_id: InstanceId,
     pub(crate) log: RwLock<OpLog>,
     pub(crate) id_alloc: Arc<MemoryIdAllocator>,
@@ -52,6 +64,14 @@ pub struct ChittaField {
     pub(crate) learners: RwLock<LearnerSet>,
     pub(crate) sparse_encoder: RwLock<SparseEncoder>,
     pub(crate) cortical_idx: RwLock<CorticalIndex>,
+    pub(crate) event_id_alloc: Arc<AtomicU64>,
+    pub(crate) session_registry: RwLock<SessionRegistry>,
+    pub(crate) transcript_registry: RwLock<TranscriptRegistry>,
+    pub(crate) task_registry: RwLock<TaskRegistry>,
+    pub(crate) user_model_registry: RwLock<UserModelRegistry>,
+    pub(crate) theme_organ: RwLock<ThemeOrgan>,
+    pub(crate) analytics_registry: RwLock<AnalyticsRegistry>,
+    pub(crate) lite_encoder: RwLock<Option<LiteEncoder>>,
 }
 
 impl Drop for ChittaField {
@@ -94,19 +114,104 @@ impl ChittaField {
         let mut call_graph = CallGraph::new();
         let mut code_files = CodeFileIndex::new();
         let mut cortical_idx = CorticalIndex::new();
+        let mut session_registry = SessionRegistry::new();
+        let mut transcript_registry = TranscriptRegistry::new();
+        let mut task_registry = TaskRegistry::new();
+        let mut user_model_registry = UserModelRegistry::new();
+        let mut theme_organ = ThemeOrgan::new();
+        let mut analytics_registry = AnalyticsRegistry::new();
+
+        // Load cortical snapshot if available; snapshot covers UpdateSparseCode ops
+        // up to snapshot_seqno so we can skip them during replay.
+        let mut snapshot_seqno: u64 = 0;
+        let snapshot_path = data_dir.join("cortex.snapshot");
+        if snapshot_path.exists() {
+            match CorticalIndex::load_snapshot(&snapshot_path) {
+                Ok((loaded, seqno)) => {
+                    cortical_idx = loaded;
+                    snapshot_seqno = seqno;
+                    eprintln!("[chitta-field] loaded cortical snapshot seqno={}", seqno);
+                }
+                Err(e) => {
+                    eprintln!("[chitta-field] snapshot load failed ({}), rebuilding from log", e);
+                }
+            }
+        }
+
+        // Load full state snapshot if available; covers all non-cortical state up to
+        // full_snapshot_seqno so we only replay ops after that point.
+        let mut full_snapshot_seqno: u64 = 0;
+        let full_snapshot_path = data_dir.join("chitta.snapshot");
+        if full_snapshot_path.exists() {
+            match FullSnapshot::load(&full_snapshot_path) {
+                Ok(snap) => {
+                    full_snapshot_seqno = snap.snapshot_seqno;
+                    payloads = snap.payloads;
+                    states = snap.states;
+                    assoc_edges = snap.assoc_edges;
+                    artifacts = snap.artifacts;
+                    artifact_paths = snap.artifact_paths;
+                    time_idx = snap.time_idx;
+                    keyword_idx = snap.keyword_idx;
+                    artifact_idx = snap.artifact_idx;
+                    triplet_store = snap.triplet_store;
+                    symbol_idx = snap.symbol_idx;
+                    call_graph = snap.call_graph;
+                    code_files = snap.code_files;
+                    eprintln!("[chitta-field] loaded full snapshot seqno={}", full_snapshot_seqno);
+                }
+                Err(e) => {
+                    eprintln!("[chitta-field] full snapshot load failed ({}), rebuilding from log", e);
+                }
+            }
+        }
+
+        // Rebuild SemanticIndex from loaded payloads (not stored in snapshot).
+        if full_snapshot_seqno > 0 {
+            for (&mid, payload) in &payloads {
+                semantic_idx.upsert(mid, payload.embedding.clone());
+            }
+        }
 
         // Replay ALL segment files to rebuild in-memory state.
-        log.replay(0, |_seqno, op| {
+        // Skip ops already covered by the full snapshot or cortical snapshot.
+        log.replay(0, |seqno, op| {
+            if seqno <= full_snapshot_seqno {
+                // This op is covered by the full snapshot.
+                // Still apply cortical ops not covered by the cortical snapshot.
+                match &op {
+                    Op::UpdateSparseCode(_) | Op::TrainPQ(_) | Op::UpdateResidualPQ(_)
+                        if seqno <= snapshot_seqno => return Ok(()),
+                    Op::UpdateSparseCode(_) | Op::TrainPQ(_) | Op::UpdateResidualPQ(_) => {
+                        // fall through: apply to cortical index only
+                    }
+                    _ => return Ok(()), // covered by full snapshot
+                }
+            } else if seqno <= snapshot_seqno {
+                // Covered by cortical snapshot but not by full snapshot (shouldn't normally happen,
+                // but handle gracefully by skipping cortical ops).
+                if matches!(op, Op::UpdateSparseCode(_) | Op::TrainPQ(_) | Op::UpdateResidualPQ(_)) {
+                    return Ok(());
+                }
+            }
             apply_op(op, &mut payloads, &mut states, &mut assoc_edges,
                      &mut artifacts, &mut artifact_paths, &mut semantic_idx,
                      &mut time_idx, &mut artifact_idx, &mut keyword_idx, &mut triplet_store,
-                     &mut symbol_idx, &mut call_graph, &mut code_files, &mut cortical_idx);
+                     &mut symbol_idx, &mut call_graph, &mut code_files, &mut cortical_idx,
+                     &mut session_registry, &mut transcript_registry, &mut task_registry,
+                     &mut user_model_registry, &mut theme_organ, &mut analytics_registry);
             Ok(())
         })?;
 
         let triplet_id_alloc = Arc::new(TripletIdAllocator::new(triplet_store.next_id()));
-        let symbol_id_alloc = Arc::new(TripletIdAllocator::new(1));
-        let code_file_id_alloc = Arc::new(TripletIdAllocator::new(1));
+
+        // Sync symbol and code-file id allocators from the loaded indexes.
+        let max_symbol_id = symbol_idx.max_id().unwrap_or(0);
+        let symbol_id_alloc = Arc::new(TripletIdAllocator::new(max_symbol_id + 1));
+        let max_code_file_id = code_files.max_id().unwrap_or(0);
+        let code_file_id_alloc = Arc::new(TripletIdAllocator::new(max_code_file_id + 1));
+
+        let loaded_lite_encoder = Self::load_lite_encoder(&data_dir);
 
         Ok(Self {
             data_dir,
@@ -133,7 +238,90 @@ impl ChittaField {
             learners: RwLock::new(LearnerSet::new()),
             sparse_encoder: RwLock::new(SparseEncoder::new()),
             cortical_idx: RwLock::new(cortical_idx),
+            event_id_alloc: Arc::new(AtomicU64::new(1)),
+            session_registry: RwLock::new(session_registry),
+            transcript_registry: RwLock::new(transcript_registry),
+            task_registry: RwLock::new(task_registry),
+            user_model_registry: RwLock::new(user_model_registry),
+            theme_organ: RwLock::new(theme_organ),
+            analytics_registry: RwLock::new(analytics_registry),
+            lite_encoder: RwLock::new(loaded_lite_encoder),
         })
+    }
+}
+
+impl ChittaField {
+    fn load_lite_encoder(data_dir: &std::path::Path) -> Option<LiteEncoder> {
+        let path = data_dir.join("lite_encoder.bin");
+        if !path.exists() {
+            return None;
+        }
+        match std::fs::read(&path) {
+            Ok(bytes) => match LiteEncoder::from_bytes(&bytes) {
+                Ok(enc) => {
+                    eprintln!("[chitta-field] loaded lite encoder ({} vocab, {} examples)",
+                        enc.vocab.len(), enc.training_examples);
+                    Some(enc)
+                }
+                Err(e) => {
+                    eprintln!("[chitta-field] lite encoder load failed: {}", e);
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+    }
+
+    /// Train the lite encoder from all memories with sparse codes.
+    /// Returns the number of training examples used.
+    pub fn train_lite_encoder(&self) -> Result<usize> {
+        let payloads = self.payloads.read();
+        let cortical_idx = self.cortical_idx.read();
+
+        let mut examples: Vec<(String, SparseCode)> = Vec::new();
+        for (mem_id, payload) in payloads.iter() {
+            if let Some(code) = cortical_idx.mem_codes.get(mem_id) {
+                if !code.is_empty() {
+                    let content = String::from_utf8_lossy(&payload.content).into_owned();
+                    if !content.trim().is_empty() {
+                        examples.push((content, code.clone()));
+                    }
+                }
+            }
+        }
+
+        let count = examples.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let encoder = LiteEncoder::train(&examples);
+        *self.lite_encoder.write() = Some(encoder);
+        Ok(count)
+    }
+
+    /// Encode text via lite encoder. Returns None if not trained or no words match vocab.
+    pub fn encode_lite(&self, text: &str) -> Option<SparseCode> {
+        self.lite_encoder.read().as_ref()?.encode(text)
+    }
+
+    /// Save lite encoder to <data_dir>/lite_encoder.bin
+    pub fn save_lite_encoder(&self) -> Result<()> {
+        let guard = self.lite_encoder.read();
+        let enc = guard.as_ref().ok_or_else(|| {
+            crate::error::FieldError::Manifest("lite encoder not trained".to_string())
+        })?;
+        let bytes = enc.to_bytes();
+        let path = self.data_dir.join("lite_encoder.bin");
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Check if the lite encoder is trained and ready.
+    pub fn lite_encoder_ready(&self) -> bool {
+        self.lite_encoder.read().is_some()
     }
 }
 
@@ -154,6 +342,12 @@ pub(crate) fn apply_op(
     call_graph: &mut CallGraph,
     code_files: &mut CodeFileIndex,
     cortical_idx: &mut CorticalIndex,
+    session_registry: &mut SessionRegistry,
+    transcript_registry: &mut TranscriptRegistry,
+    task_registry: &mut TaskRegistry,
+    user_model_registry: &mut UserModelRegistry,
+    theme_organ: &mut ThemeOrgan,
+    analytics_registry: &mut AnalyticsRegistry,
 ) {
     match op {
         Op::PutPayload(put) => {
@@ -286,6 +480,150 @@ pub(crate) fn apply_op(
                 .map(|p| (p.kind.as_str(), p.authored_at_ms))
                 .unwrap_or(("unknown", op.ts_ms));
             cortical_idx.index(op.memory_id, &code, strength, ts_ms, kind);
+        }
+        Op::DemoteMemory(d) => {
+            if let Some(state) = states.get_mut(&d.memory_id) {
+                state.tier = d.new_tier;
+            }
+        }
+        Op::TrainPQ(t) => {
+            if let Ok(pq) = bincode::deserialize::<ProductQuantizer>(&t.codebook_bytes) {
+                cortical_idx.set_pq(pq);
+            }
+        }
+        Op::UpdateResidualPQ(u) => {
+            if u.pq_bytes.len() == 32 {
+                let mut codes = [0u8; 32];
+                codes.copy_from_slice(&u.pq_bytes);
+                cortical_idx.index_pq(u.memory_id, codes);
+            }
+        }
+        Op::SessionEvent(ev) => {
+            match ev.kind.as_str() {
+                "register" => {
+                    let kind = serde_json::from_slice::<serde_json::Value>(&ev.payload_json)
+                        .ok()
+                        .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    session_registry.register(ev.session_id, kind, ev.realm, ev.ts_ms);
+                }
+                "heartbeat" => session_registry.heartbeat(&ev.session_id, ev.ts_ms),
+                "deregister" => session_registry.deregister(&ev.session_id),
+                _ => {}
+            }
+        }
+        Op::TranscriptEvent(ev) => {
+            match ev.kind.as_str() {
+                "register" => {
+                    let payload = serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
+                    let transcript_id = payload.as_ref()
+                        .and_then(|v| v.get("transcript_id").and_then(|k| k.as_str()).map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    if !transcript_id.is_empty() {
+                        transcript_registry.register(transcript_id, ev.session_id);
+                    }
+                }
+                "update_progress" => {
+                    let payload = serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
+                    let transcript_id = payload.as_ref()
+                        .and_then(|v| v.get("transcript_id").and_then(|k| k.as_str()).map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    let pct = payload.as_ref()
+                        .and_then(|v| v.get("progress_pct").and_then(|k| k.as_f64()))
+                        .unwrap_or(0.0) as f32;
+                    if !transcript_id.is_empty() {
+                        transcript_registry.update_progress(&transcript_id, pct);
+                    }
+                }
+                "add_turn" => {
+                    let payload = serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
+                    let transcript_id = payload.as_ref()
+                        .and_then(|v| v.get("transcript_id").and_then(|k| k.as_str()).map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    let role = payload.as_ref()
+                        .and_then(|v| v.get("role").and_then(|k| k.as_str()).map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    let content = payload.as_ref()
+                        .and_then(|v| v.get("content").and_then(|k| k.as_str()).map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    if !transcript_id.is_empty() {
+                        transcript_registry.add_turn(&transcript_id, role, content, ev.ts_ms);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Op::TaskEvent(ev) => {
+            let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
+            match ev.kind.as_str() {
+                "create" => {
+                    task_registry.create(
+                        ev.task_id,
+                        ev.task_type,
+                        payload_str,
+                        ev.ts_ms,
+                        ev.fencing_token,
+                    );
+                }
+                "start" | "pause" | "resume" | "complete" | "fail" => {
+                    task_registry.transition(&ev.task_id, &ev.kind, ev.ts_ms, ev.fencing_token);
+                }
+                _ => {}
+            }
+        }
+        Op::UserModelEvent(ev) => {
+            let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
+            match ev.kind.as_str() {
+                "upsert" => {
+                    user_model_registry.upsert(ev.entity_id, ev.entity_type, payload_str, ev.ts_ms);
+                }
+                "observe" | "progress" | "complete" => {
+                    user_model_registry.observe(&ev.entity_id, ev.ts_ms);
+                }
+                _ => {}
+            }
+        }
+        Op::ThemeEvent(ev) => {
+            let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
+            match ev.kind.as_str() {
+                "create" => {
+                    let name = serde_json::from_str::<serde_json::Value>(&payload_str)
+                        .ok()
+                        .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    theme_organ.create(ev.theme_id, name);
+                }
+                "update_centroid" => {
+                    let centroid = serde_json::from_str::<serde_json::Value>(&payload_str)
+                        .ok()
+                        .and_then(|v| v.get("centroid_json").and_then(|c| c.as_str()).map(|s| s.to_string()))
+                        .unwrap_or(payload_str);
+                    theme_organ.update_centroid(ev.theme_id, centroid);
+                }
+                "assign_member" => {
+                    let memory_id = serde_json::from_str::<serde_json::Value>(&payload_str)
+                        .ok()
+                        .and_then(|v| v.get("memory_id").and_then(|m| m.as_u64()))
+                        .unwrap_or(0);
+                    if memory_id > 0 {
+                        theme_organ.assign_member(ev.theme_id, memory_id);
+                    }
+                }
+                "remove_member" => {
+                    let memory_id = serde_json::from_str::<serde_json::Value>(&payload_str)
+                        .ok()
+                        .and_then(|v| v.get("memory_id").and_then(|m| m.as_u64()))
+                        .unwrap_or(0);
+                    if memory_id > 0 {
+                        theme_organ.remove_member(ev.theme_id, memory_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Op::AnalyticsEvent(ev) => {
+            let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
+            analytics_registry.append(ev.kind, ev.session_id, payload_str, ev.ts_ms);
         }
     }
 }

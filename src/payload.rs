@@ -1,8 +1,9 @@
 pub use crate::ops::{PutPayloadOp, ArtifactRef, ArtifactRelation};
 use crate::ids::{MemoryId, ChunkHash};
+use serde::{Serialize, Deserialize};
 
 /// In-memory representation of the latest payload for a memory.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryPayload {
     pub memory_id: MemoryId,
     pub version: u32,

@@ -6,9 +6,14 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use crate::field::ChittaField;
-use crate::ops::EdgeType;
+use crate::ops::{
+    EdgeType, SessionEventOp, TranscriptEventOp, TaskEventOp,
+    UserModelEventOp, ThemeEventOp, AnalyticsEventOp, Op,
+};
 use crate::recall::RecallHit;
+use serde_json;
 
 /// Opaque handle. C code holds *mut CfHandle.
 pub struct CfHandle {
@@ -134,7 +139,11 @@ pub extern "C" fn cf_put_memory(
         }
     };
     let content = unsafe { std::slice::from_raw_parts(content_ptr, content_len) };
-    let embedding = unsafe { std::slice::from_raw_parts(embedding_ptr, embedding_len) };
+    let embedding: &[f32] = if embedding_ptr.is_null() || embedding_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(embedding_ptr, embedding_len) }
+    };
 
     match handle.field.put_memory(
         kind_str,
@@ -1088,6 +1097,2071 @@ pub extern "C" fn cf_cortical_count(h: *const CfHandle) -> usize {
         return 0;
     }
     unsafe { (*h).field.cortical_count() }
+}
+
+/// Get number of prototype clusters in the CorticalIndex.
+#[no_mangle]
+pub extern "C" fn cf_prototype_count(h: *mut CfHandle) -> usize {
+    if h.is_null() {
+        return 0;
+    }
+    unsafe { (*h).field.prototype_count() }
+}
+
+/// Train product quantizer on accumulated residuals. Returns true on success.
+/// Requires at least 256 encoded memories.
+#[no_mangle]
+pub extern "C" fn cf_train_pq(h: *mut CfHandle) -> bool {
+    if h.is_null() {
+        return false;
+    }
+    let handle = unsafe { &mut *h };
+    handle.field.train_pq().is_ok()
+}
+
+/// Encode PQ residuals for all memories not yet PQ-encoded.
+/// Trains PQ first if needed. Returns count encoded, or 0 on error.
+#[no_mangle]
+pub extern "C" fn cf_encode_all_pq(h: *mut CfHandle) -> usize {
+    if h.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &mut *h };
+    match handle.field.encode_all_pq() {
+        Ok(n) => n,
+        Err(e) => {
+            handle.err(e);
+            0
+        }
+    }
+}
+
+/// Return how many memories have PQ residual codes.
+#[no_mangle]
+pub extern "C" fn cf_pq_count(h: *mut CfHandle) -> usize {
+    if h.is_null() {
+        return 0;
+    }
+    unsafe { (*h).field.pq_count() }
+}
+
+/// Save the cortical index to a binary snapshot file. Returns true on success.
+#[no_mangle]
+pub extern "C" fn cf_save_snapshot(h: *mut CfHandle) -> bool {
+    if h.is_null() {
+        return false;
+    }
+    let handle = unsafe { &mut *h };
+    handle.field.save_snapshot().is_ok()
+}
+
+/// Save the full in-memory state to a binary snapshot file (chitta.snapshot).
+/// Returns true on success.
+#[no_mangle]
+pub extern "C" fn cf_save_full_snapshot(h: *mut CfHandle) -> bool {
+    if h.is_null() {
+        return false;
+    }
+    let handle = unsafe { &mut *h };
+    handle.field.save_full_snapshot().is_ok()
+}
+
+// ── Lite Encoder ─────────────────────────────────────────────────────────────
+
+/// Train the lite encoder from all existing memories with sparse codes.
+/// Returns number of training examples or -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_train_lite_encoder(h: *mut CfHandle) -> i32 {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    match handle.field.train_lite_encoder() {
+        Ok(n) => n as i32,
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Save the lite encoder to disk (<data_dir>/lite_encoder.bin).
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_save_lite_encoder(h: *mut CfHandle) -> i32 {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    match handle.field.save_lite_encoder() {
+        Ok(()) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Check if lite encoder is trained and ready.
+/// Returns 1 if ready, 0 if not.
+#[no_mangle]
+pub extern "C" fn cf_lite_encoder_ready(h: *const CfHandle) -> u8 {
+    if h.is_null() {
+        return 0;
+    }
+    unsafe { (*h).field.lite_encoder_ready() as u8 }
+}
+
+/// Encode text via lite encoder into sparse feature indices and weights.
+/// out_atoms: caller-allocated array of at least K_ACTIVE uint32 values.
+/// out_weights: caller-allocated array of at least K_ACTIVE f32 values.
+/// Returns the number of active features written (≤ K_ACTIVE), or -1 on failure.
+#[no_mangle]
+pub extern "C" fn cf_encode_lite(
+    h: *const CfHandle,
+    text_ptr: *const u8,
+    text_len: usize,
+    out_atoms: *mut u32,
+    out_weights: *mut f32,
+) -> i32 {
+    if h.is_null() || text_ptr.is_null() || out_atoms.is_null() || out_weights.is_null() {
+        return -1;
+    }
+    let text = unsafe {
+        match std::str::from_utf8(std::slice::from_raw_parts(text_ptr, text_len)) {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+    let field = unsafe { &(*h).field };
+    match field.encode_lite(text) {
+        Some(code) => {
+            let n = code.feature_ids.len();
+            unsafe {
+                for (i, (&atom, &weight)) in code.feature_ids.iter().zip(code.activations.iter()).enumerate() {
+                    *out_atoms.add(i) = atom;
+                    *out_weights.add(i) = weight;
+                }
+            }
+            n as i32
+        }
+        None => -1,
+    }
+}
+
+/// Run a tier demotion pass. Returns demoted_count (low 32 bits) | deleted_count (high 32 bits).
+#[no_mangle]
+pub extern "C" fn cf_run_demotion(h: *mut CfHandle, now_ms: i64) -> u64 {
+    if h.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &mut *h };
+    match handle.field.run_demotion_pass(now_ms) {
+        Ok((demoted, deleted)) => (demoted as u64) | ((deleted as u64) << 32),
+        Err(e) => {
+            handle.err(e);
+            0
+        }
+    }
+}
+
+// ── Domain Event Log ──────────────────────────────────────────────────────────
+
+/// Iterate log ops starting from `from_seqno`.
+/// Callback receives: op serialized as JSON bytes, length, seqno, user ctx.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_iterate_log(
+    h: *mut CfHandle,
+    from_seqno: u64,
+    callback: extern "C" fn(*const u8, usize, u64, *mut std::ffi::c_void),
+    ctx: *mut std::ffi::c_void,
+) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let result = handle.field.log.read().replay(from_seqno, |seqno, op| {
+        let json = serde_json::to_vec(&op).unwrap_or_default();
+        callback(json.as_ptr(), json.len(), seqno, ctx);
+        Ok(())
+    });
+    match result {
+        Ok(()) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Emit a domain event into the chitta-field log.
+/// domain: "session", "transcript", "task", "user_model", "theme", "analytics"
+/// Returns assigned event_id via *out_event_id, or 0 on error.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_emit_event(
+    h: *mut CfHandle,
+    domain: *const c_char,
+    kind: *const c_char,
+    entity_id: *const c_char,
+    payload_json: *const u8,
+    payload_len: usize,
+    realm: *const c_char,
+    fencing_token: u64,
+    out_event_id: *mut u64,
+) -> c_int {
+    if h.is_null() || domain.is_null() || kind.is_null() || out_event_id.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+
+    let domain_str = unsafe {
+        match CStr::from_ptr(domain).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let kind_str = unsafe {
+        match CStr::from_ptr(kind).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let entity_id_str = if entity_id.is_null() {
+        ""
+    } else {
+        unsafe {
+            match CStr::from_ptr(entity_id).to_str() {
+                Ok(s) => s,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+    let realm_str = if realm.is_null() {
+        ""
+    } else {
+        unsafe {
+            match CStr::from_ptr(realm).to_str() {
+                Ok(s) => s,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+    let payload = if payload_json.is_null() || payload_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(payload_json, payload_len) }.to_vec()
+    };
+
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let op = match domain_str {
+        "session" => Op::SessionEvent(SessionEventOp {
+            event_id,
+            session_id: entity_id_str.to_string(),
+            kind: kind_str.to_string(),
+            payload_json: payload,
+            realm: realm_str.to_string(),
+            ts_ms,
+        }),
+        "transcript" => Op::TranscriptEvent(TranscriptEventOp {
+            event_id,
+            session_id: entity_id_str.to_string(),
+            kind: kind_str.to_string(),
+            payload_json: payload,
+            realm: realm_str.to_string(),
+            ts_ms,
+        }),
+        "task" => Op::TaskEvent(TaskEventOp {
+            event_id,
+            task_type: entity_id_str.to_string(),
+            task_id: entity_id_str.to_string(),
+            kind: kind_str.to_string(),
+            payload_json: payload,
+            realm: realm_str.to_string(),
+            ts_ms,
+            fencing_token,
+        }),
+        "user_model" => Op::UserModelEvent(UserModelEventOp {
+            event_id,
+            entity_type: entity_id_str.to_string(),
+            entity_id: entity_id_str.to_string(),
+            kind: kind_str.to_string(),
+            payload_json: payload,
+            ts_ms,
+        }),
+        "theme" => Op::ThemeEvent(ThemeEventOp {
+            event_id,
+            kind: kind_str.to_string(),
+            theme_id: fencing_token,
+            payload_json: payload,
+            ts_ms,
+        }),
+        "analytics" => Op::AnalyticsEvent(AnalyticsEventOp {
+            event_id,
+            kind: kind_str.to_string(),
+            session_id: entity_id_str.to_string(),
+            payload_json: payload,
+            ts_ms,
+        }),
+        _ => return handle.err(format!("unknown domain: {}", domain_str)),
+    };
+
+    let result = handle.field.log.write().append(&op);
+    match result {
+        Ok(_seqno) => {
+            unsafe { *out_event_id = event_id; }
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Get the payload of the most recent user_model event matching entity_type+entity_id.
+/// domain must be "user_model"; kind is matched against entity_type.
+/// Returns 0 and writes JSON payload to buf if found, 1 if not found, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_get_latest_event(
+    h: *mut CfHandle,
+    domain: *const c_char,
+    kind: *const c_char,
+    entity_id: *const c_char,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || domain.is_null() || kind.is_null() || entity_id.is_null()
+        || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+
+    let domain_str = unsafe {
+        match CStr::from_ptr(domain).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let kind_str = unsafe {
+        match CStr::from_ptr(kind).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let entity_id_str = unsafe {
+        match CStr::from_ptr(entity_id).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    if domain_str != "user_model" {
+        return handle.err(format!("cf_get_latest_event: unsupported domain '{}'", domain_str));
+    }
+
+    let registry = handle.field.user_model_registry.read();
+    match registry.get(entity_id_str) {
+        Some(entry) if entry.entity_type == kind_str => {
+            let bytes = entry.payload_json.as_bytes();
+            let n = bytes.len().min(buf_cap);
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
+                *written = n;
+            }
+            0
+        }
+        Some(_) => 1, // entity_id found but entity_type doesn't match kind
+        None => 1,
+    }
+}
+
+// ── Session high-level FFI ────────────────────────────────────────────────────
+
+/// Register a new session. kind is the session type (e.g. "claude", "sadhana").
+/// Emits a SessionEvent("register") op to the log and updates the in-memory registry.
+#[no_mangle]
+pub extern "C" fn cf_session_register(
+    h: *mut CfHandle,
+    session_id: *const c_char,
+    kind: *const c_char,
+    realm: *const c_char,
+    now_ms: i64,
+) -> c_int {
+    if h.is_null() || session_id.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let session_id_str = unsafe {
+        match CStr::from_ptr(session_id).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let kind_str = if kind.is_null() { "" } else {
+        unsafe {
+            match CStr::from_ptr(kind).to_str() {
+                Ok(s) => s,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+    let realm_str = if realm.is_null() { "" } else {
+        unsafe {
+            match CStr::from_ptr(realm).to_str() {
+                Ok(s) => s,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+
+    let payload_json = format!(r#"{{"kind":"{}"}}"#, kind_str).into_bytes();
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::SessionEvent(SessionEventOp {
+        event_id,
+        session_id: session_id_str.to_string(),
+        kind: "register".to_string(),
+        payload_json,
+        realm: realm_str.to_string(),
+        ts_ms: now_ms,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    handle.field.session_registry.write().register(
+        session_id_str.to_string(),
+        kind_str.to_string(),
+        realm_str.to_string(),
+        now_ms,
+    );
+    handle.ok()
+}
+
+/// Update the last-heartbeat timestamp for an active session.
+#[no_mangle]
+pub extern "C" fn cf_session_heartbeat(
+    h: *mut CfHandle,
+    session_id: *const c_char,
+    now_ms: i64,
+) -> c_int {
+    if h.is_null() || session_id.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let session_id_str = unsafe {
+        match CStr::from_ptr(session_id).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::SessionEvent(SessionEventOp {
+        event_id,
+        session_id: session_id_str.to_string(),
+        kind: "heartbeat".to_string(),
+        payload_json: Vec::new(),
+        realm: String::new(),
+        ts_ms: now_ms,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    handle.field.session_registry.write().heartbeat(session_id_str, now_ms);
+    handle.ok()
+}
+
+/// Mark a session as closed.
+#[no_mangle]
+pub extern "C" fn cf_session_deregister(
+    h: *mut CfHandle,
+    session_id: *const c_char,
+    now_ms: i64,
+) -> c_int {
+    if h.is_null() || session_id.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let session_id_str = unsafe {
+        match CStr::from_ptr(session_id).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::SessionEvent(SessionEventOp {
+        event_id,
+        session_id: session_id_str.to_string(),
+        kind: "deregister".to_string(),
+        payload_json: Vec::new(),
+        realm: String::new(),
+        ts_ms: now_ms,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    handle.field.session_registry.write().deregister(session_id_str);
+    handle.ok()
+}
+
+// ── Transcript high-level FFI ─────────────────────────────────────────────────
+
+/// Register a new transcript for a session.
+#[no_mangle]
+pub extern "C" fn cf_transcript_register(
+    h: *mut CfHandle,
+    transcript_id: *const c_char,
+    session_id: *const c_char,
+) -> c_int {
+    if h.is_null() || transcript_id.is_null() || session_id.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let transcript_id_str = unsafe {
+        match CStr::from_ptr(transcript_id).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let session_id_str = unsafe {
+        match CStr::from_ptr(session_id).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let payload_json = format!(r#"{{"transcript_id":"{}"}}"#, transcript_id_str).into_bytes();
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::TranscriptEvent(TranscriptEventOp {
+        event_id,
+        session_id: session_id_str.to_string(),
+        kind: "register".to_string(),
+        payload_json,
+        realm: String::new(),
+        ts_ms,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    handle.field.transcript_registry.write().register(
+        transcript_id_str.to_string(),
+        session_id_str.to_string(),
+    );
+    handle.ok()
+}
+
+/// Update transcript completion progress (0.0–100.0).
+#[no_mangle]
+pub extern "C" fn cf_transcript_update_progress(
+    h: *mut CfHandle,
+    transcript_id: *const c_char,
+    progress_pct: f32,
+) -> c_int {
+    if h.is_null() || transcript_id.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let transcript_id_str = unsafe {
+        match CStr::from_ptr(transcript_id).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let payload_json = format!(
+        r#"{{"transcript_id":"{}","progress_pct":{}}}"#,
+        transcript_id_str, progress_pct
+    ).into_bytes();
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::TranscriptEvent(TranscriptEventOp {
+        event_id,
+        session_id: String::new(),
+        kind: "update_progress".to_string(),
+        payload_json,
+        realm: String::new(),
+        ts_ms,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    handle.field.transcript_registry.write().update_progress(transcript_id_str, progress_pct);
+    handle.ok()
+}
+
+/// Add a turn to a transcript. Returns the assigned turn_id via out_turn_id.
+/// content_ptr/content_len are the UTF-8 turn content (not NUL-terminated).
+#[no_mangle]
+pub extern "C" fn cf_transcript_add_turn(
+    h: *mut CfHandle,
+    transcript_id: *const c_char,
+    role: *const c_char,
+    content_ptr: *const u8,
+    content_len: usize,
+    ts_ms: i64,
+    out_turn_id: *mut u64,
+) -> c_int {
+    if h.is_null() || transcript_id.is_null() || out_turn_id.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let transcript_id_str = unsafe {
+        match CStr::from_ptr(transcript_id).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let role_str = if role.is_null() { "user" } else {
+        unsafe {
+            match CStr::from_ptr(role).to_str() {
+                Ok(s) => s,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+    let content = if content_ptr.is_null() || content_len == 0 {
+        String::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(content_ptr, content_len) };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let payload_json = serde_json::json!({
+        "transcript_id": transcript_id_str,
+        "role": role_str,
+        "content": content,
+    }).to_string().into_bytes();
+
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::TranscriptEvent(TranscriptEventOp {
+        event_id,
+        session_id: String::new(),
+        kind: "add_turn".to_string(),
+        payload_json,
+        realm: String::new(),
+        ts_ms,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    let turn_id = handle.field.transcript_registry.write().add_turn(
+        transcript_id_str,
+        role_str.to_string(),
+        content,
+        ts_ms,
+    );
+    unsafe { *out_turn_id = turn_id; }
+    handle.ok()
+}
+
+// ── Task / Sadhana / Dream high-level FFI ────────────────────────────────────
+
+/// Create a task, sadhana, or dream.
+/// kind: "task" | "sadhana" | "dream" (or any custom type).
+/// payload_json: arbitrary UTF-8 JSON metadata (may be null/0 for empty).
+#[no_mangle]
+pub extern "C" fn cf_task_create(
+    h: *mut CfHandle,
+    task_id: *const c_char,
+    kind: *const c_char,
+    payload_json: *const u8,
+    payload_len: usize,
+    now_ms: i64,
+    fencing_token: u64,
+) -> c_int {
+    if h.is_null() || task_id.is_null() || kind.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let task_id_str = unsafe {
+        match CStr::from_ptr(task_id).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let kind_str = unsafe {
+        match CStr::from_ptr(kind).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let payload_str = if payload_json.is_null() || payload_len == 0 {
+        String::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(payload_json, payload_len) };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::TaskEvent(TaskEventOp {
+        event_id,
+        task_type: kind_str.to_string(),
+        task_id: task_id_str.to_string(),
+        kind: "create".to_string(),
+        payload_json: payload_str.as_bytes().to_vec(),
+        realm: String::new(),
+        ts_ms: now_ms,
+        fencing_token,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    handle.field.task_registry.write().create(
+        task_id_str.to_string(),
+        kind_str.to_string(),
+        payload_str,
+        now_ms,
+        fencing_token,
+    );
+    handle.ok()
+}
+
+/// Transition a task's status.
+/// new_status: "start" | "pause" | "resume" | "complete" | "fail"
+#[no_mangle]
+pub extern "C" fn cf_task_transition(
+    h: *mut CfHandle,
+    task_id: *const c_char,
+    new_status: *const c_char,
+    now_ms: i64,
+    fencing_token: u64,
+) -> c_int {
+    if h.is_null() || task_id.is_null() || new_status.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let task_id_str = unsafe {
+        match CStr::from_ptr(task_id).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let status_str = unsafe {
+        match CStr::from_ptr(new_status).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    // Determine task_type from registry for the log op.
+    let task_type = handle.field.task_registry.read()
+        .get(task_id_str)
+        .map(|t| t.kind.clone())
+        .unwrap_or_default();
+
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::TaskEvent(TaskEventOp {
+        event_id,
+        task_type,
+        task_id: task_id_str.to_string(),
+        kind: status_str.to_string(),
+        payload_json: Vec::new(),
+        realm: String::new(),
+        ts_ms: now_ms,
+        fencing_token,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    handle.field.task_registry.write().transition(task_id_str, status_str, now_ms, fencing_token);
+    handle.ok()
+}
+
+/// List tasks as a JSON array written into buf.
+/// kind_filter: null means all; "task"/"sadhana"/"dream" filters by kind.
+/// active_only: 1 = only pending/running/paused; 0 = all.
+/// Returns 0 on success, -2 if buf too small.
+#[no_mangle]
+pub extern "C" fn cf_task_list(
+    h: *mut CfHandle,
+    kind_filter: *const c_char,
+    active_only: u8,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let filter_str = if kind_filter.is_null() {
+        None
+    } else {
+        unsafe {
+            match CStr::from_ptr(kind_filter).to_str() {
+                Ok(s) if !s.is_empty() => Some(s),
+                Ok(_) => None,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+
+    // Collect owned data before dropping the read guard so we can call handle methods.
+    let json_val: Vec<serde_json::Value> = {
+        let registry = handle.field.task_registry.read();
+        let records: Vec<_> = if active_only != 0 {
+            if let Some(kind) = filter_str {
+                registry.list_active().into_iter().filter(|t| t.kind == kind).collect()
+            } else {
+                registry.list_active()
+            }
+        } else if let Some(kind) = filter_str {
+            registry.list_by_kind(kind)
+        } else {
+            registry.list_all()
+        };
+        records.iter().map(|t| serde_json::json!({
+            "task_id": t.task_id,
+            "kind": t.kind,
+            "status": t.status.as_str(),
+            "payload_json": t.payload_json,
+            "created_at_ms": t.created_at_ms,
+            "updated_at_ms": t.updated_at_ms,
+        })).collect()
+    }; // registry guard dropped here
+
+    let json_str = match serde_json::to_string(&json_val) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    let bytes = json_str.as_bytes();
+    if bytes.len() > buf_cap {
+        return -2;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *written = bytes.len();
+    }
+    handle.ok()
+}
+
+// ── User Model FFI ────────────────────────────────────────────────────────────
+
+/// Upsert a user model entity (profile, goal, habit, anticipation, calibration).
+/// payload_json may be null/0 for empty payload.
+#[no_mangle]
+pub extern "C" fn cf_user_model_upsert(
+    h: *mut CfHandle,
+    entity_id: *const c_char,
+    entity_type: *const c_char,
+    payload_json: *const u8,
+    payload_len: usize,
+    now_ms: i64,
+) -> c_int {
+    if h.is_null() || entity_id.is_null() || entity_type.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let entity_id_str = unsafe {
+        match CStr::from_ptr(entity_id).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let entity_type_str = unsafe {
+        match CStr::from_ptr(entity_type).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let payload_str = if payload_json.is_null() || payload_len == 0 {
+        String::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(payload_json, payload_len) };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::UserModelEvent(UserModelEventOp {
+        event_id,
+        entity_type: entity_type_str.to_string(),
+        entity_id: entity_id_str.to_string(),
+        kind: "upsert".to_string(),
+        payload_json: payload_str.as_bytes().to_vec(),
+        ts_ms: now_ms,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    handle.field.user_model_registry.write().upsert(
+        entity_id_str.to_string(),
+        entity_type_str.to_string(),
+        payload_str,
+        now_ms,
+    );
+    handle.ok()
+}
+
+/// Record an observation of a user model entity (increments count, updates timestamp).
+#[no_mangle]
+pub extern "C" fn cf_user_model_observe(
+    h: *mut CfHandle,
+    entity_id: *const c_char,
+    now_ms: i64,
+) -> c_int {
+    if h.is_null() || entity_id.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let entity_id_str = unsafe {
+        match CStr::from_ptr(entity_id).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::UserModelEvent(UserModelEventOp {
+        event_id,
+        entity_type: String::new(),
+        entity_id: entity_id_str.to_string(),
+        kind: "observe".to_string(),
+        payload_json: Vec::new(),
+        ts_ms: now_ms,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    handle.field.user_model_registry.write().observe(entity_id_str, now_ms);
+    handle.ok()
+}
+
+/// List user model entries as a JSON array written into buf.
+/// entity_type_filter: null means all; otherwise filter by entity_type.
+/// Returns 0 on success, -2 if buf too small.
+#[no_mangle]
+pub extern "C" fn cf_user_model_list(
+    h: *mut CfHandle,
+    entity_type_filter: *const c_char,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let filter_str = if entity_type_filter.is_null() {
+        None
+    } else {
+        unsafe {
+            match CStr::from_ptr(entity_type_filter).to_str() {
+                Ok(s) if !s.is_empty() => Some(s),
+                Ok(_) => None,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+
+    let json_val: Vec<serde_json::Value> = {
+        let registry = handle.field.user_model_registry.read();
+        let entries: Vec<_> = if let Some(etype) = filter_str {
+            registry.list_by_type(etype)
+        } else {
+            registry.list_all()
+        };
+        entries.iter().map(|e| serde_json::json!({
+            "entity_id": e.entity_id,
+            "entity_type": e.entity_type,
+            "payload_json": e.payload_json,
+            "updated_at_ms": e.updated_at_ms,
+            "observation_count": e.observation_count,
+        })).collect()
+    };
+
+    let json_str = match serde_json::to_string(&json_val) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    let bytes = json_str.as_bytes();
+    if bytes.len() > buf_cap {
+        return -2;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *written = bytes.len();
+    }
+    handle.ok()
+}
+
+// ── Theme FFI ─────────────────────────────────────────────────────────────────
+
+/// Create a new named theme.
+#[no_mangle]
+pub extern "C" fn cf_theme_create(
+    h: *mut CfHandle,
+    theme_id: u64,
+    name: *const c_char,
+) -> c_int {
+    if h.is_null() || name.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let name_str = unsafe {
+        match CStr::from_ptr(name).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let payload = serde_json::json!({ "name": name_str }).to_string();
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::ThemeEvent(ThemeEventOp {
+        event_id,
+        kind: "create".to_string(),
+        theme_id,
+        payload_json: payload.as_bytes().to_vec(),
+        ts_ms: 0,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    handle.field.theme_organ.write().create(theme_id, name_str.to_string());
+    handle.ok()
+}
+
+/// Update the centroid (JSON array of floats) for a theme.
+/// centroid_json may be null/0 to clear the centroid.
+#[no_mangle]
+pub extern "C" fn cf_theme_update_centroid(
+    h: *mut CfHandle,
+    theme_id: u64,
+    centroid_json: *const u8,
+    centroid_len: usize,
+) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let centroid_str = if centroid_json.is_null() || centroid_len == 0 {
+        String::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(centroid_json, centroid_len) };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let payload = serde_json::json!({ "centroid_json": centroid_str }).to_string();
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::ThemeEvent(ThemeEventOp {
+        event_id,
+        kind: "update_centroid".to_string(),
+        theme_id,
+        payload_json: payload.as_bytes().to_vec(),
+        ts_ms: 0,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    handle.field.theme_organ.write().update_centroid(theme_id, centroid_str);
+    handle.ok()
+}
+
+/// Assign a memory to a theme.
+#[no_mangle]
+pub extern "C" fn cf_theme_assign_member(
+    h: *mut CfHandle,
+    theme_id: u64,
+    memory_id: u64,
+) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let payload = serde_json::json!({ "memory_id": memory_id }).to_string();
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::ThemeEvent(ThemeEventOp {
+        event_id,
+        kind: "assign_member".to_string(),
+        theme_id,
+        payload_json: payload.as_bytes().to_vec(),
+        ts_ms: 0,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    handle.field.theme_organ.write().assign_member(theme_id, memory_id);
+    handle.ok()
+}
+
+/// Remove a memory from a theme.
+#[no_mangle]
+pub extern "C" fn cf_theme_remove_member(
+    h: *mut CfHandle,
+    theme_id: u64,
+    memory_id: u64,
+) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let payload = serde_json::json!({ "memory_id": memory_id }).to_string();
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::ThemeEvent(ThemeEventOp {
+        event_id,
+        kind: "remove_member".to_string(),
+        theme_id,
+        payload_json: payload.as_bytes().to_vec(),
+        ts_ms: 0,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    handle.field.theme_organ.write().remove_member(theme_id, memory_id);
+    handle.ok()
+}
+
+/// List all themes as a JSON array written into buf.
+/// Each element: {theme_id, name, member_count, centroid_json}
+/// Returns 0 on success, -2 if buf too small.
+#[no_mangle]
+pub extern "C" fn cf_theme_list(
+    h: *mut CfHandle,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let json_val: Vec<serde_json::Value> = {
+        let organ = handle.field.theme_organ.read();
+        organ.list_all().iter().map(|t| serde_json::json!({
+            "theme_id": t.theme_id,
+            "name": t.name,
+            "member_count": t.member_ids.len(),
+            "centroid_json": t.centroid,
+        })).collect()
+    };
+
+    let json_str = match serde_json::to_string(&json_val) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    let bytes = json_str.as_bytes();
+    if bytes.len() > buf_cap {
+        return -2;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *written = bytes.len();
+    }
+    handle.ok()
+}
+
+/// Get a single theme by ID as JSON. Returns 0 on success, 1 if not found, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_theme_get(
+    h: *mut CfHandle,
+    theme_id: u64,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let theme_val = {
+        let organ = handle.field.theme_organ.read();
+        organ.get(theme_id).map(|t| serde_json::json!({
+            "theme_id": t.theme_id,
+            "name": t.name,
+            "realm": t.realm,
+            "coherence": t.coherence,
+            "member_count": t.member_ids.len(),
+            "created_at": t.created_at,
+        }))
+    };
+    let json_str = match theme_val {
+        None => return 1,
+        Some(v) => match serde_json::to_string(&v) {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        },
+    };
+
+    let bytes = json_str.as_bytes();
+    if bytes.len() > buf_cap { return -2; }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *written = bytes.len();
+    }
+    handle.ok()
+}
+
+/// Get theme stats as JSON. realm="" means all realms.
+#[no_mangle]
+pub extern "C" fn cf_theme_stats(
+    h: *mut CfHandle,
+    realm: *const c_char,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let realm_str = if realm.is_null() {
+        ""
+    } else {
+        unsafe {
+            match CStr::from_ptr(realm).to_str() {
+                Ok(s) => s,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+
+    let total_memory_count = handle.field.payloads.read().len();
+    let stats = handle.field.theme_organ.read().stats(realm_str, total_memory_count);
+
+    let json_str = match serde_json::to_string(&serde_json::json!({
+        "total_themes": stats.total_themes,
+        "total_memberships": stats.total_memberships,
+        "orphan_count": stats.orphan_count,
+        "avg_size": stats.avg_size,
+        "avg_coherence": stats.avg_coherence,
+    })) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+
+    let bytes = json_str.as_bytes();
+    if bytes.len() > buf_cap { return -2; }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *written = bytes.len();
+    }
+    handle.ok()
+}
+
+/// Find top-k themes by embedding similarity. Returns JSON array of {theme_id, score}.
+#[no_mangle]
+pub extern "C" fn cf_theme_recall(
+    h: *mut CfHandle,
+    embedding_ptr: *const f32,
+    embedding_len: usize,
+    k: usize,
+    realm: *const c_char,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || embedding_ptr.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let embedding = unsafe { std::slice::from_raw_parts(embedding_ptr, embedding_len) };
+
+    let realm_str = if realm.is_null() {
+        ""
+    } else {
+        unsafe {
+            match CStr::from_ptr(realm).to_str() {
+                Ok(s) => s,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+
+    let hits = handle.field.theme_organ.read().recall_by_embedding(embedding, k, realm_str);
+
+    let json_val: Vec<serde_json::Value> = hits.iter().map(|(tid, score)| serde_json::json!({
+        "theme_id": tid,
+        "score": score,
+    })).collect();
+
+    let json_str = match serde_json::to_string(&json_val) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+
+    let bytes = json_str.as_bytes();
+    if bytes.len() > buf_cap { return -2; }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *written = bytes.len();
+    }
+    handle.ok()
+}
+
+/// Run theme maintenance (split/merge). Returns JSON ThemeMaintenanceResult.
+#[no_mangle]
+pub extern "C" fn cf_theme_maintain(
+    h: *mut CfHandle,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let embeddings: std::collections::HashMap<u64, Vec<f32>> = {
+        let payloads = handle.field.payloads.read();
+        payloads.iter().map(|(id, p)| (*id, p.embedding.clone())).collect()
+    };
+
+    let result = handle.field.theme_organ.write().maintain(&embeddings);
+
+    let json_str = match serde_json::to_string(&serde_json::json!({
+        "themes_split": result.themes_split,
+        "themes_merged": result.themes_merged,
+        "memories_reassigned": result.memories_reassigned,
+    })) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+
+    let bytes = json_str.as_bytes();
+    if bytes.len() > buf_cap { return -2; }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *written = bytes.len();
+    }
+    handle.ok()
+}
+
+/// Assign orphan memories to themes. Returns JSON {assigned, remaining}.
+#[no_mangle]
+pub extern "C" fn cf_theme_assign_orphans(
+    h: *mut CfHandle,
+    batch_size: usize,
+    realm: *const c_char,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let realm_str: String = if realm.is_null() {
+        String::new()
+    } else {
+        unsafe {
+            match CStr::from_ptr(realm).to_str() {
+                Ok(s) => s.to_string(),
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+
+    let (all_memory_ids, embeddings): (Vec<u64>, std::collections::HashMap<u64, Vec<f32>>) = {
+        let payloads = handle.field.payloads.read();
+        let ids: Vec<u64> = payloads.keys().copied().collect();
+        let embs: std::collections::HashMap<u64, Vec<f32>> = payloads.iter()
+            .map(|(id, p)| (*id, p.embedding.clone()))
+            .collect();
+        (ids, embs)
+    };
+
+    let (assigned, remaining) = handle.field.theme_organ.write().assign_orphans(
+        &all_memory_ids,
+        &embeddings,
+        &realm_str,
+        batch_size,
+        0.7,
+    );
+
+    let json_str = match serde_json::to_string(&serde_json::json!({
+        "assigned": assigned,
+        "remaining": remaining,
+    })) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+
+    let bytes = json_str.as_bytes();
+    if bytes.len() > buf_cap { return -2; }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *written = bytes.len();
+    }
+    handle.ok()
+}
+
+// ── Analytics high-level FFI ──────────────────────────────────────────────────
+
+/// Append an analytics entry. Emits an AnalyticsEvent op to the log and
+/// appends to the in-memory AnalyticsRegistry.
+/// kind: event kind string (e.g. "exposure", "recall_query").
+/// entity_id: session id or other entity identifier.
+/// payload_json / payload_len: JSON payload bytes.
+/// ts_ms: timestamp in milliseconds since Unix epoch.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_analytics_append(
+    h: *mut CfHandle,
+    kind: *const c_char,
+    entity_id: *const c_char,
+    payload_json: *const u8,
+    payload_len: usize,
+    ts_ms: i64,
+) -> c_int {
+    if h.is_null() || kind.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let kind_str = unsafe {
+        match CStr::from_ptr(kind).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let entity_id_str = if entity_id.is_null() {
+        ""
+    } else {
+        unsafe {
+            match CStr::from_ptr(entity_id).to_str() {
+                Ok(s) => s,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+    let payload = if payload_json.is_null() || payload_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(payload_json, payload_len) }.to_vec()
+    };
+    let payload_str = match std::str::from_utf8(&payload) {
+        Ok(s) => s.to_string(),
+        Err(e) => return handle.err(e),
+    };
+
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::AnalyticsEvent(AnalyticsEventOp {
+        event_id,
+        kind: kind_str.to_string(),
+        session_id: entity_id_str.to_string(),
+        payload_json: payload,
+        ts_ms,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { return handle.err(e); }
+    handle.field.analytics_registry.write().append(
+        kind_str.to_string(),
+        entity_id_str.to_string(),
+        payload_str,
+        ts_ms,
+    );
+    handle.ok()
+}
+
+/// Write the most recent `limit` analytics entries as a JSON array into buf.
+/// Returns 0 on success, -2 if buf too small, -1 on other error.
+#[no_mangle]
+pub extern "C" fn cf_analytics_recent(
+    h: *mut CfHandle,
+    limit: usize,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let json_val: Vec<serde_json::Value> = {
+        let registry = handle.field.analytics_registry.read();
+        registry.recent(limit).into_iter().map(|e| serde_json::json!({
+            "id":           e.id,
+            "kind":         e.kind,
+            "entity_id":    e.entity_id,
+            "payload_json": e.payload_json,
+            "ts_ms":        e.ts_ms,
+        })).collect()
+    };
+
+    let json_str = match serde_json::to_string(&json_val) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    let bytes = json_str.as_bytes();
+    if bytes.len() > buf_cap {
+        return -2;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *written = bytes.len();
+    }
+    handle.ok()
+}
+
+// ── New high-level query FFI (Phase 0 migration) ─────────────────────────────
+
+/// Helper: serialize JSON string into caller-allocated buffer.
+/// Returns 0 on success, -2 if buf too small.
+fn write_json_buf(json_str: &str, buf: *mut u8, buf_cap: usize, written: *mut usize) -> c_int {
+    let bytes = json_str.as_bytes();
+    if bytes.len() > buf_cap {
+        return -2;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *written = bytes.len();
+    }
+    0
+}
+
+/// 1. Filtered recall — returns JSON array of {id, content, kind, realm, confidence, strength, ts_ms}.
+/// Filters by kind (null = any), realm (null = any), min_confidence, min_strength.
+/// Returns 0 on success, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_recall_filtered(
+    h: *mut CfHandle,
+    kind: *const c_char,
+    realm: *const c_char,
+    min_confidence: f32,
+    min_strength: f32,
+    limit: usize,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let kind_filter = if kind.is_null() {
+        None
+    } else {
+        unsafe {
+            match CStr::from_ptr(kind).to_str() {
+                Ok(s) if !s.is_empty() => Some(s),
+                Ok(_) => None,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+    let realm_filter = if realm.is_null() {
+        None
+    } else {
+        unsafe {
+            match CStr::from_ptr(realm).to_str() {
+                Ok(s) if !s.is_empty() => Some(s),
+                Ok(_) => None,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let payloads = handle.field.payloads.read();
+    let states = handle.field.states.read();
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    for (mid, payload) in payloads.iter() {
+        if let Some(state) = states.get(mid) {
+            if state.deleted { continue; }
+            if state.confidence < min_confidence { continue; }
+            let eff_strength = state.effective_strength(now);
+            if eff_strength < min_strength { continue; }
+            if let Some(k) = kind_filter {
+                if payload.kind != k { continue; }
+            }
+            if let Some(r) = realm_filter {
+                if payload.realm != r { continue; }
+            }
+            let content_str = String::from_utf8_lossy(&payload.content);
+            results.push(serde_json::json!({
+                "id": mid,
+                "content": content_str,
+                "kind": payload.kind,
+                "realm": payload.realm,
+                "confidence": state.confidence,
+                "strength": eff_strength,
+                "ts_ms": payload.created_at_ms,
+            }));
+            if results.len() >= limit { break; }
+        }
+    }
+
+    drop(payloads);
+    drop(states);
+
+    let json_str = match serde_json::to_string(&results) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    write_json_buf(&json_str, buf, buf_cap, written)
+}
+
+/// 2. Paginated memory listing sorted by strength/recency/confidence.
+/// sort_by: "strength" | "recency" | "confidence" (default: "recency").
+/// Returns 0 on success, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_list_memories(
+    h: *mut CfHandle,
+    kind: *const c_char,
+    realm: *const c_char,
+    sort_by: *const c_char,
+    limit: usize,
+    offset: usize,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let kind_filter = if kind.is_null() {
+        None
+    } else {
+        unsafe {
+            match CStr::from_ptr(kind).to_str() {
+                Ok(s) if !s.is_empty() => Some(s.to_string()),
+                Ok(_) => None,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+    let realm_filter = if realm.is_null() {
+        None
+    } else {
+        unsafe {
+            match CStr::from_ptr(realm).to_str() {
+                Ok(s) if !s.is_empty() => Some(s.to_string()),
+                Ok(_) => None,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+    let sort_str = if sort_by.is_null() {
+        "recency"
+    } else {
+        unsafe {
+            match CStr::from_ptr(sort_by).to_str() {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "recency",
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let payloads = handle.field.payloads.read();
+    let states = handle.field.states.read();
+
+    let mut entries: Vec<(u64, &crate::payload::MemoryPayload, &crate::state::MemoryState)> = Vec::new();
+    for (mid, payload) in payloads.iter() {
+        if let Some(state) = states.get(mid) {
+            if state.deleted { continue; }
+            if let Some(ref k) = kind_filter {
+                if payload.kind != *k { continue; }
+            }
+            if let Some(ref r) = realm_filter {
+                if payload.realm != *r { continue; }
+            }
+            entries.push((*mid, payload, state));
+        }
+    }
+
+    match sort_str {
+        "strength" => entries.sort_by(|a, b|
+            b.2.effective_strength(now).partial_cmp(&a.2.effective_strength(now)).unwrap_or(std::cmp::Ordering::Equal)),
+        "confidence" => entries.sort_by(|a, b|
+            b.2.confidence.partial_cmp(&a.2.confidence).unwrap_or(std::cmp::Ordering::Equal)),
+        _ => entries.sort_by(|a, b| b.1.created_at_ms.cmp(&a.1.created_at_ms)),
+    }
+
+    let page: Vec<serde_json::Value> = entries.iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(mid, payload, state)| {
+            let content_str = String::from_utf8_lossy(&payload.content);
+            serde_json::json!({
+                "id": mid,
+                "content": content_str,
+                "kind": payload.kind,
+                "realm": payload.realm,
+                "confidence": state.confidence,
+                "strength": state.effective_strength(now),
+                "ts_ms": payload.created_at_ms,
+                "pinned": state.pinned,
+            })
+        })
+        .collect();
+
+    drop(payloads);
+    drop(states);
+
+    let json_str = match serde_json::to_string(&page) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    write_json_buf(&json_str, buf, buf_cap, written)
+}
+
+/// 3. Aggregate stats: count_by_kind, avg_confidence, avg_strength, total.
+/// realm_filter: null = all realms, otherwise filter by realm.
+/// Returns 0 on success, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_memory_stats(
+    h: *mut CfHandle,
+    realm_filter: *const c_char,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let realm_str = if realm_filter.is_null() {
+        None
+    } else {
+        unsafe {
+            match CStr::from_ptr(realm_filter).to_str() {
+                Ok(s) if !s.is_empty() => Some(s),
+                Ok(_) => None,
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let payloads = handle.field.payloads.read();
+    let states = handle.field.states.read();
+
+    let mut count_by_kind: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut total: usize = 0;
+    let mut sum_confidence: f64 = 0.0;
+    let mut sum_strength: f64 = 0.0;
+
+    for (mid, payload) in payloads.iter() {
+        if let Some(state) = states.get(mid) {
+            if state.deleted { continue; }
+            if let Some(r) = realm_str {
+                if payload.realm != r { continue; }
+            }
+            total += 1;
+            sum_confidence += state.confidence as f64;
+            sum_strength += state.effective_strength(now) as f64;
+            *count_by_kind.entry(payload.kind.clone()).or_insert(0) += 1;
+        }
+    }
+
+    drop(payloads);
+    drop(states);
+
+    let avg_confidence = if total > 0 { sum_confidence / total as f64 } else { 0.0 };
+    let avg_strength = if total > 0 { sum_strength / total as f64 } else { 0.0 };
+
+    let json_str = match serde_json::to_string(&serde_json::json!({
+        "total": total,
+        "count_by_kind": count_by_kind,
+        "avg_confidence": avg_confidence,
+        "avg_strength": avg_strength,
+    })) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    write_json_buf(&json_str, buf, buf_cap, written)
+}
+
+/// 4. Get single task by ID (JSON payload).
+/// Returns 0 on success, 1 if not found, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_task_get(
+    h: *mut CfHandle,
+    task_id: *const c_char,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || task_id.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let task_id_str = unsafe {
+        match CStr::from_ptr(task_id).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let json_val = {
+        let registry = handle.field.task_registry.read();
+        match registry.get(task_id_str) {
+            Some(t) => serde_json::json!({
+                "task_id": t.task_id,
+                "kind": t.kind,
+                "status": t.status.as_str(),
+                "payload_json": t.payload_json,
+                "created_at_ms": t.created_at_ms,
+                "updated_at_ms": t.updated_at_ms,
+            }),
+            None => return 1,
+        }
+    };
+
+    let json_str = match serde_json::to_string(&json_val) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    write_json_buf(&json_str, buf, buf_cap, written)
+}
+
+/// 5. Update task payload (returns 0=ok, -1=not found/error).
+#[no_mangle]
+pub extern "C" fn cf_task_update_payload(
+    h: *mut CfHandle,
+    task_id: *const c_char,
+    payload_json: *const c_char,
+    now_ms: i64,
+) -> i32 {
+    if h.is_null() || task_id.is_null() || payload_json.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let task_id_str = unsafe {
+        match CStr::from_ptr(task_id).to_str() {
+            Ok(s) => s,
+            Err(e) => { handle.err(e); return -1; }
+        }
+    };
+    let payload_str = unsafe {
+        match CStr::from_ptr(payload_json).to_str() {
+            Ok(s) => s,
+            Err(e) => { handle.err(e); return -1; }
+        }
+    };
+
+    let task_type = handle.field.task_registry.read()
+        .get(task_id_str)
+        .map(|t| t.kind.clone())
+        .unwrap_or_default();
+
+    if task_type.is_empty() {
+        handle.err("task not found");
+        return -1;
+    }
+
+    let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
+    let op = Op::TaskEvent(TaskEventOp {
+        event_id,
+        task_type,
+        task_id: task_id_str.to_string(),
+        kind: "update_payload".to_string(),
+        payload_json: payload_str.as_bytes().to_vec(),
+        realm: String::new(),
+        ts_ms: now_ms,
+        fencing_token: 0,
+    });
+
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result { handle.err(e); return -1; }
+    if handle.field.task_registry.write().update_payload(task_id_str, payload_str.to_string(), now_ms) {
+        handle.ok();
+        0
+    } else {
+        handle.err("task not found");
+        -1
+    }
+}
+
+/// 6. List sessions (JSON array). active_only=1 filters by active status.
+/// Returns 0 on success, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_session_list(
+    h: *mut CfHandle,
+    active_only: i32,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let json_val: Vec<serde_json::Value> = {
+        let registry = handle.field.session_registry.read();
+        let records: Vec<&crate::organ::session::SessionRecord> = if active_only != 0 {
+            registry.list_active()
+        } else {
+            registry.list_all()
+        };
+        records.iter().map(|s| serde_json::json!({
+            "session_id": s.session_id,
+            "kind": s.kind,
+            "realm": s.realm,
+            "started_at_ms": s.started_at_ms,
+            "last_heartbeat_ms": s.last_heartbeat_ms,
+            "status": s.status,
+        })).collect()
+    };
+
+    let json_str = match serde_json::to_string(&json_val) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    write_json_buf(&json_str, buf, buf_cap, written)
+}
+
+/// 7. List transcripts (JSON array, most recent first).
+/// Returns 0 on success, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_transcript_list(
+    h: *mut CfHandle,
+    limit: usize,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let json_val: Vec<serde_json::Value> = {
+        let registry = handle.field.transcript_registry.read();
+        let mut records: Vec<&crate::organ::transcript::TranscriptRecord> = registry.list_all();
+        records.sort_by(|a, b| {
+            let a_ts = a.turns.last().map(|t| t.ts_ms).unwrap_or(0);
+            let b_ts = b.turns.last().map(|t| t.ts_ms).unwrap_or(0);
+            b_ts.cmp(&a_ts)
+        });
+        records.iter().take(limit).map(|t| serde_json::json!({
+            "transcript_id": t.transcript_id,
+            "session_id": t.session_id,
+            "progress_pct": t.progress_pct,
+            "turn_count": t.turns.len(),
+        })).collect()
+    };
+
+    let json_str = match serde_json::to_string(&json_val) {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    write_json_buf(&json_str, buf, buf_cap, written)
+}
+
+/// 8. Get memory metadata by ID (JSON: kind, realm, confidence, strength, ts_ms, pinned).
+/// Returns 0 on success, 1 if not found/deleted, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_get_memory_metadata(
+    h: *mut CfHandle,
+    memory_id: u64,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let payloads = handle.field.payloads.read();
+    let states = handle.field.states.read();
+
+    let payload = match payloads.get(&memory_id) {
+        Some(p) => p,
+        None => return 1,
+    };
+    let state = match states.get(&memory_id) {
+        Some(s) if !s.deleted => s,
+        _ => return 1,
+    };
+
+    let json_str = match serde_json::to_string(&serde_json::json!({
+        "id": memory_id,
+        "kind": payload.kind,
+        "realm": payload.realm,
+        "confidence": state.confidence,
+        "strength": state.effective_strength(now),
+        "ts_ms": payload.created_at_ms,
+        "pinned": state.pinned,
+        "tier": state.tier,
+        "access_count": state.access_count,
+        "decay_rate": state.decay_rate,
+    })) {
+        Ok(s) => s,
+        Err(e) => {
+            drop(payloads);
+            drop(states);
+            return handle.err(e);
+        }
+    };
+
+    let rc = write_json_buf(&json_str, buf, buf_cap, written);
+    drop(payloads);
+    drop(states);
+    if rc == 0 { handle.ok() } else { rc }
+}
+
+/// 9. Update memory kind field (returns 0=ok, -1=not found/error).
+#[no_mangle]
+pub extern "C" fn cf_update_memory_kind(
+    h: *mut CfHandle,
+    memory_id: u64,
+    new_kind: *const c_char,
+) -> i32 {
+    if h.is_null() || new_kind.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let kind_str = unsafe {
+        match CStr::from_ptr(new_kind).to_str() {
+            Ok(s) => s,
+            Err(e) => { handle.err(e); return -1; }
+        }
+    };
+
+    let mut payloads = handle.field.payloads.write();
+    match payloads.get_mut(&memory_id) {
+        Some(p) => {
+            p.kind = kind_str.to_string();
+            drop(payloads);
+            handle.ok();
+            0
+        }
+        None => {
+            drop(payloads);
+            handle.err("memory not found");
+            -1
+        }
+    }
+}
+
+/// 10. List all triplets where entity is subject OR object, with limit.
+/// Returns 0 on success, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_list_triplets_for_entity(
+    h: *mut CfHandle,
+    entity: *const c_char,
+    limit: usize,
+    buf: *mut c_char,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || entity.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+
+    let entity_str = unsafe {
+        match CStr::from_ptr(entity).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let mut entries = handle.field.query_entity(entity_str)
+        .unwrap_or_default();
+    entries.truncate(limit);
+
+    // Reuse write_triplets_json (already defined above)
+    write_triplets_json(entries, buf, buf_cap, written)
 }
 
 #[cfg(test)]

@@ -1,17 +1,19 @@
 use std::collections::HashMap;
 use crate::ids::MemoryId;
+use serde::{Serialize, Deserialize};
 
 /// BM25 parameters (standard defaults).
 const K1: f32 = 1.2;
 const B: f32 = 0.75;
 
 /// A posting: memory_id + term frequency in that document.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Posting {
     memory_id: MemoryId,
     tf: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeywordIndex {
     /// term -> postings list
     postings: HashMap<String, Vec<Posting>>,

@@ -1,4 +1,5 @@
 #pragma once
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -153,6 +154,181 @@ size_t cf_code_file_count(const CfHandle* h);
 /* Sparse Predictive Associative Field (SPAF) */
 size_t cf_encode_all(CfHandle* h);
 size_t cf_cortical_count(const CfHandle* h);
+size_t cf_prototype_count(CfHandle* h);
+
+/* Residual Product Quantization */
+bool   cf_train_pq(CfHandle* h);
+size_t cf_encode_all_pq(CfHandle* h);
+size_t cf_pq_count(CfHandle* h);
+
+/* Lite Encoder (bag-of-words → sparse code, no ONNX) */
+int32_t cf_train_lite_encoder(CfHandle* h);
+int32_t cf_save_lite_encoder(CfHandle* h);
+uint8_t cf_lite_encoder_ready(const CfHandle* h);
+int32_t cf_encode_lite(const CfHandle* h,
+    const uint8_t* text_ptr, size_t text_len,
+    uint32_t* out_atoms, float* out_weights);
+
+/* Cortical snapshot */
+bool cf_save_snapshot(CfHandle* h);
+
+/* Full state snapshot */
+bool cf_save_full_snapshot(CfHandle* h);
+
+/* Tier demotion */
+uint64_t cf_run_demotion(CfHandle* h, int64_t now_ms);
+
+/* Domain Event Log */
+int cf_iterate_log(CfHandle* h, uint64_t from_seqno,
+    void (*callback)(const uint8_t* op_json, size_t op_len, uint64_t seqno, void* ctx),
+    void* ctx);
+
+int cf_emit_event(CfHandle* h,
+    const char* domain, const char* kind, const char* entity_id,
+    const uint8_t* payload_json, size_t payload_len,
+    const char* realm, uint64_t fencing_token,
+    uint64_t* out_event_id);
+
+int cf_get_latest_event(CfHandle* h,
+    const char* domain, const char* kind, const char* entity_id,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+/* Session management */
+int cf_session_register(CfHandle* h,
+    const char* session_id, const char* kind, const char* realm, int64_t now_ms);
+
+int cf_session_heartbeat(CfHandle* h,
+    const char* session_id, int64_t now_ms);
+
+int cf_session_deregister(CfHandle* h,
+    const char* session_id, int64_t now_ms);
+
+/* Transcript management */
+int cf_transcript_register(CfHandle* h,
+    const char* transcript_id, const char* session_id);
+
+int cf_transcript_update_progress(CfHandle* h,
+    const char* transcript_id, float progress_pct);
+
+int cf_transcript_add_turn(CfHandle* h,
+    const char* transcript_id, const char* role,
+    const uint8_t* content_ptr, size_t content_len,
+    int64_t ts_ms, uint64_t* out_turn_id);
+
+/* Task / Sadhana / Dream management */
+int cf_task_create(CfHandle* h,
+    const char* task_id, const char* kind,
+    const uint8_t* payload_json, size_t payload_len,
+    int64_t now_ms, uint64_t fencing_token);
+
+int cf_task_transition(CfHandle* h,
+    const char* task_id, const char* new_status,
+    int64_t now_ms, uint64_t fencing_token);
+
+int cf_task_list(CfHandle* h,
+    const char* kind_filter, uint8_t active_only,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+/* User model management */
+int cf_user_model_upsert(CfHandle* h,
+    const char* entity_id, const char* entity_type,
+    const uint8_t* payload_json, size_t payload_len,
+    int64_t now_ms);
+
+int cf_user_model_observe(CfHandle* h,
+    const char* entity_id, int64_t now_ms);
+
+int cf_user_model_list(CfHandle* h,
+    const char* entity_type_filter,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+/* Theme management */
+int cf_theme_create(CfHandle* h,
+    uint64_t theme_id, const char* name);
+
+int cf_theme_update_centroid(CfHandle* h,
+    uint64_t theme_id,
+    const uint8_t* centroid_json, size_t centroid_len);
+
+int cf_theme_assign_member(CfHandle* h,
+    uint64_t theme_id, uint64_t memory_id);
+
+int cf_theme_remove_member(CfHandle* h,
+    uint64_t theme_id, uint64_t memory_id);
+
+int cf_theme_list(CfHandle* h,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+int cf_theme_get(CfHandle* h, uint64_t theme_id,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+int cf_theme_stats(CfHandle* h, const char* realm,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+int cf_theme_recall(CfHandle* h,
+    const float* embedding_ptr, size_t embedding_len,
+    size_t k, const char* realm,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+int cf_theme_maintain(CfHandle* h,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+int cf_theme_assign_orphans(CfHandle* h,
+    size_t batch_size, const char* realm,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+/* Filtered recall — returns JSON array into buf */
+int cf_recall_filtered(CfHandle* h,
+    const char* kind, const char* realm,
+    float min_confidence, float min_strength, size_t limit,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+/* Paginated memory listing sorted by strength/recency/confidence */
+int cf_list_memories(CfHandle* h,
+    const char* kind, const char* realm,
+    const char* sort_by, size_t limit, size_t offset,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+/* Aggregate stats: count_by_kind, avg_confidence, avg_strength, total */
+int cf_memory_stats(CfHandle* h, const char* realm_filter,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+/* Get single task by ID (JSON payload) */
+int cf_task_get(CfHandle* h, const char* task_id,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+/* Update task payload (returns 0=ok, -1=not found) */
+int32_t cf_task_update_payload(CfHandle* h, const char* task_id,
+    const char* payload_json, int64_t now_ms);
+
+/* List sessions (JSON array), active_only filters by active status */
+int cf_session_list(CfHandle* h, int32_t active_only,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+/* List transcripts (JSON array, most recent first) */
+int cf_transcript_list(CfHandle* h, size_t limit,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+/* Get memory metadata by ID (JSON) */
+int cf_get_memory_metadata(CfHandle* h, uint64_t memory_id,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
+/* Update memory kind field (returns 0=ok, -1=not found) */
+int32_t cf_update_memory_kind(CfHandle* h, uint64_t memory_id, const char* new_kind);
+
+/* List all triplets where entity is subject OR object */
+int cf_list_triplets_for_entity(CfHandle* h, const char* entity, size_t limit,
+    char* buf, size_t buf_cap, size_t* written);
+
+/* Analytics */
+int cf_analytics_append(CfHandle* h,
+    const char* kind, const char* entity_id,
+    const uint8_t* payload_json, size_t payload_len,
+    int64_t ts_ms);
+
+int cf_analytics_recent(CfHandle* h,
+    size_t limit,
+    uint8_t* buf, size_t buf_cap, size_t* written);
 
 #ifdef __cplusplus
 }

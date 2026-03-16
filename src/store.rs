@@ -4,10 +4,12 @@ use crate::error::{FieldError, Result};
 use crate::field::{AssocEdge, ChittaField};
 use crate::ids::{ArtifactId, ChunkHash, MemoryId, compute_chunk_hash};
 use crate::ops::{
-    AddAssocEdgeOp, DeleteMemoryOp, EdgeType, Op, PutPayloadOp, StateDeltaOp,
+    AddAssocEdgeOp, DeleteMemoryOp, DemoteMemoryOp, EdgeType, Op, PutPayloadOp, StateDeltaOp,
     UpsertArtifactOp, ArtifactRef, AddTripletOp, InvalidateTripletOp,
     UpsertSymbolOp, RemoveSymbolOp, AddSymCallEdgeOp, UpsertCodeFileOp, UpdateSparseCodeOp,
+    TrainPQOp, UpdateResidualPQOp,
 };
+use crate::organ::pq::ProductQuantizer;
 use crate::organ::triplet::TripletEntry;
 use crate::organ::symbol::SymbolEntry;
 use crate::payload::MemoryPayload;
@@ -66,7 +68,7 @@ impl ChittaField {
         };
 
         let op_enum = Op::PutPayload(op.clone());
-        let seqno = self.log.write().append(&op_enum)?;
+        let _seqno = self.log.write().append(&op_enum)?;
 
         let payload = MemoryPayload::from(op);
         let mut state = MemoryState::new(memory_id, chunk_hash, ts);
@@ -345,51 +347,32 @@ impl ChittaField {
 
         let cortical_empty = self.cortical_idx.read().is_empty();
 
-        if cortical_empty {
-            // Pure brute-force fallback: no cortical index yet
-            let candidates = self.semantic_idx.read().search(
-                query_embedding,
-                k * 3,
-                Some(&allowed),
-            );
-            let states_r = self.states.read();
-            for hit in candidates {
-                let eff = states_r.get(&hit.memory_id).map(|s| 0.5 + 0.5 * s.effective_strength(now)).unwrap_or(0.5);
-                let conf = states_r.get(&hit.memory_id).map(|s| s.confidence).unwrap_or(1.0);
-                seen.insert(hit.memory_id, hit.cosine_similarity * eff * conf);
-            }
+        // 1. Cortical search (if index has entries)
+        let cortical_hits: Vec<(MemoryId, f32)> = if !cortical_empty {
+            let cortical = self.cortical_idx.read();
+            cortical.search(&query_code, k * 3, Some(&allowed))
         } else {
-            // Cortical index hits (fast path for indexed memories)
-            {
-                let cortical = self.cortical_idx.read();
-                for (mem_id, score) in cortical.search(&query_code, k * 3, Some(&allowed)) {
-                    seen.insert(mem_id, score);
-                }
-            }
+            vec![]
+        };
 
-            // Semantic (HNSW) fallback for memories not yet in cortical index
-            let cortical_mem_ids: std::collections::HashSet<MemoryId> = {
-                self.cortical_idx.read().mem_codes.keys().copied().collect()
-            };
-            let semantic_allowed: std::collections::HashSet<MemoryId> = allowed
-                .iter()
-                .filter(|id| !cortical_mem_ids.contains(id))
-                .copied()
-                .collect();
+        // 2. HNSW semantic search (always)
+        let hnsw_hits: Vec<(MemoryId, f32)> = {
+            let sem = self.semantic_idx.read();
+            sem.search(query_embedding, k * 3, Some(&allowed))
+                .into_iter()
+                .map(|hit| (hit.memory_id, hit.cosine_similarity))
+                .collect()
+        };
 
-            if !semantic_allowed.is_empty() {
-                let candidates = self.semantic_idx.read().search(
-                    query_embedding,
-                    k * 3,
-                    Some(&semantic_allowed),
-                );
-                let states_r = self.states.read();
-                for hit in candidates {
-                    let eff = states_r.get(&hit.memory_id).map(|s| 0.5 + 0.5 * s.effective_strength(now)).unwrap_or(0.5);
-                    let conf = states_r.get(&hit.memory_id).map(|s| s.confidence).unwrap_or(1.0);
-                    seen.entry(hit.memory_id).or_insert(hit.cosine_similarity * eff * conf);
-                }
-            }
+        // 3. Merge: take max score across both sources
+        for (mem_id, score) in cortical_hits {
+            seen.insert(mem_id, score);
+        }
+        for (mem_id, cos_sim) in hnsw_hits {
+            // cosine similarity is in [-1, 1]; map to [0, 0.85] to match cortical score range
+            let hnsw_score = ((cos_sim + 1.0) / 2.0) * 0.85;
+            let entry = seen.entry(mem_id).or_insert(0.0);
+            *entry = entry.max(hnsw_score);
         }
 
         let states = self.states.read();
@@ -437,6 +420,8 @@ impl ChittaField {
                 let _ = self.add_assoc_edge(hit_ids[i], hit_ids[j], EdgeType::CoRetrieved, 0.05);
             }
         }
+        // Strengthen prototype transitions for co-retrieved memories
+        self.cortical_idx.write().strengthen_proto_transitions(&hit_ids[..hit_ids.len().min(5)]);
 
         Ok(hits)
     }
@@ -672,6 +657,8 @@ impl ChittaField {
                 let _ = self.add_assoc_edge(hit_ids[i], hit_ids[j], EdgeType::CoRetrieved, 0.05);
             }
         }
+        // Strengthen prototype transitions for co-retrieved memories
+        self.cortical_idx.write().strengthen_proto_transitions(&hit_ids[..hit_ids.len().min(5)]);
 
         Ok(hits)
     }
@@ -944,6 +931,10 @@ impl ChittaField {
         self.cortical_idx.read().len()
     }
 
+    pub fn prototype_count(&self) -> usize {
+        self.cortical_idx.read().prototype_count()
+    }
+
     /// Encode a memory's embedding into sparse codes and index into the cortical index.
     /// Persists via UpdateSparseCode op.
     pub fn encode_memory(&self, memory_id: MemoryId) -> Result<()> {
@@ -978,6 +969,131 @@ impl ChittaField {
         Ok(())
     }
 
+    /// Save the cortical index + encoder + prototype state to a binary snapshot.
+    /// After this, on next open the snapshot covers all UpdateSparseCode ops
+    /// up to the current log position, so those ops can be skipped in replay.
+    pub fn save_snapshot(&self) -> Result<()> {
+        let seqno = self.log.read().last_seqno();
+        let path = self.data_dir.join("cortex.snapshot");
+        self.cortical_idx.read().save_snapshot(&path, seqno)
+    }
+
+    /// Save full in-memory state to a binary snapshot (chitta.snapshot).
+    /// After this, on next open only ops after snapshot_seqno need to be replayed.
+    pub fn save_full_snapshot(&self) -> Result<()> {
+        use crate::snapshot::FullSnapshot;
+        let seqno = self.log.read().last_seqno();
+        let snap = FullSnapshot {
+            snapshot_seqno: seqno,
+            payloads: self.payloads.read().clone(),
+            states: self.states.read().clone(),
+            assoc_edges: self.assoc_edges.read().clone(),
+            artifacts: self.artifacts.read().clone(),
+            artifact_paths: self.artifact_paths.read().clone(),
+            time_idx: self.time_idx.read().clone(),
+            keyword_idx: self.keyword_idx.read().clone(),
+            artifact_idx: self.artifact_idx.read().clone(),
+            triplet_store: self.triplet_store.read().clone(),
+            symbol_idx: self.symbol_idx.read().clone(),
+            call_graph: self.call_graph.read().clone(),
+            code_files: self.code_files.read().clone(),
+        };
+        let path = self.data_dir.join("chitta.snapshot");
+        snap.save(&path)
+    }
+
+    /// Run a single tier demotion pass over all memories.
+    /// Returns `(demoted_count, deleted_count)`.
+    ///
+    /// Tiers: 0=L1 (hippocampus), 1=L2 (cortex), 2=L3 (archive), then delete.
+    /// Uses `access_count` as rehearsal proxy and `strength` as utility proxy.
+    pub fn run_demotion_pass(&self, now_ms: i64) -> Result<(usize, usize)> {
+        const L1_TO_L2_AGE_MS: i64 = 7 * 24 * 3600 * 1000;
+        const L1_TO_L2_LAST_ACCESS_MS: i64 = 2 * 24 * 3600 * 1000;
+        const L1_TO_L2_MAX_STRENGTH: f32 = 0.80;
+
+        const L2_TO_L3_AGE_BASE_MS: i64 = 45 * 24 * 3600 * 1000;
+        const L2_TO_L3_REHEARSAL_BONUS_MS: i64 = 7 * 24 * 3600 * 1000;
+        const L2_TO_L3_LAST_ACCESS_MS: i64 = 14 * 24 * 3600 * 1000;
+        const L2_TO_L3_MAX_STRENGTH: f32 = 0.50;
+
+        const L3_DELETE_AGE_BASE_MS: i64 = 365 * 24 * 3600 * 1000;
+        const L3_DELETE_REHEARSAL_BONUS_MS: i64 = 30 * 24 * 3600 * 1000;
+        const L3_DELETE_LAST_ACCESS_MS: i64 = 120 * 24 * 3600 * 1000;
+        const L3_DELETE_MAX_STRENGTH: f32 = 0.12;
+        const L3_DELETE_MAX_UTILITY: f32 = 0.80;
+
+        let mut to_demote: Vec<(MemoryId, u8)> = Vec::new();
+        let mut to_delete: Vec<MemoryId> = Vec::new();
+
+        {
+            let states = self.states.read();
+            for (&memory_id, state) in states.iter() {
+                if state.deleted || state.pinned {
+                    continue;
+                }
+
+                // Strength >= L3_DELETE_MAX_UTILITY means never delete
+                let age_ms = now_ms - state.created_at_ms;
+                let last_access_ago = now_ms - state.last_accessed_ms;
+                // access_count serves as rehearsal proxy; cap at 8 for bonus calc
+                let rehearsal = state.access_count.min(8) as i64;
+
+                match state.tier {
+                    0 => {
+                        // L1 → L2
+                        if age_ms >= L1_TO_L2_AGE_MS
+                            && last_access_ago >= L1_TO_L2_LAST_ACCESS_MS
+                            && state.strength < L1_TO_L2_MAX_STRENGTH
+                        {
+                            to_demote.push((memory_id, 1));
+                        }
+                    }
+                    1 => {
+                        // L2 → L3
+                        let threshold = L2_TO_L3_AGE_BASE_MS
+                            + rehearsal * L2_TO_L3_REHEARSAL_BONUS_MS;
+                        if age_ms >= threshold
+                            && last_access_ago >= L2_TO_L3_LAST_ACCESS_MS
+                            && state.strength < L2_TO_L3_MAX_STRENGTH
+                        {
+                            to_demote.push((memory_id, 2));
+                        }
+                    }
+                    2 => {
+                        // L3 → delete
+                        let threshold = L3_DELETE_AGE_BASE_MS
+                            + rehearsal * L3_DELETE_REHEARSAL_BONUS_MS;
+                        if age_ms >= threshold
+                            && last_access_ago >= L3_DELETE_LAST_ACCESS_MS
+                            && state.strength < L3_DELETE_MAX_STRENGTH
+                            && state.strength < L3_DELETE_MAX_UTILITY
+                        {
+                            to_delete.push(memory_id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let demoted = to_demote.len();
+        let deleted = to_delete.len();
+
+        for (id, new_tier) in to_demote {
+            let op = Op::DemoteMemory(DemoteMemoryOp { memory_id: id, new_tier });
+            self.log.write().append(&op)?;
+            if let Some(state) = self.states.write().get_mut(&id) {
+                state.tier = new_tier;
+            }
+        }
+        for id in to_delete {
+            self.forget(id)?;
+        }
+
+        Ok((demoted, deleted))
+    }
+
     /// Encode all memories that don't yet have a sparse code.
     pub fn encode_all_unindexed(&self) -> Result<usize> {
         let ids: Vec<MemoryId> = {
@@ -993,6 +1109,109 @@ impl ChittaField {
             self.encode_memory(id)?;
         }
         Ok(count)
+    }
+
+    /// Train a ProductQuantizer from the residuals of all encoded memories.
+    /// Requires at least 256 memories with sparse codes.
+    pub fn train_pq(&self) -> Result<()> {
+        // Collect residuals: for each memory with a sparse code, decode and subtract
+        let residuals: Vec<Vec<f32>> = {
+            let payloads = self.payloads.read();
+            let cortical = self.cortical_idx.read();
+            let encoder = self.sparse_encoder.read();
+
+            cortical.mem_codes.iter().filter_map(|(&memory_id, code)| {
+                let embedding = payloads.get(&memory_id).map(|p| p.embedding.clone())?;
+                if embedding.len() != crate::ops::EMBED_DIM { return None; }
+                let decoded = encoder.decode(code);
+                let residual: Vec<f32> = embedding.iter().zip(decoded.iter())
+                    .map(|(e, d)| e - d)
+                    .collect();
+                Some(residual)
+            }).collect()
+        };
+
+        let pq = ProductQuantizer::train(&residuals, 20)
+            .map_err(|e| crate::error::FieldError::Manifest(e))?;
+
+        let codebook_bytes = bincode::serialize(&pq)
+            .map_err(|e| crate::error::FieldError::Serialization(e.to_string()))?;
+
+        let op = Op::TrainPQ(TrainPQOp { codebook_bytes });
+        self.log.write().append(&op)?;
+
+        self.cortical_idx.write().set_pq(pq);
+
+        Ok(())
+    }
+
+    /// Encode PQ residual for a single memory. The PQ must already be trained.
+    pub fn encode_pq_memory(&self, memory_id: MemoryId) -> Result<()> {
+        let embedding = {
+            let payloads = self.payloads.read();
+            payloads.get(&memory_id).map(|p| p.embedding.clone())
+        };
+        let Some(embedding) = embedding else { return Ok(()); };
+        if embedding.len() != crate::ops::EMBED_DIM { return Ok(()); }
+
+        let decoded = {
+            let cortical = self.cortical_idx.read();
+            let code = match cortical.mem_codes.get(&memory_id) {
+                Some(c) => c.clone(),
+                None => return Ok(()),
+            };
+            self.sparse_encoder.read().decode(&code)
+        };
+
+        let residual: Vec<f32> = embedding.iter().zip(decoded.iter())
+            .map(|(e, d)| e - d)
+            .collect();
+
+        let codes = {
+            let cortical = self.cortical_idx.read();
+            let pq = match &cortical.pq {
+                Some(pq) => pq,
+                None => return Ok(()),
+            };
+            pq.quantize(&residual)
+        };
+
+        let pq_bytes: Vec<u8> = codes.to_vec();
+        let op = Op::UpdateResidualPQ(UpdateResidualPQOp { memory_id, pq_bytes });
+        self.log.write().append(&op)?;
+
+        self.cortical_idx.write().index_pq(memory_id, codes);
+
+        Ok(())
+    }
+
+    /// Encode PQ residuals for all memories that have sparse codes but no PQ code.
+    /// If PQ is not yet trained, trains it first.
+    /// Returns the count of memories PQ-encoded.
+    pub fn encode_all_pq(&self) -> Result<usize> {
+        if !self.cortical_idx.read().is_pq_trained() {
+            self.train_pq()?;
+        }
+
+        let ids: Vec<MemoryId> = {
+            let cortical = self.cortical_idx.read();
+            cortical.mem_codes.keys()
+                .filter(|id| !cortical.mem_pq.contains_key(id))
+                .copied()
+                .collect()
+        };
+
+        let count = ids.len();
+        for id in ids {
+            self.encode_pq_memory(id)?;
+        }
+
+        Ok(count)
+    }
+
+    /// Return how many memories have PQ residual codes.
+    pub fn pq_count(&self) -> usize {
+        self.cortical_idx.read().pq_count()
     }
 }
 

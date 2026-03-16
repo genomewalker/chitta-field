@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use serde::{Serialize, Deserialize};
 
 pub type CodeFileId = u64;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeFile {
     pub id: CodeFileId,
     pub path: String,
@@ -10,6 +11,7 @@ pub struct CodeFile {
     pub mtime: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeFileIndex {
     by_id: HashMap<CodeFileId, CodeFile>,
     by_path: HashMap<String, CodeFileId>,
@@ -71,5 +73,10 @@ impl CodeFileIndex {
 
     pub fn count(&self) -> usize {
         self.by_id.len()
+    }
+
+    /// Return the maximum code file ID present, or None if empty.
+    pub fn max_id(&self) -> Option<u64> {
+        self.by_id.keys().copied().max()
     }
 }

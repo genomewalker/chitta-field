@@ -22,6 +22,10 @@ const OP_ADD_SYM_CALL_EDGE: u8 = 9;
 const OP_REMOVE_SYM_CALL_EDGE: u8 = 10;
 const OP_UPSERT_CODE_FILE: u8 = 11;
 const OP_UPDATE_SPARSE_CODE: u8 = 12;
+const OP_DEMOTE_MEMORY: u8 = 13;
+const OP_TRAIN_PQ: u8 = 14;
+const OP_UPDATE_RESIDUAL_PQ: u8 = 15;
+use crate::ops::{OP_SESSION_EVENT, OP_TRANSCRIPT_EVENT, OP_TASK_EVENT, OP_USER_MODEL_EVENT, OP_THEME_EVENT, OP_ANALYTICS_EVENT};
 
 fn op_type_byte(op: &Op) -> u8 {
     match op {
@@ -38,6 +42,15 @@ fn op_type_byte(op: &Op) -> u8 {
         Op::RemoveSymCallEdge(_) => OP_REMOVE_SYM_CALL_EDGE,
         Op::UpsertCodeFile(_) => OP_UPSERT_CODE_FILE,
         Op::UpdateSparseCode(_) => OP_UPDATE_SPARSE_CODE,
+        Op::DemoteMemory(_) => OP_DEMOTE_MEMORY,
+        Op::TrainPQ(_) => OP_TRAIN_PQ,
+        Op::UpdateResidualPQ(_) => OP_UPDATE_RESIDUAL_PQ,
+        Op::SessionEvent(_) => OP_SESSION_EVENT,
+        Op::TranscriptEvent(_) => OP_TRANSCRIPT_EVENT,
+        Op::TaskEvent(_) => OP_TASK_EVENT,
+        Op::UserModelEvent(_) => OP_USER_MODEL_EVENT,
+        Op::ThemeEvent(_) => OP_THEME_EVENT,
+        Op::AnalyticsEvent(_) => OP_ANALYTICS_EVENT,
     }
 }
 
@@ -138,6 +151,11 @@ impl OpLog {
     pub fn flush_buf(&mut self) -> Result<()> {
         self.current_segment.flush()?;
         Ok(())
+    }
+
+    /// Return the seqno of the last op appended (0 if nothing written yet).
+    pub fn last_seqno(&self) -> u64 {
+        self.next_seqno.saturating_sub(1)
     }
 
     fn rotate_if_needed(&mut self) -> Result<()> {
