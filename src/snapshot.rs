@@ -51,6 +51,20 @@ impl FullSnapshot {
         Ok(())
     }
 
+    /// Read only the magic and snapshot_seqno without deserializing the full snapshot.
+    pub fn peek_seqno(path: &Path) -> Result<u64> {
+        let f = std::fs::File::open(path)?;
+        let mut r = BufReader::new(f);
+        let mut buf = [0u8; 16];
+        r.read_exact(&mut buf)?;
+        let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        if magic != FULL_SNAPSHOT_MAGIC {
+            return Err(FieldError::Manifest("invalid full snapshot magic".to_string()));
+        }
+        // snapshot_seqno is the first bincode field (u64 LE, 8 bytes)
+        Ok(u64::from_le_bytes(buf[8..16].try_into().unwrap()))
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let f = std::fs::File::open(path)?;
         let mut r = BufReader::new(f);
