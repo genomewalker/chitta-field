@@ -625,5 +625,30 @@ pub(crate) fn apply_op(
             let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
             analytics_registry.append(ev.kind, ev.session_id, payload_str, ev.ts_ms);
         }
+        Op::ClearProject(cp) => {
+            let removed_paths = code_files.remove_by_project(&cp.project);
+            let removed_ids = symbol_idx.remove_by_file_paths(&removed_paths);
+            for id in removed_ids {
+                call_graph.remove_symbol(id);
+            }
+        }
+        Op::UpdateSymbolDescription(usd) => {
+            if let Some(sym) = symbol_idx.get_mut(usd.symbol_id) {
+                sym.description = Some(usd.description);
+            }
+        }
+        Op::UpdateMemoryContent(umc) => {
+            let content_str = String::from_utf8(umc.content.clone()).unwrap_or_default();
+            if let Some(payload) = payloads.get_mut(&umc.memory_id) {
+                payload.content = umc.content;
+                if !umc.embedding.is_empty() {
+                    payload.embedding = umc.embedding.clone();
+                }
+            }
+            if !umc.embedding.is_empty() {
+                semantic_idx.upsert(umc.memory_id, umc.embedding);
+            }
+            keyword_idx.index(umc.memory_id, &content_str);
+        }
     }
 }
