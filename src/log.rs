@@ -25,7 +25,7 @@ const OP_UPDATE_SPARSE_CODE: u8 = 12;
 const OP_DEMOTE_MEMORY: u8 = 13;
 const OP_TRAIN_PQ: u8 = 14;
 const OP_UPDATE_RESIDUAL_PQ: u8 = 15;
-use crate::ops::{OP_SESSION_EVENT, OP_TRANSCRIPT_EVENT, OP_TASK_EVENT, OP_USER_MODEL_EVENT, OP_THEME_EVENT, OP_ANALYTICS_EVENT};
+use crate::ops::{OP_SESSION_EVENT, OP_TRANSCRIPT_EVENT, OP_TASK_EVENT, OP_USER_MODEL_EVENT, OP_THEME_EVENT, OP_ANALYTICS_EVENT, OP_CLEAR_PROJECT, OP_UPDATE_SYMBOL_DESCRIPTION, OP_UPDATE_MEMORY_CONTENT};
 
 fn op_type_byte(op: &Op) -> u8 {
     match op {
@@ -51,6 +51,9 @@ fn op_type_byte(op: &Op) -> u8 {
         Op::UserModelEvent(_) => OP_USER_MODEL_EVENT,
         Op::ThemeEvent(_) => OP_THEME_EVENT,
         Op::AnalyticsEvent(_) => OP_ANALYTICS_EVENT,
+        Op::ClearProject(_) => OP_CLEAR_PROJECT,
+        Op::UpdateSymbolDescription(_) => OP_UPDATE_SYMBOL_DESCRIPTION,
+        Op::UpdateMemoryContent(_) => OP_UPDATE_MEMORY_CONTENT,
     }
 }
 

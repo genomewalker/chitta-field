@@ -11,6 +11,7 @@ use crate::field::ChittaField;
 use crate::ops::{
     EdgeType, SessionEventOp, TranscriptEventOp, TaskEventOp,
     UserModelEventOp, ThemeEventOp, AnalyticsEventOp, Op,
+    ClearProjectOp, UpdateSymbolDescriptionOp, UpdateMemoryContentOp,
 };
 use crate::recall::RecallHit;
 use serde_json;
@@ -3218,15 +3219,17 @@ pub extern "C" fn cf_clear_project(
         Ok(s) => s.to_string(),
         Err(e) => return handle.err(e),
     }};
-    // Remove matching code files, collect their paths
+    // Log op first for durability
+    let op = Op::ClearProject(ClearProjectOp { project: project_str.clone() });
+    let log_result = handle.field.log.write().append(&op);
+    if let Err(e) = log_result { return handle.err(e); }
+    // Apply in-memory
     let mut files = handle.field.code_files.write();
     let removed_paths = files.remove_by_project(&project_str);
     drop(files);
-    // Remove symbols and collect IDs so call_graph can be cleaned up
     let mut syms = handle.field.symbol_idx.write();
     let removed_ids = syms.remove_by_file_paths(&removed_paths);
     drop(syms);
-    // Remove dangling call-graph edges for every removed symbol
     let mut cg = handle.field.call_graph.write();
     for id in removed_ids {
         cg.remove_symbol(id);
@@ -3252,15 +3255,20 @@ pub extern "C" fn cf_set_symbol_description(
         Ok(s) => s.to_string(),
         Err(e) => return handle.err(e),
     };
-    let mut syms = handle.field.symbol_idx.write();
-    if let Some(sym) = syms.get_mut(symbol_id) {
-        sym.description = Some(desc);
-        drop(syms);
-        handle.ok()
-    } else {
-        drop(syms);
-        1 // not found
+    {
+        let syms = handle.field.symbol_idx.read();
+        if syms.get(symbol_id).is_none() { return 1; }
     }
+    let op = Op::UpdateSymbolDescription(UpdateSymbolDescriptionOp {
+        symbol_id,
+        description: desc.clone(),
+    });
+    let log_result = handle.field.log.write().append(&op);
+    if let Err(e) = log_result { return handle.err(e); }
+    if let Some(sym) = handle.field.symbol_idx.write().get_mut(symbol_id) {
+        sym.description = Some(desc);
+    }
+    handle.ok()
 }
 
 /// Update content + embedding for an existing memory.
@@ -3288,20 +3296,23 @@ pub extern "C" fn cf_update_memory_content(
             new_embedding.len(), crate::ops::EMBED_DIM
         ));
     }
-    let found = {
-        let mut payloads = handle.field.payloads.write();
-        if let Some(payload) = payloads.get_mut(&id) {
-            payload.content = new_content.clone();
-            if !new_embedding.is_empty() {
-                payload.embedding = new_embedding.clone();
-            }
-            true
-        } else {
-            false
+    // Check existence before logging op
+    if !handle.field.payloads.read().contains_key(&id) { return 1; }
+    // Log for durability
+    let op = Op::UpdateMemoryContent(UpdateMemoryContentOp {
+        memory_id: id,
+        content: new_content.clone(),
+        embedding: new_embedding.clone(),
+    });
+    let log_result = handle.field.log.write().append(&op);
+    if let Err(e) = log_result { return handle.err(e); }
+    // Apply in-memory
+    if let Some(payload) = handle.field.payloads.write().get_mut(&id) {
+        payload.content = new_content.clone();
+        if !new_embedding.is_empty() {
+            payload.embedding = new_embedding.clone();
         }
-    };
-    if !found { return 1; }
-    // Keep derived indexes consistent with updated payload
+    }
     if !new_embedding.is_empty() {
         handle.field.semantic_idx.write().upsert(id, new_embedding);
     }
@@ -3696,6 +3707,102 @@ mod tests {
             assert_eq!(r, -1);
             assert!(cf_last_error(std::ptr::null()).is_null());
             assert_eq!(cf_memory_count(std::ptr::null()), 0);
+        }
+    }
+
+    #[test]
+    fn test_ffi_clear_project() {
+        unsafe {
+            let (h, _tmp) = open_tmp();
+            // Register two code files in the same project
+            let path1 = CString::new("/proj/a.cpp").unwrap();
+            let path2 = CString::new("/proj/b.cpp").unwrap();
+            let proj  = CString::new("proj").unwrap();
+            let mut file_id: u64 = 0;
+            assert_eq!(cf_upsert_code_file(h, path1.as_ptr(), proj.as_ptr(), 0, &mut file_id), 0);
+            assert_eq!(cf_upsert_code_file(h, path2.as_ptr(), proj.as_ptr(), 0, &mut file_id), 0);
+
+            // Verify files are listed
+            let mut buf = vec![0u8; 4096];
+            let mut written = 0usize;
+            assert_eq!(cf_list_code_files(h, proj.as_ptr(), buf.as_mut_ptr(), buf.len(), &mut written), 0);
+            let json = std::str::from_utf8(&buf[..written]).unwrap();
+            assert!(json.contains("a.cpp") && json.contains("b.cpp"));
+
+            // Clear the project
+            assert_eq!(cf_clear_project(h, proj.as_ptr()), 0);
+
+            // Files should be gone
+            let mut written2 = 0usize;
+            assert_eq!(cf_list_code_files(h, proj.as_ptr(), buf.as_mut_ptr(), buf.len(), &mut written2), 0);
+            let json2 = std::str::from_utf8(&buf[..written2]).unwrap();
+            assert_eq!(json2, "[]");
+
+            cf_close(h);
+        }
+    }
+
+    #[test]
+    fn test_ffi_update_memory_content() {
+        unsafe {
+            let (h, _tmp) = open_tmp();
+            let kind    = CString::new("wisdom").unwrap();
+            let realm   = CString::new("test").unwrap();
+            let content = b"original content";
+            let emb     = vec![0.1f32; 768];
+            let mut id: u64 = 0;
+            assert_eq!(cf_put_memory(h,
+                kind.as_ptr(), realm.as_ptr(),
+                content.as_ptr(), content.len(),
+                emb.as_ptr(), emb.len(),
+                0.9, 0.001, 0, &mut id), 0);
+            assert!(id > 0);
+
+            // Update content + embedding
+            let new_content = b"updated content";
+            let new_emb = vec![0.9f32; 768];
+            assert_eq!(cf_update_memory_content(h, id,
+                new_content.as_ptr(), new_content.len(),
+                new_emb.as_ptr(), new_emb.len()), 0);
+
+            // Wrong embedding size must fail
+            let bad_emb = vec![0.5f32; 3];
+            assert_eq!(cf_update_memory_content(h, id,
+                new_content.as_ptr(), new_content.len(),
+                bad_emb.as_ptr(), bad_emb.len()), -1);
+
+            // Non-existent ID must return 1
+            assert_eq!(cf_update_memory_content(h, 99999,
+                new_content.as_ptr(), new_content.len(),
+                std::ptr::null(), 0), 1);
+
+            cf_close(h);
+        }
+    }
+
+    #[test]
+    fn test_ffi_realm_list_sorted() {
+        unsafe {
+            let (h, _tmp) = open_tmp();
+            let emb = vec![0.1f32; 768];
+            let mut id: u64 = 0;
+            for realm_name in &["zebra", "alpha", "middle"] {
+                let kind  = CString::new("wisdom").unwrap();
+                let realm = CString::new(*realm_name).unwrap();
+                let txt   = realm_name.as_bytes();
+                cf_put_memory(h, kind.as_ptr(), realm.as_ptr(),
+                    txt.as_ptr(), txt.len(), emb.as_ptr(), emb.len(),
+                    0.9, 0.001, 0, &mut id);
+            }
+            let mut buf = vec![0u8; 4096];
+            let mut written = 0usize;
+            assert_eq!(cf_realm_list(h, buf.as_mut_ptr(), buf.len(), &mut written), 0);
+            let json = std::str::from_utf8(&buf[..written]).unwrap();
+            let realms: Vec<String> = serde_json::from_str(json).unwrap();
+            let mut sorted = realms.clone();
+            sorted.sort_unstable();
+            assert_eq!(realms, sorted, "realm list must be sorted");
+            cf_close(h);
         }
     }
 
