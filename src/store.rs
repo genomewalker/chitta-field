@@ -61,6 +61,8 @@ impl ChittaField {
         let memory_id = self.id_alloc.next_id();
         let ts = now_ms();
 
+        let authored_at_ms = if authored_at_ms == 0 { ts } else { authored_at_ms };
+
         let op = PutPayloadOp {
             memory_id,
             version: 0,
