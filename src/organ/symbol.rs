@@ -159,13 +159,20 @@ impl SymbolIndex {
     }
 
     /// Remove all symbols whose file_path matches any of the given paths.
-    pub fn remove_by_file_paths(&mut self, paths: &[String]) {
+    /// Returns the IDs that were removed (caller must clean up call_graph).
+    pub fn remove_by_file_paths(&mut self, paths: &[String]) -> Vec<SymbolId> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let path_set: std::collections::HashSet<&str> =
+            paths.iter().map(|s| s.as_str()).collect();
         let ids_to_remove: Vec<SymbolId> = self.by_id.iter()
-            .filter(|(_, e)| paths.iter().any(|p| e.file_path == *p))
+            .filter(|(_, e)| path_set.contains(e.file_path.as_str()))
             .map(|(&id, _)| id)
             .collect();
-        for id in ids_to_remove {
-            self.remove(id);
+        for id in &ids_to_remove {
+            self.remove(*id);
         }
+        ids_to_remove
     }
 }
