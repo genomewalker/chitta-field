@@ -35,6 +35,14 @@ impl TemporalIndex {
         self.inner.remove(&(ts_ms, memory_id));
     }
 
+    /// Return all entries with a specific ts_ms (used to fix up ts_ms=0 entries after load).
+    pub fn entries_with_ts(&self, ts: i64) -> Vec<TemporalEntry> {
+        self.inner
+            .range((ts, 0)..=(ts, u64::MAX))
+            .map(|(_, e)| e.clone())
+            .collect()
+    }
+
     /// Query memories in [start_ms, end_ms], optionally filtered by realm.
     /// Returns entries sorted by ts_ms descending (most recent first), limited to `limit`.
     pub fn range_query(

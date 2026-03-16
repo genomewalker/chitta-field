@@ -208,6 +208,34 @@ impl ChittaField {
             Ok(())
         })?;
 
+        // Fix temporal entries that have ts_ms=0 (stored before authored_at_ms default fix)
+        {
+            let zero_entries = time_idx.entries_with_ts(0);
+            let fixed_count = zero_entries.len();
+            for entry in zero_entries {
+                if let Some(payload) = payloads.get(&entry.memory_id) {
+                    let correct_ts = if payload.authored_at_ms != 0 {
+                        payload.authored_at_ms
+                    } else {
+                        payload.created_at_ms
+                    };
+                    if correct_ts != 0 {
+                        time_idx.remove(entry.memory_id, 0);
+                        time_idx.upsert(TemporalEntry {
+                            memory_id: entry.memory_id,
+                            ts_ms: correct_ts,
+                            kind: entry.kind.clone(),
+                            realm: entry.realm.clone(),
+                            strength: entry.strength,
+                        });
+                    }
+                }
+            }
+            if fixed_count > 0 {
+                eprintln!("[chitta-field] fixed {} temporal entries with ts_ms=0", fixed_count);
+            }
+        }
+
         let triplet_id_alloc = Arc::new(TripletIdAllocator::new(triplet_store.next_id()));
 
         // Sync symbol and code-file id allocators from the loaded indexes.
