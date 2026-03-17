@@ -52,11 +52,26 @@ The Sparse Predictive Associative Field encodes each memory's 768-dim embedding 
 
 A `ProductQuantizer` compresses residual embeddings for approximate recall at scale. A `LiteEncoder` (bag-of-words to sparse code, no ONNX dependency) provides a fallback encoding path that works without a runtime embedder.
 
+### Iterative recall (CTM-inspired)
+
+Recall in chitta-field is not a single forward pass. Inspired by the Continuous Thought Machine (Sakana AI, 2025), the resonance engine runs up to **3 iterative passes** per query:
+
+1. **Pass 1** — standard semantic + BM25 + spreading activation with original query `q₀`
+2. **Refinement** — refined query `q₁ = normalize(0.7·q₀ + 0.3·mean(top-k embeddings))`
+3. **Pass 2+** — repeat with refined query; stop when entropy delta < 0.01 or top-k set is stable
+
+After the final pass, `cf_record_recall_batch` atomically commits all learning:
+- **Per-memory retrieval context** — each retrieved memory logs a 32-dim quantized sketch of the query context (up to 8 entries, FIFO). The cached mean signature is used to boost future recall of memories whose context matches the current query.
+- **Sync-weighted Hebbian learning** — co-retrieved pairs update `CoActivationStats` (sim_count × diversity_count). Edge strengthening scales with this multiplier, so memories that reliably fire together across *diverse* query contexts earn much stronger assoc edges than accidental co-retrievals.
+
 ## Key features
 
 - **Multi-writer NFS** — no cross-process locks; per-instance segment files
 - **Sub-millisecond cortical recall** — SDR bitset intersection
-- **Semantic recall** — cosine similarity over BGE-base-en-v1.5 768-dim embeddings
+- **Iterative resonance** — up to 3 passes with query refinement and entropy early-stop
+- **Retrieval context history** — per-memory 32-dim query sketch log for context-aware reranking
+- **Sync-weighted Hebbian edges** — co-activation diversity scales edge reinforcement
+- **Semantic recall** — ANN (IVF + LSH) over BGE-base-en-v1.5 768-dim embeddings
 - **Keyword recall** — BM25 over memory content
 - **Temporal recall** — time-range queries with kind/realm filters
 - **Association graph** — directed weighted edges between memories (DerivedFrom, SameSession, SameArtifact, CoRetrieved, Supports, Contradicts)
