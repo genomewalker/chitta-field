@@ -2,6 +2,55 @@ use crate::ids::{ChunkHash, MemoryId};
 use crate::ops::StateDeltaOp;
 use serde::{Deserialize, Serialize};
 
+/// Compact quantized sketch of a query that retrieved this memory.
+/// 32 i8 values + scale reconstruct a ~32-dim projected embedding.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RetrievalContext {
+    pub centroid_q: Vec<i8>,   // 32 dims, quantized
+    pub scale: f32,
+    pub context_hash: u64,     // hash of original query embedding + realm
+    pub ts_ms: i64,
+}
+
+/// Rolling history of up to 8 query contexts that retrieved a memory.
+/// `signature` is the cached mean of the stored centroids (full f32, 32 dims).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RetrievalHistory {
+    pub entries: Vec<RetrievalContext>,  // capped at 8, FIFO oldest-drop
+    pub signature: Vec<f32>,             // cached mean centroid (32 dims)
+}
+
+impl RetrievalHistory {
+    pub const MAX_ENTRIES: usize = 8;
+    pub const CENTROID_DIMS: usize = 32;
+
+    /// Append a new retrieval context; if full, drop the oldest.
+    /// Recomputes the cached mean signature.
+    pub fn push(&mut self, ctx: RetrievalContext) {
+        if self.entries.len() >= Self::MAX_ENTRIES {
+            self.entries.remove(0);
+        }
+        self.entries.push(ctx);
+        self.recompute_signature();
+    }
+
+    fn recompute_signature(&mut self) {
+        if self.entries.is_empty() {
+            self.signature.clear();
+            return;
+        }
+        let n = self.entries.len() as f32;
+        let dims = Self::CENTROID_DIMS;
+        let mut sig = vec![0f32; dims];
+        for entry in &self.entries {
+            for (i, &q) in entry.centroid_q.iter().take(dims).enumerate() {
+                sig[i] += (q as f32 * entry.scale) / n;
+            }
+        }
+        self.signature = sig;
+    }
+}
+
 /// Mutable overlay state for a memory — lives separately from the immutable payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryState {
@@ -23,6 +72,8 @@ pub struct MemoryState {
     pub tier: u8, // 0=L1 (hippocampus), 1=L2 (cortex), 2=L3 (archive)
     #[serde(default)]
     pub last_state_op_ts_ms: i64,
+    #[serde(default)]
+    pub retrieval_history: RetrievalHistory,
 }
 
 impl MemoryState {
@@ -42,6 +93,7 @@ impl MemoryState {
             pinned: false,
             tier: 0,
             last_state_op_ts_ms: 0,
+            retrieval_history: RetrievalHistory::default(),
         }
     }
 

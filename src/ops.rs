@@ -30,6 +30,8 @@ pub enum Op {
     ClearProject(ClearProjectOp),
     UpdateSymbolDescription(UpdateSymbolDescriptionOp),
     UpdateMemoryContent(UpdateMemoryContentOp),
+    RecordRecallBatch(RecordRecallBatchOp),
+    StrengthenAssocEdge(StrengthenAssocEdgeOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -41,6 +43,8 @@ pub const OP_ANALYTICS_EVENT: u8 = 21;
 pub const OP_CLEAR_PROJECT: u8 = 22;
 pub const OP_UPDATE_SYMBOL_DESCRIPTION: u8 = 23;
 pub const OP_UPDATE_MEMORY_CONTENT: u8 = 24;
+pub const OP_RECORD_RECALL_BATCH: u8 = 25;
+pub const OP_STRENGTHEN_ASSOC_EDGE: u8 = 26;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -298,4 +302,33 @@ pub struct AnalyticsEventOp {
     pub session_id: String,
     pub payload_json: Vec<u8>,
     pub ts_ms: i64,
+}
+
+/// Durably records a completed recall event: updates access state for each
+/// retrieved memory, appends retrieval context to their history, and updates
+/// pairwise co-activation stats for all (src, dst) pairs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordRecallBatchOp {
+    /// IDs of memories returned as the final result of this recall.
+    pub memory_ids: Vec<MemoryId>,
+    /// 32-dim quantized sketch of the (possibly refined) query centroid.
+    pub centroid_q: Vec<i8>,
+    pub centroid_scale: f32,
+    /// Stable hash of the original user query embedding + realm.
+    /// Used to measure context diversity across co-activations.
+    pub context_hash: u64,
+    pub ts_ms: i64,
+    /// Base weight delta to apply to each co-retrieved assoc edge.
+    /// Actual delta is scaled by pair stats (sim_count * diversity_count).
+    pub base_assoc_delta: f32,
+}
+
+/// Upsert an assoc edge: if one already exists between (src, dst, edge_type),
+/// add `delta` to its weight. Otherwise insert a new edge with weight = `delta`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrengthenAssocEdgeOp {
+    pub src: MemoryId,
+    pub dst: MemoryId,
+    pub edge_type: EdgeType,
+    pub delta: f32,
 }

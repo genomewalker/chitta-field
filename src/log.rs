@@ -27,8 +27,8 @@ const OP_TRAIN_PQ: u8 = 14;
 const OP_UPDATE_RESIDUAL_PQ: u8 = 15;
 use crate::ops::{
     OP_ANALYTICS_EVENT, OP_CLEAR_PROJECT, OP_SESSION_EVENT, OP_TASK_EVENT, OP_THEME_EVENT,
-    OP_TRANSCRIPT_EVENT, OP_UPDATE_MEMORY_CONTENT, OP_UPDATE_SYMBOL_DESCRIPTION,
-    OP_USER_MODEL_EVENT,
+    OP_RECORD_RECALL_BATCH, OP_STRENGTHEN_ASSOC_EDGE, OP_TRANSCRIPT_EVENT,
+    OP_UPDATE_MEMORY_CONTENT, OP_UPDATE_SYMBOL_DESCRIPTION, OP_USER_MODEL_EVENT,
 };
 
 fn op_type_byte(op: &Op) -> u8 {
@@ -58,6 +58,8 @@ fn op_type_byte(op: &Op) -> u8 {
         Op::ClearProject(_) => OP_CLEAR_PROJECT,
         Op::UpdateSymbolDescription(_) => OP_UPDATE_SYMBOL_DESCRIPTION,
         Op::UpdateMemoryContent(_) => OP_UPDATE_MEMORY_CONTENT,
+        Op::RecordRecallBatch(_) => OP_RECORD_RECALL_BATCH,
+        Op::StrengthenAssocEdge(_) => OP_STRENGTHEN_ASSOC_EDGE,
     }
 }
 
