@@ -26,7 +26,7 @@ chitta-field/
 │   └── cortex.snapshot                    (cortical sparse codes only)
 │
 └── In-RAM (rebuilt from log on open)
-    ├── SemanticIndex  (brute-force cosine, 768-dim BGE embeddings)
+    ├── SemanticIndex  (ANN: IVF coarse + LSH probing, 768-dim BGE embeddings)
     ├── KeywordIndex   (BM25)
     ├── CorticalIndex  (SDR, 64-of-16384 active bits)
     ├── TemporalIndex  (time-ordered, range queries)
@@ -291,7 +291,7 @@ Semantic recall uses BGE-base-en-v1.5 embeddings (768-dim, from BAAI), provided 
 
 > Xiao, S., Liu, Z., Zhang, P., & Muennighoff, N. (2023). C-Pack: Packaged resources to advance general Chinese embedding. *arXiv:2309.07597*. https://arxiv.org/abs/2309.07597
 
-The semantic index currently uses brute-force cosine similarity, adequate for tens of thousands of memories (~300 ms at 50K entries). A true HNSW implementation is planned as the memory corpus grows.
+The semantic index uses a two-tier ANN strategy: LSH probing (4 tables, 12 bits) for primary candidate generation, falling back to IVF coarse quantizer (256 random-projection centroids) if LSH yields no candidates. Exact cosine reranking runs over the bounded candidate set (1024–16384). This bounds query cost well below brute-force even at 50K+ memories.
 
 ## Dependencies
 
