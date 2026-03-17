@@ -1,6 +1,6 @@
+use crate::ids::{ArtifactId, MemoryId};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::ids::{MemoryId, ArtifactId};
-use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactEntry {
@@ -41,7 +41,10 @@ impl ArtifactIndex {
             strength,
         };
 
-        let entries = self.by_path.entry(path.to_string()).or_insert_with(Vec::new);
+        let entries = self
+            .by_path
+            .entry(path.to_string())
+            .or_insert_with(Vec::new);
         // Avoid duplicates: replace if same memory_id already present for this path.
         if let Some(pos) = entries.iter().position(|e| e.memory_id == memory_id) {
             entries[pos] = entry;
@@ -75,7 +78,11 @@ impl ArtifactIndex {
             return Vec::new();
         };
         let mut result: Vec<ArtifactEntry> = entries.clone();
-        result.sort_by(|a, b| b.strength.partial_cmp(&a.strength).unwrap_or(std::cmp::Ordering::Equal));
+        result.sort_by(|a, b| {
+            b.strength
+                .partial_cmp(&a.strength)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         result.truncate(limit);
         result
     }
@@ -88,17 +95,18 @@ impl ArtifactIndex {
             .filter(|(path, _)| path.starts_with(prefix))
             .flat_map(|(_, entries)| entries.iter().cloned())
             .collect();
-        result.sort_by(|a, b| b.strength.partial_cmp(&a.strength).unwrap_or(std::cmp::Ordering::Equal));
+        result.sort_by(|a, b| {
+            b.strength
+                .partial_cmp(&a.strength)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         result.truncate(limit);
         result
     }
 
     /// Get all paths associated with a memory.
     pub fn paths_for_memory(&self, memory_id: MemoryId) -> Vec<String> {
-        self.by_memory
-            .get(&memory_id)
-            .cloned()
-            .unwrap_or_default()
+        self.by_memory.get(&memory_id).cloned().unwrap_or_default()
     }
 
     pub fn len(&self) -> usize {

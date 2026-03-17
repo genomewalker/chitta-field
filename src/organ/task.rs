@@ -51,19 +51,35 @@ impl TaskRegistry {
         Self::default()
     }
 
-    pub fn create(&mut self, task_id: String, kind: String, payload_json: String, now_ms: i64, fencing_token: u64) {
-        self.tasks.insert(task_id.clone(), TaskRecord {
-            task_id,
-            kind,
-            status: TaskStatus::Pending,
-            payload_json,
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-            fencing_token,
-        });
+    pub fn create(
+        &mut self,
+        task_id: String,
+        kind: String,
+        payload_json: String,
+        now_ms: i64,
+        fencing_token: u64,
+    ) {
+        self.tasks.insert(
+            task_id.clone(),
+            TaskRecord {
+                task_id,
+                kind,
+                status: TaskStatus::Pending,
+                payload_json,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                fencing_token,
+            },
+        );
     }
 
-    pub fn transition(&mut self, task_id: &str, new_status: &str, now_ms: i64, fencing_token: u64) -> bool {
+    pub fn transition(
+        &mut self,
+        task_id: &str,
+        new_status: &str,
+        now_ms: i64,
+        fencing_token: u64,
+    ) -> bool {
         if let Some(t) = self.tasks.get_mut(task_id) {
             if fencing_token > 0 && fencing_token < t.fencing_token {
                 return false;
@@ -86,8 +102,14 @@ impl TaskRegistry {
     }
 
     pub fn list_active(&self) -> Vec<&TaskRecord> {
-        self.tasks.values()
-            .filter(|t| matches!(t.status, TaskStatus::Pending | TaskStatus::Running | TaskStatus::Paused))
+        self.tasks
+            .values()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TaskStatus::Pending | TaskStatus::Running | TaskStatus::Paused
+                )
+            })
             .collect()
     }
 

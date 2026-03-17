@@ -17,7 +17,8 @@ impl ContextLearner {
 
     /// Get recommended window size for a session type.
     pub fn recommended_window(&self, session_type: &str) -> usize {
-        self.window_priors.get(session_type)
+        self.window_priors
+            .get(session_type)
             .map(|p| p.mean().round() as usize)
             .unwrap_or(self.default_window)
             .clamp(3, 50)
@@ -27,7 +28,8 @@ impl ContextLearner {
     pub fn record_outcome(&mut self, session_type: &str, size: usize, outcome: f32) {
         // If outcome is good, update prior toward this size
         // Weight the update by the outcome quality
-        let weighted_size = size as f64 * outcome as f64 + self.recommended_window(session_type) as f64 * (1.0 - outcome as f64);
+        let weighted_size = size as f64 * outcome as f64
+            + self.recommended_window(session_type) as f64 * (1.0 - outcome as f64);
         self.window_priors
             .entry(session_type.to_string())
             .or_insert(GaussianPrior::new(10.0, 3.0))

@@ -1,6 +1,6 @@
-pub use crate::ops::{PutPayloadOp, ArtifactRef, ArtifactRelation};
-use crate::ids::{MemoryId, ChunkHash};
-use serde::{Serialize, Deserialize};
+use crate::ids::{ChunkHash, MemoryId};
+pub use crate::ops::{ArtifactRef, ArtifactRelation, PutPayloadOp};
+use serde::{Deserialize, Serialize};
 
 /// In-memory representation of the latest payload for a memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]

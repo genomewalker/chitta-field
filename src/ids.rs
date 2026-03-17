@@ -1,4 +1,4 @@
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type InstanceId = u32;
@@ -11,7 +11,10 @@ pub fn new_instance_id() -> InstanceId {
         let _ = f.read_exact(&mut buf);
     } else {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         buf.copy_from_slice(&(t as u32).to_le_bytes());
     }
     u32::from_le_bytes(buf)
@@ -41,13 +44,17 @@ pub struct MemoryIdAllocator {
 
 impl MemoryIdAllocator {
     pub fn new(start: u64) -> Self {
-        Self { next: AtomicU64::new(start) }
+        Self {
+            next: AtomicU64::new(start),
+        }
     }
 
     /// Create an allocator partitioned for a specific instance.
     /// MemoryId = (instance_id as u64) << 32 | local_counter
     pub fn with_instance(instance_id: InstanceId) -> Self {
-        Self { next: AtomicU64::new((instance_id as u64) << 32 | 1) }
+        Self {
+            next: AtomicU64::new((instance_id as u64) << 32 | 1),
+        }
     }
 
     pub fn next_id(&self) -> MemoryId {
@@ -69,11 +76,15 @@ pub struct ArtifactIdAllocator {
 
 impl ArtifactIdAllocator {
     pub fn new(start: u64) -> Self {
-        Self { next: AtomicU64::new(start) }
+        Self {
+            next: AtomicU64::new(start),
+        }
     }
 
     pub fn with_instance(instance_id: InstanceId) -> Self {
-        Self { next: AtomicU64::new((instance_id as u64) << 32 | 1) }
+        Self {
+            next: AtomicU64::new((instance_id as u64) << 32 | 1),
+        }
     }
 
     pub fn next_id(&self) -> ArtifactId {
@@ -95,7 +106,9 @@ pub struct TripletIdAllocator {
 
 impl TripletIdAllocator {
     pub fn new(start: u64) -> Self {
-        Self { next: AtomicU64::new(start) }
+        Self {
+            next: AtomicU64::new(start),
+        }
     }
 
     pub fn next_id(&self) -> u64 {

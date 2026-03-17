@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
-use crate::ids::MemoryId;
 use super::cortex::SparseCode;
+use crate::ids::MemoryId;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub type ProtoId = u32;
 
@@ -25,7 +25,9 @@ pub struct PrototypeIndex {
 }
 
 impl Default for PrototypeIndex {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PrototypeIndex {
@@ -88,9 +90,15 @@ impl PrototypeIndex {
         // Normalize activations to sum=1
         let sum: f32 = centroid.activations.iter().sum();
         if sum > 1e-9 {
-            for a in centroid.activations.iter_mut() { *a /= sum; }
+            for a in centroid.activations.iter_mut() {
+                *a /= sum;
+            }
         }
-        self.protos.push(PrototypeEntry { id, centroid, count: 1 });
+        self.protos.push(PrototypeEntry {
+            id,
+            centroid,
+            count: 1,
+        });
         id
     }
 
@@ -110,7 +118,9 @@ impl PrototypeIndex {
 
     /// Find the nearest prototype for any sparse code (used in search scoring).
     pub fn nearest_proto(&self, code: &SparseCode) -> Option<ProtoId> {
-        if self.protos.is_empty() || code.is_empty() { return None; }
+        if self.protos.is_empty() || code.is_empty() {
+            return None;
+        }
         let (best_idx, _) = self.best_match(code);
         Some(self.protos[best_idx].id)
     }
@@ -123,7 +133,12 @@ impl PrototypeIndex {
         // Merge all feature activations using a temporary map
         let mut merged: HashMap<u32, f32> = HashMap::new();
 
-        for (&fid, &act) in entry.centroid.feature_ids.iter().zip(entry.centroid.activations.iter()) {
+        for (&fid, &act) in entry
+            .centroid
+            .feature_ids
+            .iter()
+            .zip(entry.centroid.activations.iter())
+        {
             *merged.entry(fid).or_insert(0.0) += old_weight * act;
         }
         for (&fid, &act) in new_code.feature_ids.iter().zip(new_code.activations.iter()) {
@@ -134,7 +149,9 @@ impl PrototypeIndex {
         let mut features: Vec<(u32, f32)> = merged.into_iter().collect();
         const TOP_K: usize = 64;
         if features.len() > TOP_K {
-            features.select_nth_unstable_by(TOP_K, |a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            features.select_nth_unstable_by(TOP_K, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
             features.truncate(TOP_K);
         }
 
@@ -150,7 +167,9 @@ impl PrototypeIndex {
     }
 
     pub fn strengthen_transition(&mut self, a: ProtoId, b: ProtoId, delta: f32) {
-        if a == b { return; }
+        if a == b {
+            return;
+        }
         let key_ab = (a, b);
         let key_ba = (b, a);
         let val = (self.transitions.get(&key_ab).copied().unwrap_or(0.0) + delta).min(1.0);

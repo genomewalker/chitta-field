@@ -39,11 +39,25 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--memories"   => { i += 1; memories_path = Some(expand_home(&args[i])); }
-            "--triplets"   => { i += 1; triplets_path = Some(expand_home(&args[i])); }
-            "--field-dir"  => { i += 1; field_dir = expand_home(&args[i]); }
-            "--lock-dir"   => { i += 1; } // ignored — Upanishads model needs no locks
-            "--batch"      => { i += 1; batch_report = args[i].parse().unwrap_or(500); }
+            "--memories" => {
+                i += 1;
+                memories_path = Some(expand_home(&args[i]));
+            }
+            "--triplets" => {
+                i += 1;
+                triplets_path = Some(expand_home(&args[i]));
+            }
+            "--field-dir" => {
+                i += 1;
+                field_dir = expand_home(&args[i]);
+            }
+            "--lock-dir" => {
+                i += 1;
+            } // ignored — Upanishads model needs no locks
+            "--batch" => {
+                i += 1;
+                batch_report = args[i].parse().unwrap_or(500);
+            }
             _ => {}
         }
         i += 1;
@@ -76,9 +90,17 @@ fn main() {
     let zero_embedding = vec![0.0f32; EMBED_DIM];
 
     for line in reader.lines() {
-        let line = match line { Ok(l) => l, Err(e) => { eprintln!("IO error: {e}"); continue; } };
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("IO error: {e}");
+                continue;
+            }
+        };
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
 
         total += 1;
 
@@ -86,25 +108,28 @@ fn main() {
             Ok(v) => v,
             Err(e) => {
                 skipped += 1;
-                if skipped <= 5 { eprintln!("  Parse error line {total}: {e}"); }
+                if skipped <= 5 {
+                    eprintln!("  Parse error line {total}: {e}");
+                }
                 continue;
             }
         };
 
-        let content  = v["content"].as_str().unwrap_or("").as_bytes().to_vec();
-        let kind     = v["kind"].as_str().unwrap_or("unknown");
-        let realm    = v["realm"].as_str().unwrap_or("brahman");
-        let confidence  = v["confidence"].as_f64().unwrap_or(1.0) as f32;
-        let decay_rate  = v["decay_rate"].as_f64().unwrap_or(0.001) as f32;
-        let created_ms  = v["created_at_ms"].as_i64().unwrap_or(0);
-        let pinned      = v["pinned"].as_bool().unwrap_or(false);
+        let content = v["content"].as_str().unwrap_or("").as_bytes().to_vec();
+        let kind = v["kind"].as_str().unwrap_or("unknown");
+        let realm = v["realm"].as_str().unwrap_or("brahman");
+        let confidence = v["confidence"].as_f64().unwrap_or(1.0) as f32;
+        let decay_rate = v["decay_rate"].as_f64().unwrap_or(0.001) as f32;
+        let created_ms = v["created_at_ms"].as_i64().unwrap_or(0);
+        let pinned = v["pinned"].as_bool().unwrap_or(false);
         let original_id = v["original_id"].as_u64().unwrap_or(0);
 
         // Use embedding from JSON if present and correct length; otherwise zero.
         let embedding: Vec<f32> = match v["embedding"].as_array() {
-            Some(arr) if arr.len() == EMBED_DIM => {
-                arr.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect()
-            }
+            Some(arr) if arr.len() == EMBED_DIM => arr
+                .iter()
+                .filter_map(|x| x.as_f64().map(|f| f as f32))
+                .collect(),
             _ => zero_embedding.clone(),
         };
 
@@ -116,9 +141,16 @@ fn main() {
         };
 
         match field.put_memory(
-            kind, realm, &content, &embedding,
-            confidence, decay_rate, created_ms,
-            vec![], None, None,
+            kind,
+            realm,
+            &content,
+            &embedding,
+            confidence,
+            decay_rate,
+            created_ms,
+            vec![],
+            None,
+            None,
         ) {
             Ok((new_id, _)) => {
                 _id_map.insert(original_id, new_id.into());
@@ -130,13 +162,17 @@ fn main() {
             }
             Err(e) => {
                 skipped += 1;
-                if skipped <= 5 { eprintln!("  Error on record {total}: {e}"); }
+                if skipped <= 5 {
+                    eprintln!("  Error on record {total}: {e}");
+                }
             }
         }
 
         if total % batch_report == 0 {
             let rate = total as f64 / t0.elapsed().as_secs_f64();
-            println!("  memories: {total} processed ({ok} ok, {skipped} skipped) — {rate:.0} rec/s");
+            println!(
+                "  memories: {total} processed ({ok} ok, {skipped} skipped) — {rate:.0} rec/s"
+            );
         }
     }
 
@@ -149,8 +185,8 @@ fn main() {
     // --- Ingest triplets ---
     if let Some(tp) = triplets_path {
         let t1 = Instant::now();
-        let file = File::open(&tp)
-            .unwrap_or_else(|e| panic!("Cannot open {}: {}", tp.display(), e));
+        let file =
+            File::open(&tp).unwrap_or_else(|e| panic!("Cannot open {}: {}", tp.display(), e));
         let reader = BufReader::new(file);
 
         let mut trip_total = 0usize;
@@ -159,22 +195,30 @@ fn main() {
         let mut seen: HashSet<(String, String, String)> = HashSet::new();
 
         for line in reader.lines() {
-            let line = match line { Ok(l) => l, Err(_) => continue };
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
             let line = line.trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
 
             trip_total += 1;
 
             let v: serde_json::Value = match serde_json::from_str(line) {
                 Ok(v) => v,
-                Err(_) => { trip_skipped += 1; continue; }
+                Err(_) => {
+                    trip_skipped += 1;
+                    continue;
+                }
             };
 
-            let subject   = v["subject"].as_str().unwrap_or("").to_string();
+            let subject = v["subject"].as_str().unwrap_or("").to_string();
             let predicate = v["predicate"].as_str().unwrap_or("").to_string();
-            let object    = v["object"].as_str().unwrap_or("").to_string();
-            let weight    = v["weight"].as_f64().unwrap_or(1.0) as f32;
-            let source    = v["source_file"].as_str().map(|s| s.to_string());
+            let object = v["object"].as_str().unwrap_or("").to_string();
+            let weight = v["weight"].as_f64().unwrap_or(1.0) as f32;
+            let source = v["source_file"].as_str().map(|s| s.to_string());
 
             if subject.is_empty() || predicate.is_empty() || object.is_empty() {
                 trip_skipped += 1;
@@ -192,7 +236,9 @@ fn main() {
                 Ok(_) => trip_ok += 1,
                 Err(e) => {
                     trip_skipped += 1;
-                    if trip_skipped <= 5 { eprintln!("  Triplet error {trip_total}: {e}"); }
+                    if trip_skipped <= 5 {
+                        eprintln!("  Triplet error {trip_total}: {e}");
+                    }
                 }
             }
 

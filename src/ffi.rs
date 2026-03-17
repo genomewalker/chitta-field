@@ -3,18 +3,17 @@
 //! All functions return 0 on success, negative on error.
 //! Errors readable via cf_last_error().
 
+use crate::field::ChittaField;
+use crate::ops::{
+    AnalyticsEventOp, ClearProjectOp, EdgeType, Op, SessionEventOp, TaskEventOp, ThemeEventOp,
+    TranscriptEventOp, UpdateMemoryContentOp, UpdateSymbolDescriptionOp, UserModelEventOp,
+};
+use crate::recall::RecallHit;
+use serde_json;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use crate::field::ChittaField;
-use crate::ops::{
-    EdgeType, SessionEventOp, TranscriptEventOp, TaskEventOp,
-    UserModelEventOp, ThemeEventOp, AnalyticsEventOp, Op,
-    ClearProjectOp, UpdateSymbolDescriptionOp, UpdateMemoryContentOp,
-};
-use crate::recall::RecallHit;
-use serde_json;
 
 /// Opaque handle. C code holds *mut CfHandle.
 pub struct CfHandle {
@@ -60,16 +59,15 @@ fn write_hits(hits: Vec<RecallHit>, buf: *mut CfRecallHit, cap: usize, written: 
             };
         }
     }
-    unsafe { *written = n; }
+    unsafe {
+        *written = n;
+    }
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 #[no_mangle]
-pub extern "C" fn cf_open(
-    data_dir: *const c_char,
-    _lock_dir: *const c_char,
-) -> *mut CfHandle {
+pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> *mut CfHandle {
     // lock_dir is ignored — the Upanishads model needs no locks.
     let data_dir = unsafe {
         match CStr::from_ptr(data_dir).to_str() {
@@ -78,7 +76,10 @@ pub extern "C" fn cf_open(
         }
     };
     match ChittaField::open(data_dir) {
-        Ok(field) => Box::into_raw(Box::new(CfHandle { field, last_error: None })),
+        Ok(field) => Box::into_raw(Box::new(CfHandle {
+            field,
+            last_error: None,
+        })),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -159,7 +160,9 @@ pub extern "C" fn cf_put_memory(
         None,
     ) {
         Ok((memory_id, _)) => {
-            unsafe { *out_memory_id = memory_id; }
+            unsafe {
+                *out_memory_id = memory_id;
+            }
             handle.ok()
         }
         Err(e) => handle.err(e),
@@ -183,16 +186,35 @@ pub extern "C" fn cf_update_state(
     }
     let handle = unsafe { &mut *h };
 
-    let strength_delta = if strength_delta.is_nan() { None } else { Some(strength_delta) };
-    let confidence_delta = if confidence_delta.is_nan() { None } else { Some(confidence_delta) };
-    let decay_rate = if decay_rate.is_nan() { None } else { Some(decay_rate) };
+    let strength_delta = if strength_delta.is_nan() {
+        None
+    } else {
+        Some(strength_delta)
+    };
+    let confidence_delta = if confidence_delta.is_nan() {
+        None
+    } else {
+        Some(confidence_delta)
+    };
+    let decay_rate = if decay_rate.is_nan() {
+        None
+    } else {
+        Some(decay_rate)
+    };
     let pin_opt = match pin {
         -1 => None,
         0 => Some(false),
         _ => Some(true),
     };
 
-    match handle.field.update_state(memory_id, strength_delta, confidence_delta, decay_rate, touch != 0, pin_opt) {
+    match handle.field.update_state(
+        memory_id,
+        strength_delta,
+        confidence_delta,
+        decay_rate,
+        touch != 0,
+        pin_opt,
+    ) {
         Ok(()) => handle.ok(),
         Err(e) => handle.err(e),
     }
@@ -251,7 +273,9 @@ pub extern "C" fn cf_upsert_artifact(
     };
     match handle.field.upsert_artifact(path_str, None) {
         Ok(artifact_id) => {
-            unsafe { *out_artifact_id = artifact_id; }
+            unsafe {
+                *out_artifact_id = artifact_id;
+            }
             handle.ok()
         }
         Err(e) => handle.err(e),
@@ -337,7 +361,10 @@ pub extern "C" fn cf_recall_temporal(
         }
     };
 
-    match handle.field.recall_temporal(start_ms, end_ms, realm_str, limit) {
+    match handle
+        .field
+        .recall_temporal(start_ms, end_ms, realm_str, limit)
+    {
         Ok(hits) => {
             write_hits(hits, hits_buf, hits_cap, hits_written);
             handle.ok()
@@ -533,7 +560,12 @@ pub extern "C" fn cf_add_triplet(
     source_memory_id: u64,
     out_triplet_id: *mut u64,
 ) -> c_int {
-    if h.is_null() || subject.is_null() || predicate.is_null() || object.is_null() || out_triplet_id.is_null() {
+    if h.is_null()
+        || subject.is_null()
+        || predicate.is_null()
+        || object.is_null()
+        || out_triplet_id.is_null()
+    {
         return -1;
     }
     let handle = unsafe { &mut *h };
@@ -557,7 +589,11 @@ pub extern "C" fn cf_add_triplet(
         }
     };
 
-    let src_mem = if source_memory_id == 0 { None } else { Some(source_memory_id) };
+    let src_mem = if source_memory_id == 0 {
+        None
+    } else {
+        Some(source_memory_id)
+    };
 
     match handle.field.add_triplet(
         subject_str.to_string(),
@@ -568,7 +604,9 @@ pub extern "C" fn cf_add_triplet(
         None,
     ) {
         Ok(triplet_id) => {
-            unsafe { *out_triplet_id = triplet_id; }
+            unsafe {
+                *out_triplet_id = triplet_id;
+            }
             handle.ok()
         }
         Err(e) => handle.err(e),
@@ -596,13 +634,18 @@ fn write_triplets_json(
 ) -> c_int {
     use serde_json::json;
 
-    let json_val: Vec<_> = entries.iter().map(|e| json!({
-        "id": e.id,
-        "subject": e.subject,
-        "predicate": e.predicate,
-        "object": e.object,
-        "weight": e.weight,
-    })).collect();
+    let json_val: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            json!({
+                "id": e.id,
+                "subject": e.subject,
+                "predicate": e.predicate,
+                "object": e.object,
+                "weight": e.weight,
+            })
+        })
+        .collect();
 
     let s = match serde_json::to_string(&json_val) {
         Ok(s) => s,
@@ -831,9 +874,13 @@ fn write_symbol_hits(
 ) {
     let n = entries.len().min(cap);
     for (i, e) in entries.iter().take(n).enumerate() {
-        unsafe { *buf.add(i) = CfSymbolHit::from_entry(e, score); }
+        unsafe {
+            *buf.add(i) = CfSymbolHit::from_entry(e, score);
+        }
     }
-    unsafe { *written = n; }
+    unsafe {
+        *written = n;
+    }
 }
 
 /// Upsert a symbol. Returns 0 on success, -1 on error. Writes symbol_id to out_id.
@@ -879,15 +926,20 @@ pub extern "C" fn cf_upsert_symbol(
             _ => None,
         }
     };
-    let mem_id = if memory_id == 0 { None } else { Some(memory_id) };
+    let mem_id = if memory_id == 0 {
+        None
+    } else {
+        Some(memory_id)
+    };
     let emb = unsafe { std::slice::from_raw_parts(embedding, embed_len) };
 
     match handle.field.upsert_symbol(
-        kind_str, name_str, sig_str, path_str,
-        line_start, line_end, repo_id, emb, desc, mem_id,
+        kind_str, name_str, sig_str, path_str, line_start, line_end, repo_id, emb, desc, mem_id,
     ) {
         Ok(id) => {
-            unsafe { *out_id = id; }
+            unsafe {
+                *out_id = id;
+            }
             handle.ok()
         }
         Err(e) => handle.err(e),
@@ -952,10 +1004,14 @@ pub extern "C" fn cf_search_symbols_semantic(
     let n = scored.len().min(buf_len);
     for (i, (sym_id, score)) in scored.iter().take(n).enumerate() {
         if let Ok(Some(entry)) = handle.field.get_symbol(*sym_id) {
-            unsafe { *buf.add(i) = CfSymbolHit::from_entry(&entry, *score); }
+            unsafe {
+                *buf.add(i) = CfSymbolHit::from_entry(&entry, *score);
+            }
         }
     }
-    unsafe { *written = n; }
+    unsafe {
+        *written = n;
+    }
     handle.ok()
 }
 
@@ -984,11 +1040,7 @@ pub extern "C" fn cf_symbols_in_file(
 
 /// Add a call edge between two symbols.
 #[no_mangle]
-pub extern "C" fn cf_add_sym_call_edge(
-    h: *mut CfHandle,
-    caller_id: u64,
-    callee_id: u64,
-) -> c_int {
+pub extern "C" fn cf_add_sym_call_edge(h: *mut CfHandle, caller_id: u64, callee_id: u64) -> c_int {
     if h.is_null() {
         return -1;
     }
@@ -1015,9 +1067,13 @@ pub extern "C" fn cf_get_callees(
     let ids = handle.field.get_callees(symbol_id);
     let n = ids.len().min(buf_len);
     for (i, &id) in ids.iter().take(n).enumerate() {
-        unsafe { *buf.add(i) = id; }
+        unsafe {
+            *buf.add(i) = id;
+        }
     }
-    unsafe { *written = n; }
+    unsafe {
+        *written = n;
+    }
     handle.ok()
 }
 
@@ -1037,9 +1093,13 @@ pub extern "C" fn cf_get_callers(
     let ids = handle.field.get_callers(symbol_id);
     let n = ids.len().min(buf_len);
     for (i, &id) in ids.iter().take(n).enumerate() {
-        unsafe { *buf.add(i) = id; }
+        unsafe {
+            *buf.add(i) = id;
+        }
     }
-    unsafe { *written = n; }
+    unsafe {
+        *written = n;
+    }
     handle.ok()
 }
 
@@ -1067,7 +1127,9 @@ pub extern "C" fn cf_upsert_code_file(
 
     match handle.field.upsert_code_file(path_str, project_str, mtime) {
         Ok(id) => {
-            unsafe { *out_id = id; }
+            unsafe {
+                *out_id = id;
+            }
             handle.ok()
         }
         Err(e) => handle.err(e),
@@ -1248,7 +1310,12 @@ pub extern "C" fn cf_encode_lite(
         Some(code) => {
             let n = code.feature_ids.len();
             unsafe {
-                for (i, (&atom, &weight)) in code.feature_ids.iter().zip(code.activations.iter()).enumerate() {
+                for (i, (&atom, &weight)) in code
+                    .feature_ids
+                    .iter()
+                    .zip(code.activations.iter())
+                    .enumerate()
+                {
                     *out_atoms.add(i) = atom;
                     *out_weights.add(i) = weight;
                 }
@@ -1303,7 +1370,7 @@ pub extern "C" fn cf_iterate_log(
 }
 
 /// Emit a domain event into the chitta-field log.
-/// domain: "session", "transcript", "task", "user_model", "theme", "analytics"
+/// domain: "session", "transcript", "task", "theme", "analytics"
 /// Returns assigned event_id via *out_event_id, or 0 on error.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
@@ -1399,14 +1466,6 @@ pub extern "C" fn cf_emit_event(
             ts_ms,
             fencing_token,
         }),
-        "user_model" => Op::UserModelEvent(UserModelEventOp {
-            event_id,
-            entity_type: entity_id_str.to_string(),
-            entity_id: entity_id_str.to_string(),
-            kind: kind_str.to_string(),
-            payload_json: payload,
-            ts_ms,
-        }),
         "theme" => Op::ThemeEvent(ThemeEventOp {
             event_id,
             kind: kind_str.to_string(),
@@ -1421,6 +1480,9 @@ pub extern "C" fn cf_emit_event(
             payload_json: payload,
             ts_ms,
         }),
+        "user_model" => {
+            return handle.err("cf_emit_event: use cf_user_model_upsert/cf_user_model_observe for user_model events");
+        }
         _ => return handle.err(format!("unknown domain: {}", domain_str)),
     };
 
@@ -1430,19 +1492,26 @@ pub extern "C" fn cf_emit_event(
             // Immediately apply to in-memory state for same-instance reads.
             // (WAL replay only fires for foreign ops from other instances.)
             if domain_str == "transcript" {
-                handle.field.transcript_registry.write()
-                    .set_session_event(entity_id_str, kind_str, payload_str_for_apply);
+                handle.field.transcript_registry.write().set_session_event(
+                    entity_id_str,
+                    kind_str,
+                    payload_str_for_apply,
+                );
             }
-            unsafe { *out_event_id = event_id; }
+            unsafe {
+                *out_event_id = event_id;
+            }
             handle.ok()
         }
         Err(e) => handle.err(e),
     }
 }
 
-/// Get the payload of the most recent user_model event matching entity_type+entity_id.
-/// domain must be "user_model"; kind is matched against entity_type.
-/// Returns 0 and writes JSON payload to buf if found, 1 if not found, -1 on error.
+/// Get the payload of the most recent domain event matching domain+kind+entity_id.
+/// Supports domain="user_model" (kind = entity_type) and domain="transcript"
+/// (kind = transcript event kind, entity_id = session_id).
+/// Returns 0 and writes JSON payload to buf if found, 1 if not found,
+/// -2 if buf too small, -1 on error.
 #[no_mangle]
 pub extern "C" fn cf_get_latest_event(
     h: *mut CfHandle,
@@ -1453,8 +1522,13 @@ pub extern "C" fn cf_get_latest_event(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || domain.is_null() || kind.is_null() || entity_id.is_null()
-        || buf.is_null() || written.is_null() {
+    if h.is_null()
+        || domain.is_null()
+        || kind.is_null()
+        || entity_id.is_null()
+        || buf.is_null()
+        || written.is_null()
+    {
         return -1;
     }
     let handle = unsafe { &mut *h };
@@ -1488,21 +1562,20 @@ pub extern "C" fn cf_get_latest_event(
         }
         "transcript" => {
             let registry = handle.field.transcript_registry.read();
-            registry.get_session_event(entity_id_str, kind_str).map(|s| s.to_string())
+            registry
+                .get_session_event(entity_id_str, kind_str)
+                .map(|s| s.to_string())
         }
-        _ => return handle.err(format!("cf_get_latest_event: unsupported domain '{}'", domain_str)),
+        _ => {
+            return handle.err(format!(
+                "cf_get_latest_event: unsupported domain '{}'",
+                domain_str
+            ))
+        }
     };
 
     match payload {
-        Some(p) => {
-            let bytes = p.as_bytes();
-            let n = bytes.len().min(buf_cap);
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
-                *written = n;
-            }
-            0
-        }
+        Some(p) => write_json_buf(&p, buf, buf_cap, written),
         None => 1,
     }
 }
@@ -1519,7 +1592,9 @@ pub extern "C" fn cf_session_register(
     realm: *const c_char,
     now_ms: i64,
 ) -> c_int {
-    if h.is_null() || session_id.is_null() { return -1; }
+    if h.is_null() || session_id.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let session_id_str = unsafe {
@@ -1528,7 +1603,9 @@ pub extern "C" fn cf_session_register(
             Err(e) => return handle.err(e),
         }
     };
-    let kind_str = if kind.is_null() { "" } else {
+    let kind_str = if kind.is_null() {
+        ""
+    } else {
         unsafe {
             match CStr::from_ptr(kind).to_str() {
                 Ok(s) => s,
@@ -1536,7 +1613,9 @@ pub extern "C" fn cf_session_register(
             }
         }
     };
-    let realm_str = if realm.is_null() { "" } else {
+    let realm_str = if realm.is_null() {
+        ""
+    } else {
         unsafe {
             match CStr::from_ptr(realm).to_str() {
                 Ok(s) => s,
@@ -1557,7 +1636,9 @@ pub extern "C" fn cf_session_register(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
+    if let Err(e) = result {
+        return handle.err(e);
+    }
     handle.field.session_registry.write().register(
         session_id_str.to_string(),
         kind_str.to_string(),
@@ -1574,7 +1655,9 @@ pub extern "C" fn cf_session_heartbeat(
     session_id: *const c_char,
     now_ms: i64,
 ) -> c_int {
-    if h.is_null() || session_id.is_null() { return -1; }
+    if h.is_null() || session_id.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let session_id_str = unsafe {
@@ -1595,8 +1678,14 @@ pub extern "C" fn cf_session_heartbeat(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
-    handle.field.session_registry.write().heartbeat(session_id_str, now_ms);
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    handle
+        .field
+        .session_registry
+        .write()
+        .heartbeat(session_id_str, now_ms);
     handle.ok()
 }
 
@@ -1607,7 +1696,9 @@ pub extern "C" fn cf_session_deregister(
     session_id: *const c_char,
     now_ms: i64,
 ) -> c_int {
-    if h.is_null() || session_id.is_null() { return -1; }
+    if h.is_null() || session_id.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let session_id_str = unsafe {
@@ -1628,8 +1719,14 @@ pub extern "C" fn cf_session_deregister(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
-    handle.field.session_registry.write().deregister(session_id_str);
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    handle
+        .field
+        .session_registry
+        .write()
+        .deregister(session_id_str);
     handle.ok()
 }
 
@@ -1642,7 +1739,9 @@ pub extern "C" fn cf_transcript_register(
     transcript_id: *const c_char,
     session_id: *const c_char,
 ) -> c_int {
-    if h.is_null() || transcript_id.is_null() || session_id.is_null() { return -1; }
+    if h.is_null() || transcript_id.is_null() || session_id.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let transcript_id_str = unsafe {
@@ -1664,7 +1763,8 @@ pub extern "C" fn cf_transcript_register(
         .unwrap_or_default()
         .as_millis() as i64;
 
-    let payload_json = format!(r#"{{"transcript_id":"{}"}}"#, transcript_id_str).into_bytes();
+    let payload_str = format!(r#"{{"transcript_id":"{}"}}"#, transcript_id_str);
+    let payload_json = payload_str.as_bytes().to_vec();
     let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
     let op = Op::TranscriptEvent(TranscriptEventOp {
         event_id,
@@ -1676,11 +1776,14 @@ pub extern "C" fn cf_transcript_register(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
-    handle.field.transcript_registry.write().register(
-        transcript_id_str.to_string(),
-        session_id_str.to_string(),
-    );
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    {
+        let mut registry = handle.field.transcript_registry.write();
+        registry.set_session_event(session_id_str, "register", payload_str);
+        registry.register(transcript_id_str.to_string(), session_id_str.to_string());
+    }
     handle.ok()
 }
 
@@ -1691,7 +1794,9 @@ pub extern "C" fn cf_transcript_update_progress(
     transcript_id: *const c_char,
     progress_pct: f32,
 ) -> c_int {
-    if h.is_null() || transcript_id.is_null() { return -1; }
+    if h.is_null() || transcript_id.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let transcript_id_str = unsafe {
@@ -1707,14 +1812,26 @@ pub extern "C" fn cf_transcript_update_progress(
         .unwrap_or_default()
         .as_millis() as i64;
 
-    let payload_json = format!(
+    let session_id = {
+        let registry = handle.field.transcript_registry.read();
+        registry
+            .get(transcript_id_str)
+            .map(|record| record.session_id.clone())
+    };
+    let session_id = match session_id {
+        Some(session_id) => session_id,
+        None => return handle.err(format!("unknown transcript_id: {}", transcript_id_str)),
+    };
+
+    let payload_str = format!(
         r#"{{"transcript_id":"{}","progress_pct":{}}}"#,
         transcript_id_str, progress_pct
-    ).into_bytes();
+    );
+    let payload_json = payload_str.as_bytes().to_vec();
     let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
     let op = Op::TranscriptEvent(TranscriptEventOp {
         event_id,
-        session_id: String::new(),
+        session_id: session_id.clone(),
         kind: "update_progress".to_string(),
         payload_json,
         realm: String::new(),
@@ -1722,8 +1839,14 @@ pub extern "C" fn cf_transcript_update_progress(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
-    handle.field.transcript_registry.write().update_progress(transcript_id_str, progress_pct);
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    {
+        let mut registry = handle.field.transcript_registry.write();
+        registry.set_session_event(&session_id, "update_progress", payload_str);
+        registry.update_progress(transcript_id_str, progress_pct);
+    }
     handle.ok()
 }
 
@@ -1739,7 +1862,9 @@ pub extern "C" fn cf_transcript_add_turn(
     ts_ms: i64,
     out_turn_id: *mut u64,
 ) -> c_int {
-    if h.is_null() || transcript_id.is_null() || out_turn_id.is_null() { return -1; }
+    if h.is_null() || transcript_id.is_null() || out_turn_id.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let transcript_id_str = unsafe {
@@ -1748,7 +1873,9 @@ pub extern "C" fn cf_transcript_add_turn(
             Err(e) => return handle.err(e),
         }
     };
-    let role_str = if role.is_null() { "user" } else {
+    let role_str = if role.is_null() {
+        "user"
+    } else {
         unsafe {
             match CStr::from_ptr(role).to_str() {
                 Ok(s) => s,
@@ -1766,16 +1893,29 @@ pub extern "C" fn cf_transcript_add_turn(
         }
     };
 
-    let payload_json = serde_json::json!({
+    let session_id = {
+        let registry = handle.field.transcript_registry.read();
+        registry
+            .get(transcript_id_str)
+            .map(|record| record.session_id.clone())
+    };
+    let session_id = match session_id {
+        Some(session_id) => session_id,
+        None => return handle.err(format!("unknown transcript_id: {}", transcript_id_str)),
+    };
+
+    let payload_str = serde_json::json!({
         "transcript_id": transcript_id_str,
         "role": role_str,
         "content": content,
-    }).to_string().into_bytes();
+    })
+    .to_string();
+    let payload_json = payload_str.as_bytes().to_vec();
 
     let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
     let op = Op::TranscriptEvent(TranscriptEventOp {
         event_id,
-        session_id: String::new(),
+        session_id: session_id.clone(),
         kind: "add_turn".to_string(),
         payload_json,
         realm: String::new(),
@@ -1783,14 +1923,17 @@ pub extern "C" fn cf_transcript_add_turn(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
-    let turn_id = handle.field.transcript_registry.write().add_turn(
-        transcript_id_str,
-        role_str.to_string(),
-        content,
-        ts_ms,
-    );
-    unsafe { *out_turn_id = turn_id; }
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    let turn_id = {
+        let mut registry = handle.field.transcript_registry.write();
+        registry.set_session_event(&session_id, "add_turn", payload_str);
+        registry.add_turn(transcript_id_str, role_str.to_string(), content, ts_ms)
+    };
+    unsafe {
+        *out_turn_id = turn_id;
+    }
     handle.ok()
 }
 
@@ -1809,7 +1952,9 @@ pub extern "C" fn cf_task_create(
     now_ms: i64,
     fencing_token: u64,
 ) -> c_int {
-    if h.is_null() || task_id.is_null() || kind.is_null() { return -1; }
+    if h.is_null() || task_id.is_null() || kind.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let task_id_str = unsafe {
@@ -1847,7 +1992,9 @@ pub extern "C" fn cf_task_create(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
+    if let Err(e) = result {
+        return handle.err(e);
+    }
     handle.field.task_registry.write().create(
         task_id_str.to_string(),
         kind_str.to_string(),
@@ -1868,7 +2015,9 @@ pub extern "C" fn cf_task_transition(
     now_ms: i64,
     fencing_token: u64,
 ) -> c_int {
-    if h.is_null() || task_id.is_null() || new_status.is_null() { return -1; }
+    if h.is_null() || task_id.is_null() || new_status.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let task_id_str = unsafe {
@@ -1885,7 +2034,10 @@ pub extern "C" fn cf_task_transition(
     };
 
     // Determine task_type from registry for the log op.
-    let task_type = handle.field.task_registry.read()
+    let task_type = handle
+        .field
+        .task_registry
+        .read()
         .get(task_id_str)
         .map(|t| t.kind.clone())
         .unwrap_or_default();
@@ -1903,8 +2055,14 @@ pub extern "C" fn cf_task_transition(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
-    handle.field.task_registry.write().transition(task_id_str, status_str, now_ms, fencing_token);
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    handle
+        .field
+        .task_registry
+        .write()
+        .transition(task_id_str, status_str, now_ms, fencing_token);
     handle.ok()
 }
 
@@ -1921,7 +2079,9 @@ pub extern "C" fn cf_task_list(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let filter_str = if kind_filter.is_null() {
@@ -1941,7 +2101,11 @@ pub extern "C" fn cf_task_list(
         let registry = handle.field.task_registry.read();
         let records: Vec<_> = if active_only != 0 {
             if let Some(kind) = filter_str {
-                registry.list_active().into_iter().filter(|t| t.kind == kind).collect()
+                registry
+                    .list_active()
+                    .into_iter()
+                    .filter(|t| t.kind == kind)
+                    .collect()
             } else {
                 registry.list_active()
             }
@@ -1950,14 +2114,19 @@ pub extern "C" fn cf_task_list(
         } else {
             registry.list_all()
         };
-        records.iter().map(|t| serde_json::json!({
-            "task_id": t.task_id,
-            "kind": t.kind,
-            "status": t.status.as_str(),
-            "payload_json": t.payload_json,
-            "created_at_ms": t.created_at_ms,
-            "updated_at_ms": t.updated_at_ms,
-        })).collect()
+        records
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "task_id": t.task_id,
+                    "kind": t.kind,
+                    "status": t.status.as_str(),
+                    "payload_json": t.payload_json,
+                    "created_at_ms": t.created_at_ms,
+                    "updated_at_ms": t.updated_at_ms,
+                })
+            })
+            .collect()
     }; // registry guard dropped here
 
     let json_str = match serde_json::to_string(&json_val) {
@@ -1988,7 +2157,9 @@ pub extern "C" fn cf_user_model_upsert(
     payload_len: usize,
     now_ms: i64,
 ) -> c_int {
-    if h.is_null() || entity_id.is_null() || entity_type.is_null() { return -1; }
+    if h.is_null() || entity_id.is_null() || entity_type.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let entity_id_str = unsafe {
@@ -2024,7 +2195,9 @@ pub extern "C" fn cf_user_model_upsert(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
+    if let Err(e) = result {
+        return handle.err(e);
+    }
     handle.field.user_model_registry.write().upsert(
         entity_id_str.to_string(),
         entity_type_str.to_string(),
@@ -2041,7 +2214,9 @@ pub extern "C" fn cf_user_model_observe(
     entity_id: *const c_char,
     now_ms: i64,
 ) -> c_int {
-    if h.is_null() || entity_id.is_null() { return -1; }
+    if h.is_null() || entity_id.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let entity_id_str = unsafe {
@@ -2062,8 +2237,14 @@ pub extern "C" fn cf_user_model_observe(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
-    handle.field.user_model_registry.write().observe(entity_id_str, now_ms);
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    handle
+        .field
+        .user_model_registry
+        .write()
+        .observe(entity_id_str, now_ms);
     handle.ok()
 }
 
@@ -2078,7 +2259,9 @@ pub extern "C" fn cf_user_model_list(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let filter_str = if entity_type_filter.is_null() {
@@ -2100,13 +2283,18 @@ pub extern "C" fn cf_user_model_list(
         } else {
             registry.list_all()
         };
-        entries.iter().map(|e| serde_json::json!({
-            "entity_id": e.entity_id,
-            "entity_type": e.entity_type,
-            "payload_json": e.payload_json,
-            "updated_at_ms": e.updated_at_ms,
-            "observation_count": e.observation_count,
-        })).collect()
+        entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "entity_id": e.entity_id,
+                    "entity_type": e.entity_type,
+                    "payload_json": e.payload_json,
+                    "updated_at_ms": e.updated_at_ms,
+                    "observation_count": e.observation_count,
+                })
+            })
+            .collect()
     };
 
     let json_str = match serde_json::to_string(&json_val) {
@@ -2128,12 +2316,10 @@ pub extern "C" fn cf_user_model_list(
 
 /// Create a new named theme.
 #[no_mangle]
-pub extern "C" fn cf_theme_create(
-    h: *mut CfHandle,
-    theme_id: u64,
-    name: *const c_char,
-) -> c_int {
-    if h.is_null() || name.is_null() { return -1; }
+pub extern "C" fn cf_theme_create(h: *mut CfHandle, theme_id: u64, name: *const c_char) -> c_int {
+    if h.is_null() || name.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let name_str = unsafe {
@@ -2154,8 +2340,14 @@ pub extern "C" fn cf_theme_create(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
-    handle.field.theme_organ.write().create(theme_id, name_str.to_string());
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    handle
+        .field
+        .theme_organ
+        .write()
+        .create(theme_id, name_str.to_string());
     handle.ok()
 }
 
@@ -2168,7 +2360,9 @@ pub extern "C" fn cf_theme_update_centroid(
     centroid_json: *const u8,
     centroid_len: usize,
 ) -> c_int {
-    if h.is_null() { return -1; }
+    if h.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let centroid_str = if centroid_json.is_null() || centroid_len == 0 {
@@ -2192,19 +2386,23 @@ pub extern "C" fn cf_theme_update_centroid(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
-    handle.field.theme_organ.write().update_centroid(theme_id, centroid_str);
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    handle
+        .field
+        .theme_organ
+        .write()
+        .update_centroid(theme_id, centroid_str);
     handle.ok()
 }
 
 /// Assign a memory to a theme.
 #[no_mangle]
-pub extern "C" fn cf_theme_assign_member(
-    h: *mut CfHandle,
-    theme_id: u64,
-    memory_id: u64,
-) -> c_int {
-    if h.is_null() { return -1; }
+pub extern "C" fn cf_theme_assign_member(h: *mut CfHandle, theme_id: u64, memory_id: u64) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let payload = serde_json::json!({ "memory_id": memory_id }).to_string();
@@ -2218,19 +2416,23 @@ pub extern "C" fn cf_theme_assign_member(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
-    handle.field.theme_organ.write().assign_member(theme_id, memory_id);
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    handle
+        .field
+        .theme_organ
+        .write()
+        .assign_member(theme_id, memory_id);
     handle.ok()
 }
 
 /// Remove a memory from a theme.
 #[no_mangle]
-pub extern "C" fn cf_theme_remove_member(
-    h: *mut CfHandle,
-    theme_id: u64,
-    memory_id: u64,
-) -> c_int {
-    if h.is_null() { return -1; }
+pub extern "C" fn cf_theme_remove_member(h: *mut CfHandle, theme_id: u64, memory_id: u64) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let payload = serde_json::json!({ "memory_id": memory_id }).to_string();
@@ -2244,8 +2446,14 @@ pub extern "C" fn cf_theme_remove_member(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
-    handle.field.theme_organ.write().remove_member(theme_id, memory_id);
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    handle
+        .field
+        .theme_organ
+        .write()
+        .remove_member(theme_id, memory_id);
     handle.ok()
 }
 
@@ -2259,17 +2467,25 @@ pub extern "C" fn cf_theme_list(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let json_val: Vec<serde_json::Value> = {
         let organ = handle.field.theme_organ.read();
-        organ.list_all().iter().map(|t| serde_json::json!({
-            "theme_id": t.theme_id,
-            "name": t.name,
-            "member_count": t.member_ids.len(),
-            "centroid_json": t.centroid,
-        })).collect()
+        organ
+            .list_all()
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "theme_id": t.theme_id,
+                    "name": t.name,
+                    "member_count": t.member_ids.len(),
+                    "centroid_json": t.centroid,
+                })
+            })
+            .collect()
     };
 
     let json_str = match serde_json::to_string(&json_val) {
@@ -2296,19 +2512,23 @@ pub extern "C" fn cf_theme_get(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let theme_val = {
         let organ = handle.field.theme_organ.read();
-        organ.get(theme_id).map(|t| serde_json::json!({
-            "theme_id": t.theme_id,
-            "name": t.name,
-            "realm": t.realm,
-            "coherence": t.coherence,
-            "member_count": t.member_ids.len(),
-            "created_at": t.created_at,
-        }))
+        organ.get(theme_id).map(|t| {
+            serde_json::json!({
+                "theme_id": t.theme_id,
+                "name": t.name,
+                "realm": t.realm,
+                "coherence": t.coherence,
+                "member_count": t.member_ids.len(),
+                "created_at": t.created_at,
+            })
+        })
     };
     let json_str = match theme_val {
         None => return 1,
@@ -2319,7 +2539,9 @@ pub extern "C" fn cf_theme_get(
     };
 
     let bytes = json_str.as_bytes();
-    if bytes.len() > buf_cap { return -2; }
+    if bytes.len() > buf_cap {
+        return -2;
+    }
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
         *written = bytes.len();
@@ -2336,7 +2558,9 @@ pub extern "C" fn cf_theme_stats(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let realm_str = if realm.is_null() {
@@ -2351,7 +2575,11 @@ pub extern "C" fn cf_theme_stats(
     };
 
     let total_memory_count = handle.field.payloads.read().len();
-    let stats = handle.field.theme_organ.read().stats(realm_str, total_memory_count);
+    let stats = handle
+        .field
+        .theme_organ
+        .read()
+        .stats(realm_str, total_memory_count);
 
     let json_str = match serde_json::to_string(&serde_json::json!({
         "total_themes": stats.total_themes,
@@ -2365,7 +2593,9 @@ pub extern "C" fn cf_theme_stats(
     };
 
     let bytes = json_str.as_bytes();
-    if bytes.len() > buf_cap { return -2; }
+    if bytes.len() > buf_cap {
+        return -2;
+    }
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
         *written = bytes.len();
@@ -2385,7 +2615,9 @@ pub extern "C" fn cf_theme_recall(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || embedding_ptr.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || embedding_ptr.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let embedding = unsafe { std::slice::from_raw_parts(embedding_ptr, embedding_len) };
@@ -2401,12 +2633,21 @@ pub extern "C" fn cf_theme_recall(
         }
     };
 
-    let hits = handle.field.theme_organ.read().recall_by_embedding(embedding, k, realm_str);
+    let hits = handle
+        .field
+        .theme_organ
+        .read()
+        .recall_by_embedding(embedding, k, realm_str);
 
-    let json_val: Vec<serde_json::Value> = hits.iter().map(|(tid, score)| serde_json::json!({
-        "theme_id": tid,
-        "score": score,
-    })).collect();
+    let json_val: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|(tid, score)| {
+            serde_json::json!({
+                "theme_id": tid,
+                "score": score,
+            })
+        })
+        .collect();
 
     let json_str = match serde_json::to_string(&json_val) {
         Ok(s) => s,
@@ -2414,7 +2655,9 @@ pub extern "C" fn cf_theme_recall(
     };
 
     let bytes = json_str.as_bytes();
-    if bytes.len() > buf_cap { return -2; }
+    if bytes.len() > buf_cap {
+        return -2;
+    }
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
         *written = bytes.len();
@@ -2430,12 +2673,17 @@ pub extern "C" fn cf_theme_maintain(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let embeddings: std::collections::HashMap<u64, Vec<f32>> = {
         let payloads = handle.field.payloads.read();
-        payloads.iter().map(|(id, p)| (*id, p.embedding.clone())).collect()
+        payloads
+            .iter()
+            .map(|(id, p)| (*id, p.embedding.clone()))
+            .collect()
     };
 
     let result = handle.field.theme_organ.write().maintain(&embeddings);
@@ -2450,7 +2698,9 @@ pub extern "C" fn cf_theme_maintain(
     };
 
     let bytes = json_str.as_bytes();
-    if bytes.len() > buf_cap { return -2; }
+    if bytes.len() > buf_cap {
+        return -2;
+    }
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
         *written = bytes.len();
@@ -2468,7 +2718,9 @@ pub extern "C" fn cf_theme_assign_orphans(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let realm_str: String = if realm.is_null() {
@@ -2485,7 +2737,8 @@ pub extern "C" fn cf_theme_assign_orphans(
     let (all_memory_ids, embeddings): (Vec<u64>, std::collections::HashMap<u64, Vec<f32>>) = {
         let payloads = handle.field.payloads.read();
         let ids: Vec<u64> = payloads.keys().copied().collect();
-        let embs: std::collections::HashMap<u64, Vec<f32>> = payloads.iter()
+        let embs: std::collections::HashMap<u64, Vec<f32>> = payloads
+            .iter()
             .map(|(id, p)| (*id, p.embedding.clone()))
             .collect();
         (ids, embs)
@@ -2508,7 +2761,9 @@ pub extern "C" fn cf_theme_assign_orphans(
     };
 
     let bytes = json_str.as_bytes();
-    if bytes.len() > buf_cap { return -2; }
+    if bytes.len() > buf_cap {
+        return -2;
+    }
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
         *written = bytes.len();
@@ -2534,7 +2789,9 @@ pub extern "C" fn cf_analytics_append(
     payload_len: usize,
     ts_ms: i64,
 ) -> c_int {
-    if h.is_null() || kind.is_null() { return -1; }
+    if h.is_null() || kind.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let kind_str = unsafe {
@@ -2573,7 +2830,9 @@ pub extern "C" fn cf_analytics_append(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { return handle.err(e); }
+    if let Err(e) = result {
+        return handle.err(e);
+    }
     handle.field.analytics_registry.write().append(
         kind_str.to_string(),
         entity_id_str.to_string(),
@@ -2593,18 +2852,26 @@ pub extern "C" fn cf_analytics_recent(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let json_val: Vec<serde_json::Value> = {
         let registry = handle.field.analytics_registry.read();
-        registry.recent(limit).into_iter().map(|e| serde_json::json!({
-            "id":           e.id,
-            "kind":         e.kind,
-            "entity_id":    e.entity_id,
-            "payload_json": e.payload_json,
-            "ts_ms":        e.ts_ms,
-        })).collect()
+        registry
+            .recent(limit)
+            .into_iter()
+            .map(|e| {
+                serde_json::json!({
+                    "id":           e.id,
+                    "kind":         e.kind,
+                    "entity_id":    e.entity_id,
+                    "payload_json": e.payload_json,
+                    "ts_ms":        e.ts_ms,
+                })
+            })
+            .collect()
     };
 
     let json_str = match serde_json::to_string(&json_val) {
@@ -2653,7 +2920,9 @@ pub extern "C" fn cf_recall_filtered(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let kind_filter = if kind.is_null() {
@@ -2691,15 +2960,25 @@ pub extern "C" fn cf_recall_filtered(
     let mut results: Vec<serde_json::Value> = Vec::new();
     for (mid, payload) in payloads.iter() {
         if let Some(state) = states.get(mid) {
-            if state.deleted { continue; }
-            if state.confidence < min_confidence { continue; }
+            if state.deleted {
+                continue;
+            }
+            if state.confidence < min_confidence {
+                continue;
+            }
             let eff_strength = state.effective_strength(now);
-            if eff_strength < min_strength { continue; }
+            if eff_strength < min_strength {
+                continue;
+            }
             if let Some(k) = kind_filter {
-                if payload.kind != k { continue; }
+                if payload.kind != k {
+                    continue;
+                }
             }
             if let Some(r) = realm_filter {
-                if payload.realm != r { continue; }
+                if payload.realm != r {
+                    continue;
+                }
             }
             let content_str = String::from_utf8_lossy(&payload.content);
             results.push(serde_json::json!({
@@ -2711,7 +2990,9 @@ pub extern "C" fn cf_recall_filtered(
                 "strength": eff_strength,
                 "ts_ms": payload.created_at_ms,
             }));
-            if results.len() >= limit { break; }
+            if results.len() >= limit {
+                break;
+            }
         }
     }
 
@@ -2740,7 +3021,9 @@ pub extern "C" fn cf_list_memories(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let kind_filter = if kind.is_null() {
@@ -2786,29 +3069,46 @@ pub extern "C" fn cf_list_memories(
     let payloads = handle.field.payloads.read();
     let states = handle.field.states.read();
 
-    let mut entries: Vec<(u64, &crate::payload::MemoryPayload, &crate::state::MemoryState)> = Vec::new();
+    let mut entries: Vec<(
+        u64,
+        &crate::payload::MemoryPayload,
+        &crate::state::MemoryState,
+    )> = Vec::new();
     for (mid, payload) in payloads.iter() {
         if let Some(state) = states.get(mid) {
-            if state.deleted { continue; }
+            if state.deleted {
+                continue;
+            }
             if let Some(ref k) = kind_filter {
-                if payload.kind != *k { continue; }
+                if payload.kind != *k {
+                    continue;
+                }
             }
             if let Some(ref r) = realm_filter {
-                if payload.realm != *r { continue; }
+                if payload.realm != *r {
+                    continue;
+                }
             }
             entries.push((*mid, payload, state));
         }
     }
 
     match sort_str {
-        "strength" => entries.sort_by(|a, b|
-            b.2.effective_strength(now).partial_cmp(&a.2.effective_strength(now)).unwrap_or(std::cmp::Ordering::Equal)),
-        "confidence" => entries.sort_by(|a, b|
-            b.2.confidence.partial_cmp(&a.2.confidence).unwrap_or(std::cmp::Ordering::Equal)),
+        "strength" => entries.sort_by(|a, b| {
+            b.2.effective_strength(now)
+                .partial_cmp(&a.2.effective_strength(now))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        "confidence" => entries.sort_by(|a, b| {
+            b.2.confidence
+                .partial_cmp(&a.2.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
         _ => entries.sort_by(|a, b| b.1.created_at_ms.cmp(&a.1.created_at_ms)),
     }
 
-    let page: Vec<serde_json::Value> = entries.iter()
+    let page: Vec<serde_json::Value> = entries
+        .iter()
         .skip(offset)
         .take(limit)
         .map(|(mid, payload, state)| {
@@ -2847,7 +3147,9 @@ pub extern "C" fn cf_memory_stats(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let realm_str = if realm_filter.is_null() {
@@ -2871,16 +3173,21 @@ pub extern "C" fn cf_memory_stats(
     let payloads = handle.field.payloads.read();
     let states = handle.field.states.read();
 
-    let mut count_by_kind: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut count_by_kind: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut total: usize = 0;
     let mut sum_confidence: f64 = 0.0;
     let mut sum_strength: f64 = 0.0;
 
     for (mid, payload) in payloads.iter() {
         if let Some(state) = states.get(mid) {
-            if state.deleted { continue; }
+            if state.deleted {
+                continue;
+            }
             if let Some(r) = realm_str {
-                if payload.realm != r { continue; }
+                if payload.realm != r {
+                    continue;
+                }
             }
             total += 1;
             sum_confidence += state.confidence as f64;
@@ -2892,8 +3199,16 @@ pub extern "C" fn cf_memory_stats(
     drop(payloads);
     drop(states);
 
-    let avg_confidence = if total > 0 { sum_confidence / total as f64 } else { 0.0 };
-    let avg_strength = if total > 0 { sum_strength / total as f64 } else { 0.0 };
+    let avg_confidence = if total > 0 {
+        sum_confidence / total as f64
+    } else {
+        0.0
+    };
+    let avg_strength = if total > 0 {
+        sum_strength / total as f64
+    } else {
+        0.0
+    };
 
     let json_str = match serde_json::to_string(&serde_json::json!({
         "total": total,
@@ -2917,7 +3232,9 @@ pub extern "C" fn cf_task_get(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || task_id.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || task_id.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let task_id_str = unsafe {
@@ -2957,23 +3274,34 @@ pub extern "C" fn cf_task_update_payload(
     payload_json: *const c_char,
     now_ms: i64,
 ) -> i32 {
-    if h.is_null() || task_id.is_null() || payload_json.is_null() { return -1; }
+    if h.is_null() || task_id.is_null() || payload_json.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let task_id_str = unsafe {
         match CStr::from_ptr(task_id).to_str() {
             Ok(s) => s,
-            Err(e) => { handle.err(e); return -1; }
+            Err(e) => {
+                handle.err(e);
+                return -1;
+            }
         }
     };
     let payload_str = unsafe {
         match CStr::from_ptr(payload_json).to_str() {
             Ok(s) => s,
-            Err(e) => { handle.err(e); return -1; }
+            Err(e) => {
+                handle.err(e);
+                return -1;
+            }
         }
     };
 
-    let task_type = handle.field.task_registry.read()
+    let task_type = handle
+        .field
+        .task_registry
+        .read()
         .get(task_id_str)
         .map(|t| t.kind.clone())
         .unwrap_or_default();
@@ -2996,8 +3324,15 @@ pub extern "C" fn cf_task_update_payload(
     });
 
     let result = handle.field.log.write().append(&op);
-    if let Err(e) = result { handle.err(e); return -1; }
-    if handle.field.task_registry.write().update_payload(task_id_str, payload_str.to_string(), now_ms) {
+    if let Err(e) = result {
+        handle.err(e);
+        return -1;
+    }
+    if handle.field.task_registry.write().update_payload(
+        task_id_str,
+        payload_str.to_string(),
+        now_ms,
+    ) {
         handle.ok();
         0
     } else {
@@ -3016,7 +3351,9 @@ pub extern "C" fn cf_session_list(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let json_val: Vec<serde_json::Value> = {
@@ -3026,14 +3363,19 @@ pub extern "C" fn cf_session_list(
         } else {
             registry.list_all()
         };
-        records.iter().map(|s| serde_json::json!({
-            "session_id": s.session_id,
-            "kind": s.kind,
-            "realm": s.realm,
-            "started_at_ms": s.started_at_ms,
-            "last_heartbeat_ms": s.last_heartbeat_ms,
-            "status": s.status,
-        })).collect()
+        records
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "session_id": s.session_id,
+                    "kind": s.kind,
+                    "realm": s.realm,
+                    "started_at_ms": s.started_at_ms,
+                    "last_heartbeat_ms": s.last_heartbeat_ms,
+                    "status": s.status,
+                })
+            })
+            .collect()
     };
 
     let json_str = match serde_json::to_string(&json_val) {
@@ -3053,7 +3395,9 @@ pub extern "C" fn cf_transcript_list(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let json_val: Vec<serde_json::Value> = {
@@ -3064,12 +3408,18 @@ pub extern "C" fn cf_transcript_list(
             let b_ts = b.turns.last().map(|t| t.ts_ms).unwrap_or(0);
             b_ts.cmp(&a_ts)
         });
-        records.iter().take(limit).map(|t| serde_json::json!({
-            "transcript_id": t.transcript_id,
-            "session_id": t.session_id,
-            "progress_pct": t.progress_pct,
-            "turn_count": t.turns.len(),
-        })).collect()
+        records
+            .iter()
+            .take(limit)
+            .map(|t| {
+                serde_json::json!({
+                    "transcript_id": t.transcript_id,
+                    "session_id": t.session_id,
+                    "progress_pct": t.progress_pct,
+                    "turn_count": t.turns.len(),
+                })
+            })
+            .collect()
     };
 
     let json_str = match serde_json::to_string(&json_val) {
@@ -3089,7 +3439,9 @@ pub extern "C" fn cf_get_memory_metadata(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3133,7 +3485,11 @@ pub extern "C" fn cf_get_memory_metadata(
     let rc = write_json_buf(&json_str, buf, buf_cap, written);
     drop(payloads);
     drop(states);
-    if rc == 0 { handle.ok() } else { rc }
+    if rc == 0 {
+        handle.ok()
+    } else {
+        rc
+    }
 }
 
 /// 9. Update memory kind field (returns 0=ok, -1=not found/error).
@@ -3143,13 +3499,18 @@ pub extern "C" fn cf_update_memory_kind(
     memory_id: u64,
     new_kind: *const c_char,
 ) -> i32 {
-    if h.is_null() || new_kind.is_null() { return -1; }
+    if h.is_null() || new_kind.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let kind_str = unsafe {
         match CStr::from_ptr(new_kind).to_str() {
             Ok(s) => s,
-            Err(e) => { handle.err(e); return -1; }
+            Err(e) => {
+                handle.err(e);
+                return -1;
+            }
         }
     };
 
@@ -3180,7 +3541,9 @@ pub extern "C" fn cf_list_triplets_for_entity(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || entity.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || entity.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
 
     let entity_str = unsafe {
@@ -3190,8 +3553,7 @@ pub extern "C" fn cf_list_triplets_for_entity(
         }
     };
 
-    let mut entries = handle.field.query_entity(entity_str)
-        .unwrap_or_default();
+    let mut entries = handle.field.query_entity(entity_str).unwrap_or_default();
     entries.truncate(limit);
 
     // Reuse write_triplets_json (already defined above)
@@ -3210,24 +3572,33 @@ pub extern "C" fn cf_list_code_files(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
-    let project = if project_filter.is_null() { None } else {
-        unsafe { match CStr::from_ptr(project_filter).to_str() {
-            Ok(s) if !s.is_empty() => Some(s.to_string()),
-            Ok(_) => None,
-            Err(e) => return handle.err(e),
-        }}
+    let project = if project_filter.is_null() {
+        None
+    } else {
+        unsafe {
+            match CStr::from_ptr(project_filter).to_str() {
+                Ok(s) if !s.is_empty() => Some(s.to_string()),
+                Ok(_) => None,
+                Err(e) => return handle.err(e),
+            }
+        }
     };
     let files = handle.field.code_files.read();
-    let result: Vec<serde_json::Value> = files.iter()
+    let result: Vec<serde_json::Value> = files
+        .iter()
         .filter(|f| project.as_ref().map(|p| f.project == *p).unwrap_or(true))
-        .map(|f| serde_json::json!({
-            "id": f.id,
-            "path": f.path,
-            "project": f.project,
-            "mtime": f.mtime,
-        }))
+        .map(|f| {
+            serde_json::json!({
+                "id": f.id,
+                "path": f.path,
+                "project": f.project,
+                "mtime": f.mtime,
+            })
+        })
         .collect();
     drop(files);
     let json_str = match serde_json::to_string(&result) {
@@ -3235,27 +3606,34 @@ pub extern "C" fn cf_list_code_files(
         Err(e) => return handle.err(e),
     };
     let rc = write_json_buf(&json_str, buf, buf_cap, written);
-    if rc == 0 { handle.ok(); }
+    if rc == 0 {
+        handle.ok();
+    }
     rc
 }
 
 /// Remove all code files and their associated symbols for a project.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
-pub extern "C" fn cf_clear_project(
-    h: *mut CfHandle,
-    project: *const c_char,
-) -> c_int {
-    if h.is_null() || project.is_null() { return -1; }
+pub extern "C" fn cf_clear_project(h: *mut CfHandle, project: *const c_char) -> c_int {
+    if h.is_null() || project.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
-    let project_str = unsafe { match CStr::from_ptr(project).to_str() {
-        Ok(s) => s.to_string(),
-        Err(e) => return handle.err(e),
-    }};
+    let project_str = unsafe {
+        match CStr::from_ptr(project).to_str() {
+            Ok(s) => s.to_string(),
+            Err(e) => return handle.err(e),
+        }
+    };
     // Log op first for durability
-    let op = Op::ClearProject(ClearProjectOp { project: project_str.clone() });
+    let op = Op::ClearProject(ClearProjectOp {
+        project: project_str.clone(),
+    });
     let log_result = handle.field.log.write().append(&op);
-    if let Err(e) = log_result { return handle.err(e); }
+    if let Err(e) = log_result {
+        return handle.err(e);
+    }
     // Apply in-memory
     let mut files = handle.field.code_files.write();
     let removed_paths = files.remove_by_project(&project_str);
@@ -3280,24 +3658,33 @@ pub extern "C" fn cf_set_symbol_description(
     description: *const c_char,
     description_len: usize,
 ) -> c_int {
-    if h.is_null() || description.is_null() { return -1; }
+    if h.is_null() || description.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
     let desc = match unsafe {
-        std::str::from_utf8(std::slice::from_raw_parts(description as *const u8, description_len))
+        std::str::from_utf8(std::slice::from_raw_parts(
+            description as *const u8,
+            description_len,
+        ))
     } {
         Ok(s) => s.to_string(),
         Err(e) => return handle.err(e),
     };
     {
         let syms = handle.field.symbol_idx.read();
-        if syms.get(symbol_id).is_none() { return 1; }
+        if syms.get(symbol_id).is_none() {
+            return 1;
+        }
     }
     let op = Op::UpdateSymbolDescription(UpdateSymbolDescriptionOp {
         symbol_id,
         description: desc.clone(),
     });
     let log_result = handle.field.log.write().append(&op);
-    if let Err(e) = log_result { return handle.err(e); }
+    if let Err(e) = log_result {
+        return handle.err(e);
+    }
     if let Some(sym) = handle.field.symbol_idx.write().get_mut(symbol_id) {
         sym.description = Some(desc);
     }
@@ -3315,7 +3702,9 @@ pub extern "C" fn cf_update_memory_content(
     embedding: *const f32,
     embedding_len: usize,
 ) -> c_int {
-    if h.is_null() || content.is_null() { return -1; }
+    if h.is_null() || content.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
     let new_content = unsafe { std::slice::from_raw_parts(content, content_len) }.to_vec();
     let new_embedding: Vec<f32> = if embedding.is_null() || embedding_len == 0 {
@@ -3326,11 +3715,14 @@ pub extern "C" fn cf_update_memory_content(
     if !new_embedding.is_empty() && new_embedding.len() != crate::ops::EMBED_DIM {
         return handle.err(format!(
             "embedding length {} != EMBED_DIM {}",
-            new_embedding.len(), crate::ops::EMBED_DIM
+            new_embedding.len(),
+            crate::ops::EMBED_DIM
         ));
     }
     // Check existence before logging op
-    if !handle.field.payloads.read().contains_key(&id) { return 1; }
+    if !handle.field.payloads.read().contains_key(&id) {
+        return 1;
+    }
     // Log for durability
     let op = Op::UpdateMemoryContent(UpdateMemoryContentOp {
         memory_id: id,
@@ -3338,7 +3730,9 @@ pub extern "C" fn cf_update_memory_content(
         embedding: new_embedding.clone(),
     });
     let log_result = handle.field.log.write().append(&op);
-    if let Err(e) = log_result { return handle.err(e); }
+    if let Err(e) = log_result {
+        return handle.err(e);
+    }
     // Apply in-memory
     if let Some(payload) = handle.field.payloads.write().get_mut(&id) {
         payload.content = new_content.clone();
@@ -3365,7 +3759,9 @@ pub extern "C" fn cf_realm_list(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
     let payloads = handle.field.payloads.read();
     let states = handle.field.states.read();
@@ -3399,18 +3795,22 @@ pub extern "C" fn cf_recall_by_kind(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
-    if h.is_null() || kind.is_null() || buf.is_null() || written.is_null() { return -1; }
+    if h.is_null() || kind.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
     let handle = unsafe { &mut *h };
-    let kind_str = unsafe { match CStr::from_ptr(kind).to_str() {
-        Ok(s) => s.to_string(),
-        Err(e) => return handle.err(e),
-    }};
+    let kind_str = unsafe {
+        match CStr::from_ptr(kind).to_str() {
+            Ok(s) => s.to_string(),
+            Err(e) => return handle.err(e),
+        }
+    };
     let payloads = handle.field.payloads.read();
     let states = handle.field.states.read();
-    let mut entries: Vec<(u64, f32, &[u8])> = payloads.iter()
+    let mut entries: Vec<(u64, f32, &[u8])> = payloads
+        .iter()
         .filter(|(mid, payload)| {
-            payload.kind == kind_str &&
-            states.get(mid).map(|s| !s.deleted).unwrap_or(false)
+            payload.kind == kind_str && states.get(mid).map(|s| !s.deleted).unwrap_or(false)
         })
         .map(|(mid, payload)| {
             let conf = states.get(mid).map(|s| s.confidence).unwrap_or(0.0);
@@ -3418,13 +3818,16 @@ pub extern "C" fn cf_recall_by_kind(
         })
         .collect();
     entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let page: Vec<serde_json::Value> = entries.iter()
+    let page: Vec<serde_json::Value> = entries
+        .iter()
         .take(limit)
-        .map(|(mid, conf, content)| serde_json::json!({
-            "id": mid,
-            "confidence": conf,
-            "content": String::from_utf8_lossy(content),
-        }))
+        .map(|(mid, conf, content)| {
+            serde_json::json!({
+                "id": mid,
+                "confidence": conf,
+                "content": String::from_utf8_lossy(content),
+            })
+        })
         .collect();
     drop(payloads);
     drop(states);
@@ -3450,6 +3853,33 @@ mod tests {
         (h, tmp)
     }
 
+    unsafe fn get_latest_event(
+        h: *mut CfHandle,
+        domain: &str,
+        kind: &str,
+        entity_id: &str,
+    ) -> Result<Option<String>, c_int> {
+        let domain = CString::new(domain).unwrap();
+        let kind = CString::new(kind).unwrap();
+        let entity_id = CString::new(entity_id).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let mut written = 0usize;
+        let rc = cf_get_latest_event(
+            h,
+            domain.as_ptr(),
+            kind.as_ptr(),
+            entity_id.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut written,
+        );
+        match rc {
+            0 => Ok(Some(String::from_utf8(buf[..written].to_vec()).unwrap())),
+            1 => Ok(None),
+            other => Err(other),
+        }
+    }
+
     #[test]
     fn test_ffi_put_recall() {
         unsafe {
@@ -3460,23 +3890,44 @@ mod tests {
             let embedding = vec![0.1f32; 768];
             let mut id: u64 = 0;
 
-            let r = cf_put_memory(h,
-                kind.as_ptr(), realm.as_ptr(),
-                content.as_ptr(), content.len(),
-                embedding.as_ptr(), embedding.len(),
-                0.9, 0.001, 0,
+            let r = cf_put_memory(
+                h,
+                kind.as_ptr(),
+                realm.as_ptr(),
+                content.as_ptr(),
+                content.len(),
+                embedding.as_ptr(),
+                embedding.len(),
+                0.9,
+                0.001,
+                0,
                 &mut id,
             );
             assert_eq!(r, 0);
             assert!(id > 0);
 
             // recall it back
-            let mut hits = vec![CfRecallHit { memory_id: 0, score: 0.0, semantic_score: 0.0, ts_ms: 0, strength: 0.0, confidence: 0.0 }; 10];
+            let mut hits = vec![
+                CfRecallHit {
+                    memory_id: 0,
+                    score: 0.0,
+                    semantic_score: 0.0,
+                    ts_ms: 0,
+                    strength: 0.0,
+                    confidence: 0.0
+                };
+                10
+            ];
             let mut written: usize = 0;
-            let r = cf_recall_semantic(h,
-                embedding.as_ptr(), embedding.len(),
-                realm.as_ptr(), 5,
-                hits.as_mut_ptr(), hits.len(), &mut written,
+            let r = cf_recall_semantic(
+                h,
+                embedding.as_ptr(),
+                embedding.len(),
+                realm.as_ptr(),
+                5,
+                hits.as_mut_ptr(),
+                hits.len(),
+                &mut written,
             );
             assert_eq!(r, 0);
             assert_eq!(written, 1);
@@ -3495,20 +3946,46 @@ mod tests {
             let content = b"to forget";
             let embedding = vec![0.5f32; 768];
             let mut id: u64 = 0;
-            cf_put_memory(h, kind.as_ptr(), realm.as_ptr(),
-                content.as_ptr(), content.len(),
-                embedding.as_ptr(), embedding.len(),
-                1.0, 0.001, 0, &mut id);
+            cf_put_memory(
+                h,
+                kind.as_ptr(),
+                realm.as_ptr(),
+                content.as_ptr(),
+                content.len(),
+                embedding.as_ptr(),
+                embedding.len(),
+                1.0,
+                0.001,
+                0,
+                &mut id,
+            );
 
             let r = cf_forget(h, id);
             assert_eq!(r, 0);
 
             // should not appear in recall
-            let mut hits = vec![CfRecallHit { memory_id: 0, score: 0.0, semantic_score: 0.0, ts_ms: 0, strength: 0.0, confidence: 0.0 }; 10];
+            let mut hits = vec![
+                CfRecallHit {
+                    memory_id: 0,
+                    score: 0.0,
+                    semantic_score: 0.0,
+                    ts_ms: 0,
+                    strength: 0.0,
+                    confidence: 0.0
+                };
+                10
+            ];
             let mut written: usize = 0;
-            cf_recall_semantic(h, embedding.as_ptr(), embedding.len(),
-                std::ptr::null(), 10,
-                hits.as_mut_ptr(), hits.len(), &mut written);
+            cf_recall_semantic(
+                h,
+                embedding.as_ptr(),
+                embedding.len(),
+                std::ptr::null(),
+                10,
+                hits.as_mut_ptr(),
+                hits.len(),
+                &mut written,
+            );
             assert_eq!(written, 0);
 
             cf_close(h);
@@ -3524,10 +4001,19 @@ mod tests {
             let content = b"hello from ffi";
             let embedding = vec![0.3f32; 768];
             let mut id: u64 = 0;
-            cf_put_memory(h, kind.as_ptr(), realm.as_ptr(),
-                content.as_ptr(), content.len(),
-                embedding.as_ptr(), embedding.len(),
-                1.0, 0.001, 0, &mut id);
+            cf_put_memory(
+                h,
+                kind.as_ptr(),
+                realm.as_ptr(),
+                content.as_ptr(),
+                content.len(),
+                embedding.as_ptr(),
+                embedding.len(),
+                1.0,
+                0.001,
+                0,
+                &mut id,
+            );
 
             let mut buf = vec![0u8; 256];
             let mut written: usize = 0;
@@ -3548,10 +4034,19 @@ mod tests {
             let content = b"state test";
             let embedding = vec![0.2f32; 768];
             let mut id: u64 = 0;
-            cf_put_memory(h, kind.as_ptr(), realm.as_ptr(),
-                content.as_ptr(), content.len(),
-                embedding.as_ptr(), embedding.len(),
-                1.0, 0.001, 0, &mut id);
+            cf_put_memory(
+                h,
+                kind.as_ptr(),
+                realm.as_ptr(),
+                content.as_ptr(),
+                content.len(),
+                embedding.as_ptr(),
+                embedding.len(),
+                1.0,
+                0.001,
+                0,
+                &mut id,
+            );
 
             // Apply strength delta
             let r = cf_update_state(h, id, 0.1, f32::NAN, f32::NAN, 1, -1);
@@ -3570,12 +4065,32 @@ mod tests {
             let emb = vec![0.1f32; 768];
             let mut id1: u64 = 0;
             let mut id2: u64 = 0;
-            cf_put_memory(h, kind.as_ptr(), realm.as_ptr(),
-                b"a".as_ptr(), 1, emb.as_ptr(), emb.len(),
-                1.0, 0.001, 0, &mut id1);
-            cf_put_memory(h, kind.as_ptr(), realm.as_ptr(),
-                b"b".as_ptr(), 1, emb.as_ptr(), emb.len(),
-                1.0, 0.001, 0, &mut id2);
+            cf_put_memory(
+                h,
+                kind.as_ptr(),
+                realm.as_ptr(),
+                b"a".as_ptr(),
+                1,
+                emb.as_ptr(),
+                emb.len(),
+                1.0,
+                0.001,
+                0,
+                &mut id1,
+            );
+            cf_put_memory(
+                h,
+                kind.as_ptr(),
+                realm.as_ptr(),
+                b"b".as_ptr(),
+                1,
+                emb.as_ptr(),
+                emb.len(),
+                1.0,
+                0.001,
+                0,
+                &mut id2,
+            );
 
             let r = cf_add_assoc_edge(h, id1, id2, 0, 0.8); // DerivedFrom
             assert_eq!(r, 0);
@@ -3612,14 +4127,42 @@ mod tests {
             let realm = CString::new("test").unwrap();
             let emb = vec![0.4f32; 768];
             let mut id: u64 = 0;
-            cf_put_memory(h, kind.as_ptr(), realm.as_ptr(),
-                b"temporal".as_ptr(), 8, emb.as_ptr(), emb.len(),
-                1.0, 0.001, 1000, &mut id);
+            cf_put_memory(
+                h,
+                kind.as_ptr(),
+                realm.as_ptr(),
+                b"temporal".as_ptr(),
+                8,
+                emb.as_ptr(),
+                emb.len(),
+                1.0,
+                0.001,
+                1000,
+                &mut id,
+            );
 
-            let mut hits = vec![CfRecallHit { memory_id: 0, score: 0.0, semantic_score: 0.0, ts_ms: 0, strength: 0.0, confidence: 0.0 }; 10];
+            let mut hits = vec![
+                CfRecallHit {
+                    memory_id: 0,
+                    score: 0.0,
+                    semantic_score: 0.0,
+                    ts_ms: 0,
+                    strength: 0.0,
+                    confidence: 0.0
+                };
+                10
+            ];
             let mut written: usize = 0;
-            let r = cf_recall_temporal(h, 0, 10000, std::ptr::null(), 10,
-                hits.as_mut_ptr(), hits.len(), &mut written);
+            let r = cf_recall_temporal(
+                h,
+                0,
+                10000,
+                std::ptr::null(),
+                10,
+                hits.as_mut_ptr(),
+                hits.len(),
+                &mut written,
+            );
             assert_eq!(r, 0);
             assert_eq!(written, 1);
             assert_eq!(hits[0].memory_id, id);
@@ -3648,9 +4191,19 @@ mod tests {
             let realm = CString::new("test").unwrap();
             let emb = vec![0.1f32; 768];
             let mut id: u64 = 0;
-            cf_put_memory(h, kind.as_ptr(), realm.as_ptr(),
-                b"x".as_ptr(), 1, emb.as_ptr(), emb.len(),
-                1.0, 0.001, 0, &mut id);
+            cf_put_memory(
+                h,
+                kind.as_ptr(),
+                realm.as_ptr(),
+                b"x".as_ptr(),
+                1,
+                emb.as_ptr(),
+                emb.len(),
+                1.0,
+                0.001,
+                0,
+                &mut id,
+            );
             assert_eq!(cf_memory_count(h as *const CfHandle), 1);
 
             cf_forget(h, id);
@@ -3668,20 +4221,34 @@ mod tests {
             let realm = CString::new("myproject").unwrap();
             let emb = vec![0.7f32; 768];
             let mut id: u64 = 0;
-            cf_put_memory(h, kind.as_ptr(), realm.as_ptr(),
-                b"content".as_ptr(), 7, emb.as_ptr(), emb.len(),
-                1.0, 0.001, 0, &mut id);
+            cf_put_memory(
+                h,
+                kind.as_ptr(),
+                realm.as_ptr(),
+                b"content".as_ptr(),
+                7,
+                emb.as_ptr(),
+                emb.len(),
+                1.0,
+                0.001,
+                0,
+                &mut id,
+            );
 
             let mut buf = [0u8; 64];
             let r = cf_get_kind(h, id, buf.as_mut_ptr(), buf.len());
             assert_eq!(r, 0);
-            let kind_result = std::ffi::CStr::from_ptr(buf.as_ptr() as *const c_char).to_str().unwrap();
+            let kind_result = std::ffi::CStr::from_ptr(buf.as_ptr() as *const c_char)
+                .to_str()
+                .unwrap();
             assert_eq!(kind_result, "correction");
 
             let mut buf2 = [0u8; 64];
             let r2 = cf_get_realm(h, id, buf2.as_mut_ptr(), buf2.len());
             assert_eq!(r2, 0);
-            let realm_result = std::ffi::CStr::from_ptr(buf2.as_ptr() as *const c_char).to_str().unwrap();
+            let realm_result = std::ffi::CStr::from_ptr(buf2.as_ptr() as *const c_char)
+                .to_str()
+                .unwrap();
             assert_eq!(realm_result, "myproject");
 
             cf_close(h);
@@ -3697,21 +4264,57 @@ mod tests {
             let emb = vec![0.1f32; 768];
             let mut id1: u64 = 0;
             let mut id2: u64 = 0;
-            cf_put_memory(h, kind.as_ptr(), realm.as_ptr(),
-                b"seed".as_ptr(), 4, emb.as_ptr(), emb.len(),
-                1.0, 0.001, 0, &mut id1);
-            cf_put_memory(h, kind.as_ptr(), realm.as_ptr(),
-                b"linked".as_ptr(), 6, emb.as_ptr(), emb.len(),
-                1.0, 0.001, 0, &mut id2);
+            cf_put_memory(
+                h,
+                kind.as_ptr(),
+                realm.as_ptr(),
+                b"seed".as_ptr(),
+                4,
+                emb.as_ptr(),
+                emb.len(),
+                1.0,
+                0.001,
+                0,
+                &mut id1,
+            );
+            cf_put_memory(
+                h,
+                kind.as_ptr(),
+                realm.as_ptr(),
+                b"linked".as_ptr(),
+                6,
+                emb.as_ptr(),
+                emb.len(),
+                1.0,
+                0.001,
+                0,
+                &mut id2,
+            );
             cf_add_assoc_edge(h, id1, id2, 0, 1.0); // DerivedFrom
 
             let seeds = [id1];
-            let mut hits = vec![CfRecallHit { memory_id: 0, score: 0.0, semantic_score: 0.0, ts_ms: 0, strength: 0.0, confidence: 0.0 }; 10];
+            let mut hits = vec![
+                CfRecallHit {
+                    memory_id: 0,
+                    score: 0.0,
+                    semantic_score: 0.0,
+                    ts_ms: 0,
+                    strength: 0.0,
+                    confidence: 0.0
+                };
+                10
+            ];
             let mut written: usize = 0;
-            let r = cf_expand_associations(h,
-                seeds.as_ptr(), seeds.len(),
-                2, 10,
-                hits.as_mut_ptr(), hits.len(), &mut written);
+            let r = cf_expand_associations(
+                h,
+                seeds.as_ptr(),
+                seeds.len(),
+                2,
+                10,
+                hits.as_mut_ptr(),
+                hits.len(),
+                &mut written,
+            );
             assert_eq!(r, 0);
             assert_eq!(written, 1);
             assert_eq!(hits[0].memory_id, id2);
@@ -3737,12 +4340,10 @@ mod tests {
 
     #[test]
     fn test_ffi_null_handle_returns_error() {
-        unsafe {
-            let r = cf_forget(std::ptr::null_mut(), 1);
-            assert_eq!(r, -1);
-            assert!(cf_last_error(std::ptr::null()).is_null());
-            assert_eq!(cf_memory_count(std::ptr::null()), 0);
-        }
+        let r = cf_forget(std::ptr::null_mut(), 1);
+        assert_eq!(r, -1);
+        assert!(cf_last_error(std::ptr::null()).is_null());
+        assert_eq!(cf_memory_count(std::ptr::null()), 0);
     }
 
     #[test]
@@ -3752,15 +4353,24 @@ mod tests {
             // Register two code files in the same project
             let path1 = CString::new("/proj/a.cpp").unwrap();
             let path2 = CString::new("/proj/b.cpp").unwrap();
-            let proj  = CString::new("proj").unwrap();
+            let proj = CString::new("proj").unwrap();
             let mut file_id: u64 = 0;
-            assert_eq!(cf_upsert_code_file(h, path1.as_ptr(), proj.as_ptr(), 0, &mut file_id), 0);
-            assert_eq!(cf_upsert_code_file(h, path2.as_ptr(), proj.as_ptr(), 0, &mut file_id), 0);
+            assert_eq!(
+                cf_upsert_code_file(h, path1.as_ptr(), proj.as_ptr(), 0, &mut file_id),
+                0
+            );
+            assert_eq!(
+                cf_upsert_code_file(h, path2.as_ptr(), proj.as_ptr(), 0, &mut file_id),
+                0
+            );
 
             // Verify files are listed
             let mut buf = vec![0u8; 4096];
             let mut written = 0usize;
-            assert_eq!(cf_list_code_files(h, proj.as_ptr(), buf.as_mut_ptr(), buf.len(), &mut written), 0);
+            assert_eq!(
+                cf_list_code_files(h, proj.as_ptr(), buf.as_mut_ptr(), buf.len(), &mut written),
+                0
+            );
             let json = std::str::from_utf8(&buf[..written]).unwrap();
             assert!(json.contains("a.cpp") && json.contains("b.cpp"));
 
@@ -3769,7 +4379,10 @@ mod tests {
 
             // Files should be gone
             let mut written2 = 0usize;
-            assert_eq!(cf_list_code_files(h, proj.as_ptr(), buf.as_mut_ptr(), buf.len(), &mut written2), 0);
+            assert_eq!(
+                cf_list_code_files(h, proj.as_ptr(), buf.as_mut_ptr(), buf.len(), &mut written2),
+                0
+            );
             let json2 = std::str::from_utf8(&buf[..written2]).unwrap();
             assert_eq!(json2, "[]");
 
@@ -3781,35 +4394,70 @@ mod tests {
     fn test_ffi_update_memory_content() {
         unsafe {
             let (h, _tmp) = open_tmp();
-            let kind    = CString::new("wisdom").unwrap();
-            let realm   = CString::new("test").unwrap();
+            let kind = CString::new("wisdom").unwrap();
+            let realm = CString::new("test").unwrap();
             let content = b"original content";
-            let emb     = vec![0.1f32; 768];
+            let emb = vec![0.1f32; 768];
             let mut id: u64 = 0;
-            assert_eq!(cf_put_memory(h,
-                kind.as_ptr(), realm.as_ptr(),
-                content.as_ptr(), content.len(),
-                emb.as_ptr(), emb.len(),
-                0.9, 0.001, 0, &mut id), 0);
+            assert_eq!(
+                cf_put_memory(
+                    h,
+                    kind.as_ptr(),
+                    realm.as_ptr(),
+                    content.as_ptr(),
+                    content.len(),
+                    emb.as_ptr(),
+                    emb.len(),
+                    0.9,
+                    0.001,
+                    0,
+                    &mut id
+                ),
+                0
+            );
             assert!(id > 0);
 
             // Update content + embedding
             let new_content = b"updated content";
             let new_emb = vec![0.9f32; 768];
-            assert_eq!(cf_update_memory_content(h, id,
-                new_content.as_ptr(), new_content.len(),
-                new_emb.as_ptr(), new_emb.len()), 0);
+            assert_eq!(
+                cf_update_memory_content(
+                    h,
+                    id,
+                    new_content.as_ptr(),
+                    new_content.len(),
+                    new_emb.as_ptr(),
+                    new_emb.len()
+                ),
+                0
+            );
 
             // Wrong embedding size must fail
             let bad_emb = vec![0.5f32; 3];
-            assert_eq!(cf_update_memory_content(h, id,
-                new_content.as_ptr(), new_content.len(),
-                bad_emb.as_ptr(), bad_emb.len()), -1);
+            assert_eq!(
+                cf_update_memory_content(
+                    h,
+                    id,
+                    new_content.as_ptr(),
+                    new_content.len(),
+                    bad_emb.as_ptr(),
+                    bad_emb.len()
+                ),
+                -1
+            );
 
             // Non-existent ID must return 1
-            assert_eq!(cf_update_memory_content(h, 99999,
-                new_content.as_ptr(), new_content.len(),
-                std::ptr::null(), 0), 1);
+            assert_eq!(
+                cf_update_memory_content(
+                    h,
+                    99999,
+                    new_content.as_ptr(),
+                    new_content.len(),
+                    std::ptr::null(),
+                    0
+                ),
+                1
+            );
 
             cf_close(h);
         }
@@ -3822,16 +4470,29 @@ mod tests {
             let emb = vec![0.1f32; 768];
             let mut id: u64 = 0;
             for realm_name in &["zebra", "alpha", "middle"] {
-                let kind  = CString::new("wisdom").unwrap();
+                let kind = CString::new("wisdom").unwrap();
                 let realm = CString::new(*realm_name).unwrap();
-                let txt   = realm_name.as_bytes();
-                cf_put_memory(h, kind.as_ptr(), realm.as_ptr(),
-                    txt.as_ptr(), txt.len(), emb.as_ptr(), emb.len(),
-                    0.9, 0.001, 0, &mut id);
+                let txt = realm_name.as_bytes();
+                cf_put_memory(
+                    h,
+                    kind.as_ptr(),
+                    realm.as_ptr(),
+                    txt.as_ptr(),
+                    txt.len(),
+                    emb.as_ptr(),
+                    emb.len(),
+                    0.9,
+                    0.001,
+                    0,
+                    &mut id,
+                );
             }
             let mut buf = vec![0u8; 4096];
             let mut written = 0usize;
-            assert_eq!(cf_realm_list(h, buf.as_mut_ptr(), buf.len(), &mut written), 0);
+            assert_eq!(
+                cf_realm_list(h, buf.as_mut_ptr(), buf.len(), &mut written),
+                0
+            );
             let json = std::str::from_utf8(&buf[..written]).unwrap();
             let realms: Vec<String> = serde_json::from_str(json).unwrap();
             let mut sorted = realms.clone();
@@ -3847,12 +4508,185 @@ mod tests {
             let (h, _tmp) = open_tmp();
             // No memories associated yet — should return 0 hits, not an error
             let path = CString::new("src/main.cpp").unwrap();
-            let mut hits = vec![CfRecallHit { memory_id: 0, score: 0.0, semantic_score: 0.0, ts_ms: 0, strength: 0.0, confidence: 0.0 }; 10];
+            let mut hits = vec![
+                CfRecallHit {
+                    memory_id: 0,
+                    score: 0.0,
+                    semantic_score: 0.0,
+                    ts_ms: 0,
+                    strength: 0.0,
+                    confidence: 0.0
+                };
+                10
+            ];
             let mut written: usize = 0;
-            let r = cf_recall_artifact(h, path.as_ptr(), 10,
-                hits.as_mut_ptr(), hits.len(), &mut written);
+            let r = cf_recall_artifact(
+                h,
+                path.as_ptr(),
+                10,
+                hits.as_mut_ptr(),
+                hits.len(),
+                &mut written,
+            );
             assert_eq!(r, 0);
             assert_eq!(written, 0);
+            cf_close(h);
+        }
+    }
+
+    #[test]
+    fn test_ffi_transcript_latest_event_roundtrip_and_reopen() {
+        unsafe {
+            let (h, tmp) = open_tmp();
+            let session_id = CString::new("sess-1").unwrap();
+            let transcript_id = CString::new("tx-1").unwrap();
+            let role = CString::new("assistant").unwrap();
+            let mut turn_id = 0u64;
+
+            assert_eq!(
+                cf_transcript_register(h, transcript_id.as_ptr(), session_id.as_ptr()),
+                0
+            );
+            assert_eq!(
+                cf_transcript_update_progress(h, transcript_id.as_ptr(), 42.5),
+                0
+            );
+            assert_eq!(
+                cf_transcript_add_turn(
+                    h,
+                    transcript_id.as_ptr(),
+                    role.as_ptr(),
+                    b"hello".as_ptr(),
+                    5,
+                    1234,
+                    &mut turn_id,
+                ),
+                0
+            );
+            assert_eq!(turn_id, 0);
+
+            let progress = get_latest_event(h, "transcript", "update_progress", "sess-1")
+                .unwrap()
+                .unwrap();
+            assert!(progress.contains(r#""transcript_id":"tx-1""#));
+            assert!(progress.contains(r#""progress_pct":42.5"#));
+
+            let turn = get_latest_event(h, "transcript", "add_turn", "sess-1")
+                .unwrap()
+                .unwrap();
+            assert!(turn.contains(r#""transcript_id":"tx-1""#));
+            assert!(turn.contains(r#""role":"assistant""#));
+            assert!(turn.contains(r#""content":"hello""#));
+
+            cf_close(h);
+
+            let data = CString::new(tmp.path().join("data").to_str().unwrap()).unwrap();
+            let lock = CString::new(tmp.path().join("lock").to_str().unwrap()).unwrap();
+            let reopened = cf_open(data.as_ptr(), lock.as_ptr());
+            assert!(!reopened.is_null());
+
+            let reopened_progress =
+                get_latest_event(reopened, "transcript", "update_progress", "sess-1")
+                    .unwrap()
+                    .unwrap();
+            assert!(reopened_progress.contains(r#""progress_pct":42.5"#));
+
+            let reopened_turn = get_latest_event(reopened, "transcript", "add_turn", "sess-1")
+                .unwrap()
+                .unwrap();
+            assert!(reopened_turn.contains(r#""content":"hello""#));
+
+            cf_close(reopened);
+        }
+    }
+
+    #[test]
+    fn test_ffi_transcript_update_requires_registered_transcript() {
+        unsafe {
+            let (h, _tmp) = open_tmp();
+            let transcript_id = CString::new("missing").unwrap();
+            assert_eq!(
+                cf_transcript_update_progress(h, transcript_id.as_ptr(), 1.0),
+                -1
+            );
+            assert_eq!(
+                cf_transcript_add_turn(
+                    h,
+                    transcript_id.as_ptr(),
+                    std::ptr::null(),
+                    b"x".as_ptr(),
+                    1,
+                    0,
+                    &mut 0u64,
+                ),
+                -1
+            );
+            cf_close(h);
+        }
+    }
+
+    #[test]
+    fn test_ffi_get_latest_event_returns_buf_too_small() {
+        unsafe {
+            let (h, _tmp) = open_tmp();
+            let entity_id = CString::new("profile-1").unwrap();
+            let entity_type = CString::new("profile").unwrap();
+            assert_eq!(
+                cf_user_model_upsert(
+                    h,
+                    entity_id.as_ptr(),
+                    entity_type.as_ptr(),
+                    br#"{"name":"abcdef"}"#.as_ptr(),
+                    br#"{"name":"abcdef"}"#.len(),
+                    100,
+                ),
+                0
+            );
+
+            let domain = CString::new("user_model").unwrap();
+            let kind = CString::new("profile").unwrap();
+            let mut buf = [0u8; 4];
+            let mut written = 0usize;
+            assert_eq!(
+                cf_get_latest_event(
+                    h,
+                    domain.as_ptr(),
+                    kind.as_ptr(),
+                    entity_id.as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut written,
+                ),
+                -2
+            );
+            assert_eq!(written, 0);
+            cf_close(h);
+        }
+    }
+
+    #[test]
+    fn test_ffi_emit_event_rejects_user_model_domain() {
+        unsafe {
+            let (h, _tmp) = open_tmp();
+            let domain = CString::new("user_model").unwrap();
+            let kind = CString::new("upsert").unwrap();
+            let entity_id = CString::new("profile-1").unwrap();
+            let mut event_id = 0u64;
+            assert_eq!(
+                cf_emit_event(
+                    h,
+                    domain.as_ptr(),
+                    kind.as_ptr(),
+                    entity_id.as_ptr(),
+                    br#"{}"#.as_ptr(),
+                    2,
+                    std::ptr::null(),
+                    0,
+                    &mut event_id,
+                ),
+                -1
+            );
+            assert_eq!(event_id, 0);
             cf_close(h);
         }
     }

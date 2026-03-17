@@ -1,20 +1,20 @@
-use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
-use std::path::Path;
-use std::io::{BufWriter, BufReader, Write, Read};
-use crate::ids::{MemoryId, ArtifactId};
-use crate::payload::MemoryPayload;
-use crate::state::MemoryState;
+use crate::error::{FieldError, Result};
 use crate::field::AssocEdge;
 use crate::hnsw::SemanticIndex;
-use crate::organ::temporal::TemporalIndex;
-use crate::organ::keyword::KeywordIndex;
+use crate::ids::{ArtifactId, MemoryId};
 use crate::organ::artifact::ArtifactIndex;
-use crate::organ::triplet::TripletStore;
-use crate::organ::symbol::SymbolIndex;
 use crate::organ::callgraph::CallGraph;
 use crate::organ::codefile::CodeFileIndex;
-use crate::error::{FieldError, Result};
+use crate::organ::keyword::KeywordIndex;
+use crate::organ::symbol::SymbolIndex;
+use crate::organ::temporal::TemporalIndex;
+use crate::organ::triplet::TripletStore;
+use crate::payload::MemoryPayload;
+use crate::state::MemoryState;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::Path;
 
 const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_0003;
 
@@ -59,7 +59,9 @@ impl FullSnapshot {
         r.read_exact(&mut buf)?;
         let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         if magic != FULL_SNAPSHOT_MAGIC {
-            return Err(FieldError::Manifest("invalid full snapshot magic".to_string()));
+            return Err(FieldError::Manifest(
+                "invalid full snapshot magic".to_string(),
+            ));
         }
         // snapshot_seqno is the first bincode field (u64 LE, 8 bytes)
         Ok(u64::from_le_bytes(buf[8..16].try_into().unwrap()))
@@ -72,9 +74,10 @@ impl FullSnapshot {
         r.read_exact(&mut magic_buf)?;
         let magic = u64::from_le_bytes(magic_buf);
         if magic != FULL_SNAPSHOT_MAGIC {
-            return Err(FieldError::Manifest("invalid full snapshot magic".to_string()));
+            return Err(FieldError::Manifest(
+                "invalid full snapshot magic".to_string(),
+            ));
         }
-        bincode::deserialize_from(r)
-            .map_err(|e| FieldError::Serialization(e.to_string()))
+        bincode::deserialize_from(r).map_err(|e| FieldError::Serialization(e.to_string()))
     }
 }

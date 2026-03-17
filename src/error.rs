@@ -9,7 +9,11 @@ pub enum FieldError {
     CorruptLog { seqno: u64, reason: String },
 
     #[error("CRC mismatch at seqno {seqno}: expected {expected:#010x}, got {actual:#010x}")]
-    CrcMismatch { seqno: u64, expected: u32, actual: u32 },
+    CrcMismatch {
+        seqno: u64,
+        expected: u32,
+        actual: u32,
+    },
 
     #[error("Truncated entry at seqno {seqno}")]
     TruncatedEntry { seqno: u64 },

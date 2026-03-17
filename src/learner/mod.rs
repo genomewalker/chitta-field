@@ -1,12 +1,12 @@
 pub mod bandit;
+pub mod context;
 pub mod plasticity;
 pub mod route;
-pub mod context;
 
 pub use bandit::{BetaPrior, GaussianPrior};
-pub use plasticity::PlasticityLearner;
-pub use route::{RouteLearner, Route, QueryIntent};
 pub use context::ContextLearner;
+pub use plasticity::PlasticityLearner;
+pub use route::{QueryIntent, Route, RouteLearner};
 
 /// Manages all three learners together.
 pub struct LearnerSet {
@@ -39,7 +39,11 @@ mod tests {
         }
         let rate = p.recommended_decay_rate(1);
         // Frequently accessed should decay slower than default
-        assert!(rate < 0.001, "frequent access should lower decay rate, got {}", rate);
+        assert!(
+            rate < 0.001,
+            "frequent access should lower decay rate, got {}",
+            rate
+        );
     }
 
     #[test]
@@ -49,7 +53,8 @@ mod tests {
         for i in 0..20u64 {
             let (ep, _route) = r.select_route(QueryIntent::Code, i * 1000);
             // Force feedback as if Keyword always worked
-            r.arms.entry((QueryIntent::Code, Route::Keyword))
+            r.arms
+                .entry((QueryIntent::Code, Route::Keyword))
                 .or_insert(BetaPrior::new())
                 .update(1.0);
             r.pending.remove(&ep);
@@ -72,8 +77,17 @@ mod tests {
 
     #[test]
     fn test_detect_intent() {
-        assert_eq!(RouteLearner::detect_intent("what happened yesterday"), QueryIntent::Temporal);
-        assert_eq!(RouteLearner::detect_intent("fix the rust code in main.rs"), QueryIntent::FileRef);
-        assert_eq!(RouteLearner::detect_intent("that was wrong actually"), QueryIntent::Correction);
+        assert_eq!(
+            RouteLearner::detect_intent("what happened yesterday"),
+            QueryIntent::Temporal
+        );
+        assert_eq!(
+            RouteLearner::detect_intent("fix the rust code in main.rs"),
+            QueryIntent::FileRef
+        );
+        assert_eq!(
+            RouteLearner::detect_intent("that was wrong actually"),
+            QueryIntent::Correction
+        );
     }
 }

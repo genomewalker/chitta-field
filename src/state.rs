@@ -1,6 +1,6 @@
-use crate::ids::{MemoryId, ChunkHash};
+use crate::ids::{ChunkHash, MemoryId};
 use crate::ops::StateDeltaOp;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Mutable overlay state for a memory — lives separately from the immutable payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,7 +20,7 @@ pub struct MemoryState {
     pub created_at_ms: i64,
 
     pub pinned: bool,
-    pub tier: u8,  // 0=L1 (hippocampus), 1=L2 (cortex), 2=L3 (archive)
+    pub tier: u8, // 0=L1 (hippocampus), 1=L2 (cortex), 2=L3 (archive)
     #[serde(default)]
     pub last_state_op_ts_ms: i64,
 }

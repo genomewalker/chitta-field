@@ -2,18 +2,23 @@
 /// Used by RouteLearner for multi-armed bandit over retrieval routes.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BetaPrior {
-    pub alpha: f64,   // successes + 1
-    pub beta: f64,    // failures + 1
+    pub alpha: f64, // successes + 1
+    pub beta: f64,  // failures + 1
 }
 
 impl BetaPrior {
-    pub fn new() -> Self { Self { alpha: 1.0, beta: 1.0 } }
+    pub fn new() -> Self {
+        Self {
+            alpha: 1.0,
+            beta: 1.0,
+        }
+    }
 
     /// Update with outcome (reward in [0,1]).
     pub fn update(&mut self, reward: f32) {
         let r = reward.clamp(0.0, 1.0) as f64;
         self.alpha += r;
-        self.beta  += 1.0 - r;
+        self.beta += 1.0 - r;
     }
 
     /// Expected value (mean of Beta distribution).
@@ -32,14 +37,19 @@ impl BetaPrior {
         let std = var.sqrt();
         // Box-Muller with LCG seed
         let u1 = lcg_uniform(seed);
-        let u2 = lcg_uniform(seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407));
+        let u2 = lcg_uniform(
+            seed.wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407),
+        );
         let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
         (mean + std * z).clamp(0.0, 1.0)
     }
 }
 
 fn lcg_uniform(seed: u64) -> f64 {
-    let x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let x = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (x >> 11) as f64 / (1u64 << 53) as f64
 }
 
@@ -52,7 +62,9 @@ pub struct GaussianPrior {
 }
 
 impl GaussianPrior {
-    pub fn new(mu: f64, sigma: f64) -> Self { Self { mu, sigma, n: 0 } }
+    pub fn new(mu: f64, sigma: f64) -> Self {
+        Self { mu, sigma, n: 0 }
+    }
 
     /// Online update with a new observation (Welford's algorithm for sigma).
     pub fn update(&mut self, value: f64) {
@@ -64,5 +76,7 @@ impl GaussianPrior {
         self.sigma = new_sigma.max(0.01);
     }
 
-    pub fn mean(&self) -> f64 { self.mu }
+    pub fn mean(&self) -> f64 {
+        self.mu
+    }
 }

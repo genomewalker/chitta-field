@@ -1,10 +1,10 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
-use crc32fast::Hasher as CrcHasher;
 use crate::error::{FieldError, Result};
 use crate::ids::InstanceId;
 use crate::ops::Op;
+use crc32fast::Hasher as CrcHasher;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 
 pub const SEGMENT_MAGIC: &[u8; 8] = b"CFLOG001";
 pub const MAX_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
@@ -25,7 +25,11 @@ const OP_UPDATE_SPARSE_CODE: u8 = 12;
 const OP_DEMOTE_MEMORY: u8 = 13;
 const OP_TRAIN_PQ: u8 = 14;
 const OP_UPDATE_RESIDUAL_PQ: u8 = 15;
-use crate::ops::{OP_SESSION_EVENT, OP_TRANSCRIPT_EVENT, OP_TASK_EVENT, OP_USER_MODEL_EVENT, OP_THEME_EVENT, OP_ANALYTICS_EVENT, OP_CLEAR_PROJECT, OP_UPDATE_SYMBOL_DESCRIPTION, OP_UPDATE_MEMORY_CONTENT};
+use crate::ops::{
+    OP_ANALYTICS_EVENT, OP_CLEAR_PROJECT, OP_SESSION_EVENT, OP_TASK_EVENT, OP_THEME_EVENT,
+    OP_TRANSCRIPT_EVENT, OP_UPDATE_MEMORY_CONTENT, OP_UPDATE_SYMBOL_DESCRIPTION,
+    OP_USER_MODEL_EVENT,
+};
 
 fn op_type_byte(op: &Op) -> u8 {
     match op {
@@ -78,7 +82,10 @@ impl OpLog {
         if let Some(last_path) = existing.last() {
             let size = last_path.metadata()?.len();
             if size < MAX_SEGMENT_SIZE {
-                let f = OpenOptions::new().write(true).append(true).open(last_path)?;
+                let f = OpenOptions::new()
+                    .write(true)
+                    .append(true)
+                    .open(last_path)?;
                 return Ok(Self {
                     data_dir: data_dir.to_path_buf(),
                     instance_id,
@@ -109,8 +116,8 @@ impl OpLog {
 
         let seqno = self.next_seqno;
         let op_type = op_type_byte(op);
-        let payload = rmp_serde::to_vec(op)
-            .map_err(|e| FieldError::Serialization(e.to_string()))?;
+        let payload =
+            rmp_serde::to_vec(op).map_err(|e| FieldError::Serialization(e.to_string()))?;
 
         let payload_len = payload.len() as u32;
         let seqno_bytes = seqno.to_be_bytes();
@@ -183,7 +190,11 @@ fn segment_path(data_dir: &Path, instance_id: InstanceId, first_seqno: u64) -> P
 }
 
 fn create_segment(path: &Path, first_seqno: u64) -> Result<File> {
-    let mut f = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
     f.write_all(SEGMENT_MAGIC)?;
     f.write_all(&first_seqno.to_be_bytes())?;
     f.sync_all()?;
@@ -193,8 +204,10 @@ fn create_segment(path: &Path, first_seqno: u64) -> Result<File> {
 fn is_valid_segment_name(name: &str) -> bool {
     let Some(stem) = name.strip_suffix(".seg") else { return false; };
     let Some((instance_hex, seqno)) = stem.split_once('_') else { return false; };
-    instance_hex.len() == 8 && instance_hex.chars().all(|c| c.is_ascii_hexdigit())
-        && seqno.len() == 12 && seqno.chars().all(|c| c.is_ascii_digit())
+    instance_hex.len() == 8
+        && instance_hex.chars().all(|c| c.is_ascii_hexdigit())
+        && seqno.len() == 12
+        && seqno.chars().all(|c| c.is_ascii_digit())
 }
 
 /// All .seg files in directory matching the canonical naming pattern, sorted.
@@ -207,7 +220,11 @@ fn collect_all_segments(seg_dir: &Path) -> Result<Vec<PathBuf>> {
             let e = e.ok()?;
             let p = e.path();
             let name = p.file_name().and_then(|n| n.to_str())?;
-            if is_valid_segment_name(name) { Some(p) } else { None }
+            if is_valid_segment_name(name) {
+                Some(p)
+            } else {
+                None
+            }
         })
         .collect();
     paths.sort();
@@ -218,24 +235,33 @@ fn collect_all_segments(seg_dir: &Path) -> Result<Vec<PathBuf>> {
 fn collect_instance_segments(seg_dir: &Path, instance_id: InstanceId) -> Result<Vec<PathBuf>> {
     let prefix = format!("{:08x}_", instance_id);
     let all = collect_all_segments(seg_dir)?;
-    Ok(all.into_iter().filter(|p| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with(&prefix))
-            .unwrap_or(false)
-    }).collect())
+    Ok(all
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with(&prefix))
+                .unwrap_or(false)
+        })
+        .collect())
 }
 
 /// Collect all segment files in `data_dir/segments/` not owned by `own_instance_id`.
-pub fn collect_foreign_segments(data_dir: &Path, own_instance_id: InstanceId) -> Result<Vec<PathBuf>> {
+pub fn collect_foreign_segments(
+    data_dir: &Path,
+    own_instance_id: InstanceId,
+) -> Result<Vec<PathBuf>> {
     let seg_dir = data_dir.join("segments");
     let own_prefix = format!("{:08x}_", own_instance_id);
     let all = collect_all_segments(&seg_dir)?;
-    Ok(all.into_iter()
-        .filter(|p| p.file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| !n.starts_with(&own_prefix))
-            .unwrap_or(false))
+    Ok(all
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| !n.starts_with(&own_prefix))
+                .unwrap_or(false)
+        })
         .collect())
 }
 
@@ -256,9 +282,14 @@ where
 
     let mut cursor = if byte_offset == 0 {
         let mut magic = [0u8; 8];
-        if file.read_exact(&mut magic).is_err() { return Ok(0); }
+        if file.read_exact(&mut magic).is_err() {
+            return Ok(0);
+        }
         if &magic != SEGMENT_MAGIC {
-            return Err(FieldError::Manifest(format!("bad segment magic in {}", path.display())));
+            return Err(FieldError::Manifest(format!(
+                "bad segment magic in {}",
+                path.display()
+            )));
         }
         let mut _buf = [0u8; 8];
         let _ = file.read_exact(&mut _buf);
@@ -279,17 +310,25 @@ where
         let entry_size = 4u64 + 8 + 1 + payload_len as u64 + 4;
 
         let mut seqno_buf = [0u8; 8];
-        if file.read_exact(&mut seqno_buf).is_err() { break; }
+        if file.read_exact(&mut seqno_buf).is_err() {
+            break;
+        }
         let seqno = u64::from_be_bytes(seqno_buf);
 
         let mut op_type_buf = [0u8; 1];
-        if file.read_exact(&mut op_type_buf).is_err() { break; }
+        if file.read_exact(&mut op_type_buf).is_err() {
+            break;
+        }
 
         let mut payload = vec![0u8; payload_len];
-        if file.read_exact(&mut payload).is_err() { break; }
+        if file.read_exact(&mut payload).is_err() {
+            break;
+        }
 
         let mut crc_buf = [0u8; 4];
-        if file.read_exact(&mut crc_buf).is_err() { break; }
+        if file.read_exact(&mut crc_buf).is_err() {
+            break;
+        }
         let stored_crc = u32::from_be_bytes(crc_buf);
 
         let mut hasher = CrcHasher::new();
@@ -320,13 +359,20 @@ where
     let mut file = File::open(path)?;
 
     let mut magic = [0u8; 8];
-    if file.read_exact(&mut magic).is_err() { return Ok(()); }
+    if file.read_exact(&mut magic).is_err() {
+        return Ok(());
+    }
     if &magic != SEGMENT_MAGIC {
-        return Err(FieldError::Manifest(format!("bad segment magic in {}", path.display())));
+        return Err(FieldError::Manifest(format!(
+            "bad segment magic in {}",
+            path.display()
+        )));
     }
 
     let mut _first_seqno_buf = [0u8; 8];
-    if file.read_exact(&mut _first_seqno_buf).is_err() { return Ok(()); }
+    if file.read_exact(&mut _first_seqno_buf).is_err() {
+        return Ok(());
+    }
 
     loop {
         let mut len_buf = [0u8; 4];
@@ -368,18 +414,30 @@ where
         let computed_crc = hasher.finalize();
 
         if computed_crc != stored_crc {
-            return Err(FieldError::CrcMismatch { seqno, expected: stored_crc, actual: computed_crc });
+            return Err(FieldError::CrcMismatch {
+                seqno,
+                expected: stored_crc,
+                actual: computed_crc,
+            });
         }
 
-        if seqno < start_seqno { continue; }
+        if seqno < start_seqno {
+            continue;
+        }
 
-        let op: Op = rmp_serde::from_slice(&payload)
-            .map_err(|e| FieldError::CorruptLog { seqno, reason: format!("msgpack decode failed: {}", e) })?;
+        let op: Op = rmp_serde::from_slice(&payload).map_err(|e| FieldError::CorruptLog {
+            seqno,
+            reason: format!("msgpack decode failed: {}", e),
+        })?;
 
         if op_type_byte(&op) != op_type {
             return Err(FieldError::CorruptLog {
                 seqno,
-                reason: format!("op_type discriminant mismatch: stored {}, decoded {}", op_type, op_type_byte(&op)),
+                reason: format!(
+                    "op_type discriminant mismatch: stored {}, decoded {}",
+                    op_type,
+                    op_type_byte(&op)
+                ),
             });
         }
 

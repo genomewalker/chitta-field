@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
 use super::symbol::SymbolId;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallGraph {
@@ -17,8 +17,14 @@ impl CallGraph {
     }
 
     pub fn add_edge(&mut self, caller: SymbolId, callee: SymbolId) {
-        self.callees.entry(caller).or_insert_with(HashSet::new).insert(callee);
-        self.callers.entry(callee).or_insert_with(HashSet::new).insert(caller);
+        self.callees
+            .entry(caller)
+            .or_insert_with(HashSet::new)
+            .insert(callee);
+        self.callers
+            .entry(callee)
+            .or_insert_with(HashSet::new)
+            .insert(caller);
     }
 
     pub fn remove_symbol(&mut self, id: SymbolId) {

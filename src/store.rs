@@ -1,22 +1,21 @@
-use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::{FieldError, Result};
 use crate::field::{AssocEdge, ChittaField};
-use crate::ids::{ArtifactId, ChunkHash, MemoryId, compute_chunk_hash};
+use crate::ids::{compute_chunk_hash, ArtifactId, ChunkHash, MemoryId};
+use crate::learner::route::{Route, RouteLearner};
+use crate::ops::EMBED_DIM;
 use crate::ops::{
-    AddAssocEdgeOp, DeleteMemoryOp, DemoteMemoryOp, EdgeType, Op, PutPayloadOp, StateDeltaOp,
-    UpsertArtifactOp, ArtifactRef, AddTripletOp, InvalidateTripletOp,
-    UpsertSymbolOp, RemoveSymbolOp, AddSymCallEdgeOp, UpsertCodeFileOp, UpdateSparseCodeOp,
-    TrainPQOp, UpdateResidualPQOp,
+    AddAssocEdgeOp, AddSymCallEdgeOp, AddTripletOp, ArtifactRef, DeleteMemoryOp, DemoteMemoryOp,
+    EdgeType, InvalidateTripletOp, Op, PutPayloadOp, RemoveSymbolOp, StateDeltaOp, TrainPQOp,
+    UpdateResidualPQOp, UpdateSparseCodeOp, UpsertArtifactOp, UpsertCodeFileOp, UpsertSymbolOp,
 };
 use crate::organ::pq::ProductQuantizer;
-use crate::organ::triplet::TripletEntry;
 use crate::organ::symbol::SymbolEntry;
+use crate::organ::triplet::TripletEntry;
 use crate::payload::MemoryPayload;
-use crate::state::MemoryState;
-use crate::ops::EMBED_DIM;
 use crate::recall::RecallHit;
-use crate::learner::route::{Route, RouteLearner};
+use crate::state::MemoryState;
+use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -61,7 +60,11 @@ impl ChittaField {
         let memory_id = self.id_alloc.next_id();
         let ts = now_ms();
 
-        let authored_at_ms = if authored_at_ms == 0 { ts } else { authored_at_ms };
+        let authored_at_ms = if authored_at_ms == 0 {
+            ts
+        } else {
+            authored_at_ms
+        };
 
         let op = PutPayloadOp {
             memory_id,
@@ -89,8 +92,18 @@ impl ChittaField {
 
         self.payloads.write().insert(memory_id, payload);
         self.states.write().insert(memory_id, state);
-        self.chunk_hash_idx.write().entry(chunk_hash).or_insert(memory_id);
-        self.semantic_idx.write().upsert(memory_id, embedding.to_vec());
+        self.chunk_hash_idx
+            .write()
+            .entry(chunk_hash)
+            .or_insert(memory_id);
+        self.realm_members
+            .write()
+            .entry(realm.to_string())
+            .or_default()
+            .insert(memory_id);
+        self.semantic_idx
+            .write()
+            .upsert(memory_id, embedding.to_vec());
         let content_str = std::str::from_utf8(content).unwrap_or("").to_string();
         self.keyword_idx.write().index(memory_id, &content_str);
 
@@ -127,7 +140,9 @@ impl ChittaField {
     pub fn get_memory(&self, memory_id: MemoryId) -> Result<MemoryPayload> {
         {
             let states = self.states.read();
-            let state = states.get(&memory_id).ok_or(FieldError::NotFound(memory_id))?;
+            let state = states
+                .get(&memory_id)
+                .ok_or(FieldError::NotFound(memory_id))?;
             if state.deleted {
                 return Err(FieldError::Deleted(memory_id));
             }
@@ -136,7 +151,11 @@ impl ChittaField {
         let ts = now_ms();
 
         // Record access in plasticity learner and get recommended decay rate.
-        let recommended_decay = self.learners.write().plasticity.record_access(memory_id, ts);
+        let recommended_decay = self
+            .learners
+            .write()
+            .plasticity
+            .record_access(memory_id, ts);
 
         // Check if current decay rate differs significantly; if so, update it.
         let new_decay_rate = {
@@ -198,7 +217,9 @@ impl ChittaField {
     ) -> Result<()> {
         {
             let states = self.states.read();
-            let state = states.get(&memory_id).ok_or(FieldError::NotFound(memory_id))?;
+            let state = states
+                .get(&memory_id)
+                .ok_or(FieldError::NotFound(memory_id))?;
             if state.deleted {
                 return Err(FieldError::Deleted(memory_id));
             }
@@ -230,7 +251,9 @@ impl ChittaField {
     pub fn forget(&self, memory_id: MemoryId) -> Result<()> {
         {
             let states = self.states.read();
-            states.get(&memory_id).ok_or(FieldError::NotFound(memory_id))?;
+            states
+                .get(&memory_id)
+                .ok_or(FieldError::NotFound(memory_id))?;
         }
 
         let ts = now_ms();
@@ -254,7 +277,19 @@ impl ChittaField {
         {
             let payloads = self.payloads.read();
             if let Some(payload) = payloads.get(&memory_id) {
-                self.time_idx.write().remove(memory_id, payload.authored_at_ms);
+                self.time_idx
+                    .write()
+                    .remove(memory_id, payload.authored_at_ms);
+                let mut realm_members = self.realm_members.write();
+                let remove_realm = if let Some(ids) = realm_members.get_mut(&payload.realm) {
+                    ids.remove(&memory_id);
+                    ids.is_empty()
+                } else {
+                    false
+                };
+                if remove_realm {
+                    realm_members.remove(&payload.realm);
+                }
             }
         }
         self.artifact_idx.write().remove_memory(memory_id);
@@ -294,7 +329,11 @@ impl ChittaField {
             .write()
             .entry(src)
             .or_insert_with(Vec::new)
-            .push(AssocEdge { dst, edge_type, weight });
+            .push(AssocEdge {
+                dst,
+                edge_type,
+                weight,
+            });
 
         Ok(())
     }
@@ -314,13 +353,90 @@ impl ChittaField {
         self.states.read().values().filter(|s| !s.deleted).count()
     }
 
+    fn enqueue_recall_effects(&self, hit_ids: &[MemoryId]) {
+        const MAX_PENDING_STRENGTHEN: usize = 100_000;
+        const MAX_PENDING_PAIRS: usize = 200_000;
+        const MAX_PENDING_WINDOWS: usize = 20_000;
+
+        if hit_ids.is_empty() {
+            return;
+        }
+
+        let strengthen_ids = &hit_ids[..hit_ids.len().min(16)];
+        let window_ids = hit_ids[..hit_ids.len().min(5)].to_vec();
+
+        let mut pending = self.pending_recall.lock();
+        for &id in strengthen_ids {
+            if pending.strengthen.len() >= MAX_PENDING_STRENGTHEN {
+                break;
+            }
+            pending.strengthen.insert(id);
+        }
+
+        for i in 0..window_ids.len() {
+            for j in (i + 1)..window_ids.len() {
+                if pending.co_retrieval_pairs.len() >= MAX_PENDING_PAIRS
+                    && !pending
+                        .co_retrieval_pairs
+                        .contains_key(&(window_ids[i], window_ids[j]))
+                {
+                    continue;
+                }
+                *pending
+                    .co_retrieval_pairs
+                    .entry((window_ids[i], window_ids[j]))
+                    .or_insert(0.0) += 0.05;
+            }
+        }
+
+        if !window_ids.is_empty() && pending.proto_windows.len() < MAX_PENDING_WINDOWS {
+            pending.proto_windows.push(window_ids);
+        }
+    }
+
+    pub(crate) fn drain_pending_recall_effects(&self) -> Result<()> {
+        let pending = {
+            let mut guard = self.pending_recall.lock();
+            if guard.strengthen.is_empty()
+                && guard.co_retrieval_pairs.is_empty()
+                && guard.proto_windows.is_empty()
+            {
+                return Ok(());
+            }
+            std::mem::take(&mut *guard)
+        };
+
+        for memory_id in pending.strengthen {
+            let _ = self.update_state(memory_id, Some(0.01), None, None, true, None);
+            let new_strength = self.states.read().get(&memory_id).map(|s| s.strength);
+            if let Some(strength) = new_strength {
+                self.cortical_idx
+                    .write()
+                    .update_strength(memory_id, strength);
+            }
+        }
+
+        for ((src, dst), weight) in pending.co_retrieval_pairs {
+            let _ = self.add_assoc_edge(src, dst, EdgeType::CoRetrieved, weight);
+        }
+
+        if !pending.proto_windows.is_empty() {
+            let mut cortical_idx = self.cortical_idx.write();
+            for window in pending.proto_windows {
+                cortical_idx.strengthen_proto_transitions(&window);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Semantic recall: find k most similar memories to a query embedding.
     ///
     /// Applies realm filter and strength-weighted final scoring:
     ///   `score = semantic_score × (0.5 + 0.5 × effective_strength) × confidence`
     ///
-    /// Queries `k * 3` candidates from the index to give the score re-ranking
-    /// room to promote high-confidence results.
+    /// Uses the ANN semantic index directly, with optional realm filtering.
+    /// Recall-side maintenance effects are deferred until flush/snapshot.
     pub fn recall_semantic(
         &self,
         query_embedding: &[f32],
@@ -334,76 +450,36 @@ impl ChittaField {
             });
         }
 
-        // Build realm-filtered allowed set from payloads (realm lives in payload, not state).
-        let allowed: HashSet<MemoryId> = {
-            let payloads = self.payloads.read();
-            let states = self.states.read();
-            payloads
-                .iter()
-                .filter(|(id, p)| {
-                    let not_deleted = states
-                        .get(id)
-                        .map(|s| !s.deleted)
-                        .unwrap_or(false);
-                    let realm_match = realm.map(|r| p.realm == r).unwrap_or(true);
-                    not_deleted && realm_match
-                })
-                .map(|(id, _)| *id)
-                .collect()
-        };
-
-        // Encode query into sparse code
-        let query_code = self.sparse_encoder.read().encode(query_embedding);
-
         let now = now_ms();
+        let realm_members = self.realm_members.read();
+        let allowed = realm.and_then(|r| realm_members.get(r));
 
-        // Merge cortical and semantic results
-        let mut seen: std::collections::HashMap<MemoryId, f32> = std::collections::HashMap::new();
-
-        let cortical_empty = self.cortical_idx.read().is_empty();
-
-        // 1. Cortical search (if index has entries)
-        let cortical_hits: Vec<(MemoryId, f32)> = if !cortical_empty {
-            let cortical = self.cortical_idx.read();
-            cortical.search(&query_code, k * 3, Some(&allowed))
-        } else {
-            vec![]
-        };
-
-        // 2. HNSW semantic search (always)
-        let hnsw_hits: Vec<(MemoryId, f32)> = {
-            let sem = self.semantic_idx.read();
-            sem.search(query_embedding, k * 3, Some(&allowed))
-                .into_iter()
-                .map(|hit| (hit.memory_id, hit.cosine_similarity))
-                .collect()
-        };
-
-        // 3. Merge: take max score across both sources
-        for (mem_id, score) in cortical_hits {
-            seen.insert(mem_id, score);
-        }
-        for (mem_id, cos_sim) in hnsw_hits {
-            // cosine similarity is in [-1, 1]; map to [0, 0.85] to match cortical score range
-            let hnsw_score = ((cos_sim + 1.0) / 2.0) * 0.85;
-            let entry = seen.entry(mem_id).or_insert(0.0);
-            *entry = entry.max(hnsw_score);
-        }
+        let result_limit = k.saturating_mul(3).max(k);
+        let semantic_hits = self
+            .semantic_idx
+            .read()
+            .search(query_embedding, result_limit, allowed);
 
         let states = self.states.read();
         let payloads = self.payloads.read();
 
-        let mut hits: Vec<RecallHit> = seen
+        let mut hits: Vec<RecallHit> = semantic_hits
             .into_iter()
-            .filter_map(|(memory_id, score)| {
+            .filter_map(|hit| {
+                let memory_id = hit.memory_id;
                 let state = states.get(&memory_id)?;
+                if state.deleted {
+                    return None;
+                }
                 let payload = payloads.get(&memory_id)?;
                 let eff_strength = state.effective_strength(now);
+                let semantic_score = hit.cosine_similarity;
+                let semantic_weight = ((semantic_score + 1.0) / 2.0).max(0.0);
                 Some(RecallHit {
                     memory_id,
-                    score,
-                    semantic_score: score,
-                    ts_ms: payload.created_at_ms,
+                    score: semantic_weight * (0.5 + 0.5 * eff_strength) * state.confidence,
+                    semantic_score,
+                    ts_ms: payload.authored_at_ms,
                     kind: payload.kind.clone(),
                     realm: payload.realm.clone(),
                     strength: eff_strength,
@@ -414,29 +490,16 @@ impl ChittaField {
             .collect();
 
         hits.sort_unstable_by(|a, b| {
-            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         hits.truncate(k);
 
-        // Reconsolidation: mini-strengthen each returned memory
         let hit_ids: Vec<MemoryId> = hits.iter().map(|h| h.memory_id).collect();
         drop(states);
         drop(payloads);
-        for &id in &hit_ids {
-            let _ = self.update_state(id, Some(0.01), None, None, true, None);
-            let new_strength = self.states.read().get(&id).map(|s| s.strength);
-            if let Some(s) = new_strength {
-                self.cortical_idx.write().update_strength(id, s);
-            }
-        }
-        // Add co-retrieval edges for top results
-        for i in 0..hit_ids.len().min(5) {
-            for j in (i + 1)..hit_ids.len().min(5) {
-                let _ = self.add_assoc_edge(hit_ids[i], hit_ids[j], EdgeType::CoRetrieved, 0.05);
-            }
-        }
-        // Strengthen prototype transitions for co-retrieved memories
-        self.cortical_idx.write().strengthen_proto_transitions(&hit_ids[..hit_ids.len().min(5)]);
+        self.enqueue_recall_effects(&hit_ids);
 
         Ok(hits)
     }
@@ -472,13 +535,12 @@ impl ChittaField {
 
         let seed_set: HashSet<MemoryId> = seed_ids.iter().copied().collect();
         // activation accumulator: memory_id -> max activation score seen
-        let mut activation: std::collections::HashMap<MemoryId, f32> = std::collections::HashMap::new();
+        let mut activation: std::collections::HashMap<MemoryId, f32> =
+            std::collections::HashMap::new();
 
         // frontier: (memory_id, activation_score, hops_remaining)
-        let mut frontier: Vec<(MemoryId, f32, usize)> = seed_ids
-            .iter()
-            .map(|&id| (id, 1.0, max_hops))
-            .collect();
+        let mut frontier: Vec<(MemoryId, f32, usize)> =
+            seed_ids.iter().map(|&id| (id, 1.0, max_hops)).collect();
 
         let assoc_edges = self.assoc_edges.read();
         let states = self.states.read();
@@ -537,7 +599,9 @@ impl ChittaField {
             .collect();
 
         hits.sort_unstable_by(|a, b| {
-            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         hits.truncate(limit);
 
@@ -587,7 +651,10 @@ impl ChittaField {
         realm: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RecallHit>> {
-        let entries = self.time_idx.read().range_query(start_ms, end_ms, realm, limit);
+        let entries = self
+            .time_idx
+            .read()
+            .range_query(start_ms, end_ms, realm, limit);
         let now = now_ms();
         let states = self.states.read();
         let payloads = self.payloads.read();
@@ -651,39 +718,22 @@ impl ChittaField {
             .collect();
 
         hits.sort_unstable_by(|a, b| {
-            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         hits.truncate(k);
 
-        // Reconsolidation: mini-strengthen each returned memory
         let hit_ids: Vec<MemoryId> = hits.iter().map(|h| h.memory_id).collect();
         drop(states);
         drop(payloads);
-        for &id in &hit_ids {
-            let _ = self.update_state(id, Some(0.01), None, None, true, None);
-            let new_strength = self.states.read().get(&id).map(|s| s.strength);
-            if let Some(s) = new_strength {
-                self.cortical_idx.write().update_strength(id, s);
-            }
-        }
-        // Add co-retrieval edges for top results
-        for i in 0..hit_ids.len().min(5) {
-            for j in (i + 1)..hit_ids.len().min(5) {
-                let _ = self.add_assoc_edge(hit_ids[i], hit_ids[j], EdgeType::CoRetrieved, 0.05);
-            }
-        }
-        // Strengthen prototype transitions for co-retrieved memories
-        self.cortical_idx.write().strengthen_proto_transitions(&hit_ids[..hit_ids.len().min(5)]);
+        self.enqueue_recall_effects(&hit_ids);
 
         Ok(hits)
     }
 
     /// Recall memories associated with a file path (exact match).
-    pub fn recall_artifact(
-        &self,
-        path: &str,
-        limit: usize,
-    ) -> Result<Vec<RecallHit>> {
+    pub fn recall_artifact(&self, path: &str, limit: usize) -> Result<Vec<RecallHit>> {
         let entries = self.artifact_idx.read().query_path(path, limit);
         let now = now_ms();
         let states = self.states.read();
@@ -772,21 +822,33 @@ impl ChittaField {
     pub fn query_subject(&self, subject: &str) -> Result<Vec<TripletEntry>> {
         let at_ms = now_ms();
         let store = self.triplet_store.read();
-        Ok(store.query_subject(subject, at_ms).into_iter().cloned().collect())
+        Ok(store
+            .query_subject(subject, at_ms)
+            .into_iter()
+            .cloned()
+            .collect())
     }
 
     /// Query all currently-valid triplets with the given object.
     pub fn query_object(&self, object: &str) -> Result<Vec<TripletEntry>> {
         let at_ms = now_ms();
         let store = self.triplet_store.read();
-        Ok(store.query_object(object, at_ms).into_iter().cloned().collect())
+        Ok(store
+            .query_object(object, at_ms)
+            .into_iter()
+            .cloned()
+            .collect())
     }
 
     /// Query all currently-valid triplets where subject OR object matches.
     pub fn query_entity(&self, entity: &str) -> Result<Vec<TripletEntry>> {
         let at_ms = now_ms();
         let store = self.triplet_store.read();
-        Ok(store.query_entity(entity, at_ms).into_iter().cloned().collect())
+        Ok(store
+            .query_entity(entity, at_ms)
+            .into_iter()
+            .cloned()
+            .collect())
     }
 
     /// Apply feedback for a recall episode (route learning).
@@ -797,12 +859,18 @@ impl ChittaField {
 
     /// Get recommended window size for a session type.
     pub fn recommended_window(&self, session_type: &str) -> usize {
-        self.learners.read().context.recommended_window(session_type)
+        self.learners
+            .read()
+            .context
+            .recommended_window(session_type)
     }
 
     /// Record context outcome for a session type and window size.
     pub fn record_context_outcome(&self, session_type: &str, size: usize, outcome: f32) {
-        self.learners.write().context.record_outcome(session_type, size, outcome);
+        self.learners
+            .write()
+            .context
+            .record_outcome(session_type, size, outcome);
     }
 
     /// Select a retrieval route using Thompson sampling. Returns (episode_id, route).
@@ -904,7 +972,10 @@ impl ChittaField {
 
     /// Add a call edge between two symbols (idempotent).
     pub fn add_call_edge(&self, caller_id: u64, callee_id: u64) -> Result<()> {
-        let op = Op::AddSymCallEdge(AddSymCallEdgeOp { caller_id, callee_id });
+        let op = Op::AddSymCallEdge(AddSymCallEdgeOp {
+            caller_id,
+            callee_id,
+        });
         let _seqno = self.log.write().append(&op)?;
         self.call_graph.write().add_edge(caller_id, callee_id);
         Ok(())
@@ -923,7 +994,10 @@ impl ChittaField {
     /// Upsert a code file record. Returns its CodeFileId.
     pub fn upsert_code_file(&self, path: &str, project: &str, mtime: i64) -> Result<u64> {
         let next_id_fn = || self.code_file_id_alloc.next_id();
-        let (file_id, _was_updated) = self.code_files.write().upsert(path, project, mtime, next_id_fn);
+        let (file_id, _was_updated) = self
+            .code_files
+            .write()
+            .upsert(path, project, mtime, next_id_fn);
         let op = Op::UpsertCodeFile(UpsertCodeFileOp {
             file_id,
             path: path.to_string(),
@@ -957,11 +1031,17 @@ impl ChittaField {
             let payloads = self.payloads.read();
             payloads.get(&memory_id).map(|p| p.embedding.clone())
         };
-        let Some(embedding) = embedding else { return Ok(()); };
-        if embedding.len() != EMBED_DIM { return Ok(()); }
+        let Some(embedding) = embedding else {
+            return Ok(());
+        };
+        if embedding.len() != EMBED_DIM {
+            return Ok(());
+        }
 
         let code = self.sparse_encoder.read().encode(&embedding);
-        if code.is_empty() { return Ok(()); }
+        if code.is_empty() {
+            return Ok(());
+        }
 
         // Hebbian update
         self.sparse_encoder.write().update(&embedding, &code);
@@ -976,10 +1056,27 @@ impl ChittaField {
         self.log.write().append(&op)?;
 
         // Index in cortical index
-        let strength = self.states.read().get(&memory_id).map(|s| s.strength).unwrap_or(0.5);
-        let kind = self.payloads.read().get(&memory_id).map(|p| p.kind.clone()).unwrap_or_default();
-        let authored_at = self.payloads.read().get(&memory_id).map(|p| p.authored_at_ms).unwrap_or(ts_ms);
-        self.cortical_idx.write().index(memory_id, &code, strength, authored_at, &kind);
+        let strength = self
+            .states
+            .read()
+            .get(&memory_id)
+            .map(|s| s.strength)
+            .unwrap_or(0.5);
+        let kind = self
+            .payloads
+            .read()
+            .get(&memory_id)
+            .map(|p| p.kind.clone())
+            .unwrap_or_default();
+        let authored_at = self
+            .payloads
+            .read()
+            .get(&memory_id)
+            .map(|p| p.authored_at_ms)
+            .unwrap_or(ts_ms);
+        self.cortical_idx
+            .write()
+            .index(memory_id, &code, strength, authored_at, &kind);
 
         Ok(())
     }
@@ -988,8 +1085,11 @@ impl ChittaField {
     /// After this, on next open the snapshot covers all UpdateSparseCode ops
     /// up to the current log position, so those ops can be skipped in replay.
     pub fn save_snapshot(&self) -> Result<()> {
+        self.drain_pending_recall_effects()?;
         let seqno = self.log.read().last_seqno();
-        let path = self.data_dir.join(format!("cortex.{:08x}.snapshot", self.instance_id));
+        let path = self
+            .data_dir
+            .join(format!("cortex.{:08x}.snapshot", self.instance_id));
         self.cortical_idx.read().save_snapshot(&path, seqno)
     }
 
@@ -997,6 +1097,7 @@ impl ChittaField {
     /// After this, on next open only ops after snapshot_seqno need to be replayed.
     pub fn save_full_snapshot(&self) -> Result<()> {
         use crate::snapshot::FullSnapshot;
+        self.drain_pending_recall_effects()?;
         let seqno = self.log.read().last_seqno();
         let snap = FullSnapshot {
             snapshot_seqno: seqno,
@@ -1014,7 +1115,9 @@ impl ChittaField {
             code_files: self.code_files.read().clone(),
             semantic_idx: self.semantic_idx.read().clone(),
         };
-        let path = self.data_dir.join(format!("chitta.{:08x}.snapshot", self.instance_id));
+        let path = self
+            .data_dir
+            .join(format!("chitta.{:08x}.snapshot", self.instance_id));
         snap.save(&path)
     }
 
@@ -1067,8 +1170,8 @@ impl ChittaField {
                     }
                     1 => {
                         // L2 → L3
-                        let threshold = L2_TO_L3_AGE_BASE_MS
-                            + rehearsal * L2_TO_L3_REHEARSAL_BONUS_MS;
+                        let threshold =
+                            L2_TO_L3_AGE_BASE_MS + rehearsal * L2_TO_L3_REHEARSAL_BONUS_MS;
                         if age_ms >= threshold
                             && last_access_ago >= L2_TO_L3_LAST_ACCESS_MS
                             && state.strength < L2_TO_L3_MAX_STRENGTH
@@ -1078,8 +1181,8 @@ impl ChittaField {
                     }
                     2 => {
                         // L3 → delete
-                        let threshold = L3_DELETE_AGE_BASE_MS
-                            + rehearsal * L3_DELETE_REHEARSAL_BONUS_MS;
+                        let threshold =
+                            L3_DELETE_AGE_BASE_MS + rehearsal * L3_DELETE_REHEARSAL_BONUS_MS;
                         if age_ms >= threshold
                             && last_access_ago >= L3_DELETE_LAST_ACCESS_MS
                             && state.strength < L3_DELETE_MAX_STRENGTH
@@ -1097,7 +1200,10 @@ impl ChittaField {
         let deleted = to_delete.len();
 
         for (id, new_tier) in to_demote {
-            let op = Op::DemoteMemory(DemoteMemoryOp { memory_id: id, new_tier });
+            let op = Op::DemoteMemory(DemoteMemoryOp {
+                memory_id: id,
+                new_tier,
+            });
             self.log.write().append(&op)?;
             if let Some(state) = self.states.write().get_mut(&id) {
                 state.tier = new_tier;
@@ -1115,7 +1221,8 @@ impl ChittaField {
         let ids: Vec<MemoryId> = {
             let payloads = self.payloads.read();
             let cortical = self.cortical_idx.read();
-            payloads.keys()
+            payloads
+                .keys()
                 .filter(|id| !cortical.mem_codes.contains_key(id))
                 .copied()
                 .collect()
@@ -1136,15 +1243,23 @@ impl ChittaField {
             let cortical = self.cortical_idx.read();
             let encoder = self.sparse_encoder.read();
 
-            cortical.mem_codes.iter().filter_map(|(&memory_id, code)| {
-                let embedding = payloads.get(&memory_id).map(|p| p.embedding.clone())?;
-                if embedding.len() != crate::ops::EMBED_DIM { return None; }
-                let decoded = encoder.decode(code);
-                let residual: Vec<f32> = embedding.iter().zip(decoded.iter())
-                    .map(|(e, d)| e - d)
-                    .collect();
-                Some(residual)
-            }).collect()
+            cortical
+                .mem_codes
+                .iter()
+                .filter_map(|(&memory_id, code)| {
+                    let embedding = payloads.get(&memory_id).map(|p| p.embedding.clone())?;
+                    if embedding.len() != crate::ops::EMBED_DIM {
+                        return None;
+                    }
+                    let decoded = encoder.decode(code);
+                    let residual: Vec<f32> = embedding
+                        .iter()
+                        .zip(decoded.iter())
+                        .map(|(e, d)| e - d)
+                        .collect();
+                    Some(residual)
+                })
+                .collect()
         };
 
         let pq = ProductQuantizer::train(&residuals, 20)
@@ -1167,8 +1282,12 @@ impl ChittaField {
             let payloads = self.payloads.read();
             payloads.get(&memory_id).map(|p| p.embedding.clone())
         };
-        let Some(embedding) = embedding else { return Ok(()); };
-        if embedding.len() != crate::ops::EMBED_DIM { return Ok(()); }
+        let Some(embedding) = embedding else {
+            return Ok(());
+        };
+        if embedding.len() != crate::ops::EMBED_DIM {
+            return Ok(());
+        }
 
         let decoded = {
             let cortical = self.cortical_idx.read();
@@ -1179,7 +1298,9 @@ impl ChittaField {
             self.sparse_encoder.read().decode(&code)
         };
 
-        let residual: Vec<f32> = embedding.iter().zip(decoded.iter())
+        let residual: Vec<f32> = embedding
+            .iter()
+            .zip(decoded.iter())
             .map(|(e, d)| e - d)
             .collect();
 
@@ -1193,7 +1314,10 @@ impl ChittaField {
         };
 
         let pq_bytes: Vec<u8> = codes.to_vec();
-        let op = Op::UpdateResidualPQ(UpdateResidualPQOp { memory_id, pq_bytes });
+        let op = Op::UpdateResidualPQ(UpdateResidualPQOp {
+            memory_id,
+            pq_bytes,
+        });
         self.log.write().append(&op)?;
 
         self.cortical_idx.write().index_pq(memory_id, codes);
@@ -1211,7 +1335,9 @@ impl ChittaField {
 
         let ids: Vec<MemoryId> = {
             let cortical = self.cortical_idx.read();
-            cortical.mem_codes.keys()
+            cortical
+                .mem_codes
+                .keys()
                 .filter(|id| !cortical.mem_pq.contains_key(id))
                 .copied()
                 .collect()
@@ -1247,10 +1373,20 @@ mod tests {
     fn test_put_get_roundtrip() {
         let (field, _tmp) = open_test_field();
         let embedding = vec![0.1f32; 768];
-        let (id, hash) = field.put_memory(
-            "wisdom", "test", b"hello world", &embedding,
-            0.9, 0.001, 0, vec![], None, None,
-        ).unwrap();
+        let (id, hash) = field
+            .put_memory(
+                "wisdom",
+                "test",
+                b"hello world",
+                &embedding,
+                0.9,
+                0.001,
+                0,
+                vec![],
+                None,
+                None,
+            )
+            .unwrap();
 
         let payload = field.get_memory(id).unwrap();
         assert_eq!(payload.content, b"hello world");
@@ -1262,12 +1398,25 @@ mod tests {
     fn test_forget() {
         let (field, _tmp) = open_test_field();
         let embedding = vec![0.0f32; 768];
-        let (id, _) = field.put_memory(
-            "wisdom", "test", b"to forget", &embedding,
-            1.0, 0.001, 0, vec![], None, None,
-        ).unwrap();
+        let (id, _) = field
+            .put_memory(
+                "wisdom",
+                "test",
+                b"to forget",
+                &embedding,
+                1.0,
+                0.001,
+                0,
+                vec![],
+                None,
+                None,
+            )
+            .unwrap();
         field.forget(id).unwrap();
-        assert!(matches!(field.get_memory(id), Err(crate::error::FieldError::Deleted(_))));
+        assert!(matches!(
+            field.get_memory(id),
+            Err(crate::error::FieldError::Deleted(_))
+        ));
     }
 
     #[test]
@@ -1278,10 +1427,20 @@ mod tests {
         let id = {
             let field = ChittaField::open(data_dir.clone()).unwrap();
             let embedding = vec![0.5f32; 768];
-            let (id, _) = field.put_memory(
-                "episode", "test", b"persisted", &embedding,
-                0.8, 0.002, 0, vec![], None, None,
-            ).unwrap();
+            let (id, _) = field
+                .put_memory(
+                    "episode",
+                    "test",
+                    b"persisted",
+                    &embedding,
+                    0.8,
+                    0.002,
+                    0,
+                    vec![],
+                    None,
+                    None,
+                )
+                .unwrap();
             id
         };
 
@@ -1295,9 +1454,37 @@ mod tests {
     fn test_assoc_edge() {
         let (field, _tmp) = open_test_field();
         let emb = vec![0.1f32; 768];
-        let (id1, _) = field.put_memory("wisdom", "test", b"a", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
-        let (id2, _) = field.put_memory("wisdom", "test", b"b", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
-        field.add_assoc_edge(id1, id2, EdgeType::CoRetrieved, 0.7).unwrap();
+        let (id1, _) = field
+            .put_memory(
+                "wisdom",
+                "test",
+                b"a",
+                &emb,
+                1.0,
+                0.001,
+                0,
+                vec![],
+                None,
+                None,
+            )
+            .unwrap();
+        let (id2, _) = field
+            .put_memory(
+                "wisdom",
+                "test",
+                b"b",
+                &emb,
+                1.0,
+                0.001,
+                0,
+                vec![],
+                None,
+                None,
+            )
+            .unwrap();
+        field
+            .add_assoc_edge(id1, id2, EdgeType::CoRetrieved, 0.7)
+            .unwrap();
         let neighbors = field.list_neighbors(id1).unwrap();
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].dst, id2);
@@ -1308,10 +1495,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let field = ChittaField::open(tmp.path().join("data")).unwrap();
 
-        let id = field.add_triplet(
-            "chitta".into(), "replaces".into(), "duckdb".into(),
-            1.0, None, None,
-        ).unwrap();
+        let id = field
+            .add_triplet(
+                "chitta".into(),
+                "replaces".into(),
+                "duckdb".into(),
+                1.0,
+                None,
+                None,
+            )
+            .unwrap();
         assert!(id > 0);
 
         let results = field.query_subject("chitta").unwrap();
@@ -1326,7 +1519,9 @@ mod tests {
 
         {
             let field = ChittaField::open(data_dir.clone()).unwrap();
-            field.add_triplet("a".into(), "b".into(), "c".into(), 1.0, None, None).unwrap();
+            field
+                .add_triplet("a".into(), "b".into(), "c".into(), 1.0, None, None)
+                .unwrap();
         }
 
         let field2 = ChittaField::open(data_dir).unwrap();
@@ -1339,10 +1534,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let field = ChittaField::open(tmp.path().join("data")).unwrap();
 
-        let id = field.add_triplet(
-            "chitta".into(), "uses".into(), "duckdb".into(),
-            1.0, None, None,
-        ).unwrap();
+        let id = field
+            .add_triplet(
+                "chitta".into(),
+                "uses".into(),
+                "duckdb".into(),
+                1.0,
+                None,
+                None,
+            )
+            .unwrap();
 
         let before = field.query_subject("chitta").unwrap();
         assert_eq!(before.len(), 1);
@@ -1358,9 +1559,36 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let field = ChittaField::open(tmp.path().join("data")).unwrap();
 
-        field.add_triplet("alice".into(), "knows".into(), "bob".into(), 1.0, None, None).unwrap();
-        field.add_triplet("charlie".into(), "knows".into(), "alice".into(), 1.0, None, None).unwrap();
-        field.add_triplet("alice".into(), "works_at".into(), "anthropic".into(), 1.0, None, None).unwrap();
+        field
+            .add_triplet(
+                "alice".into(),
+                "knows".into(),
+                "bob".into(),
+                1.0,
+                None,
+                None,
+            )
+            .unwrap();
+        field
+            .add_triplet(
+                "charlie".into(),
+                "knows".into(),
+                "alice".into(),
+                1.0,
+                None,
+                None,
+            )
+            .unwrap();
+        field
+            .add_triplet(
+                "alice".into(),
+                "works_at".into(),
+                "anthropic".into(),
+                1.0,
+                None,
+                None,
+            )
+            .unwrap();
 
         let results = field.query_entity("alice").unwrap();
         assert_eq!(results.len(), 3);
@@ -1371,17 +1599,88 @@ mod tests {
         let (field, _tmp) = open_test_field();
         let emb = vec![0.1f32; 768];
 
-        field.put_memory("wisdom", "test",
-            b"rust ownership model prevents memory leaks automatically",
-            &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
-        field.put_memory("wisdom", "test",
-            b"python garbage collector handles memory management",
-            &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+        field
+            .put_memory(
+                "wisdom",
+                "test",
+                b"rust ownership model prevents memory leaks automatically",
+                &emb,
+                1.0,
+                0.001,
+                0,
+                vec![],
+                None,
+                None,
+            )
+            .unwrap();
+        field
+            .put_memory(
+                "wisdom",
+                "test",
+                b"python garbage collector handles memory management",
+                &emb,
+                1.0,
+                0.001,
+                0,
+                vec![],
+                None,
+                None,
+            )
+            .unwrap();
 
         let hits = field.recall_keyword("rust ownership", 5).unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].kind, "wisdom");
         // "rust" and "ownership" only in doc 1
         assert!(hits[0].content.contains("rust"));
+    }
+
+    #[test]
+    fn test_recall_effects_are_deferred_until_flush() {
+        let (field, _tmp) = open_test_field();
+
+        let mut emb1 = vec![0.0f32; 768];
+        emb1[0] = 1.0;
+        let mut emb2 = vec![0.0f32; 768];
+        emb2[1] = 1.0;
+
+        field
+            .put_memory(
+                "wisdom",
+                "test",
+                b"alpha memory",
+                &emb1,
+                1.0,
+                0.001,
+                0,
+                vec![],
+                None,
+                None,
+            )
+            .unwrap();
+        field
+            .put_memory(
+                "wisdom",
+                "test",
+                b"beta memory",
+                &emb2,
+                1.0,
+                0.001,
+                0,
+                vec![],
+                None,
+                None,
+            )
+            .unwrap();
+
+        let seqno_before = field.log.read().last_seqno();
+        let hits = field.recall_semantic(&emb1, 2, Some("test")).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(field.log.read().last_seqno(), seqno_before);
+        assert!(!field.pending_recall.lock().strengthen.is_empty());
+
+        field.flush().unwrap();
+        assert!(field.log.read().last_seqno() > seqno_before);
+        assert!(field.pending_recall.lock().strengthen.is_empty());
     }
 }

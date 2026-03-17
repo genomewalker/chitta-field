@@ -14,12 +14,26 @@ pub struct AnalyticsRegistry {
 }
 
 impl AnalyticsRegistry {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub fn append(&mut self, kind: String, entity_id: String, payload_json: String, ts_ms: i64) -> u64 {
+    pub fn append(
+        &mut self,
+        kind: String,
+        entity_id: String,
+        payload_json: String,
+        ts_ms: i64,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.entries.push(AnalyticsEntry { id, kind, entity_id, payload_json, ts_ms });
+        self.entries.push(AnalyticsEntry {
+            id,
+            kind,
+            entity_id,
+            payload_json,
+            ts_ms,
+        });
         id
     }
 
@@ -28,5 +42,7 @@ impl AnalyticsRegistry {
         self.entries[start..].iter().collect()
     }
 
-    pub fn count(&self) -> usize { self.entries.len() }
+    pub fn count(&self) -> usize {
+        self.entries.len()
+    }
 }

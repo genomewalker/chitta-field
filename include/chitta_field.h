@@ -192,6 +192,8 @@ int cf_emit_event(CfHandle* h,
     const char* realm, uint64_t fencing_token,
     uint64_t* out_event_id);
 
+/* Supports domain="user_model" and domain="transcript".
+ * Returns 0 on success, 1 if not found, -2 if buf too small, -1 on error. */
 int cf_get_latest_event(CfHandle* h,
     const char* domain, const char* kind, const char* entity_id,
     uint8_t* buf, size_t buf_cap, size_t* written);
