@@ -5,8 +5,9 @@
 
 use crate::field::ChittaField;
 use crate::ops::{
-    AnalyticsEventOp, ClearProjectOp, EdgeType, Op, SessionEventOp, TaskEventOp, ThemeEventOp,
-    TranscriptEventOp, UpdateMemoryContentOp, UpdateSymbolDescriptionOp, UserModelEventOp,
+    AnalyticsEventOp, ClearProjectOp, EdgeType, Op, RecordRecallBatchOp, SessionEventOp,
+    TaskEventOp, ThemeEventOp, TranscriptEventOp, UpdateMemoryContentOp,
+    UpdateSymbolDescriptionOp, UserModelEventOp,
 };
 use crate::recall::RecallHit;
 use serde_json;
@@ -3836,6 +3837,119 @@ pub extern "C" fn cf_recall_by_kind(
         Err(e) => return handle.err(e),
     };
     write_json_buf(&json_str, buf, buf_cap, written)
+}
+
+/// Return the 768-dim embeddings for a batch of memory IDs as JSON.
+/// Output: {"embeddings": {"<id>": [f32, ...], ...}}
+/// Missing IDs are silently omitted.
+#[no_mangle]
+pub unsafe extern "C" fn cf_get_memory_embeddings_batch(
+    handle: *const CfHandle,
+    ids: *const u64,
+    ids_len: usize,
+    out_buf: *mut u8,
+    out_buf_len: usize,
+    written: *mut usize,
+) -> i32 {
+    if handle.is_null() || ids.is_null() || out_buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let field = &(*handle).field;
+    let id_slice = std::slice::from_raw_parts(ids, ids_len);
+    let payloads = field.payloads.read();
+    let mut result: std::collections::HashMap<String, Vec<f32>> =
+        std::collections::HashMap::new();
+    for &id in id_slice {
+        if let Some(payload) = payloads.get(&id) {
+            result.insert(id.to_string(), payload.embedding.clone());
+        }
+    }
+    let json = serde_json::json!({"embeddings": result});
+    let json_str = match serde_json::to_string(&json) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    write_json_buf(&json_str, out_buf, out_buf_len, written)
+}
+
+/// Durably record a completed recall event. Appends a RecordRecallBatchOp to
+/// the WAL and applies the effects (touch, retrieval history, co-activation
+/// stats, Hebbian edge strengthening) to in-memory state.
+#[no_mangle]
+pub unsafe extern "C" fn cf_record_recall_batch(
+    handle: *mut CfHandle,
+    ids: *const u64,
+    ids_len: usize,
+    centroid_q: *const i8,
+    centroid_q_len: usize,
+    centroid_scale: f32,
+    context_hash: u64,
+    ts_ms: i64,
+    base_assoc_delta: f32,
+) -> i32 {
+    if handle.is_null() || ids.is_null() || centroid_q.is_null() {
+        return -1;
+    }
+    let h = &mut *handle;
+    let id_slice = std::slice::from_raw_parts(ids, ids_len);
+    let cq_slice = std::slice::from_raw_parts(centroid_q, centroid_q_len);
+
+    let op = Op::RecordRecallBatch(RecordRecallBatchOp {
+        memory_ids: id_slice.to_vec(),
+        centroid_q: cq_slice.to_vec(),
+        centroid_scale,
+        context_hash,
+        ts_ms,
+        base_assoc_delta,
+    });
+
+    let append_result = h.field.log.write().append(&op);
+    match append_result {
+        Ok(_seqno) => {
+            // Apply to in-memory state immediately.
+            let ctx = crate::state::RetrievalContext {
+                centroid_q: cq_slice.to_vec(),
+                scale: centroid_scale,
+                context_hash,
+                ts_ms,
+            };
+            {
+                let mut states = h.field.states.write();
+                for &mid in id_slice {
+                    if let Some(state) = states.get_mut(&mid) {
+                        state.access_count += 1;
+                        state.last_accessed_ms = ts_ms;
+                        state.retrieval_history.push(ctx.clone());
+                    }
+                }
+            }
+            {
+                let mut coact = h.field.coactivation_stats.write();
+                let mut assoc = h.field.assoc_edges.write();
+                for i in 0..id_slice.len() {
+                    for j in (i + 1)..id_slice.len() {
+                        let key = (
+                            id_slice[i].min(id_slice[j]),
+                            id_slice[i].max(id_slice[j]),
+                        );
+                        let stats = coact.entry(key).or_default();
+                        stats.record(context_hash, ts_ms);
+                        let multiplier = stats.hebbian_multiplier();
+                        let delta = base_assoc_delta * multiplier;
+                        crate::field::strengthen_assoc_edge_map(
+                            &mut assoc,
+                            id_slice[i],
+                            id_slice[j],
+                            crate::ops::EdgeType::CoRetrieved,
+                            delta,
+                        );
+                    }
+                }
+            }
+            h.ok()
+        }
+        Err(e) => h.err(e),
+    }
 }
 
 #[cfg(test)]

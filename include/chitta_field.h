@@ -349,6 +349,10 @@ int cf_realm_list(CfHandle* h,
 int cf_recall_by_kind(CfHandle* h, const char* kind, size_t limit,
     uint8_t* buf, size_t buf_cap, size_t* written);
 
+/* Recall instrumentation */
+int32_t cf_get_memory_embeddings_batch(const CfHandle* handle, const uint64_t* ids, size_t ids_len, char* out_buf, size_t out_buf_len, size_t* written);
+int32_t cf_record_recall_batch(CfHandle* handle, const uint64_t* ids, size_t ids_len, const int8_t* centroid_q, size_t centroid_q_len, float centroid_scale, uint64_t context_hash, int64_t ts_ms, float base_assoc_delta);
+
 /* Analytics */
 int cf_analytics_append(CfHandle* h,
     const char* kind, const char* entity_id,

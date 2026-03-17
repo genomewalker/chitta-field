@@ -1114,6 +1114,7 @@ impl ChittaField {
             call_graph: self.call_graph.read().clone(),
             code_files: self.code_files.read().clone(),
             semantic_idx: self.semantic_idx.read().clone(),
+            coactivation_stats: self.coactivation_stats.read().clone(),
         };
         let path = self
             .data_dir

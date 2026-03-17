@@ -1,5 +1,5 @@
 use crate::error::{FieldError, Result};
-use crate::field::AssocEdge;
+use crate::field::{AssocEdge, CoActivationStats};
 use crate::hnsw::SemanticIndex;
 use crate::ids::{ArtifactId, MemoryId};
 use crate::organ::artifact::ArtifactIndex;
@@ -18,8 +18,10 @@ use std::path::Path;
 
 /// Magic for snapshots written before the ANN SemanticIndex rewrite (v1.0.3 and earlier).
 const FULL_SNAPSHOT_MAGIC_V1: u64 = 0xF011_5741_7E00_0003;
-/// Magic for snapshots written after the ANN SemanticIndex rewrite (v1.0.4+).
-const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_0004;
+/// Magic for v1.0.4 snapshots (post-ANN, pre-CTM features).
+const FULL_SNAPSHOT_MAGIC_V4: u64 = 0xF011_5741_7E00_0004;
+/// Magic for current snapshots (v1.0.5+) with coactivation_stats + RetrievalHistory.
+const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_0005;
 
 /// SemanticIndex as it existed before the ANN rewrite (two fields only).
 /// Used solely for migrating v1 snapshots on first load.
@@ -65,6 +67,8 @@ pub struct FullSnapshot {
     pub call_graph: CallGraph,
     pub code_files: CodeFileIndex,
     pub semantic_idx: SemanticIndex,
+    #[serde(default)]
+    pub coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats>,
 }
 
 impl FullSnapshot {
@@ -90,7 +94,7 @@ impl FullSnapshot {
         let mut buf = [0u8; 16];
         r.read_exact(&mut buf)?;
         let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        if magic != FULL_SNAPSHOT_MAGIC && magic != FULL_SNAPSHOT_MAGIC_V1 {
+        if magic != FULL_SNAPSHOT_MAGIC && magic != FULL_SNAPSHOT_MAGIC_V4 && magic != FULL_SNAPSHOT_MAGIC_V1 {
             return Err(FieldError::Manifest("invalid full snapshot magic".to_string()));
         }
         Ok(u64::from_le_bytes(buf[8..16].try_into().unwrap()))
@@ -104,7 +108,15 @@ impl FullSnapshot {
         }
         let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
         if magic == FULL_SNAPSHOT_MAGIC {
-            // Current format: deserialize directly.
+            // Current format (v5): deserialize directly.
+            let r = BufReader::new(&bytes[8..]);
+            return bincode::deserialize_from(r)
+                .map_err(|e| FieldError::Serialization(e.to_string()));
+        }
+        if magic == FULL_SNAPSHOT_MAGIC_V4 {
+            // v4 snapshots have SemanticIndex (ANN) but no coactivation_stats.
+            // Since coactivation_stats has #[serde(default)], deserialize directly.
+            eprintln!("[chitta-field] migrating v4 snapshot to v5 format (coactivation_stats)");
             let r = BufReader::new(&bytes[8..]);
             return bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()));
@@ -135,6 +147,7 @@ impl FullSnapshot {
                 call_graph: legacy.call_graph,
                 code_files: legacy.code_files,
                 semantic_idx,
+                coactivation_stats: HashMap::new(),
             });
         }
         Err(FieldError::Manifest(format!("unknown snapshot magic: {:#x}", magic)))

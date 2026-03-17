@@ -40,6 +40,41 @@ pub struct AssocEdge {
     pub weight: f32,
 }
 
+/// Tracks how often two memories were co-retrieved and in how many
+/// distinct query contexts. Used to weight Hebbian edge strengthening.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct CoActivationStats {
+    /// Total number of co-retrieval events.
+    pub sim_count: u32,
+    /// Distinct context_hash values seen (capped at 64).
+    pub recent_context_hashes: Vec<u64>,
+    /// Number of distinct contexts (len of deduplicated recent_context_hashes).
+    pub diversity_count: u16,
+    pub last_seen_ms: i64,
+}
+
+impl CoActivationStats {
+    const MAX_HASHES: usize = 64;
+
+    pub fn record(&mut self, context_hash: u64, ts_ms: i64) {
+        self.sim_count += 1;
+        self.last_seen_ms = ts_ms;
+        if !self.recent_context_hashes.contains(&context_hash) {
+            if self.recent_context_hashes.len() >= Self::MAX_HASHES {
+                self.recent_context_hashes.remove(0);
+            }
+            self.recent_context_hashes.push(context_hash);
+        }
+        self.diversity_count = self.recent_context_hashes.len() as u16;
+    }
+
+    /// Hebbian multiplier: sim_count * diversity_count, capped at 16.0
+    pub fn hebbian_multiplier(&self) -> f32 {
+        let raw = self.sim_count as f32 * self.diversity_count as f32;
+        raw.min(16.0)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct PendingRecallEffects {
     pub strengthen: HashSet<MemoryId>,
@@ -87,6 +122,7 @@ pub struct ChittaField {
     pub(crate) chunk_hash_idx: RwLock<HashMap<crate::ids::ChunkHash, MemoryId>>,
     pub(crate) realm_members: RwLock<HashMap<String, HashSet<MemoryId>>>,
     pub(crate) pending_recall: Mutex<PendingRecallEffects>,
+    pub(crate) coactivation_stats: RwLock<HashMap<(MemoryId, MemoryId), CoActivationStats>>,
 }
 
 impl Drop for ChittaField {
@@ -137,6 +173,7 @@ impl ChittaField {
         let mut theme_organ = ThemeOrgan::new();
         let mut analytics_registry = AnalyticsRegistry::new();
         let mut chunk_hash_idx: HashMap<crate::ids::ChunkHash, MemoryId> = HashMap::new();
+        let mut snapshot_coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats> = HashMap::new();
 
         // Find best cortical snapshot by peeking seqno (16-byte read per file), then load only that one.
         let mut snapshot_seqno: u64 = 0;
@@ -233,6 +270,7 @@ impl ChittaField {
                     call_graph = snap.call_graph;
                     code_files = snap.code_files;
                     semantic_idx = snap.semantic_idx;
+                    snapshot_coactivation_stats = snap.coactivation_stats;
                     eprintln!(
                         "[chitta-field] loaded full snapshot seqno={} from {:?}",
                         full_snapshot_seqno, path
@@ -251,6 +289,7 @@ impl ChittaField {
         // Replay ALL segment files to rebuild in-memory state.
         // Skip ops already covered by the full snapshot or cortical snapshot.
         let mut replay_realm_members: HashMap<String, HashSet<MemoryId>> = HashMap::new();
+        let mut replay_coactivation_stats = snapshot_coactivation_stats;
         log.replay(0, |seqno, op| {
             if seqno <= full_snapshot_seqno {
                 // This op is covered by the full snapshot.
@@ -300,6 +339,7 @@ impl ChittaField {
                 &mut analytics_registry,
                 &mut chunk_hash_idx,
                 &mut replay_realm_members,
+                &mut replay_coactivation_stats,
             );
             Ok(())
         })?;
@@ -387,6 +427,7 @@ impl ChittaField {
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
             realm_members: RwLock::new(realm_members),
             pending_recall: Mutex::new(PendingRecallEffects::default()),
+            coactivation_stats: RwLock::new(replay_coactivation_stats),
         })
     }
 }
@@ -449,6 +490,7 @@ impl ChittaField {
         let mut analytics_reg = self.analytics_registry.write();
         let mut chunk_hash_idx = self.chunk_hash_idx.write();
         let mut realm_members = self.realm_members.write();
+        let mut coactivation_stats = self.coactivation_stats.write();
 
         for op in ops {
             apply_op(
@@ -475,6 +517,7 @@ impl ChittaField {
                 &mut *analytics_reg,
                 &mut *chunk_hash_idx,
                 &mut *realm_members,
+                &mut *coactivation_stats,
             );
         }
 
@@ -618,6 +661,7 @@ pub(crate) fn apply_op(
     analytics_registry: &mut AnalyticsRegistry,
     chunk_hash_idx: &mut HashMap<crate::ids::ChunkHash, MemoryId>,
     realm_members: &mut HashMap<String, HashSet<MemoryId>>,
+    coactivation_stats: &mut HashMap<(MemoryId, MemoryId), CoActivationStats>,
 ) {
     match op {
         Op::PutPayload(put) => {
@@ -987,6 +1031,85 @@ pub(crate) fn apply_op(
             }
             keyword_idx.index(umc.memory_id, &content_str);
         }
+        Op::RecordRecallBatch(op) => {
+            let ctx = crate::state::RetrievalContext {
+                centroid_q: op.centroid_q.clone(),
+                scale: op.centroid_scale,
+                context_hash: op.context_hash,
+                ts_ms: op.ts_ms,
+            };
+            // Touch each memory and append retrieval context
+            for &mid in &op.memory_ids {
+                if let Some(state) = states.get_mut(&mid) {
+                    state.access_count += 1;
+                    state.last_accessed_ms = op.ts_ms;
+                    state.retrieval_history.push(ctx.clone());
+                }
+            }
+            // Update pairwise co-activation stats and strengthen edges
+            let ids = &op.memory_ids;
+            for i in 0..ids.len() {
+                for j in (i + 1)..ids.len() {
+                    let key = (ids[i].min(ids[j]), ids[i].max(ids[j]));
+                    let stats = coactivation_stats.entry(key).or_default();
+                    stats.record(op.context_hash, op.ts_ms);
+                    let multiplier = stats.hebbian_multiplier();
+                    let delta = op.base_assoc_delta * multiplier;
+                    strengthen_assoc_edge_map(assoc_edges, ids[i], ids[j], crate::ops::EdgeType::CoRetrieved, delta);
+                }
+            }
+        }
+        Op::StrengthenAssocEdge(op) => {
+            strengthen_assoc_edge_map(assoc_edges, op.src, op.dst, op.edge_type, op.delta);
+        }
+    }
+}
+
+/// Upsert an assoc edge: if one already exists between (src, dst, edge_type),
+/// add `delta` to its weight. Otherwise insert a new edge with weight = `delta`.
+/// Also maintains the reverse direction edge.
+/// Upsert an assoc edge on a raw HashMap. Public so FFI can apply in-memory
+/// without going through the full apply_op path.
+pub fn strengthen_assoc_edge_map(
+    assoc_edges: &mut HashMap<MemoryId, Vec<AssocEdge>>,
+    src: MemoryId,
+    dst: MemoryId,
+    edge_type: EdgeType,
+    delta: f32,
+) {
+    // Forward direction
+    let edges = assoc_edges.entry(src).or_default();
+    let mut found = false;
+    for edge in edges.iter_mut() {
+        if edge.dst == dst && std::mem::discriminant(&edge.edge_type) == std::mem::discriminant(&edge_type) {
+            edge.weight = (edge.weight + delta).min(1.0);
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        edges.push(AssocEdge {
+            dst,
+            edge_type: edge_type.clone(),
+            weight: delta.clamp(0.0, 1.0),
+        });
+    }
+    // Reverse direction
+    let rev_edges = assoc_edges.entry(dst).or_default();
+    let mut rev_found = false;
+    for edge in rev_edges.iter_mut() {
+        if edge.dst == src && std::mem::discriminant(&edge.edge_type) == std::mem::discriminant(&edge_type) {
+            edge.weight = (edge.weight + delta).min(1.0);
+            rev_found = true;
+            break;
+        }
+    }
+    if !rev_found {
+        rev_edges.push(AssocEdge {
+            dst: src,
+            edge_type,
+            weight: delta.clamp(0.0, 1.0),
+        });
     }
 }
 

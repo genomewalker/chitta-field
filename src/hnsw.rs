@@ -159,6 +159,80 @@ impl SemanticIndex {
         heap_to_hits(top_k)
     }
 
+    /// Like `search`, but applies a retrieval-signature alignment boost.
+    ///
+    /// For each candidate, after computing cosine similarity, adds:
+    ///   `beta * max(0.0, dot(query_ctx_32, signature_32))`
+    /// where `query_ctx_32` is a 32-dim projected query context sketch and
+    /// `signature_32` is the cached mean retrieval signature for that memory
+    /// (from `RetrievalHistory::signature`).
+    ///
+    /// Memories with empty signatures receive zero boost.
+    pub fn search_with_signature_boost(
+        &self,
+        query: &[f32],
+        k: usize,
+        allowed: Option<&HashSet<MemoryId>>,
+        query_ctx_32: &[f32],
+        signatures: &HashMap<MemoryId, Vec<f32>>,
+        beta: f32,
+    ) -> Vec<SemanticHit> {
+        if query.len() != EMBED_DIM {
+            return vec![];
+        }
+        let Some(query_unit) = normalize(query) else {
+            return vec![];
+        };
+
+        let candidates = if let Some(allowed_ids) = allowed {
+            if allowed_ids.len() <= MIN_CANDIDATES {
+                allowed_ids.iter().copied().collect::<Vec<_>>()
+            } else {
+                let mut cands = self.collect_lsh_candidates(&query_unit, allowed, k);
+                if cands.is_empty() {
+                    let probes = self.choose_probe_ids(&query_unit, MIN_PROBES);
+                    cands = self.collect_candidates(&probes, allowed, k);
+                }
+                cands
+            }
+        } else {
+            let mut cands = self.collect_lsh_candidates(&query_unit, allowed, k);
+            if cands.is_empty() {
+                let probes = self.choose_probe_ids(&query_unit, MIN_PROBES);
+                cands = self.collect_candidates(&probes, allowed, k);
+            }
+            cands
+        };
+
+        if candidates.is_empty() {
+            return vec![];
+        }
+
+        let mut top_k = BinaryHeap::new();
+        for memory_id in candidates {
+            if self.deleted.contains(&memory_id) {
+                continue;
+            }
+            let Some(embedding) = self.embeddings.get(&memory_id) else {
+                continue;
+            };
+            let base_sim = dot(&query_unit, embedding);
+            let boost = if let Some(sig) = signatures.get(&memory_id) {
+                if !sig.is_empty() && !query_ctx_32.is_empty() {
+                    beta * dot_n(query_ctx_32, sig, 32).max(0.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            let adjusted_sim = base_sim + boost;
+            push_top_k(&mut top_k, k, memory_id, adjusted_sim);
+        }
+
+        heap_to_hits(top_k)
+    }
+
     /// Exact cosine search over a bounded candidate set.
     pub fn search_candidates<I>(&self, query: &[f32], candidates: I, k: usize) -> Vec<SemanticHit>
     where
@@ -424,6 +498,10 @@ fn normalize_in_place(v: &mut [f32]) {
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+fn dot_n(a: &[f32], b: &[f32], n: usize) -> f32 {
+    a.iter().zip(b.iter()).take(n).map(|(x, y)| x * y).sum()
 }
 
 #[derive(Clone, Copy, Debug)]
