@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use crate::ids::MemoryId;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub type SymbolId = u64;
 
@@ -47,20 +47,34 @@ impl SymbolIndex {
 
         if let Some(&existing_id) = self.dedup.get(&key) {
             // Update existing entry in place.
-            self.by_id.insert(existing_id, SymbolEntry { id: existing_id, ..entry });
+            self.by_id.insert(
+                existing_id,
+                SymbolEntry {
+                    id: existing_id,
+                    ..entry
+                },
+            );
             return existing_id;
         }
 
         let id = entry.id;
         self.dedup.insert(key, id);
-        self.by_name.entry(entry.name.clone()).or_insert_with(Vec::new).push(id);
+        self.by_name
+            .entry(entry.name.clone())
+            .or_insert_with(Vec::new)
+            .push(id);
         self.by_id.insert(id, entry);
         id
     }
 
     pub fn remove(&mut self, id: SymbolId) {
         if let Some(entry) = self.by_id.remove(&id) {
-            let key = (entry.kind, entry.name.clone(), entry.file_path, entry.line_start);
+            let key = (
+                entry.kind,
+                entry.name.clone(),
+                entry.file_path,
+                entry.line_start,
+            );
             self.dedup.remove(&key);
             if let Some(ids) = self.by_name.get_mut(&entry.name) {
                 ids.retain(|&x| x != id);
@@ -122,7 +136,12 @@ impl SymbolIndex {
                 if e.embedding.len() != query.len() {
                     return None;
                 }
-                let dot: f32 = e.embedding.iter().zip(query.iter()).map(|(a, b)| a * b).sum();
+                let dot: f32 = e
+                    .embedding
+                    .iter()
+                    .zip(query.iter())
+                    .map(|(a, b)| a * b)
+                    .sum();
                 let emb_norm: f32 = e.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
                 if emb_norm == 0.0 {
                     return None;
@@ -164,9 +183,10 @@ impl SymbolIndex {
         if paths.is_empty() {
             return Vec::new();
         }
-        let path_set: std::collections::HashSet<&str> =
-            paths.iter().map(|s| s.as_str()).collect();
-        let ids_to_remove: Vec<SymbolId> = self.by_id.iter()
+        let path_set: std::collections::HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let ids_to_remove: Vec<SymbolId> = self
+            .by_id
+            .iter()
             .filter(|(_, e)| path_set.contains(e.file_path.as_str()))
             .map(|(&id, _)| id)
             .collect();

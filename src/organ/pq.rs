@@ -32,10 +32,7 @@ impl ProductQuantizer {
             let end = start + DIM_PER_SUB;
 
             // Extract subvectors for this subspace
-            let subvecs: Vec<Vec<f32>> = residuals
-                .iter()
-                .map(|r| r[start..end].to_vec())
-                .collect();
+            let subvecs: Vec<Vec<f32>> = residuals.iter().map(|r| r[start..end].to_vec()).collect();
 
             let centroids = kmeans(&subvecs, N_CENTROIDS, n_iter);
             codebooks.push(centroids);
@@ -92,9 +89,7 @@ fn kmeans(data: &[Vec<f32>], k: usize, n_iter: usize) -> Vec<Vec<f32>> {
 
     // Initialize centroids by striding through data
     let stride = n / k;
-    let mut centroids: Vec<Vec<f32>> = (0..k)
-        .map(|i| data[i * stride].clone())
-        .collect();
+    let mut centroids: Vec<Vec<f32>> = (0..k).map(|i| data[i * stride].clone()).collect();
 
     for _ in 0..n_iter {
         // Assignment step: assign each point to nearest centroid

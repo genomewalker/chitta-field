@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
 use crate::ids::MemoryId;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Entry in the temporal index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +98,7 @@ mod tests {
         }
         let results = idx.range_query(2000, 5000, None, 100);
         assert_eq!(results.len(), 4); // ts 2000, 3000, 4000, 5000
-        // most recent first
+                                      // most recent first
         assert_eq!(results[0].ts_ms, 5000);
     }
 

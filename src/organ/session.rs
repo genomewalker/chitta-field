@@ -21,14 +21,17 @@ impl SessionRegistry {
     }
 
     pub fn register(&mut self, session_id: String, kind: String, realm: String, now_ms: i64) {
-        self.sessions.insert(session_id.clone(), SessionRecord {
-            session_id,
-            kind,
-            realm,
-            started_at_ms: now_ms,
-            last_heartbeat_ms: now_ms,
-            status: "active".into(),
-        });
+        self.sessions.insert(
+            session_id.clone(),
+            SessionRecord {
+                session_id,
+                kind,
+                realm,
+                started_at_ms: now_ms,
+                last_heartbeat_ms: now_ms,
+                status: "active".into(),
+            },
+        );
     }
 
     pub fn heartbeat(&mut self, session_id: &str, now_ms: i64) {
@@ -48,7 +51,8 @@ impl SessionRegistry {
     }
 
     pub fn list_active(&self) -> Vec<&SessionRecord> {
-        self.sessions.values()
+        self.sessions
+            .values()
             .filter(|s| s.status == "active")
             .collect()
     }

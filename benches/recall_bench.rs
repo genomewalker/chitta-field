@@ -1,13 +1,8 @@
-//! Manual benchmark for chitta-field recall performance.
+//! Manual large-scale benchmark for chitta-field.
 //!
-//! Run with:
+//! Examples:
 //!   ./build.sh run --bin bench --release
-//!
-//! Tests recall_semantic, recall_keyword, recall_temporal, and hybrid
-//! (semantic + keyword merge) at corpus sizes 100, 1_000, 5_000, 10_000.
-//!
-//! Each method is exercised with 100 queries and the mean latency is reported.
-//! A bottleneck analysis section explains the dominant cost at each scale.
+//!   ./build.sh run --bin bench --release -- --sizes 100000,1000000 --queries 50 --flush
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -16,25 +11,86 @@ use std::time::{Duration, Instant};
 use chitta_field::field::ChittaField;
 use chitta_field::ops::EMBED_DIM;
 
+struct Config {
+    sizes: Vec<usize>,
+    query_iters: usize,
+    top_k: usize,
+    flush_after_queries: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            sizes: vec![10_000, 100_000],
+            query_iters: 50,
+            top_k: 10,
+            flush_after_queries: true,
+        }
+    }
+}
+
+impl Config {
+    fn from_args() -> Self {
+        let mut cfg = Self::default();
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--sizes" => {
+                    if let Some(v) = args.next() {
+                        cfg.sizes = parse_sizes(&v);
+                    }
+                }
+                "--queries" => {
+                    if let Some(v) = args.next() {
+                        cfg.query_iters = v.parse().unwrap_or(cfg.query_iters);
+                    }
+                }
+                "--top-k" => {
+                    if let Some(v) = args.next() {
+                        cfg.top_k = v.parse().unwrap_or(cfg.top_k);
+                    }
+                }
+                "--flush" => cfg.flush_after_queries = true,
+                "--no-flush" => cfg.flush_after_queries = false,
+                _ => {}
+            }
+        }
+        cfg
+    }
+}
+
+fn parse_sizes(v: &str) -> Vec<usize> {
+    let mut sizes = Vec::new();
+    for raw in v.split(',') {
+        if let Ok(n) = raw.trim().parse() {
+            sizes.push(n);
+        }
+    }
+    if sizes.is_empty() {
+        Config::default().sizes
+    } else {
+        sizes
+    }
+}
+
 fn tmp_field(tag: &str) -> (ChittaField, PathBuf) {
     let base = std::env::temp_dir().join(format!("chitta-bench-{tag}"));
     let data = base.join("data");
-    // Start fresh
     let _ = std::fs::remove_dir_all(&base);
     let field = ChittaField::open(data).expect("open");
     (field, base)
 }
 
-/// A deterministic unit embedding for index i.
-/// Two non-zero dimensions ensure varied cosine similarity across queries.
 fn make_embedding(i: usize) -> Vec<f32> {
     let mut e = vec![0.0f32; EMBED_DIM];
     e[i % EMBED_DIM] = 1.0;
     e[(i.wrapping_mul(7)) % EMBED_DIM] += 0.5;
-    // normalise
+    e[(i.wrapping_mul(13)) % EMBED_DIM] += 0.25;
     let norm: f32 = e.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
-        for x in &mut e { *x /= norm; }
+        for x in &mut e {
+            *x /= norm;
+        }
     }
     e
 }
@@ -45,9 +101,10 @@ struct BenchResult {
     max_ms: f64,
 }
 
-fn bench<F: FnMut() -> ()>(mut f: F, iters: usize) -> BenchResult {
-    // Warmup
-    for _ in 0..5 { f(); }
+fn bench<F: FnMut()>(mut f: F, iters: usize) -> BenchResult {
+    for _ in 0..5.min(iters) {
+        f();
+    }
 
     let mut durations: Vec<Duration> = Vec::with_capacity(iters);
     for _ in 0..iters {
@@ -58,136 +115,171 @@ fn bench<F: FnMut() -> ()>(mut f: F, iters: usize) -> BenchResult {
 
     let total: Duration = durations.iter().sum();
     let mean_ms = total.as_secs_f64() * 1000.0 / iters as f64;
-    let min_ms  = durations.iter().map(|d| d.as_secs_f64() * 1000.0).fold(f64::INFINITY, f64::min);
-    let max_ms  = durations.iter().map(|d| d.as_secs_f64() * 1000.0).fold(0.0f64, f64::max);
+    let min_ms = durations
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .fold(f64::INFINITY, f64::min);
+    let max_ms = durations
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .fold(0.0f64, f64::max);
 
-    BenchResult { mean_ms, min_ms, max_ms }
+    BenchResult {
+        mean_ms,
+        min_ms,
+        max_ms,
+    }
 }
 
 fn print_result(label: &str, r: &BenchResult, iters: usize) {
     println!(
-        "    {:<22} mean={:6.2}ms  min={:5.2}ms  max={:6.2}ms  ({} iters)",
+        "    {:<26} mean={:8.2}ms  min={:7.2}ms  max={:8.2}ms  ({} iters)",
         label, r.mean_ms, r.min_ms, r.max_ms, iters
     );
 }
 
-fn main() {
-    let corpus_sizes: &[usize] = &[100, 1_000, 5_000, 10_000];
-    let query_iters = 100usize;
+fn insert_corpus(field: &ChittaField, n: usize) {
+    let t0 = Instant::now();
+    for i in 0..n {
+        let emb = make_embedding(i);
+        let topic = i % 256;
+        let project = i % 32;
+        let shard = i % 16;
+        let realm = if i % 2 == 0 { "bench-a" } else { "bench-b" };
+        let content = format!(
+            "memory{i} topic{topic} project{project} shard{shard} architecture retrieval benchmark synthetic corpus"
+        );
+        field
+            .put_memory(
+                "wisdom",
+                realm,
+                content.as_bytes(),
+                &emb,
+                0.9,
+                0.001,
+                i as i64 * 1000,
+                vec![],
+                None,
+                None,
+            )
+            .unwrap();
+        if (i + 1) % 100_000 == 0 {
+            let elapsed = t0.elapsed().as_secs_f64().max(1e-6);
+            println!(
+                "    inserted {:>8} / {:>8} ({:>8.0} rec/s)",
+                i + 1,
+                n,
+                (i + 1) as f64 / elapsed
+            );
+        }
+    }
+}
 
-    println!("chitta-field recall benchmark");
-    println!("EMBED_DIM={EMBED_DIM}, query_iters={query_iters}");
+fn main() {
+    let cfg = Config::from_args();
+
+    println!("chitta-field scalable benchmark");
+    println!(
+        "EMBED_DIM={} sizes={:?} query_iters={} top_k={} flush_after_queries={}",
+        EMBED_DIM, cfg.sizes, cfg.query_iters, cfg.top_k, cfg.flush_after_queries
+    );
     println!();
 
-    for &n in corpus_sizes {
+    for &n in &cfg.sizes {
         println!("=== Corpus: {n} memories ===");
-
         let (field, base) = tmp_field(&n.to_string());
 
-        // --- Insert phase ---
         let t_insert = Instant::now();
-        for i in 0..n {
-            let emb = make_embedding(i);
-            let topic = i % 20;
-            let project = i % 5;
-            let content = format!(
-                "memory {i} discusses topic {topic} in project {project} \
-                 with context about system design and architecture patterns"
-            );
-            field.put_memory(
-                "wisdom", "bench",
-                content.as_bytes(), &emb,
-                0.9, 0.001, i as i64 * 1000,
-                vec![], None, None,
-            ).unwrap();
-        }
+        insert_corpus(&field, n);
         let insert_ms = t_insert.elapsed().as_secs_f64() * 1000.0;
         println!(
-            "  Insert {n}: {insert_ms:.0}ms  ({:.0} rec/s)",
+            "  Insert {n}: {:.0}ms ({:.0} rec/s)",
+            insert_ms,
             n as f64 / (insert_ms / 1000.0).max(1e-6)
         );
 
-        // Query embedding: aligned with topic 0 memories
         let query_emb = make_embedding(0);
+        let keyword_query = "topic0 project0 shard0";
 
-        // --- recall_semantic ---
-        let r = bench(|| {
-            let hits = field.recall_semantic(&query_emb, 10, Some("bench")).unwrap();
-            assert!(!hits.is_empty());
-        }, query_iters);
-        print_result("recall_semantic(k=10)", &r, query_iters);
+        let r = bench(
+            || {
+                let hits = field
+                    .recall_semantic(&query_emb, cfg.top_k, Some("bench-a"))
+                    .unwrap();
+                assert!(!hits.is_empty());
+            },
+            cfg.query_iters,
+        );
+        print_result("recall_semantic(realm)", &r, cfg.query_iters);
 
-        // --- recall_semantic without realm filter (no allowed-set build cost) ---
-        let r = bench(|| {
-            let hits = field.recall_semantic(&query_emb, 10, None).unwrap();
-            assert!(!hits.is_empty());
-        }, query_iters);
-        print_result("recall_semantic(no realm)", &r, query_iters);
+        let r = bench(
+            || {
+                let hits = field.recall_semantic(&query_emb, cfg.top_k, None).unwrap();
+                assert!(!hits.is_empty());
+            },
+            cfg.query_iters,
+        );
+        print_result("recall_semantic(global)", &r, cfg.query_iters);
 
-        // --- recall_keyword ---
-        let r = bench(|| {
-            let hits = field.recall_keyword("topic project memory system", 10).unwrap();
-            let _ = hits;
-        }, query_iters);
-        print_result("recall_keyword(k=10)", &r, query_iters);
+        let r = bench(
+            || {
+                let hits = field.recall_keyword(keyword_query, cfg.top_k).unwrap();
+                assert!(!hits.is_empty());
+            },
+            cfg.query_iters,
+        );
+        print_result("recall_keyword", &r, cfg.query_iters);
 
-        // --- recall_temporal ---
         let mid_ms = (n as i64 / 2) * 1000;
-        let r = bench(|| {
-            let hits = field.recall_temporal(0, mid_ms, Some("bench"), 10).unwrap();
-            let _ = hits;
-        }, query_iters);
-        print_result("recall_temporal(k=10)", &r, query_iters);
+        let r = bench(
+            || {
+                let hits = field
+                    .recall_temporal(0, mid_ms, Some("bench-a"), cfg.top_k)
+                    .unwrap();
+                let _ = hits;
+            },
+            cfg.query_iters,
+        );
+        print_result("recall_temporal", &r, cfg.query_iters);
 
-        // --- hybrid: semantic + keyword, deduplicated union ---
-        let r = bench(|| {
-            let sem = field.recall_semantic(&query_emb, 20, Some("bench")).unwrap();
-            let kw  = field.recall_keyword("topic project design", 20).unwrap();
-            let mut seen = HashSet::new();
-            let combined: Vec<_> = sem.into_iter()
-                .chain(kw)
-                .filter(|h| seen.insert(h.memory_id))
-                .take(10)
-                .collect();
-            assert!(!combined.is_empty());
-        }, query_iters);
-        print_result("hybrid(sem+kw, k=10)", &r, query_iters);
+        let r = bench(
+            || {
+                let sem = field
+                    .recall_semantic(&query_emb, cfg.top_k * 2, Some("bench-a"))
+                    .unwrap();
+                let kw = field.recall_keyword(keyword_query, cfg.top_k * 2).unwrap();
+                let mut seen = HashSet::new();
+                let combined: Vec<_> = sem
+                    .into_iter()
+                    .chain(kw)
+                    .filter(|h| seen.insert(h.memory_id))
+                    .take(cfg.top_k)
+                    .collect();
+                assert!(!combined.is_empty());
+            },
+            cfg.query_iters,
+        );
+        print_result("hybrid(sem+kw)", &r, cfg.query_iters);
 
-        // --- expand_associations (no edges → O(1) but measures overhead) ---
-        let r = bench(|| {
-            let hits = field.expand_associations(&[1], 2, 10).unwrap();
-            let _ = hits;
-        }, query_iters);
-        print_result("expand_associations", &r, query_iters);
+        if cfg.flush_after_queries {
+            let r = bench(
+                || {
+                    field.flush().unwrap();
+                },
+                10,
+            );
+            print_result("flush(deferred effects)", &r, 10);
+        }
 
+        println!("  memory_count={}", field.memory_count());
         println!();
 
-        // Cleanup temp dir
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // --- Scaling summary ---
-    println!("=== Scaling analysis ===");
-    println!();
-    println!("recall_semantic:");
-    println!("  Cost: O(n × {EMBED_DIM}) dot products + O(n log n) sort.");
-    println!("  With realm filter: additionally O(n) HashSet build over payloads.");
-    println!("  Dominant cost at >10k memories. Replace SemanticIndex with HNSW");
-    println!("  (instant-distance crate) for O(log n) approximate recall.");
-    println!();
-    println!("recall_keyword (BM25):");
-    println!("  Cost: O(|postings| per query term) — sublinear in n.");
-    println!("  Scales well; bottleneck is postings list iteration, not corpus size.");
-    println!();
-    println!("recall_temporal:");
-    println!("  Cost: O(log n) BTreeMap range scan + O(result) filter.");
-    println!("  Essentially free; no scaling concern up to millions of memories.");
-    println!();
-    println!("hybrid (sem+kw):");
-    println!("  Cost: recall_semantic + recall_keyword + O(k) dedup.");
-    println!("  Dominated by semantic scan at scale.");
-    println!();
-    println!("expand_associations:");
-    println!("  Cost: O(hops × fanout) BFS over assoc_edges HashMap.");
-    println!("  Fast when edge density is low; fanout capped at 16 per hop.");
+    println!("Notes:");
+    println!("  semantic recall uses the ANN index directly");
+    println!("  ANN candidate generation uses LSH first, then coarse centroid buckets");
+    println!("  recall-side reconsolidation is deferred until flush/snapshot");
+    println!("  use --sizes 1000000 to drive a 1M synthetic run");
 }

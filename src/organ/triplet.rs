@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
 use crate::ids::MemoryId;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// A single subject-predicate-object fact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,7 +52,16 @@ impl TripletStore {
     ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.insert_with_id(id, subject, predicate, object, weight, valid_from_ms, source_memory_id, source_file);
+        self.insert_with_id(
+            id,
+            subject,
+            predicate,
+            object,
+            weight,
+            valid_from_ms,
+            source_memory_id,
+            source_file,
+        );
         id
     }
 
@@ -72,7 +81,16 @@ impl TripletStore {
         if id >= self.next_id {
             self.next_id = id + 1;
         }
-        self.insert_with_id(id, subject, predicate, object, weight, valid_from_ms, source_memory_id, source_file);
+        self.insert_with_id(
+            id,
+            subject,
+            predicate,
+            object,
+            weight,
+            valid_from_ms,
+            source_memory_id,
+            source_file,
+        );
     }
 
     fn insert_with_id(
@@ -102,9 +120,18 @@ impl TripletStore {
         };
         self.entries.push(entry);
 
-        self.by_subject.entry(subject).or_insert_with(Vec::new).push(id);
-        self.by_object.entry(object).or_insert_with(Vec::new).push(id);
-        self.by_predicate.entry(predicate).or_insert_with(Vec::new).push(id);
+        self.by_subject
+            .entry(subject)
+            .or_insert_with(Vec::new)
+            .push(id);
+        self.by_object
+            .entry(object)
+            .or_insert_with(Vec::new)
+            .push(id);
+        self.by_predicate
+            .entry(predicate)
+            .or_insert_with(Vec::new)
+            .push(id);
     }
 
     /// Invalidate a triplet (set valid_to_ms = now_ms).
@@ -163,8 +190,16 @@ impl TripletStore {
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
 
-        let subject_ids = self.by_subject.get(entity).map(|v| v.as_slice()).unwrap_or(&[]);
-        let object_ids = self.by_object.get(entity).map(|v| v.as_slice()).unwrap_or(&[]);
+        let subject_ids = self
+            .by_subject
+            .get(entity)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let object_ids = self
+            .by_object
+            .get(entity)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
 
         for &id in subject_ids.iter().chain(object_ids.iter()) {
             if seen.insert(id) {
@@ -214,9 +249,33 @@ mod tests {
     #[test]
     fn test_add_query_subject() {
         let mut store = TripletStore::new();
-        store.add("chitta".into(), "uses".into(), "duckdb".into(), 1.0, 0, None, None);
-        store.add("chitta".into(), "has".into(), "memory".into(), 0.9, 0, None, None);
-        store.add("duckdb".into(), "is_a".into(), "database".into(), 1.0, 0, None, None);
+        store.add(
+            "chitta".into(),
+            "uses".into(),
+            "duckdb".into(),
+            1.0,
+            0,
+            None,
+            None,
+        );
+        store.add(
+            "chitta".into(),
+            "has".into(),
+            "memory".into(),
+            0.9,
+            0,
+            None,
+            None,
+        );
+        store.add(
+            "duckdb".into(),
+            "is_a".into(),
+            "database".into(),
+            1.0,
+            0,
+            None,
+            None,
+        );
 
         let results = store.query_subject("chitta", 0);
         assert_eq!(results.len(), 2);
@@ -225,7 +284,15 @@ mod tests {
     #[test]
     fn test_temporal_invalidation() {
         let mut store = TripletStore::new();
-        let id = store.add("chitta".into(), "uses".into(), "duckdb".into(), 1.0, 0, None, None);
+        let id = store.add(
+            "chitta".into(),
+            "uses".into(),
+            "duckdb".into(),
+            1.0,
+            0,
+            None,
+            None,
+        );
 
         // Valid at time 500
         let results = store.query_subject("chitta", 500);
@@ -246,9 +313,33 @@ mod tests {
     #[test]
     fn test_query_entity() {
         let mut store = TripletStore::new();
-        store.add("alice".into(), "knows".into(), "bob".into(), 1.0, 0, None, None);
-        store.add("charlie".into(), "knows".into(), "alice".into(), 1.0, 0, None, None);
-        store.add("alice".into(), "works_at".into(), "anthropic".into(), 1.0, 0, None, None);
+        store.add(
+            "alice".into(),
+            "knows".into(),
+            "bob".into(),
+            1.0,
+            0,
+            None,
+            None,
+        );
+        store.add(
+            "charlie".into(),
+            "knows".into(),
+            "alice".into(),
+            1.0,
+            0,
+            None,
+            None,
+        );
+        store.add(
+            "alice".into(),
+            "works_at".into(),
+            "anthropic".into(),
+            1.0,
+            0,
+            None,
+            None,
+        );
 
         let results = store.query_entity("alice", 0);
         assert_eq!(results.len(), 3); // alice appears as subject twice, object once
@@ -257,8 +348,24 @@ mod tests {
     #[test]
     fn test_query_object() {
         let mut store = TripletStore::new();
-        store.add("chitta".into(), "uses".into(), "duckdb".into(), 1.0, 0, None, None);
-        store.add("amber".into(), "uses".into(), "duckdb".into(), 0.8, 0, None, None);
+        store.add(
+            "chitta".into(),
+            "uses".into(),
+            "duckdb".into(),
+            1.0,
+            0,
+            None,
+            None,
+        );
+        store.add(
+            "amber".into(),
+            "uses".into(),
+            "duckdb".into(),
+            0.8,
+            0,
+            None,
+            None,
+        );
 
         let results = store.query_object("duckdb", 0);
         assert_eq!(results.len(), 2);
@@ -267,9 +374,33 @@ mod tests {
     #[test]
     fn test_query_predicate() {
         let mut store = TripletStore::new();
-        store.add("chitta".into(), "uses".into(), "duckdb".into(), 1.0, 0, None, None);
-        store.add("chitta".into(), "uses".into(), "hnsw".into(), 0.9, 0, None, None);
-        store.add("chitta".into(), "has".into(), "memory".into(), 1.0, 0, None, None);
+        store.add(
+            "chitta".into(),
+            "uses".into(),
+            "duckdb".into(),
+            1.0,
+            0,
+            None,
+            None,
+        );
+        store.add(
+            "chitta".into(),
+            "uses".into(),
+            "hnsw".into(),
+            0.9,
+            0,
+            None,
+            None,
+        );
+        store.add(
+            "chitta".into(),
+            "has".into(),
+            "memory".into(),
+            1.0,
+            0,
+            None,
+            None,
+        );
 
         let results = store.query_predicate("uses", 0);
         assert_eq!(results.len(), 2);
@@ -278,9 +409,33 @@ mod tests {
     #[test]
     fn test_objects_of() {
         let mut store = TripletStore::new();
-        store.add("chitta".into(), "uses".into(), "duckdb".into(), 1.0, 0, None, None);
-        store.add("chitta".into(), "uses".into(), "hnsw".into(), 0.9, 0, None, None);
-        store.add("chitta".into(), "has".into(), "memory".into(), 1.0, 0, None, None);
+        store.add(
+            "chitta".into(),
+            "uses".into(),
+            "duckdb".into(),
+            1.0,
+            0,
+            None,
+            None,
+        );
+        store.add(
+            "chitta".into(),
+            "uses".into(),
+            "hnsw".into(),
+            0.9,
+            0,
+            None,
+            None,
+        );
+        store.add(
+            "chitta".into(),
+            "has".into(),
+            "memory".into(),
+            1.0,
+            0,
+            None,
+            None,
+        );
 
         let objects = store.objects_of("chitta", "uses", 0);
         assert_eq!(objects.len(), 2);
@@ -291,8 +446,24 @@ mod tests {
     #[test]
     fn test_subjects_of() {
         let mut store = TripletStore::new();
-        store.add("chitta".into(), "uses".into(), "duckdb".into(), 1.0, 0, None, None);
-        store.add("amber".into(), "uses".into(), "duckdb".into(), 0.8, 0, None, None);
+        store.add(
+            "chitta".into(),
+            "uses".into(),
+            "duckdb".into(),
+            1.0,
+            0,
+            None,
+            None,
+        );
+        store.add(
+            "amber".into(),
+            "uses".into(),
+            "duckdb".into(),
+            0.8,
+            0,
+            None,
+            None,
+        );
 
         let subjects = store.subjects_of("uses", "duckdb", 0);
         assert_eq!(subjects.len(), 2);

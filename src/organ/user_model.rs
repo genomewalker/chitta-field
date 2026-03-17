@@ -19,14 +19,23 @@ impl UserModelRegistry {
         Self::default()
     }
 
-    pub fn upsert(&mut self, entity_id: String, entity_type: String, payload_json: String, now_ms: i64) {
-        self.entries.insert(entity_id.clone(), UserModelEntry {
-            entity_id,
-            entity_type,
-            payload_json,
-            updated_at_ms: now_ms,
-            observation_count: 0,
-        });
+    pub fn upsert(
+        &mut self,
+        entity_id: String,
+        entity_type: String,
+        payload_json: String,
+        now_ms: i64,
+    ) {
+        self.entries.insert(
+            entity_id.clone(),
+            UserModelEntry {
+                entity_id,
+                entity_type,
+                payload_json,
+                updated_at_ms: now_ms,
+                observation_count: 0,
+            },
+        );
     }
 
     pub fn observe(&mut self, entity_id: &str, now_ms: i64) {
@@ -41,7 +50,10 @@ impl UserModelRegistry {
     }
 
     pub fn list_by_type(&self, entity_type: &str) -> Vec<&UserModelEntry> {
-        self.entries.values().filter(|e| e.entity_type == entity_type).collect()
+        self.entries
+            .values()
+            .filter(|e| e.entity_type == entity_type)
+            .collect()
     }
 
     pub fn list_all(&self) -> Vec<&UserModelEntry> {

@@ -1,5 +1,5 @@
+use crate::ids::{ArtifactId, ChunkHash, MemoryId};
 use serde::{Deserialize, Serialize};
-use crate::ids::{MemoryId, ChunkHash, ArtifactId};
 
 pub const EMBED_DIM: usize = 768; // BGE-base-en-v1.5
 
@@ -165,7 +165,7 @@ pub struct UpdateSparseCodeOp {
     pub memory_id: u64,
     pub feature_ids: Vec<u32>,
     pub activations: Vec<f32>,
-    pub ts_ms: i64,  // when encoded
+    pub ts_ms: i64, // when encoded
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,7 +286,7 @@ pub struct UpdateSymbolDescriptionOp {
 pub struct UpdateMemoryContentOp {
     pub memory_id: MemoryId,
     pub content: Vec<u8>,
-    pub embedding: Vec<f32>,  // empty = no embedding change
+    pub embedding: Vec<f32>, // empty = no embedding change
 }
 
 /// Domain event envelope for analytics events.

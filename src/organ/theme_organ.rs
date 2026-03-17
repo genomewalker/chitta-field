@@ -37,7 +37,11 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
 }
 
 impl ThemeOrgan {
@@ -49,15 +53,18 @@ impl ThemeOrgan {
         if theme_id >= self.next_id {
             self.next_id = theme_id + 1;
         }
-        self.themes.insert(theme_id, ThemeRecord {
+        self.themes.insert(
             theme_id,
-            name,
-            centroid: Vec::new(),
-            realm: String::new(),
-            coherence: 1.0,
-            member_ids: HashSet::new(),
-            created_at: 0,
-        });
+            ThemeRecord {
+                theme_id,
+                name,
+                centroid: Vec::new(),
+                realm: String::new(),
+                coherence: 1.0,
+                member_ids: HashSet::new(),
+                created_at: 0,
+            },
+        );
     }
 
     /// Update centroid from a JSON string (used during log replay).
@@ -78,7 +85,9 @@ impl ThemeOrgan {
             Some(t) => t,
             None => return,
         };
-        let member_embs: Vec<&Vec<f32>> = t.member_ids.iter()
+        let member_embs: Vec<&Vec<f32>> = t
+            .member_ids
+            .iter()
             .filter_map(|id| embeddings.get(id))
             .collect();
         if member_embs.is_empty() {
@@ -153,9 +162,13 @@ impl ThemeOrgan {
 
         // Collect all themed memory ids
         let all_themed: HashSet<u64> = if realm.is_empty() {
-            self.themes.values().flat_map(|t| t.member_ids.iter().copied()).collect()
+            self.themes
+                .values()
+                .flat_map(|t| t.member_ids.iter().copied())
+                .collect()
         } else {
-            self.themes.values()
+            self.themes
+                .values()
                 .filter(|t| t.realm == realm)
                 .flat_map(|t| t.member_ids.iter().copied())
                 .collect()
@@ -173,7 +186,9 @@ impl ThemeOrgan {
 
     /// Find top-k themes by cosine similarity between query embedding and theme centroids.
     pub fn recall_by_embedding(&self, embedding: &[f32], k: usize, realm: &str) -> Vec<(u64, f32)> {
-        let mut scored: Vec<(u64, f32)> = self.themes.values()
+        let mut scored: Vec<(u64, f32)> = self
+            .themes
+            .values()
             .filter(|t| realm.is_empty() || t.realm == realm)
             .filter(|t| !t.centroid.is_empty())
             .map(|t| (t.theme_id, cosine_sim(embedding, &t.centroid)))
@@ -195,11 +210,14 @@ impl ThemeOrgan {
         assignment_threshold: f32,
     ) -> (usize, usize) {
         // Collect all themed memory ids
-        let themed: HashSet<u64> = self.themes.values()
+        let themed: HashSet<u64> = self
+            .themes
+            .values()
             .flat_map(|t| t.member_ids.iter().copied())
             .collect();
 
-        let orphans: Vec<u64> = all_memory_ids.iter()
+        let orphans: Vec<u64> = all_memory_ids
+            .iter()
             .copied()
             .filter(|id| !themed.contains(id))
             .collect();
@@ -215,7 +233,9 @@ impl ThemeOrgan {
             };
 
             // Find best matching theme
-            let best = self.themes.values()
+            let best = self
+                .themes
+                .values()
                 .filter(|t| realm.is_empty() || t.realm == realm)
                 .filter(|t| !t.centroid.is_empty())
                 .map(|t| (t.theme_id, cosine_sim(emb, &t.centroid)))
@@ -223,7 +243,11 @@ impl ThemeOrgan {
 
             if let Some((best_id, best_score)) = best {
                 if best_score >= assignment_threshold {
-                    self.themes.get_mut(&best_id).unwrap().member_ids.insert(*mem_id);
+                    self.themes
+                        .get_mut(&best_id)
+                        .unwrap()
+                        .member_ids
+                        .insert(*mem_id);
                     assigned += 1;
                     continue;
                 }
@@ -259,7 +283,9 @@ impl ThemeOrgan {
         let mut memories_reassigned = 0usize;
 
         // --- Split pass ---
-        let split_candidates: Vec<u64> = self.themes.values()
+        let split_candidates: Vec<u64> = self
+            .themes
+            .values()
             .filter(|t| t.member_ids.len() > 100)
             .map(|t| t.theme_id)
             .collect();
@@ -270,16 +296,24 @@ impl ThemeOrgan {
                     Some(t) => t,
                     None => continue,
                 };
-                if t.member_ids.len() <= 100 { continue; }
-                (t.member_ids.iter().copied().collect::<Vec<u64>>(), t.realm.clone())
+                if t.member_ids.len() <= 100 {
+                    continue;
+                }
+                (
+                    t.member_ids.iter().copied().collect::<Vec<u64>>(),
+                    t.realm.clone(),
+                )
             };
 
-            let members_with_emb: Vec<(u64, &Vec<f32>)> = member_ids.iter()
+            let members_with_emb: Vec<(u64, &Vec<f32>)> = member_ids
+                .iter()
                 .filter_map(|id| embeddings.get(id).map(|e| (*id, e)))
                 .filter(|(_, e)| !e.is_empty())
                 .collect();
 
-            if members_with_emb.len() < 2 { continue; }
+            if members_with_emb.len() < 2 {
+                continue;
+            }
 
             // Pick two seeds: first and last in the list
             let seed_a = members_with_emb[0].1.clone();
@@ -310,7 +344,9 @@ impl ThemeOrgan {
                 }
             }
 
-            if cluster_a.is_empty() || cluster_b.is_empty() { continue; }
+            if cluster_a.is_empty() || cluster_b.is_empty() {
+                continue;
+            }
 
             // Update the original theme with cluster_a
             {
@@ -321,7 +357,9 @@ impl ThemeOrgan {
                     t.coherence = 1.0;
                 } else {
                     let n = t.member_ids.len() as f32;
-                    let sum: f32 = t.member_ids.iter()
+                    let sum: f32 = t
+                        .member_ids
+                        .iter()
                         .filter_map(|id| embeddings.get(id))
                         .map(|e| cosine_sim(e, &t.centroid))
                         .sum();
@@ -337,7 +375,8 @@ impl ThemeOrgan {
                 1.0
             } else {
                 let n = member_count_b as f32;
-                let sum: f32 = cluster_b.iter()
+                let sum: f32 = cluster_b
+                    .iter()
                     .filter_map(|id| embeddings.get(id))
                     .map(|e| cosine_sim(e, &centroid_b))
                     .sum();
@@ -363,10 +402,14 @@ impl ThemeOrgan {
 
         'outer: for i in 0..theme_ids.len() {
             let id_a = theme_ids[i];
-            if merged.contains(&id_a) { continue; }
+            if merged.contains(&id_a) {
+                continue;
+            }
             for j in (i + 1)..theme_ids.len() {
                 let id_b = theme_ids[j];
-                if merged.contains(&id_b) { continue; }
+                if merged.contains(&id_b) {
+                    continue;
+                }
 
                 let sim = {
                     let ta = match self.themes.get(&id_a) {
@@ -384,7 +427,10 @@ impl ThemeOrgan {
                     // Merge b into a
                     let (members_b, _) = {
                         let tb = self.themes.get(&id_b).unwrap();
-                        (tb.member_ids.iter().copied().collect::<Vec<u64>>(), tb.realm.clone())
+                        (
+                            tb.member_ids.iter().copied().collect::<Vec<u64>>(),
+                            tb.realm.clone(),
+                        )
                     };
                     let reassigned = members_b.len();
                     {
@@ -407,7 +453,11 @@ impl ThemeOrgan {
             self.themes.remove(id);
         }
 
-        ThemeMaintenanceResult { themes_split, themes_merged, memories_reassigned }
+        ThemeMaintenanceResult {
+            themes_split,
+            themes_merged,
+            memories_reassigned,
+        }
     }
 }
 

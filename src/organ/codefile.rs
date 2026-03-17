@@ -1,5 +1,5 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
 
 pub type CodeFileId = u64;
 
@@ -87,7 +87,9 @@ impl CodeFileIndex {
 
     /// Remove all code files belonging to a project. Returns removed file paths.
     pub fn remove_by_project(&mut self, project: &str) -> Vec<String> {
-        let ids_to_remove: Vec<CodeFileId> = self.by_id.iter()
+        let ids_to_remove: Vec<CodeFileId> = self
+            .by_id
+            .iter()
             .filter(|(_, f)| f.project == project)
             .map(|(&id, _)| id)
             .collect();

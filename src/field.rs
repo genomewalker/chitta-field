@@ -1,33 +1,36 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use parking_lot::RwLock;
 use crate::error::Result;
-use crate::ids::{MemoryId, ArtifactId, InstanceId, MemoryIdAllocator, ArtifactIdAllocator, TripletIdAllocator, new_instance_id};
-use crate::log::OpLog;
-use crate::ops::{Op, EdgeType};
-use crate::payload::MemoryPayload;
-use crate::state::MemoryState;
 use crate::hnsw::SemanticIndex;
-use crate::organ::temporal::{TemporalIndex, TemporalEntry};
+use crate::ids::{
+    new_instance_id, ArtifactId, ArtifactIdAllocator, InstanceId, MemoryId, MemoryIdAllocator,
+    TripletIdAllocator,
+};
+use crate::learner::LearnerSet;
+use crate::log::OpLog;
+use crate::ops::{EdgeType, Op};
+use crate::organ::analytics::AnalyticsRegistry;
 use crate::organ::artifact::ArtifactIndex;
-use crate::organ::keyword::KeywordIndex;
-use crate::organ::triplet::TripletStore;
-use crate::organ::symbol::{SymbolIndex, SymbolEntry};
 use crate::organ::callgraph::CallGraph;
 use crate::organ::codefile::CodeFileIndex;
-use crate::organ::cortex::{SparseEncoder, CorticalIndex, SparseCode};
-use crate::organ::session::SessionRegistry;
-use crate::organ::transcript::TranscriptRegistry;
-use crate::organ::task::TaskRegistry;
-use crate::organ::user_model::UserModelRegistry;
-use crate::organ::theme_organ::ThemeOrgan;
-use crate::organ::analytics::AnalyticsRegistry;
-use crate::organ::pq::ProductQuantizer;
+use crate::organ::cortex::{CorticalIndex, SparseCode, SparseEncoder};
+use crate::organ::keyword::KeywordIndex;
 use crate::organ::lite_encoder::LiteEncoder;
-use crate::learner::LearnerSet;
+use crate::organ::pq::ProductQuantizer;
+use crate::organ::session::SessionRegistry;
+use crate::organ::symbol::{SymbolEntry, SymbolIndex};
+use crate::organ::task::TaskRegistry;
+use crate::organ::temporal::{TemporalEntry, TemporalIndex};
+use crate::organ::theme_organ::ThemeOrgan;
+use crate::organ::transcript::TranscriptRegistry;
+use crate::organ::triplet::TripletStore;
+use crate::organ::user_model::UserModelRegistry;
+use crate::payload::MemoryPayload;
 use crate::snapshot::FullSnapshot;
+use crate::state::MemoryState;
+use parking_lot::{Mutex, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 /// A single directed association edge stored in memory.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -35,6 +38,13 @@ pub struct AssocEdge {
     pub dst: MemoryId,
     pub edge_type: EdgeType,
     pub weight: f32,
+}
+
+#[derive(Default)]
+pub(crate) struct PendingRecallEffects {
+    pub strengthen: HashSet<MemoryId>,
+    pub co_retrieval_pairs: HashMap<(MemoryId, MemoryId), f32>,
+    pub proto_windows: Vec<Vec<MemoryId>>,
 }
 
 pub struct ChittaField {
@@ -75,6 +85,8 @@ pub struct ChittaField {
     /// Byte offsets for each foreign segment file, used by sync_foreign().
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
     pub(crate) chunk_hash_idx: RwLock<HashMap<crate::ids::ChunkHash, MemoryId>>,
+    pub(crate) realm_members: RwLock<HashMap<String, HashSet<MemoryId>>>,
+    pub(crate) pending_recall: Mutex<PendingRecallEffects>,
 }
 
 impl Drop for ChittaField {
@@ -86,6 +98,7 @@ impl Drop for ChittaField {
 impl ChittaField {
     /// Flush the write buffer to the OS.
     pub fn flush(&self) -> Result<()> {
+        self.drain_pending_recall_effects()?;
         self.log.write().flush_buf()
     }
 
@@ -143,7 +156,11 @@ impl ChittaField {
                         }
                         Ok(_) => stale_cortex_paths.push(entry.path()),
                         Err(e) => {
-                            eprintln!("[chitta-field] skipping corrupt cortical snapshot {:?}: {}", entry.path(), e);
+                            eprintln!(
+                                "[chitta-field] skipping corrupt cortical snapshot {:?}: {}",
+                                entry.path(),
+                                e
+                            );
                             stale_cortex_paths.push(entry.path());
                         }
                     }
@@ -155,9 +172,15 @@ impl ChittaField {
                 Ok((loaded, seqno)) => {
                     cortical_idx = loaded;
                     snapshot_seqno = seqno;
-                    eprintln!("[chitta-field] loaded cortical snapshot seqno={} from {:?}", seqno, path);
+                    eprintln!(
+                        "[chitta-field] loaded cortical snapshot seqno={} from {:?}",
+                        seqno, path
+                    );
                 }
-                Err(e) => eprintln!("[chitta-field] failed to load cortical snapshot {:?}: {}", path, e),
+                Err(e) => eprintln!(
+                    "[chitta-field] failed to load cortical snapshot {:?}: {}",
+                    path, e
+                ),
             }
         }
         for path in &stale_cortex_paths {
@@ -182,7 +205,11 @@ impl ChittaField {
                         }
                         Ok(_) => stale_full_paths.push(entry.path()),
                         Err(e) => {
-                            eprintln!("[chitta-field] skipping corrupt full snapshot {:?}: {}", entry.path(), e);
+                            eprintln!(
+                                "[chitta-field] skipping corrupt full snapshot {:?}: {}",
+                                entry.path(),
+                                e
+                            );
                             stale_full_paths.push(entry.path());
                         }
                     }
@@ -206,9 +233,15 @@ impl ChittaField {
                     call_graph = snap.call_graph;
                     code_files = snap.code_files;
                     semantic_idx = snap.semantic_idx;
-                    eprintln!("[chitta-field] loaded full snapshot seqno={} from {:?}", full_snapshot_seqno, path);
+                    eprintln!(
+                        "[chitta-field] loaded full snapshot seqno={} from {:?}",
+                        full_snapshot_seqno, path
+                    );
                 }
-                Err(e) => eprintln!("[chitta-field] failed to load full snapshot {:?}: {}", path, e),
+                Err(e) => eprintln!(
+                    "[chitta-field] failed to load full snapshot {:?}: {}",
+                    path, e
+                ),
             }
         }
         for path in &stale_full_paths {
@@ -217,13 +250,17 @@ impl ChittaField {
 
         // Replay ALL segment files to rebuild in-memory state.
         // Skip ops already covered by the full snapshot or cortical snapshot.
+        let mut replay_realm_members: HashMap<String, HashSet<MemoryId>> = HashMap::new();
         log.replay(0, |seqno, op| {
             if seqno <= full_snapshot_seqno {
                 // This op is covered by the full snapshot.
                 // Still apply cortical ops not covered by the cortical snapshot.
                 match &op {
                     Op::UpdateSparseCode(_) | Op::TrainPQ(_) | Op::UpdateResidualPQ(_)
-                        if seqno <= snapshot_seqno => return Ok(()),
+                        if seqno <= snapshot_seqno =>
+                    {
+                        return Ok(())
+                    }
                     Op::UpdateSparseCode(_) | Op::TrainPQ(_) | Op::UpdateResidualPQ(_) => {
                         // fall through: apply to cortical index only
                     }
@@ -232,19 +269,44 @@ impl ChittaField {
             } else if seqno <= snapshot_seqno {
                 // Covered by cortical snapshot but not by full snapshot (shouldn't normally happen,
                 // but handle gracefully by skipping cortical ops).
-                if matches!(op, Op::UpdateSparseCode(_) | Op::TrainPQ(_) | Op::UpdateResidualPQ(_)) {
+                if matches!(
+                    op,
+                    Op::UpdateSparseCode(_) | Op::TrainPQ(_) | Op::UpdateResidualPQ(_)
+                ) {
                     return Ok(());
                 }
             }
-            apply_op(op, &mut payloads, &mut states, &mut assoc_edges,
-                     &mut artifacts, &mut artifact_paths, &mut semantic_idx,
-                     &mut time_idx, &mut artifact_idx, &mut keyword_idx, &mut triplet_store,
-                     &mut symbol_idx, &mut call_graph, &mut code_files, &mut cortical_idx,
-                     &mut session_registry, &mut transcript_registry, &mut task_registry,
-                     &mut user_model_registry, &mut theme_organ, &mut analytics_registry,
-                     &mut chunk_hash_idx);
+            apply_op(
+                op,
+                &mut payloads,
+                &mut states,
+                &mut assoc_edges,
+                &mut artifacts,
+                &mut artifact_paths,
+                &mut semantic_idx,
+                &mut time_idx,
+                &mut artifact_idx,
+                &mut keyword_idx,
+                &mut triplet_store,
+                &mut symbol_idx,
+                &mut call_graph,
+                &mut code_files,
+                &mut cortical_idx,
+                &mut session_registry,
+                &mut transcript_registry,
+                &mut task_registry,
+                &mut user_model_registry,
+                &mut theme_organ,
+                &mut analytics_registry,
+                &mut chunk_hash_idx,
+                &mut replay_realm_members,
+            );
             Ok(())
         })?;
+
+        semantic_idx.normalize_all();
+        keyword_idx.rebuild_reverse_index();
+        let realm_members = build_realm_members(&payloads, &states);
 
         // Fix temporal entries that have ts_ms=0 (stored before authored_at_ms default fix)
         {
@@ -270,7 +332,10 @@ impl ChittaField {
                 }
             }
             if fixed_count > 0 {
-                eprintln!("[chitta-field] fixed {} temporal entries with ts_ms=0", fixed_count);
+                eprintln!(
+                    "[chitta-field] fixed {} temporal entries with ts_ms=0",
+                    fixed_count
+                );
             }
         }
 
@@ -320,6 +385,8 @@ impl ChittaField {
             lite_encoder: RwLock::new(loaded_lite_encoder),
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
+            realm_members: RwLock::new(realm_members),
+            pending_recall: Mutex::new(PendingRecallEffects::default()),
         })
     }
 }
@@ -360,39 +427,54 @@ impl ChittaField {
 
         // Acquire all write locks and apply every foreign op in one pass,
         // reusing the same apply_op path used during startup replay.
-        let mut payloads        = self.payloads.write();
-        let mut states          = self.states.write();
-        let mut assoc_edges     = self.assoc_edges.write();
-        let mut artifacts       = self.artifacts.write();
-        let mut artifact_paths  = self.artifact_paths.write();
-        let mut semantic_idx    = self.semantic_idx.write();
-        let mut time_idx        = self.time_idx.write();
-        let mut artifact_idx    = self.artifact_idx.write();
-        let mut keyword_idx     = self.keyword_idx.write();
-        let mut triplet_store   = self.triplet_store.write();
-        let mut symbol_idx      = self.symbol_idx.write();
-        let mut call_graph      = self.call_graph.write();
-        let mut code_files      = self.code_files.write();
-        let mut cortical_idx    = self.cortical_idx.write();
-        let mut session_reg     = self.session_registry.write();
-        let mut transcript_reg  = self.transcript_registry.write();
-        let mut task_reg        = self.task_registry.write();
-        let mut user_model_reg  = self.user_model_registry.write();
-        let mut theme_organ     = self.theme_organ.write();
-        let mut analytics_reg   = self.analytics_registry.write();
-        let mut chunk_hash_idx  = self.chunk_hash_idx.write();
+        let mut payloads = self.payloads.write();
+        let mut states = self.states.write();
+        let mut assoc_edges = self.assoc_edges.write();
+        let mut artifacts = self.artifacts.write();
+        let mut artifact_paths = self.artifact_paths.write();
+        let mut semantic_idx = self.semantic_idx.write();
+        let mut time_idx = self.time_idx.write();
+        let mut artifact_idx = self.artifact_idx.write();
+        let mut keyword_idx = self.keyword_idx.write();
+        let mut triplet_store = self.triplet_store.write();
+        let mut symbol_idx = self.symbol_idx.write();
+        let mut call_graph = self.call_graph.write();
+        let mut code_files = self.code_files.write();
+        let mut cortical_idx = self.cortical_idx.write();
+        let mut session_reg = self.session_registry.write();
+        let mut transcript_reg = self.transcript_registry.write();
+        let mut task_reg = self.task_registry.write();
+        let mut user_model_reg = self.user_model_registry.write();
+        let mut theme_organ = self.theme_organ.write();
+        let mut analytics_reg = self.analytics_registry.write();
+        let mut chunk_hash_idx = self.chunk_hash_idx.write();
+        let mut realm_members = self.realm_members.write();
 
         for op in ops {
             apply_op(
                 op,
-                &mut *payloads, &mut *states, &mut *assoc_edges,
-                &mut *artifacts, &mut *artifact_paths, &mut *semantic_idx,
-                &mut *time_idx, &mut *artifact_idx, &mut *keyword_idx,
-                &mut *triplet_store, &mut *symbol_idx, &mut *call_graph,
-                &mut *code_files, &mut *cortical_idx,
-                &mut *session_reg, &mut *transcript_reg, &mut *task_reg,
-                &mut *user_model_reg, &mut *theme_organ, &mut *analytics_reg,
+                &mut *payloads,
+                &mut *states,
+                &mut *assoc_edges,
+                &mut *artifacts,
+                &mut *artifact_paths,
+                &mut *semantic_idx,
+                &mut *time_idx,
+                &mut *artifact_idx,
+                &mut *keyword_idx,
+                &mut *triplet_store,
+                &mut *symbol_idx,
+                &mut *call_graph,
+                &mut *code_files,
+                &mut *cortical_idx,
+                &mut *session_reg,
+                &mut *transcript_reg,
+                &mut *task_reg,
+                &mut *user_model_reg,
+                &mut *theme_organ,
+                &mut *analytics_reg,
                 &mut *chunk_hash_idx,
+                &mut *realm_members,
             );
         }
 
@@ -405,13 +487,20 @@ impl ChittaField {
 }
 
 impl ChittaField {
-    fn seen_offsets_path(data_dir: &std::path::Path, instance_id: crate::ids::InstanceId) -> std::path::PathBuf {
+    fn seen_offsets_path(
+        data_dir: &std::path::Path,
+        instance_id: crate::ids::InstanceId,
+    ) -> std::path::PathBuf {
         data_dir.join(format!("seen_offsets.{:08x}.json", instance_id))
     }
 
-    fn load_seen_offsets(data_dir: &std::path::Path, instance_id: crate::ids::InstanceId) -> HashMap<PathBuf, u64> {
+    fn load_seen_offsets(
+        data_dir: &std::path::Path,
+        instance_id: crate::ids::InstanceId,
+    ) -> HashMap<PathBuf, u64> {
         let path = Self::seen_offsets_path(data_dir, instance_id);
-        std::fs::read_to_string(&path).ok()
+        std::fs::read_to_string(&path)
+            .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
@@ -435,8 +524,11 @@ impl ChittaField {
         match std::fs::read(&path) {
             Ok(bytes) => match LiteEncoder::from_bytes(&bytes) {
                 Ok(enc) => {
-                    eprintln!("[chitta-field] loaded lite encoder ({} vocab, {} examples)",
-                        enc.vocab.len(), enc.training_examples);
+                    eprintln!(
+                        "[chitta-field] loaded lite encoder ({} vocab, {} examples)",
+                        enc.vocab.len(),
+                        enc.training_examples
+                    );
                     Some(enc)
                 }
                 Err(e) => {
@@ -525,13 +617,18 @@ pub(crate) fn apply_op(
     theme_organ: &mut ThemeOrgan,
     analytics_registry: &mut AnalyticsRegistry,
     chunk_hash_idx: &mut HashMap<crate::ids::ChunkHash, MemoryId>,
+    realm_members: &mut HashMap<String, HashSet<MemoryId>>,
 ) {
     match op {
         Op::PutPayload(put) => {
             let memory_id = put.memory_id;
             let chunk_hash = put.chunk_hash;
             let created_at_ms = put.created_at_ms;
-            let authored_at_ms = if put.authored_at_ms == 0 { created_at_ms } else { put.authored_at_ms };
+            let authored_at_ms = if put.authored_at_ms == 0 {
+                created_at_ms
+            } else {
+                put.authored_at_ms
+            };
             let version = put.version;
             let kind = put.kind.clone();
             let realm = put.realm.clone();
@@ -539,9 +636,9 @@ pub(crate) fn apply_op(
             let artifact_refs = put.artifact_refs.clone();
             let content_str = String::from_utf8(put.content.clone()).unwrap_or_default();
 
-            let state = states.entry(memory_id).or_insert_with(|| {
-                MemoryState::new(memory_id, chunk_hash, created_at_ms)
-            });
+            let state = states
+                .entry(memory_id)
+                .or_insert_with(|| MemoryState::new(memory_id, chunk_hash, created_at_ms));
             state.current_version = version;
             state.current_chunk_hash = chunk_hash;
             let strength = state.strength;
@@ -550,6 +647,10 @@ pub(crate) fn apply_op(
             chunk_hash_idx.entry(chunk_hash).or_insert(memory_id);
             semantic_idx.upsert(memory_id, embedding);
             keyword_idx.index(memory_id, &content_str);
+            realm_members
+                .entry(realm.clone())
+                .or_default()
+                .insert(memory_id);
 
             time_idx.upsert(TemporalEntry {
                 memory_id,
@@ -580,6 +681,15 @@ pub(crate) fn apply_op(
             keyword_idx.remove(memory_id);
             if let Some(payload) = payloads.get(&memory_id) {
                 time_idx.remove(memory_id, payload.authored_at_ms);
+                let remove_realm = if let Some(ids) = realm_members.get_mut(&payload.realm) {
+                    ids.remove(&memory_id);
+                    ids.is_empty()
+                } else {
+                    false
+                };
+                if remove_realm {
+                    realm_members.remove(&payload.realm);
+                }
             }
             artifact_idx.remove_memory(memory_id);
         }
@@ -592,8 +702,12 @@ pub(crate) fn apply_op(
             });
         }
         Op::UpsertArtifact(art_op) => {
-            artifacts.entry(art_op.normalized_path.clone()).or_insert(art_op.artifact_id);
-            artifact_paths.entry(art_op.artifact_id).or_insert(art_op.normalized_path);
+            artifacts
+                .entry(art_op.normalized_path.clone())
+                .or_insert(art_op.artifact_id);
+            artifact_paths
+                .entry(art_op.artifact_id)
+                .or_insert(art_op.normalized_path);
         }
         Op::AddTriplet(t) => {
             triplet_store.replay_add(
@@ -638,7 +752,8 @@ pub(crate) fn apply_op(
             let callees = call_graph.get_callees(e.caller_id);
             if callees.contains(&e.callee_id) {
                 // Reconstruct by removing and re-adding remaining edges for caller.
-                let remaining: Vec<u64> = callees.into_iter().filter(|&c| c != e.callee_id).collect();
+                let remaining: Vec<u64> =
+                    callees.into_iter().filter(|&c| c != e.callee_id).collect();
                 call_graph.remove_symbol(e.caller_id);
                 for callee in remaining {
                     call_graph.add_edge(e.caller_id, callee);
@@ -654,7 +769,8 @@ pub(crate) fn apply_op(
                 activations: op.activations.clone(),
             };
             let strength = states.get(&op.memory_id).map(|s| s.strength).unwrap_or(0.5);
-            let (kind, ts_ms) = payloads.get(&op.memory_id)
+            let (kind, ts_ms) = payloads
+                .get(&op.memory_id)
                 .map(|p| (p.kind.as_str(), p.authored_at_ms))
                 .unwrap_or(("unknown", op.ts_ms));
             cortical_idx.index(op.memory_id, &code, strength, ts_ms, kind);
@@ -676,20 +792,22 @@ pub(crate) fn apply_op(
                 cortical_idx.index_pq(u.memory_id, codes);
             }
         }
-        Op::SessionEvent(ev) => {
-            match ev.kind.as_str() {
-                "register" => {
-                    let kind = serde_json::from_slice::<serde_json::Value>(&ev.payload_json)
-                        .ok()
-                        .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(|s| s.to_string()))
-                        .unwrap_or_default();
-                    session_registry.register(ev.session_id, kind, ev.realm, ev.ts_ms);
-                }
-                "heartbeat" => session_registry.heartbeat(&ev.session_id, ev.ts_ms),
-                "deregister" => session_registry.deregister(&ev.session_id),
-                _ => {}
+        Op::SessionEvent(ev) => match ev.kind.as_str() {
+            "register" => {
+                let kind = serde_json::from_slice::<serde_json::Value>(&ev.payload_json)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("kind")
+                            .and_then(|k| k.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_default();
+                session_registry.register(ev.session_id, kind, ev.realm, ev.ts_ms);
             }
-        }
+            "heartbeat" => session_registry.heartbeat(&ev.session_id, ev.ts_ms),
+            "deregister" => session_registry.deregister(&ev.session_id),
+            _ => {}
+        },
         Op::TranscriptEvent(ev) => {
             // Always store the raw payload for cf_get_latest_event("transcript", kind, session_id)
             let payload_str = String::from_utf8(ev.payload_json.clone()).unwrap_or_default();
@@ -697,20 +815,33 @@ pub(crate) fn apply_op(
 
             match ev.kind.as_str() {
                 "register" => {
-                    let payload = serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
-                    let transcript_id = payload.as_ref()
-                        .and_then(|v| v.get("transcript_id").and_then(|k| k.as_str()).map(|s| s.to_string()))
+                    let payload =
+                        serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
+                    let transcript_id = payload
+                        .as_ref()
+                        .and_then(|v| {
+                            v.get("transcript_id")
+                                .and_then(|k| k.as_str())
+                                .map(|s| s.to_string())
+                        })
                         .unwrap_or_default();
                     if !transcript_id.is_empty() {
                         transcript_registry.register(transcript_id, ev.session_id);
                     }
                 }
                 "update_progress" => {
-                    let payload = serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
-                    let transcript_id = payload.as_ref()
-                        .and_then(|v| v.get("transcript_id").and_then(|k| k.as_str()).map(|s| s.to_string()))
+                    let payload =
+                        serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
+                    let transcript_id = payload
+                        .as_ref()
+                        .and_then(|v| {
+                            v.get("transcript_id")
+                                .and_then(|k| k.as_str())
+                                .map(|s| s.to_string())
+                        })
                         .unwrap_or_default();
-                    let pct = payload.as_ref()
+                    let pct = payload
+                        .as_ref()
                         .and_then(|v| v.get("progress_pct").and_then(|k| k.as_f64()))
                         .unwrap_or(0.0) as f32;
                     if !transcript_id.is_empty() {
@@ -718,15 +849,31 @@ pub(crate) fn apply_op(
                     }
                 }
                 "add_turn" => {
-                    let payload = serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
-                    let transcript_id = payload.as_ref()
-                        .and_then(|v| v.get("transcript_id").and_then(|k| k.as_str()).map(|s| s.to_string()))
+                    let payload =
+                        serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
+                    let transcript_id = payload
+                        .as_ref()
+                        .and_then(|v| {
+                            v.get("transcript_id")
+                                .and_then(|k| k.as_str())
+                                .map(|s| s.to_string())
+                        })
                         .unwrap_or_default();
-                    let role = payload.as_ref()
-                        .and_then(|v| v.get("role").and_then(|k| k.as_str()).map(|s| s.to_string()))
+                    let role = payload
+                        .as_ref()
+                        .and_then(|v| {
+                            v.get("role")
+                                .and_then(|k| k.as_str())
+                                .map(|s| s.to_string())
+                        })
                         .unwrap_or_default();
-                    let content = payload.as_ref()
-                        .and_then(|v| v.get("content").and_then(|k| k.as_str()).map(|s| s.to_string()))
+                    let content = payload
+                        .as_ref()
+                        .and_then(|v| {
+                            v.get("content")
+                                .and_then(|k| k.as_str())
+                                .map(|s| s.to_string())
+                        })
                         .unwrap_or_default();
                     if !transcript_id.is_empty() {
                         transcript_registry.add_turn(&transcript_id, role, content, ev.ts_ms);
@@ -771,14 +918,22 @@ pub(crate) fn apply_op(
                 "create" => {
                     let name = serde_json::from_str::<serde_json::Value>(&payload_str)
                         .ok()
-                        .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                        .and_then(|v| {
+                            v.get("name")
+                                .and_then(|n| n.as_str())
+                                .map(|s| s.to_string())
+                        })
                         .unwrap_or_default();
                     theme_organ.create(ev.theme_id, name);
                 }
                 "update_centroid" => {
                     let centroid = serde_json::from_str::<serde_json::Value>(&payload_str)
                         .ok()
-                        .and_then(|v| v.get("centroid_json").and_then(|c| c.as_str()).map(|s| s.to_string()))
+                        .and_then(|v| {
+                            v.get("centroid_json")
+                                .and_then(|c| c.as_str())
+                                .map(|s| s.to_string())
+                        })
                         .unwrap_or(payload_str);
                     theme_organ.update_centroid(ev.theme_id, centroid);
                 }
@@ -833,4 +988,22 @@ pub(crate) fn apply_op(
             keyword_idx.index(umc.memory_id, &content_str);
         }
     }
+}
+
+fn build_realm_members(
+    payloads: &HashMap<MemoryId, MemoryPayload>,
+    states: &HashMap<MemoryId, MemoryState>,
+) -> HashMap<String, HashSet<MemoryId>> {
+    let mut realm_members: HashMap<String, HashSet<MemoryId>> = HashMap::new();
+    for (&memory_id, payload) in payloads {
+        let not_deleted = states.get(&memory_id).map(|s| !s.deleted).unwrap_or(false);
+        if !not_deleted {
+            continue;
+        }
+        realm_members
+            .entry(payload.realm.clone())
+            .or_default()
+            .insert(memory_id);
+    }
+    realm_members
 }

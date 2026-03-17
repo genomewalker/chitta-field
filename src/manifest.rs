@@ -1,8 +1,8 @@
+use crate::error::{FieldError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use crate::error::{FieldError, Result};
 
 pub const MANIFEST_MAGIC: &str = "CHITTA_FIELD_MANIFEST_V1";
 pub const FORMAT_VERSION: u32 = 1;
@@ -134,7 +134,11 @@ impl Manifest {
     /// Returns which slot this generation writes to (1 or 2).
     /// Even generation → slot 1, odd generation → slot 2.
     fn slot(&self) -> u8 {
-        if self.generation % 2 == 0 { 1 } else { 2 }
+        if self.generation % 2 == 0 {
+            1
+        } else {
+            2
+        }
     }
 }
 

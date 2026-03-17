@@ -1,6 +1,6 @@
+use crate::organ::cortex::{SparseCode, K_ACTIVE, N_LEFT, N_RIGHT};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
-use crate::organ::cortex::{SparseCode, N_LEFT, N_RIGHT, K_ACTIVE};
 
 pub const VOCAB_SIZE: usize = 16_384;
 pub const MIN_WORD_LEN: usize = 3;
@@ -14,7 +14,7 @@ pub struct LiteEncoder {
     /// word → vocab index (top VOCAB_SIZE by frequency)
     pub vocab: HashMap<String, usize>,
     /// word_left_weights[vocab_id][left_centroid_idx] = association weight
-    pub word_left: Vec<Vec<f32>>,   // VOCAB_SIZE × N_LEFT
+    pub word_left: Vec<Vec<f32>>, // VOCAB_SIZE × N_LEFT
     /// word_right_weights[vocab_id][right_centroid_idx] = association weight
     pub word_right: Vec<Vec<f32>>, // VOCAB_SIZE × N_RIGHT
     /// idf[vocab_id] = log(N / df(w))
@@ -53,7 +53,8 @@ impl LiteEncoder {
         // Step 2: Compute IDF — for each vocab word, count docs containing it
         let mut df: Vec<u64> = vec![0u64; vocab.len()];
         for (content, _) in examples {
-            let words: std::collections::HashSet<String> = Self::tokenize(content).into_iter().collect();
+            let words: std::collections::HashSet<String> =
+                Self::tokenize(content).into_iter().collect();
             for word in &words {
                 if let Some(&vid) = vocab.get(word) {
                     df[vid] += 1;
@@ -61,7 +62,8 @@ impl LiteEncoder {
             }
         }
 
-        let idf: Vec<f32> = df.iter()
+        let idf: Vec<f32> = df
+            .iter()
             .map(|&d| ((n as f32 + 1.0) / (d as f32 + 1.0)).ln() + 1.0)
             .collect();
 
@@ -91,7 +93,11 @@ impl LiteEncoder {
             // Extract left/right centroid activations from sparse_code
             let mut left_act = [0.0f32; N_LEFT];
             let mut right_act = [0.0f32; N_RIGHT];
-            for (&atom_idx, &weight) in sparse_code.feature_ids.iter().zip(sparse_code.activations.iter()) {
+            for (&atom_idx, &weight) in sparse_code
+                .feature_ids
+                .iter()
+                .zip(sparse_code.activations.iter())
+            {
                 let left_idx = atom_idx as usize / N_RIGHT;
                 let right_idx = atom_idx as usize % N_RIGHT;
                 left_act[left_idx] += weight;
@@ -102,10 +108,14 @@ impl LiteEncoder {
             let left_sum: f32 = left_act.iter().sum();
             let right_sum: f32 = right_act.iter().sum();
             if left_sum > 1e-9 {
-                for v in left_act.iter_mut() { *v /= left_sum; }
+                for v in left_act.iter_mut() {
+                    *v /= left_sum;
+                }
             }
             if right_sum > 1e-9 {
-                for v in right_act.iter_mut() { *v /= right_sum; }
+                for v in right_act.iter_mut() {
+                    *v /= right_sum;
+                }
             }
 
             // Accumulate word weights
@@ -133,13 +143,17 @@ impl LiteEncoder {
         for row in word_left.iter_mut() {
             let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > 1e-9 {
-                for x in row.iter_mut() { *x /= norm; }
+                for x in row.iter_mut() {
+                    *x /= norm;
+                }
             }
         }
         for row in word_right.iter_mut() {
             let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > 1e-9 {
-                for x in row.iter_mut() { *x /= norm; }
+                for x in row.iter_mut() {
+                    *x /= norm;
+                }
             }
         }
 
@@ -191,17 +205,25 @@ impl LiteEncoder {
 
         // Top-8 left indices by left_score
         const TOP_HALF: usize = 8;
-        let mut left_indexed: Vec<(f32, usize)> = left_score.iter().enumerate()
+        let mut left_indexed: Vec<(f32, usize)> = left_score
+            .iter()
+            .enumerate()
             .map(|(i, &s)| (s, i))
             .collect();
-        left_indexed.select_nth_unstable_by(TOP_HALF, |a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        left_indexed.select_nth_unstable_by(TOP_HALF, |a, b| {
+            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+        });
         let top_left = &left_indexed[..TOP_HALF];
 
         // Top-8 right indices by right_score
-        let mut right_indexed: Vec<(f32, usize)> = right_score.iter().enumerate()
+        let mut right_indexed: Vec<(f32, usize)> = right_score
+            .iter()
+            .enumerate()
             .map(|(i, &s)| (s, i))
             .collect();
-        right_indexed.select_nth_unstable_by(TOP_HALF, |a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        right_indexed.select_nth_unstable_by(TOP_HALF, |a, b| {
+            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+        });
         let top_right = &right_indexed[..TOP_HALF];
 
         // Build TOP_HALF² = 64 (left, right) pairs by score product
@@ -218,7 +240,9 @@ impl LiteEncoder {
             return None;
         }
 
-        candidates.select_nth_unstable_by(k, |a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.select_nth_unstable_by(k, |a, b| {
+            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+        });
         candidates.truncate(k);
 
         // Filter non-positive scores
@@ -239,7 +263,10 @@ impl LiteEncoder {
         let feature_ids: Vec<u32> = candidates.iter().map(|(_, id)| *id).collect();
         let activations: Vec<f32> = candidates.iter().map(|(s, _)| s / weight_sum).collect();
 
-        Some(SparseCode { feature_ids, activations })
+        Some(SparseCode {
+            feature_ids,
+            activations,
+        })
     }
 
     /// Tokenize text: lowercase, split on non-alpha, filter short words

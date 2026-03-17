@@ -1,8 +1,8 @@
 //! Train the lite encoder from existing memories and save to disk.
 //! Usage: ./build.sh run --bin train_lite --release -- --field-dir ~/.claude/mind/chitta-field
 
-use std::path::PathBuf;
 use chitta_field::field::ChittaField;
+use std::path::PathBuf;
 
 fn expand_home(p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
@@ -15,7 +15,8 @@ fn expand_home(p: &str) -> PathBuf {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let field_dir = args.windows(2)
+    let field_dir = args
+        .windows(2)
         .find(|w| w[0] == "--field-dir")
         .map(|w| expand_home(&w[1]))
         .unwrap_or_else(|| {
@@ -27,13 +28,19 @@ fn main() {
     let field = ChittaField::open(field_dir).expect("failed to open chitta-field");
 
     let total = field.memory_count();
-    eprintln!("Total memories: {}  Cortical index: {}", total, field.cortical_count());
+    eprintln!(
+        "Total memories: {}  Cortical index: {}",
+        total,
+        field.cortical_count()
+    );
 
     eprintln!("Training lite encoder...");
     match field.train_lite_encoder() {
         Ok(n) => {
             eprintln!("Trained on {} examples.", n);
-            field.save_lite_encoder().expect("failed to save lite encoder");
+            field
+                .save_lite_encoder()
+                .expect("failed to save lite encoder");
             eprintln!("Lite encoder saved.");
             eprintln!("Ready: {}", field.lite_encoder_ready());
         }

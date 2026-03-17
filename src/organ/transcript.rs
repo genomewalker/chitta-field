@@ -46,12 +46,15 @@ impl TranscriptRegistry {
     }
 
     pub fn register(&mut self, transcript_id: String, session_id: String) {
-        self.transcripts.insert(transcript_id.clone(), TranscriptRecord {
-            transcript_id,
-            session_id,
-            progress_pct: 0.0,
-            turns: Vec::new(),
-        });
+        self.transcripts.insert(
+            transcript_id.clone(),
+            TranscriptRecord {
+                transcript_id,
+                session_id,
+                progress_pct: 0.0,
+                turns: Vec::new(),
+            },
+        );
     }
 
     pub fn update_progress(&mut self, transcript_id: &str, pct: f32) {
@@ -60,11 +63,22 @@ impl TranscriptRegistry {
         }
     }
 
-    pub fn add_turn(&mut self, transcript_id: &str, role: String, content: String, ts_ms: i64) -> u64 {
+    pub fn add_turn(
+        &mut self,
+        transcript_id: &str,
+        role: String,
+        content: String,
+        ts_ms: i64,
+    ) -> u64 {
         let id = self.next_turn_id;
         self.next_turn_id += 1;
         if let Some(t) = self.transcripts.get_mut(transcript_id) {
-            t.turns.push(TurnRecord { id, role, content, ts_ms });
+            t.turns.push(TurnRecord {
+                id,
+                role,
+                content,
+                ts_ms,
+            });
         }
         id
     }

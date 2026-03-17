@@ -12,7 +12,7 @@ public:
     explicit FieldStore(CfHandle* handle) : handle_(handle) {}
 
     /// Emit a domain event into the chitta-field log.
-    /// domain: "session", "transcript", "task", "user_model", "theme", "analytics"
+    /// domain: "session", "transcript", "task", "theme", "analytics"
     /// Returns the assigned event_id, or 0 on error.
     uint64_t emit_event(const std::string& domain, const std::string& kind,
         const std::string& entity_id, const std::string& payload_json,
@@ -25,7 +25,7 @@ public:
     }
 
     /// Get the payload of the most recent domain event matching domain+kind+entity_id.
-    /// Currently supports domain="user_model"; kind matches entity_type.
+    /// Supports domain="user_model" and domain="transcript".
     /// Returns the JSON payload string if found, or nullopt if not found.
     std::optional<std::string> get_latest_event(
         const std::string& domain,

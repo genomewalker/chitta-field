@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::ids::MemoryId;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 struct AccessStats {
@@ -17,7 +17,10 @@ pub struct PlasticityLearner {
 
 impl PlasticityLearner {
     pub fn new() -> Self {
-        Self { stats: HashMap::new(), alpha: 0.3 }
+        Self {
+            stats: HashMap::new(),
+            alpha: 0.3,
+        }
     }
 
     /// Record an access to a memory. Returns the new recommended decay rate.
@@ -25,14 +28,15 @@ impl PlasticityLearner {
     /// Never-accessed memories keep the default.
     pub fn record_access(&mut self, memory_id: MemoryId, now_ms: i64) -> f32 {
         let entry = self.stats.entry(memory_id).or_insert(AccessStats {
-            ewma_interval_ms: 86_400_000.0,  // default: 1 day
+            ewma_interval_ms: 86_400_000.0, // default: 1 day
             last_accessed_ms: now_ms,
             access_count: 0,
         });
 
         if entry.access_count > 0 {
             let interval = (now_ms - entry.last_accessed_ms).max(1) as f64;
-            entry.ewma_interval_ms = self.alpha * interval + (1.0 - self.alpha) * entry.ewma_interval_ms;
+            entry.ewma_interval_ms =
+                self.alpha * interval + (1.0 - self.alpha) * entry.ewma_interval_ms;
         }
         entry.last_accessed_ms = now_ms;
         entry.access_count += 1;
@@ -44,7 +48,9 @@ impl PlasticityLearner {
     /// Base: 0.001/day. Faster for rarely accessed, slower for frequently accessed.
     /// Range: [0.0001, 0.01] per day.
     pub fn recommended_decay_rate(&self, memory_id: MemoryId) -> f32 {
-        let ewma = self.stats.get(&memory_id)
+        let ewma = self
+            .stats
+            .get(&memory_id)
             .map(|s| s.ewma_interval_ms)
             .unwrap_or(86_400_000.0);
 
@@ -56,5 +62,7 @@ impl PlasticityLearner {
         rate as f32
     }
 
-    pub fn memory_count(&self) -> usize { self.stats.len() }
+    pub fn memory_count(&self) -> usize {
+        self.stats.len()
+    }
 }
