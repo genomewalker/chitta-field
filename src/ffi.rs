@@ -3211,11 +3211,14 @@ pub extern "C" fn cf_memory_stats(
         0.0
     };
 
+    let triplet_count = handle.field.triplet_store.read().triplet_count();
+
     let json_str = match serde_json::to_string(&serde_json::json!({
         "total": total,
         "count_by_kind": count_by_kind,
         "avg_confidence": avg_confidence,
         "avg_strength": avg_strength,
+        "total_triplets": triplet_count,
     })) {
         Ok(s) => s,
         Err(e) => return handle.err(e),
