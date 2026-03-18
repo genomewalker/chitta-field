@@ -484,6 +484,7 @@ impl ChittaField {
                     realm: payload.realm.clone(),
                     strength: eff_strength,
                     confidence: state.confidence,
+                    access_count: state.access_count,
                     content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
                 })
             })
@@ -593,6 +594,7 @@ impl ChittaField {
                     realm: payload.realm.clone(),
                     strength: eff_strength,
                     confidence: state.confidence,
+                    access_count: state.access_count,
                     content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
                 })
             })
@@ -677,6 +679,7 @@ impl ChittaField {
                     realm: payload.realm.clone(),
                     strength: eff_strength,
                     confidence: state.confidence,
+                    access_count: state.access_count,
                     content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
                 })
             })
@@ -712,6 +715,7 @@ impl ChittaField {
                     realm: payload.realm.clone(),
                     strength: eff_strength,
                     confidence: state.confidence,
+                    access_count: state.access_count,
                     content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
                 })
             })
@@ -757,6 +761,7 @@ impl ChittaField {
                     realm: payload.realm.clone(),
                     strength: eff_strength,
                     confidence: state.confidence,
+                    access_count: state.access_count,
                     content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
                 })
             })

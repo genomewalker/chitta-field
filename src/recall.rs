@@ -10,6 +10,7 @@ pub struct RecallHit {
     pub realm: String,
     pub strength: f32,
     pub confidence: f32,
+    pub access_count: u32,
     /// UTF-8 decoded content (empty string if content is not valid UTF-8).
     pub content: String,
 }

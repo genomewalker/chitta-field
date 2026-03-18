@@ -16,6 +16,7 @@ typedef struct {
     int64_t  ts_ms;
     float    strength;
     float    confidence;
+    uint32_t access_count;
 } CfRecallHit;
 
 /* Lifecycle */
@@ -362,6 +363,10 @@ int cf_analytics_append(CfHandle* h,
 int cf_analytics_recent(CfHandle* h,
     size_t limit,
     uint8_t* buf, size_t buf_cap, size_t* written);
+
+/* Association edge query */
+int cf_get_assoc_edges(CfHandle* h, uint64_t memory_id, size_t limit,
+    char* buf, size_t buf_cap, size_t* written);
 
 #ifdef __cplusplus
 }
