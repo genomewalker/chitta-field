@@ -57,6 +57,7 @@ fn write_hits(hits: Vec<RecallHit>, buf: *mut CfRecallHit, cap: usize, written: 
                 ts_ms: h.ts_ms,
                 strength: h.strength,
                 confidence: h.confidence,
+                access_count: h.access_count,
             };
         }
     }
@@ -295,6 +296,7 @@ pub struct CfRecallHit {
     pub ts_ms: i64,
     pub strength: f32,
     pub confidence: f32,
+    pub access_count: u32,
 }
 
 /// Output buffer for recall results. Caller allocates hits_buf with capacity hits_cap.
@@ -3955,6 +3957,93 @@ pub unsafe extern "C" fn cf_record_recall_batch(
     }
 }
 
+// ── Association edge query ────────────────────────────────────────────────────
+
+/// Return association edges for a memory as a null-terminated JSON array.
+/// JSON: [{"src":id,"dst":id,"edge_type":0,"weight":0.5}, ...]
+/// Returns 0 on success, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_get_assoc_edges(
+    h: *mut CfHandle,
+    memory_id: u64,
+    limit: usize,
+    buf: *mut c_char,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+
+    fn et_u8(et: &crate::ops::EdgeType) -> u8 {
+        match et {
+            crate::ops::EdgeType::DerivedFrom  => 0,
+            crate::ops::EdgeType::SameSession  => 1,
+            crate::ops::EdgeType::SameArtifact => 2,
+            crate::ops::EdgeType::CoRetrieved  => 3,
+            crate::ops::EdgeType::Supports     => 4,
+            crate::ops::EdgeType::Contradicts  => 5,
+        }
+    }
+
+    // Collect edges while holding lock, serialize, then drop lock before handle.ok()
+    let serialized: Result<String, ()> = {
+        let assoc_edges = handle.field.assoc_edges.read();
+        let mut results: Vec<serde_json::Value> = Vec::new();
+
+        if let Some(edges) = assoc_edges.get(&memory_id) {
+            for e in edges.iter().take(limit) {
+                results.push(serde_json::json!({
+                    "src": memory_id,
+                    "dst": e.dst,
+                    "edge_type": et_u8(&e.edge_type),
+                    "weight": e.weight,
+                }));
+            }
+        }
+
+        let remaining = limit.saturating_sub(results.len());
+        if remaining > 0 {
+            'outer: for (&src_id, edges) in assoc_edges.iter() {
+                if src_id == memory_id { continue; }
+                for e in edges {
+                    if e.dst == memory_id {
+                        results.push(serde_json::json!({
+                            "src": src_id,
+                            "dst": memory_id,
+                            "edge_type": et_u8(&e.edge_type),
+                            "weight": e.weight,
+                        }));
+                        if results.len() >= limit { break 'outer; }
+                    }
+                }
+            }
+        }
+
+        serde_json::to_string(&results).map_err(|_| ())
+        // lock dropped here
+    };
+
+    let s = match serialized {
+        Ok(s) => s,
+        Err(()) => return handle.err("failed to serialize assoc edges"),
+    };
+
+    let bytes = s.as_bytes();
+    if bytes.len() + 1 > buf_cap {
+        return -2;
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+        *(buf as *mut u8).add(bytes.len()) = 0;
+        *written = bytes.len();
+    }
+
+    handle.ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4031,7 +4120,8 @@ mod tests {
                     semantic_score: 0.0,
                     ts_ms: 0,
                     strength: 0.0,
-                    confidence: 0.0
+                    confidence: 0.0,
+                    access_count: 0,
                 };
                 10
             ];
@@ -4088,7 +4178,8 @@ mod tests {
                     semantic_score: 0.0,
                     ts_ms: 0,
                     strength: 0.0,
-                    confidence: 0.0
+                    confidence: 0.0,
+                    access_count: 0,
                 };
                 10
             ];
@@ -4265,7 +4356,8 @@ mod tests {
                     semantic_score: 0.0,
                     ts_ms: 0,
                     strength: 0.0,
-                    confidence: 0.0
+                    confidence: 0.0,
+                    access_count: 0,
                 };
                 10
             ];
@@ -4417,7 +4509,8 @@ mod tests {
                     semantic_score: 0.0,
                     ts_ms: 0,
                     strength: 0.0,
-                    confidence: 0.0
+                    confidence: 0.0,
+                    access_count: 0,
                 };
                 10
             ];
@@ -4632,7 +4725,8 @@ mod tests {
                     semantic_score: 0.0,
                     ts_ms: 0,
                     strength: 0.0,
-                    confidence: 0.0
+                    confidence: 0.0,
+                    access_count: 0,
                 };
                 10
             ];
