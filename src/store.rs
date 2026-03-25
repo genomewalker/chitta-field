@@ -53,7 +53,9 @@ impl ChittaField {
             let idx = self.chunk_hash_idx.read();
             if let Some(&existing_id) = idx.get(&chunk_hash) {
                 drop(idx);
-                let _ = self.update_state(existing_id, Some(0.0), None, None, true, None);
+                // Recurrence: same observation seen again → boost confidence (+0.05)
+                // After 6+ recurrences, provisional (0.50) reaches durable tier (0.80)
+                let _ = self.update_state(existing_id, Some(0.0), Some(0.05), None, true, None);
                 return Ok((existing_id, chunk_hash));
             }
         }
