@@ -84,6 +84,9 @@ int cf_add_triplet(CfHandle* h,
     uint64_t* out_triplet_id);
 
 int cf_invalidate_triplet(CfHandle* h, uint64_t triplet_id);
+int cf_forget_triplet(CfHandle* h, const char* subject, const char* predicate, const char* object);
+int cf_backfill_embedding(CfHandle* h, uint64_t memory_id, const float* embedding_ptr, size_t embedding_len);
+int cf_pending_embeddings(CfHandle* h, uint64_t* out_ids, size_t max_ids, size_t* out_count);
 
 int cf_query_subject(CfHandle* h, const char* subject,
     char* buf, size_t buf_cap, size_t* written);

@@ -74,6 +74,8 @@ pub struct MemoryState {
     pub last_state_op_ts_ms: i64,
     #[serde(default)]
     pub retrieval_history: RetrievalHistory,
+    #[serde(default)]
+    pub embed_pending: bool,
 }
 
 impl MemoryState {
@@ -94,6 +96,7 @@ impl MemoryState {
             tier: 0,
             last_state_op_ts_ms: 0,
             retrieval_history: RetrievalHistory::default(),
+            embed_pending: false,
         }
     }
 

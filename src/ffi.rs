@@ -629,6 +629,55 @@ pub extern "C" fn cf_invalidate_triplet(h: *mut CfHandle, triplet_id: u64) -> c_
     }
 }
 
+#[no_mangle]
+pub extern "C" fn cf_forget_triplet(
+    h: *mut CfHandle, subject: *const c_char,
+    predicate: *const c_char, object: *const c_char,
+) -> c_int {
+    if h.is_null() || subject.is_null() || predicate.is_null() || object.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let s = unsafe { std::ffi::CStr::from_ptr(subject) }.to_string_lossy();
+    let p = unsafe { std::ffi::CStr::from_ptr(predicate) }.to_string_lossy();
+    let o = unsafe { std::ffi::CStr::from_ptr(object) }.to_string_lossy();
+    match handle.field.forget_triplet(&s, &p, &o) {
+        Ok(_) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_backfill_embedding(
+    h: *mut CfHandle, memory_id: u64,
+    embedding_ptr: *const f32, embedding_len: usize,
+) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let embedding = if embedding_ptr.is_null() || embedding_len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(embedding_ptr, embedding_len) }
+    };
+    match handle.field.backfill_embedding(memory_id, embedding) {
+        Ok(()) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_pending_embeddings(
+    h: *mut CfHandle, out_ids: *mut u64, max_ids: usize, out_count: *mut usize,
+) -> c_int {
+    if h.is_null() || out_ids.is_null() || out_count.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let ids = handle.field.pending_embeddings(max_ids);
+    let n = ids.len().min(max_ids);
+    unsafe {
+        std::ptr::copy_nonoverlapping(ids.as_ptr(), out_ids, n);
+        *out_count = n;
+    }
+    handle.ok()
+}
+
 fn write_triplets_json(
     entries: Vec<crate::organ::triplet::TripletEntry>,
     buf: *mut c_char,

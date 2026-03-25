@@ -39,7 +39,8 @@ impl ChittaField {
         source_session: Option<String>,
         source_tool: Option<String>,
     ) -> Result<(MemoryId, ChunkHash)> {
-        if embedding.len() != EMBED_DIM {
+        let embed_pending = embedding.is_empty();
+        if !embed_pending && embedding.len() != EMBED_DIM {
             return Err(FieldError::InvalidEmbedDim {
                 expected: EMBED_DIM,
                 actual: embedding.len(),
@@ -75,7 +76,7 @@ impl ChittaField {
             kind: kind.to_string(),
             realm: realm.to_string(),
             content: content.to_vec(),
-            embedding_model: "bge-base-en-v1.5".to_string(),
+            embedding_model: if embed_pending { "none".to_string() } else { "bge-base-en-v1.5".to_string() },
             embedding: embedding.to_vec(),
             artifact_refs: artifact_refs.clone(),
             source_session,
@@ -90,6 +91,7 @@ impl ChittaField {
         state.confidence = confidence;
         state.decay_rate = decay_rate;
 
+        state.embed_pending = embed_pending;
         self.payloads.write().insert(memory_id, payload);
         self.states.write().insert(memory_id, state);
         self.chunk_hash_idx
@@ -101,9 +103,11 @@ impl ChittaField {
             .entry(realm.to_string())
             .or_default()
             .insert(memory_id);
-        self.semantic_idx
-            .write()
-            .upsert(memory_id, embedding.to_vec());
+        if !embed_pending {
+            self.semantic_idx
+                .write()
+                .upsert(memory_id, embedding.to_vec());
+        }
         let content_str = std::str::from_utf8(content).unwrap_or("").to_string();
         self.keyword_idx.write().index(memory_id, &content_str);
 
@@ -810,6 +814,55 @@ impl ChittaField {
     }
 
     /// Invalidate a triplet (marks it as expired at the current time).
+    /// Backfill embedding for a memory stored with embed_pending=true.
+    pub fn backfill_embedding(&self, memory_id: MemoryId, embedding: &[f32]) -> Result<()> {
+        if embedding.len() != EMBED_DIM {
+            return Err(FieldError::InvalidEmbedDim { expected: EMBED_DIM, actual: embedding.len() });
+        }
+        let pending = {
+            let s = self.states.read();
+            s.get(&memory_id).map(|st| st.embed_pending).unwrap_or(false)
+        };
+        if !pending { return Ok(()); }
+        self.semantic_idx.write().upsert(memory_id, embedding.to_vec());
+        {
+            let mut s = self.states.write();
+            if let Some(st) = s.get_mut(&memory_id) {
+                st.embed_pending = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// Return memory IDs with embed_pending=true, sorted oldest first, up to limit.
+    pub fn pending_embeddings(&self, limit: usize) -> Vec<MemoryId> {
+        let s = self.states.read();
+        let mut pending: Vec<(i64, MemoryId)> = s
+            .iter()
+            .filter(|(_, st)| st.embed_pending && !st.deleted)
+            .map(|(id, st)| (st.created_at_ms, *id))
+            .collect();
+        pending.sort_by_key(|(ts, _)| *ts);
+        pending.into_iter().take(limit).map(|(_, id)| id).collect()
+    }
+
+    /// Remove triplet by subject+predicate+object (invalidates first matching entry).
+    pub fn forget_triplet(&self, subject: &str, predicate: &str, object: &str) -> Result<bool> {
+        let at_ms = now_ms();
+        let store = self.triplet_store.read();
+        let matches: Vec<u64> = store
+            .query_subject(subject, at_ms)
+            .into_iter()
+            .filter(|t| t.predicate == predicate && t.object == object)
+            .map(|t| t.id)
+            .collect();
+        drop(store);
+        for id in &matches {
+            self.invalidate_triplet(*id)?;
+        }
+        Ok(!matches.is_empty())
+    }
+
     pub fn invalidate_triplet(&self, triplet_id: u64) -> Result<()> {
         let now = now_ms();
         let op = Op::InvalidateTriplet(InvalidateTripletOp {
