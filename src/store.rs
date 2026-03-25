@@ -813,6 +813,17 @@ impl ChittaField {
         Ok(triplet_id)
     }
 
+    /// Set the lifecycle status of a memory (Active/Superseded/Contradicted/Archived).
+    pub fn set_memory_status(&self, memory_id: MemoryId, status: crate::state::MemoryStatus) -> Result<()> {
+        let mut states = self.states.write();
+        if let Some(st) = states.get_mut(&memory_id) {
+            st.status = status;
+            Ok(())
+        } else {
+            Err(FieldError::NotFound(memory_id))
+        }
+    }
+
     /// Invalidate a triplet (marks it as expired at the current time).
     /// Backfill embedding for a memory stored with embed_pending=true.
     pub fn backfill_embedding(&self, memory_id: MemoryId, embedding: &[f32]) -> Result<()> {

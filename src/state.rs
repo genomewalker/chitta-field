@@ -52,6 +52,17 @@ impl RetrievalHistory {
 }
 
 /// Mutable overlay state for a memory — lives separately from the immutable payload.
+/// First-class memory lifecycle status.
+/// `Active` is the default; `Superseded` is set when a correction replaces this memory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub enum MemoryStatus {
+    #[default]
+    Active,
+    Superseded,
+    Contradicted,
+    Archived,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryState {
     pub memory_id: MemoryId,
@@ -76,6 +87,8 @@ pub struct MemoryState {
     pub retrieval_history: RetrievalHistory,
     #[serde(default)]
     pub embed_pending: bool,
+    #[serde(default)]
+    pub status: MemoryStatus,
 }
 
 impl MemoryState {
@@ -97,6 +110,7 @@ impl MemoryState {
             last_state_op_ts_ms: 0,
             retrieval_history: RetrievalHistory::default(),
             embed_pending: false,
+            status: MemoryStatus::Active,
         }
     }
 
