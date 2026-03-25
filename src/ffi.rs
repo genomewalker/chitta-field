@@ -4988,3 +4988,21 @@ mod tests {
         }
     }
 }
+
+/// Set memory lifecycle status. status: 0=Active, 1=Superseded, 2=Contradicted, 3=Archived
+#[no_mangle]
+pub extern "C" fn cf_set_memory_status(h: *mut CfHandle, memory_id: u64, status: u8) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    use crate::state::MemoryStatus;
+    let s = match status {
+        1 => MemoryStatus::Superseded,
+        2 => MemoryStatus::Contradicted,
+        3 => MemoryStatus::Archived,
+        _ => MemoryStatus::Active,
+    };
+    match handle.field.set_memory_status(memory_id, s) {
+        Ok(()) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
