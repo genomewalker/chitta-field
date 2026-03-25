@@ -30,8 +30,25 @@ pub struct RouteLearner {
 
 impl RouteLearner {
     pub fn new() -> Self {
+        // Pre-seed Hybrid route with a stronger prior so Thompson sampling
+        // starts near current default behavior while still allowing learning.
+        let mut arms = HashMap::new();
+        let intents = [
+            QueryIntent::General,
+            QueryIntent::Temporal,
+            QueryIntent::FileRef,
+            QueryIntent::Correction,
+            QueryIntent::Code,
+        ];
+        for intent in &intents {
+            // Hybrid: 5 successes, 2 failures → ~71% win rate head start
+            arms.insert((intent.clone(), Route::Hybrid), BetaPrior { alpha: 5.0, beta: 2.0 });
+            // Semantic: 3 successes, 1 failure → good for semantic intent
+            arms.insert((intent.clone(), Route::Semantic), BetaPrior { alpha: 3.0, beta: 1.0 });
+            // Others start uniform (alpha=1, beta=1)
+        }
         Self {
-            arms: HashMap::new(),
+            arms,
             pending: HashMap::new(),
             next_episode_id: 1,
         }

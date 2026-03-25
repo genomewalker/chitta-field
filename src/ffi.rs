@@ -629,6 +629,43 @@ pub extern "C" fn cf_invalidate_triplet(h: *mut CfHandle, triplet_id: u64) -> c_
     }
 }
 
+/// Select retrieval route for a query. Returns (episode_id, route_int).
+/// route_int: 0=Semantic, 1=Keyword, 2=Temporal, 3=Artifact, 4=Hybrid, 5=Full
+#[no_mangle]
+pub extern "C" fn cf_select_route(
+    h: *mut CfHandle, query: *const c_char,
+    out_episode_id: *mut u64, out_route: *mut u8,
+) -> c_int {
+    if h.is_null() || query.is_null() || out_episode_id.is_null() || out_route.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let q = unsafe { std::ffi::CStr::from_ptr(query) }.to_string_lossy();
+    let (episode_id, route) = handle.field.select_route(&q);
+    use crate::learner::route::Route;
+    let route_int: u8 = match route {
+        Route::Semantic  => 0,
+        Route::Keyword   => 1,
+        Route::Temporal  => 2,
+        Route::Artifact  => 3,
+        Route::Hybrid    => 4,
+        Route::Full      => 5,
+    };
+    unsafe { *out_episode_id = episode_id; *out_route = route_int; }
+    handle.ok()
+}
+
+/// Record outcome for a retrieval episode. reward in [-1, 1].
+#[no_mangle]
+pub extern "C" fn cf_route_feedback(
+    h: *mut CfHandle, episode_id: u64, reward: f32,
+) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    match handle.field.feedback(episode_id, reward) {
+        Ok(()) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cf_forget_triplet(
     h: *mut CfHandle, subject: *const c_char,
