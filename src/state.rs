@@ -61,6 +61,19 @@ pub enum MemoryStatus {
     Superseded,
     Contradicted,
     Archived,
+    Proposed,
+    Observed,
+    Verified,
+}
+
+/// How a memory was obtained — orthogonal to confidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub enum EpistemicStatus {
+    UserStated = 0,
+    #[default]
+    ToolDerived = 1,
+    ModelInferred = 2,
+    AutonomousSynthesis = 3,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +102,8 @@ pub struct MemoryState {
     pub embed_pending: bool,
     #[serde(default)]
     pub status: MemoryStatus,
+    #[serde(default)]
+    pub epistemic_status: EpistemicStatus,
 }
 
 impl MemoryState {
@@ -111,6 +126,7 @@ impl MemoryState {
             retrieval_history: RetrievalHistory::default(),
             embed_pending: false,
             status: MemoryStatus::Active,
+            epistemic_status: EpistemicStatus::ToolDerived,
         }
     }
 
@@ -145,7 +161,18 @@ impl MemoryState {
                 1 => MemoryStatus::Superseded,
                 2 => MemoryStatus::Contradicted,
                 3 => MemoryStatus::Archived,
+                4 => MemoryStatus::Proposed,
+                5 => MemoryStatus::Observed,
+                6 => MemoryStatus::Verified,
                 _ => MemoryStatus::Active,
+            };
+        }
+        if let Some(es) = delta.epistemic_status {
+            self.epistemic_status = match es {
+                0 => EpistemicStatus::UserStated,
+                2 => EpistemicStatus::ModelInferred,
+                3 => EpistemicStatus::AutonomousSynthesis,
+                _ => EpistemicStatus::ToolDerived,
             };
         }
     }
