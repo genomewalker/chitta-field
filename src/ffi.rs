@@ -58,6 +58,10 @@ fn write_hits(hits: Vec<RecallHit>, buf: *mut CfRecallHit, cap: usize, written: 
                 strength: h.strength,
                 confidence: h.confidence,
                 access_count: h.access_count,
+                semantic_weight: h.semantic_weight,
+                status_mul: h.status_mul,
+                epistemic_mul: h.epistemic_mul,
+                strength_factor: h.strength_factor,
             };
         }
     }
@@ -297,6 +301,10 @@ pub struct CfRecallHit {
     pub strength: f32,
     pub confidence: f32,
     pub access_count: u32,
+    pub semantic_weight: f32,
+    pub status_mul: f32,
+    pub epistemic_mul: f32,
+    pub strength_factor: f32,
 }
 
 /// Output buffer for recall results. Caller allocates hits_buf with capacity hits_cap.
@@ -4217,6 +4225,10 @@ mod tests {
                     strength: 0.0,
                     confidence: 0.0,
                     access_count: 0,
+                    semantic_weight: 0.0,
+                    status_mul: 0.0,
+                    epistemic_mul: 0.0,
+                    strength_factor: 0.0,
                 };
                 10
             ];
@@ -4275,6 +4287,10 @@ mod tests {
                     strength: 0.0,
                     confidence: 0.0,
                     access_count: 0,
+                    semantic_weight: 0.0,
+                    status_mul: 0.0,
+                    epistemic_mul: 0.0,
+                    strength_factor: 0.0,
                 };
                 10
             ];
@@ -4453,6 +4469,10 @@ mod tests {
                     strength: 0.0,
                     confidence: 0.0,
                     access_count: 0,
+                    semantic_weight: 0.0,
+                    status_mul: 0.0,
+                    epistemic_mul: 0.0,
+                    strength_factor: 0.0,
                 };
                 10
             ];
@@ -4606,6 +4626,10 @@ mod tests {
                     strength: 0.0,
                     confidence: 0.0,
                     access_count: 0,
+                    semantic_weight: 0.0,
+                    status_mul: 0.0,
+                    epistemic_mul: 0.0,
+                    strength_factor: 0.0,
                 };
                 10
             ];
@@ -4822,6 +4846,10 @@ mod tests {
                     strength: 0.0,
                     confidence: 0.0,
                     access_count: 0,
+                    semantic_weight: 0.0,
+                    status_mul: 0.0,
+                    epistemic_mul: 0.0,
+                    strength_factor: 0.0,
                 };
                 10
             ];
