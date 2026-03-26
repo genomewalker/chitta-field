@@ -19,10 +19,10 @@ pub use field::{AssocEdge, ChittaField};
 pub use hnsw::{SemanticHit, SemanticIndex};
 pub use ids::{ArtifactId, ChunkHash, MemoryId, SeqNo};
 pub use ops::{
-    AddAssocEdgeOp, AddTripletOp, AnalyticsEventOp, DeleteMemoryOp, InvalidateTripletOp, Op,
-    PutPayloadOp, SessionEventOp, StateDeltaOp, TaskEventOp, ThemeEventOp, TranscriptEventOp,
-    UpsertArtifactOp, UserModelEventOp, OP_ANALYTICS_EVENT, OP_SESSION_EVENT, OP_TASK_EVENT,
-    OP_THEME_EVENT, OP_TRANSCRIPT_EVENT, OP_USER_MODEL_EVENT,
+    AddAssocEdgeOp, AddTripletOp, AnalyticsEventOp, DeleteMemoryOp, InvalidateTripletOp,
+    MsgEventOp, Op, PutPayloadOp, SessionEventOp, StateDeltaOp, TaskEventOp, ThemeEventOp,
+    TranscriptEventOp, UpsertArtifactOp, UserModelEventOp, OP_ANALYTICS_EVENT, OP_MSG_EVENT,
+    OP_SESSION_EVENT, OP_TASK_EVENT, OP_THEME_EVENT, OP_TRANSCRIPT_EVENT, OP_USER_MODEL_EVENT,
 };
 pub use organ::cortex::{CorticalIndex, SparseCode, SparseEncoder};
 pub use organ::pq::{ProductQuantizer, PQ_BYTES};

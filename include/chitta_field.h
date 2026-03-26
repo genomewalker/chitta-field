@@ -208,6 +208,13 @@ int cf_get_latest_event(CfHandle* h,
     const char* domain, const char* kind, const char* entity_id,
     uint8_t* buf, size_t buf_cap, size_t* written);
 
+/* Query events by domain+kind+target (e.g. msg_inbox). Returns JSON array into buf.
+ * Returns 0=ok, -2=buf too small, -1=error. */
+int cf_get_events_by_target(CfHandle* h,
+    const char* domain, const char* kind, const char* target,
+    size_t limit,
+    uint8_t* out_buf, size_t buf_cap, size_t* written);
+
 /* Session management */
 int cf_session_register(CfHandle* h,
     const char* session_id, const char* kind, const char* realm, int64_t now_ms);
