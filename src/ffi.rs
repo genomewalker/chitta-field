@@ -4998,7 +4998,7 @@ mod tests {
     }
 }
 
-/// Set memory lifecycle status. status: 0=Active, 1=Superseded, 2=Contradicted, 3=Archived
+/// Set memory lifecycle status. status: 0=Active, 1=Superseded, 2=Contradicted, 3=Archived, 4=Proposed, 5=Observed, 6=Verified
 #[no_mangle]
 pub extern "C" fn cf_set_memory_status(h: *mut CfHandle, memory_id: u64, status: u8) -> c_int {
     if h.is_null() { return -1; }
@@ -5008,9 +5008,30 @@ pub extern "C" fn cf_set_memory_status(h: *mut CfHandle, memory_id: u64, status:
         1 => MemoryStatus::Superseded,
         2 => MemoryStatus::Contradicted,
         3 => MemoryStatus::Archived,
+        4 => MemoryStatus::Proposed,
+        5 => MemoryStatus::Observed,
+        6 => MemoryStatus::Verified,
         _ => MemoryStatus::Active,
     };
     match handle.field.set_memory_status(memory_id, s) {
+        Ok(()) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Set epistemic status. es: 0=UserStated, 1=ToolDerived, 2=ModelInferred, 3=AutonomousSynthesis
+#[no_mangle]
+pub extern "C" fn cf_set_epistemic_status(h: *mut CfHandle, memory_id: u64, es: u8) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    use crate::state::EpistemicStatus;
+    let status = match es {
+        0 => EpistemicStatus::UserStated,
+        2 => EpistemicStatus::ModelInferred,
+        3 => EpistemicStatus::AutonomousSynthesis,
+        _ => EpistemicStatus::ToolDerived,
+    };
+    match handle.field.set_epistemic_status(memory_id, status) {
         Ok(()) => handle.ok(),
         Err(e) => handle.err(e),
     }

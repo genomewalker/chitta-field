@@ -373,6 +373,8 @@ int cf_analytics_recent(CfHandle* h,
 int cf_get_assoc_edges(CfHandle* h, uint64_t memory_id, size_t limit,
     char* buf, size_t buf_cap, size_t* written);
 
+int cf_set_epistemic_status(CfHandle* h, uint64_t memory_id, uint8_t epistemic_status);
+
 #ifdef __cplusplus
 }
 #endif

@@ -188,6 +188,7 @@ impl ChittaField {
             pin: None,
             op_ts_ms: ts,
             status: None,
+            epistemic_status: None,
         };
         let _seqno = self.log.write().append(&Op::UpdateState(delta.clone()))?;
 
@@ -244,6 +245,7 @@ impl ChittaField {
             pin,
             op_ts_ms: ts,
             status: None,
+            epistemic_status: None,
         };
         let _seqno = self.log.write().append(&Op::UpdateState(delta.clone()))?;
 
@@ -825,10 +827,13 @@ impl ChittaField {
     pub fn set_memory_status(&self, memory_id: MemoryId, status: crate::state::MemoryStatus) -> Result<()> {
         use crate::state::MemoryStatus;
         let status_u8: u8 = match status {
-            MemoryStatus::Active      => 0,
-            MemoryStatus::Superseded  => 1,
+            MemoryStatus::Active       => 0,
+            MemoryStatus::Superseded   => 1,
             MemoryStatus::Contradicted => 2,
-            MemoryStatus::Archived    => 3,
+            MemoryStatus::Archived     => 3,
+            MemoryStatus::Proposed     => 4,
+            MemoryStatus::Observed     => 5,
+            MemoryStatus::Verified     => 6,
         };
         // Write to WAL first for durability
         let delta = crate::ops::StateDeltaOp {
@@ -840,10 +845,43 @@ impl ChittaField {
             pin: None,
             op_ts_ms: now_ms(),
             status: Some(status_u8),
+            epistemic_status: None,
         };
         self.log.write().append(&Op::UpdateState(delta.clone()))?;
         let _ = self.log.write().sync(); // status transitions are critical lifecycle events
         // Apply to in-memory state
+        let mut states = self.states.write();
+        if let Some(st) = states.get_mut(&memory_id) {
+            st.apply_delta(&delta, now_ms());
+            Ok(())
+        } else {
+            Err(FieldError::NotFound(memory_id))
+        }
+    }
+
+    /// Set the epistemic status of a memory (UserStated/ToolDerived/ModelInferred/AutonomousSynthesis).
+    /// Durable: writes UpdateState op to WAL.
+    pub fn set_epistemic_status(&self, memory_id: MemoryId, es: crate::state::EpistemicStatus) -> Result<()> {
+        use crate::state::EpistemicStatus;
+        let es_u8: u8 = match es {
+            EpistemicStatus::UserStated          => 0,
+            EpistemicStatus::ToolDerived         => 1,
+            EpistemicStatus::ModelInferred       => 2,
+            EpistemicStatus::AutonomousSynthesis => 3,
+        };
+        let delta = crate::ops::StateDeltaOp {
+            memory_id,
+            strength_delta: None,
+            confidence_delta: None,
+            decay_rate: None,
+            touch: false,
+            pin: None,
+            op_ts_ms: now_ms(),
+            status: None,
+            epistemic_status: Some(es_u8),
+        };
+        self.log.write().append(&Op::UpdateState(delta.clone()))?;
+        let _ = self.log.write().sync();
         let mut states = self.states.write();
         if let Some(st) = states.get_mut(&memory_id) {
             st.apply_delta(&delta, now_ms());
