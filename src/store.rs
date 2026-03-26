@@ -1428,6 +1428,15 @@ impl ChittaField {
     /// After compaction, only segments with seqno >= snapshot_seqno are kept.
     /// This bounds WAL growth and speeds up startup replay.
     pub fn compact_wal(&self) -> Result<usize> {
+        let count = {
+            let states = self.states.read();
+            states.values().filter(|s| !s.deleted).count()
+        };
+        if count < 100 {
+            return Err(FieldError::Other(format!(
+                "refusing compact_wal on near-empty store ({} live memories, minimum 100)", count
+            )));
+        }
         self.save_full_snapshot()?;
         let snapshot_seqno = self.log.read().last_seqno();
         
@@ -2283,5 +2292,58 @@ mod tests {
             field.log.read().last_seqno(), seqno_before,
             "WAL must not grow when ID is invalid"
         );
+    }
+
+    #[test]
+    fn test_compact_wal_guard_rejects_small_store() {
+        let (field, _tmp) = open_test_field();
+        let embedding = vec![0.1f32; 768];
+        for i in 0..50 {
+            field
+                .put_memory(
+                    "wisdom",
+                    "test",
+                    format!("memory {}", i).as_bytes(),
+                    &embedding,
+                    0.9,
+                    0.001,
+                    0,
+                    vec![],
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let result = field.compact_wal();
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("refusing compact_wal"),
+            "expected guard error, got: {}", err_msg
+        );
+    }
+
+    #[test]
+    fn test_compact_wal_guard_allows_large_store() {
+        let (field, _tmp) = open_test_field();
+        let embedding = vec![0.1f32; 768];
+        for i in 0..100 {
+            field
+                .put_memory(
+                    "wisdom",
+                    "test",
+                    format!("memory {}", i).as_bytes(),
+                    &embedding,
+                    0.9,
+                    0.001,
+                    0,
+                    vec![],
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let result = field.compact_wal();
+        assert!(result.is_ok(), "compact_wal should succeed with 100+ memories, got: {:?}", result);
     }
 }
