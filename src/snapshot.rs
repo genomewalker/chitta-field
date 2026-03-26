@@ -10,7 +10,7 @@ use crate::organ::symbol::SymbolIndex;
 use crate::organ::temporal::TemporalIndex;
 use crate::organ::triplet::TripletStore;
 use crate::payload::MemoryPayload;
-use crate::state::MemoryState;
+use crate::state::{EpistemicStatus, MemoryState, MemoryStatus, RetrievalHistory};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -18,26 +18,126 @@ use std::path::Path;
 
 /// Magic for snapshots written before the ANN SemanticIndex rewrite (v1.0.3 and earlier).
 const FULL_SNAPSHOT_MAGIC_V1: u64 = 0xF011_5741_7E00_0003;
-/// Magic for v1.0.4 snapshots (post-ANN, pre-CTM features).
+/// Magic for v1.0.4 snapshots (post-ANN, old MemoryState, no coactivation_stats).
 const FULL_SNAPSHOT_MAGIC_V4: u64 = 0xF011_5741_7E00_0004;
-/// Magic for current snapshots (v1.0.5+) with coactivation_stats + RetrievalHistory.
-const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_0005;
+/// Magic for v1.0.5 snapshots (with coactivation_stats, but 14-field MemoryState).
+/// These were written before RetrievalHistory/embed_pending/MemoryStatus/EpistemicStatus
+/// were added to MemoryState on 2026-03-26.
+const FULL_SNAPSHOT_MAGIC_V5: u64 = 0xF011_5741_7E00_0005;
+/// Current magic (v1.0.6+): full MemoryState with RetrievalHistory, embed_pending,
+/// MemoryStatus, and EpistemicStatus.
+const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_0006;
 
-/// SemanticIndex as it existed before the ANN rewrite (two fields only).
-/// Used solely for migrating v1 snapshots on first load.
+// ── Legacy SemanticIndex (pre-ANN rewrite) ───────────────────────────────────
+
 #[derive(Serialize, Deserialize)]
 struct LegacySemanticIndex {
     embeddings: std::collections::HashMap<MemoryId, Vec<f32>>,
     deleted: std::collections::HashSet<MemoryId>,
 }
 
-/// FullSnapshot layout for v1 (pre-ANN) snapshots. Identical to FullSnapshot
-/// except it uses LegacySemanticIndex so bincode can deserialize the old bytes.
+// ── Legacy MemoryState (V4 and V5 snapshots, 14-field layout) ────────────────
+
+/// MemoryState as serialized in V4 snapshots (pre-CTM, 14 fields).
+/// Lacks RetrievalHistory, embed_pending, MemoryStatus, and EpistemicStatus.
 #[derive(Serialize, Deserialize)]
-struct LegacyFullSnapshot {
+struct LegacyMemoryStateV4 {
+    pub memory_id: MemoryId,
+    pub current_version: u32,
+    pub current_chunk_hash: crate::ids::ChunkHash,
+    pub deleted: bool,
+    pub strength: f32,
+    pub decay_rate: f32,
+    pub confidence: f32,
+    pub access_count: u32,
+    pub last_accessed_ms: i64,
+    pub last_strengthened_ms: i64,
+    pub created_at_ms: i64,
+    pub pinned: bool,
+    pub tier: u8,
+    pub last_state_op_ts_ms: i64,
+}
+
+impl LegacyMemoryStateV4 {
+    fn upgrade(self) -> MemoryState {
+        MemoryState {
+            memory_id: self.memory_id,
+            current_version: self.current_version,
+            current_chunk_hash: self.current_chunk_hash,
+            deleted: self.deleted,
+            strength: self.strength,
+            decay_rate: self.decay_rate,
+            confidence: self.confidence,
+            access_count: self.access_count,
+            last_accessed_ms: self.last_accessed_ms,
+            last_strengthened_ms: self.last_strengthened_ms,
+            created_at_ms: self.created_at_ms,
+            pinned: self.pinned,
+            tier: self.tier,
+            last_state_op_ts_ms: self.last_state_op_ts_ms,
+            retrieval_history: RetrievalHistory::default(),
+            embed_pending: false,
+            status: MemoryStatus::Active,
+            epistemic_status: EpistemicStatus::ToolDerived,
+        }
+    }
+}
+
+/// MemoryState as serialized in V5 snapshots (15 fields: added RetrievalHistory).
+/// Written by binaries from 2026-03-17 (commit c61a955) through 2026-03-25.
+/// Lacks embed_pending, MemoryStatus, and EpistemicStatus.
+#[derive(Serialize, Deserialize)]
+struct LegacyMemoryStateV5 {
+    pub memory_id: MemoryId,
+    pub current_version: u32,
+    pub current_chunk_hash: crate::ids::ChunkHash,
+    pub deleted: bool,
+    pub strength: f32,
+    pub decay_rate: f32,
+    pub confidence: f32,
+    pub access_count: u32,
+    pub last_accessed_ms: i64,
+    pub last_strengthened_ms: i64,
+    pub created_at_ms: i64,
+    pub pinned: bool,
+    pub tier: u8,
+    pub last_state_op_ts_ms: i64,
+    pub retrieval_history: RetrievalHistory,
+}
+
+impl LegacyMemoryStateV5 {
+    fn upgrade(self) -> MemoryState {
+        MemoryState {
+            memory_id: self.memory_id,
+            current_version: self.current_version,
+            current_chunk_hash: self.current_chunk_hash,
+            deleted: self.deleted,
+            strength: self.strength,
+            decay_rate: self.decay_rate,
+            confidence: self.confidence,
+            access_count: self.access_count,
+            last_accessed_ms: self.last_accessed_ms,
+            last_strengthened_ms: self.last_strengthened_ms,
+            created_at_ms: self.created_at_ms,
+            pinned: self.pinned,
+            tier: self.tier,
+            last_state_op_ts_ms: self.last_state_op_ts_ms,
+            retrieval_history: self.retrieval_history,
+            embed_pending: false,
+            status: MemoryStatus::Active,
+            epistemic_status: EpistemicStatus::ToolDerived,
+        }
+    }
+}
+
+// ── Legacy snapshot structs ───────────────────────────────────────────────────
+
+/// V1 snapshot: pre-ANN SemanticIndex + 14-field MemoryState.
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV1 {
     pub snapshot_seqno: u64,
-    pub payloads: HashMap<MemoryId, crate::payload::MemoryPayload>,
-    pub states: HashMap<MemoryId, crate::state::MemoryState>,
+    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub states: HashMap<MemoryId, LegacyMemoryStateV4>,
     pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
     pub artifacts: HashMap<String, ArtifactId>,
     pub artifact_paths: HashMap<ArtifactId, String>,
@@ -50,6 +150,47 @@ struct LegacyFullSnapshot {
     pub code_files: CodeFileIndex,
     pub semantic_idx: LegacySemanticIndex,
 }
+
+/// V4 snapshot: SemanticIndex (ANN), 14-field MemoryState, no coactivation_stats.
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV4 {
+    pub snapshot_seqno: u64,
+    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub states: HashMap<MemoryId, LegacyMemoryStateV4>,
+    pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts: HashMap<String, ArtifactId>,
+    pub artifact_paths: HashMap<ArtifactId, String>,
+    pub time_idx: TemporalIndex,
+    pub keyword_idx: KeywordIndex,
+    pub artifact_idx: ArtifactIndex,
+    pub triplet_store: TripletStore,
+    pub symbol_idx: SymbolIndex,
+    pub call_graph: CallGraph,
+    pub code_files: CodeFileIndex,
+    pub semantic_idx: SemanticIndex,
+}
+
+/// V5 snapshot: SemanticIndex (ANN), 15-field MemoryState (with RetrievalHistory), with coactivation_stats.
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV5 {
+    pub snapshot_seqno: u64,
+    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub states: HashMap<MemoryId, LegacyMemoryStateV5>,
+    pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts: HashMap<String, ArtifactId>,
+    pub artifact_paths: HashMap<ArtifactId, String>,
+    pub time_idx: TemporalIndex,
+    pub keyword_idx: KeywordIndex,
+    pub artifact_idx: ArtifactIndex,
+    pub triplet_store: TripletStore,
+    pub symbol_idx: SymbolIndex,
+    pub call_graph: CallGraph,
+    pub code_files: CodeFileIndex,
+    pub semantic_idx: SemanticIndex,
+    pub coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats>,
+}
+
+// ── Current snapshot struct ───────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
 pub struct FullSnapshot {
@@ -67,7 +208,6 @@ pub struct FullSnapshot {
     pub call_graph: CallGraph,
     pub code_files: CodeFileIndex,
     pub semantic_idx: SemanticIndex,
-    #[serde(default)]
     pub coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats>,
 }
 
@@ -87,69 +227,119 @@ impl FullSnapshot {
     }
 
     /// Read only the magic and snapshot_seqno without deserializing the full snapshot.
-    /// Accepts both v1 and v2 magic values.
     pub fn peek_seqno(path: &Path) -> Result<u64> {
         let f = std::fs::File::open(path)?;
         let mut r = BufReader::new(f);
         let mut buf = [0u8; 16];
         r.read_exact(&mut buf)?;
         let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        if magic != FULL_SNAPSHOT_MAGIC && magic != FULL_SNAPSHOT_MAGIC_V4 && magic != FULL_SNAPSHOT_MAGIC_V1 {
+        if magic != FULL_SNAPSHOT_MAGIC
+            && magic != FULL_SNAPSHOT_MAGIC_V5
+            && magic != FULL_SNAPSHOT_MAGIC_V4
+            && magic != FULL_SNAPSHOT_MAGIC_V1
+        {
             return Err(FieldError::Manifest("invalid full snapshot magic".to_string()));
         }
         Ok(u64::from_le_bytes(buf[8..16].try_into().unwrap()))
     }
 
-    /// Load a full snapshot from disk. Transparently migrates v1 (pre-ANN) snapshots.
+    /// Load a full snapshot from disk. Transparently migrates all legacy formats.
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)?;
         if bytes.len() < 8 {
             return Err(FieldError::Manifest("snapshot too short".to_string()));
         }
         let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+
         if magic == FULL_SNAPSHOT_MAGIC {
-            // Current format (v5): deserialize directly.
+            // Current format (v6): full MemoryState, deserialize directly.
             let r = BufReader::new(&bytes[8..]);
             return bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()));
         }
-        if magic == FULL_SNAPSHOT_MAGIC_V4 {
-            // v4 snapshots have SemanticIndex (ANN) but no coactivation_stats.
-            // Since coactivation_stats has #[serde(default)], deserialize directly.
-            eprintln!("[chitta-field] migrating v4 snapshot to v5 format (coactivation_stats)");
+
+        if magic == FULL_SNAPSHOT_MAGIC_V5 {
+            // V5: 14-field MemoryState + coactivation_stats.
+            eprintln!("[chitta-field] migrating v5 snapshot → v6 (adding MemoryStatus + EpistemicStatus + RetrievalHistory)");
             let r = BufReader::new(&bytes[8..]);
-            return bincode::deserialize_from(r)
-                .map_err(|e| FieldError::Serialization(e.to_string()));
-        }
-        if magic == FULL_SNAPSHOT_MAGIC_V1 {
-            // Legacy format: deserialize with old SemanticIndex shape, then migrate.
-            eprintln!("[chitta-field] migrating v1 snapshot to v2 format (ANN index)");
-            let r = BufReader::new(&bytes[8..]);
-            let legacy: LegacyFullSnapshot = bincode::deserialize_from(r)
+            let v5: LegacyFullSnapshotV5 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
-            // Rebuild SemanticIndex from legacy embeddings.
+            let states = v5.states.into_iter().map(|(id, s)| (id, s.upgrade())).collect();
+            return Ok(FullSnapshot {
+                snapshot_seqno: v5.snapshot_seqno,
+                payloads: v5.payloads,
+                states,
+                assoc_edges: v5.assoc_edges,
+                artifacts: v5.artifacts,
+                artifact_paths: v5.artifact_paths,
+                time_idx: v5.time_idx,
+                keyword_idx: v5.keyword_idx,
+                artifact_idx: v5.artifact_idx,
+                triplet_store: v5.triplet_store,
+                symbol_idx: v5.symbol_idx,
+                call_graph: v5.call_graph,
+                code_files: v5.code_files,
+                semantic_idx: v5.semantic_idx,
+                coactivation_stats: v5.coactivation_stats,
+            });
+        }
+
+        if magic == FULL_SNAPSHOT_MAGIC_V4 {
+            // V4: 14-field MemoryState, no coactivation_stats.
+            eprintln!("[chitta-field] migrating v4 snapshot → v6 (adding coactivation_stats + MemoryStatus + EpistemicStatus)");
+            let r = BufReader::new(&bytes[8..]);
+            let v4: LegacyFullSnapshotV4 = bincode::deserialize_from(r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            let states = v4.states.into_iter().map(|(id, s)| (id, s.upgrade())).collect();
+            return Ok(FullSnapshot {
+                snapshot_seqno: v4.snapshot_seqno,
+                payloads: v4.payloads,
+                states,
+                assoc_edges: v4.assoc_edges,
+                artifacts: v4.artifacts,
+                artifact_paths: v4.artifact_paths,
+                time_idx: v4.time_idx,
+                keyword_idx: v4.keyword_idx,
+                artifact_idx: v4.artifact_idx,
+                triplet_store: v4.triplet_store,
+                symbol_idx: v4.symbol_idx,
+                call_graph: v4.call_graph,
+                code_files: v4.code_files,
+                semantic_idx: v4.semantic_idx,
+                coactivation_stats: HashMap::new(),
+            });
+        }
+
+        if magic == FULL_SNAPSHOT_MAGIC_V1 {
+            // V1: pre-ANN SemanticIndex + 14-field MemoryState.
+            eprintln!("[chitta-field] migrating v1 snapshot → v6 (ANN index + MemoryStatus + EpistemicStatus)");
+            let r = BufReader::new(&bytes[8..]);
+            let v1: LegacyFullSnapshotV1 = bincode::deserialize_from(r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
             let mut semantic_idx = SemanticIndex::new();
-            for (mem_id, emb) in legacy.semantic_idx.embeddings {
+            for (mem_id, emb) in v1.semantic_idx.embeddings {
                 semantic_idx.upsert(mem_id, emb);
             }
+            let states = v1.states.into_iter().map(|(id, s)| (id, s.upgrade())).collect::<HashMap<_, _>>();
             return Ok(FullSnapshot {
-                snapshot_seqno: legacy.snapshot_seqno,
-                payloads: legacy.payloads,
-                states: legacy.states,
-                assoc_edges: legacy.assoc_edges,
-                artifacts: legacy.artifacts,
-                artifact_paths: legacy.artifact_paths,
-                time_idx: legacy.time_idx,
-                keyword_idx: legacy.keyword_idx,
-                artifact_idx: legacy.artifact_idx,
-                triplet_store: legacy.triplet_store,
-                symbol_idx: legacy.symbol_idx,
-                call_graph: legacy.call_graph,
-                code_files: legacy.code_files,
+                snapshot_seqno: v1.snapshot_seqno,
+                payloads: v1.payloads,
+                states,
+                assoc_edges: v1.assoc_edges,
+                artifacts: v1.artifacts,
+                artifact_paths: v1.artifact_paths,
+                time_idx: v1.time_idx,
+                keyword_idx: v1.keyword_idx,
+                artifact_idx: v1.artifact_idx,
+                triplet_store: v1.triplet_store,
+                symbol_idx: v1.symbol_idx,
+                call_graph: v1.call_graph,
+                code_files: v1.code_files,
                 semantic_idx,
                 coactivation_stats: HashMap::new(),
             });
         }
+
         Err(FieldError::Manifest(format!("unknown snapshot magic: {:#x}", magic)))
     }
 }
