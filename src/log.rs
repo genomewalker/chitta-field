@@ -192,6 +192,7 @@ impl OpLog {
             return Ok(());
         }
         self.current_segment.flush()?;
+        let _ = self.current_segment.get_ref().sync_data(); // ensure old segment is durable before rotation
         let new_path = segment_path(&self.data_dir, self.instance_id, self.next_seqno);
         let f = create_segment(&new_path, self.next_seqno)?;
         let header_size = (SEGMENT_MAGIC.len() + 8) as u64;
