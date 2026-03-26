@@ -2147,11 +2147,15 @@ pub extern "C" fn cf_task_transition(
     if let Err(e) = result {
         return handle.err(e);
     }
-    handle
+    let transitioned = handle
         .field
         .task_registry
         .write()
         .transition(task_id_str, status_str, now_ms, fencing_token);
+    if !transitioned {
+        // Transition rejected: stale fencing token or unknown task_id — signal error to caller
+        return handle.err("task transition rejected: stale fencing token or unknown task_id");
+    }
     handle.ok()
 }
 
