@@ -379,6 +379,16 @@ int cf_get_assoc_edges(CfHandle* h, uint64_t memory_id, size_t limit,
 
 int cf_set_epistemic_status(CfHandle* h, uint64_t memory_id, uint8_t epistemic_status);
 
+/* Contradiction engine */
+int cf_get_conflicts(CfHandle* h, uint64_t memory_id,
+    uint64_t* out_ids, size_t max_ids, size_t* out_count);
+
+int cf_get_supersession_chain(CfHandle* h, uint64_t memory_id,
+    uint64_t* out_ids, size_t max_ids, size_t* out_count);
+
+int cf_get_confirmations(CfHandle* h, uint64_t memory_id,
+    uint64_t* out_ids, size_t max_ids, size_t* out_count);
+
 #ifdef __cplusplus
 }
 #endif

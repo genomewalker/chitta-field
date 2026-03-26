@@ -1200,6 +1200,86 @@ pub extern "C" fn cf_get_callers(
     handle.ok()
 }
 
+// ── Contradiction engine ─────────────────────────────────────────────────────
+
+/// Get memory IDs that contradict the given memory (bidirectional).
+#[no_mangle]
+pub extern "C" fn cf_get_conflicts(
+    h: *mut CfHandle,
+    memory_id: u64,
+    out_ids: *mut u64,
+    max_ids: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if h.is_null() || out_ids.is_null() || out_count.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    match handle.field.get_conflicts(memory_id) {
+        Ok(ids) => {
+            let n = ids.len().min(max_ids);
+            for (i, &id) in ids.iter().take(n).enumerate() {
+                unsafe { *out_ids.add(i) = id; }
+            }
+            unsafe { *out_count = n; }
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Follow supersession chain from memory_id. Returns chain including self.
+#[no_mangle]
+pub extern "C" fn cf_get_supersession_chain(
+    h: *mut CfHandle,
+    memory_id: u64,
+    out_ids: *mut u64,
+    max_ids: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if h.is_null() || out_ids.is_null() || out_count.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    match handle.field.get_supersession_chain(memory_id) {
+        Ok(ids) => {
+            let n = ids.len().min(max_ids);
+            for (i, &id) in ids.iter().take(n).enumerate() {
+                unsafe { *out_ids.add(i) = id; }
+            }
+            unsafe { *out_count = n; }
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Get memory IDs that confirm the given memory.
+#[no_mangle]
+pub extern "C" fn cf_get_confirmations(
+    h: *mut CfHandle,
+    memory_id: u64,
+    out_ids: *mut u64,
+    max_ids: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if h.is_null() || out_ids.is_null() || out_count.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    match handle.field.get_confirmations(memory_id) {
+        Ok(ids) => {
+            let n = ids.len().min(max_ids);
+            for (i, &id) in ids.iter().take(n).enumerate() {
+                unsafe { *out_ids.add(i) = id; }
+            }
+            unsafe { *out_count = n; }
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
 /// Upsert a code file. Returns its file_id via *out_id.
 #[no_mangle]
 pub extern "C" fn cf_upsert_code_file(
