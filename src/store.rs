@@ -835,7 +835,13 @@ impl ChittaField {
             MemoryStatus::Observed     => 5,
             MemoryStatus::Verified     => 6,
         };
-        // Write to WAL first for durability
+        // Check existence before writing to WAL
+        {
+            let states = self.states.read();
+            if !states.contains_key(&memory_id) {
+                return Err(FieldError::NotFound(memory_id));
+            }
+        }
         let delta = crate::ops::StateDeltaOp {
             memory_id,
             strength_delta: None,
@@ -849,7 +855,6 @@ impl ChittaField {
         };
         self.log.write().append(&Op::UpdateState(delta.clone()))?;
         let _ = self.log.write().sync(); // status transitions are critical lifecycle events
-        // Apply to in-memory state
         let mut states = self.states.write();
         if let Some(st) = states.get_mut(&memory_id) {
             st.apply_delta(&delta, now_ms());
@@ -869,6 +874,13 @@ impl ChittaField {
             EpistemicStatus::ModelInferred       => 2,
             EpistemicStatus::AutonomousSynthesis => 3,
         };
+        // Check existence before writing to WAL
+        {
+            let states = self.states.read();
+            if !states.contains_key(&memory_id) {
+                return Err(FieldError::NotFound(memory_id));
+            }
+        }
         let delta = crate::ops::StateDeltaOp {
             memory_id,
             strength_delta: None,
@@ -898,17 +910,18 @@ impl ChittaField {
         if embedding.len() != EMBED_DIM {
             return Err(FieldError::InvalidEmbedDim { expected: EMBED_DIM, actual: embedding.len() });
         }
-        let (pending, existing_content) = {
+        let existing_content = {
             let states = self.states.read();
-            let pending = states.get(&memory_id).map(|st| st.embed_pending).unwrap_or(false);
-            let content = if pending {
-                self.payloads.read().get(&memory_id).map(|p| p.content.clone()).unwrap_or_default()
-            } else {
-                vec![]
-            };
-            (pending, content)
+            match states.get(&memory_id) {
+                None => return Err(FieldError::NotFound(memory_id)),
+                Some(st) if !st.embed_pending => return Ok(()),
+                Some(_) => {
+                    self.payloads.read().get(&memory_id)
+                        .map(|p| p.content.clone())
+                        .unwrap_or_default()
+                }
+            }
         };
-        if !pending { return Ok(()); }
 
         // Persist to WAL via UpdateMemoryContent (empty content = reuse existing)
         let op = Op::UpdateMemoryContent(crate::ops::UpdateMemoryContentOp {
