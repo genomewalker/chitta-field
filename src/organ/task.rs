@@ -141,3 +141,72 @@ impl TaskRegistry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_registry() -> TaskRegistry {
+        let mut r = TaskRegistry::default();
+        r.create("t1".to_string(), "job".to_string(), "{}".to_string(), 1000, 1);
+        r
+    }
+
+    #[test]
+    fn test_valid_transition_accepted() {
+        let mut r = make_registry();
+        assert!(r.transition("t1", "running", 2000, 1));
+        assert_eq!(r.get("t1").unwrap().status, TaskStatus::Running);
+    }
+
+    #[test]
+    fn test_stale_token_rejected() {
+        let mut r = make_registry();
+        // Advance to token=5
+        r.transition("t1", "running", 2000, 5);
+        // Stale writer with token=3 must be rejected
+        assert!(!r.transition("t1", "completed", 3000, 3));
+        assert_eq!(r.get("t1").unwrap().status, TaskStatus::Running);
+    }
+
+    #[test]
+    fn test_same_token_older_timestamp_rejected() {
+        let mut r = make_registry();
+        r.transition("t1", "running", 2000, 2);
+        // Same token, same timestamp — tie-break rejects it
+        assert!(!r.transition("t1", "completed", 2000, 2));
+        assert_eq!(r.get("t1").unwrap().status, TaskStatus::Running);
+    }
+
+    #[test]
+    fn test_same_token_newer_timestamp_accepted() {
+        let mut r = make_registry();
+        r.transition("t1", "running", 2000, 2);
+        // Same token, strictly newer timestamp — accepted
+        assert!(r.transition("t1", "completed", 2001, 2));
+        assert_eq!(r.get("t1").unwrap().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn test_higher_token_overwrites_regardless_of_timestamp() {
+        let mut r = make_registry();
+        r.transition("t1", "running", 9000, 5);
+        // Higher token, older timestamp — still accepted (token takes priority)
+        assert!(r.transition("t1", "completed", 1000, 6));
+        assert_eq!(r.get("t1").unwrap().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn test_zero_token_bypasses_fencing() {
+        let mut r = make_registry();
+        // token=0 disables fencing checks
+        assert!(r.transition("t1", "failed", 5000, 0));
+        assert_eq!(r.get("t1").unwrap().status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn test_transition_unknown_task_returns_false() {
+        let mut r = make_registry();
+        assert!(!r.transition("no-such-task", "running", 1000, 1));
+    }
+}
