@@ -842,6 +842,7 @@ impl ChittaField {
             status: Some(status_u8),
         };
         self.log.write().append(&Op::UpdateState(delta.clone()))?;
+        let _ = self.log.write().sync(); // status transitions are critical lifecycle events
         // Apply to in-memory state
         let mut states = self.states.write();
         if let Some(st) = states.get_mut(&memory_id) {
