@@ -1901,4 +1901,93 @@ mod tests {
         assert!(field.log.read().last_seqno() > seqno_before);
         assert!(field.pending_recall.lock().strengthen.is_empty());
     }
+
+    // ── Regression tests for replay/contract correctness ─────────────────────
+
+    fn put_test_memory(field: &ChittaField, content: &[u8]) -> MemoryId {
+        let emb = vec![0.1f32; 768];
+        field.put_memory("wisdom", "test", content, &emb, 1.0, 0.001, 0, vec![], None, None)
+            .unwrap().0
+    }
+
+    /// Bug fix: UpdateState replay used now_ms=0, corrupting last_accessed_ms and
+    /// last_strengthened_ms. After reopen the timestamps must reflect op_ts_ms, not epoch 0.
+    #[test]
+    fn test_replay_update_state_timestamps_nonzero() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+
+        let id = {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            let id = put_test_memory(&field, b"state-replay");
+            // touch=true writes an UpdateState op with real op_ts_ms
+            field.update_state(id, None, None, None, true, None).unwrap();
+            field.flush().unwrap();
+            id
+        };
+
+        let field2 = ChittaField::open(data_dir).unwrap();
+        let state = field2.get_state(id).unwrap();
+        assert!(
+            state.last_accessed_ms > 0,
+            "last_accessed_ms must not be 0 after replay, got {}",
+            state.last_accessed_ms
+        );
+    }
+
+    /// Bug fix: UpdateMemoryContent replay did not clear embed_pending, so backfilled
+    /// memories were re-queued as pending after every restart.
+    #[test]
+    fn test_replay_backfill_clears_embed_pending() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+
+        let id = {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            // Empty embedding slice → embed_pending = true
+            let (id, _) = field.put_memory("wisdom", "test", b"needs-embed", &[], 1.0, 0.001, 0, vec![], None, None).unwrap();
+            let emb = vec![0.2f32; 768];
+            field.backfill_embedding(id, &emb).unwrap();
+            field.flush().unwrap();
+            id
+        };
+
+        let field2 = ChittaField::open(data_dir).unwrap();
+        assert!(
+            !field2.pending_embeddings(100).contains(&id),
+            "backfilled memory must not appear in pending_embeddings after replay"
+        );
+    }
+
+    /// Bug fix: backfill_embedding() previously returned Ok(()) for nonexistent IDs.
+    #[test]
+    fn test_backfill_nonexistent_returns_not_found() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.0f32; 768];
+        let fake_id: MemoryId = 0xdeadbeef_cafebabe;
+        let result = field.backfill_embedding(fake_id, &emb);
+        assert!(
+            matches!(result, Err(crate::error::FieldError::NotFound(_))),
+            "expected NotFound, got {:?}", result
+        );
+    }
+
+    /// Bug fix: set_memory_status() and set_epistemic_status() wrote WAL before
+    /// confirming the memory exists, leaving orphaned WAL entries on invalid IDs.
+    #[test]
+    fn test_set_status_invalid_id_no_wal_mutation() {
+        let (field, _tmp) = open_test_field();
+        let fake_id: MemoryId = 0xdeadbeef_00000001;
+        let seqno_before = field.log.read().last_seqno();
+
+        let r1 = field.set_memory_status(fake_id, crate::state::MemoryStatus::Archived);
+        let r2 = field.set_epistemic_status(fake_id, crate::state::EpistemicStatus::ModelInferred);
+
+        assert!(matches!(r1, Err(crate::error::FieldError::NotFound(_))));
+        assert!(matches!(r2, Err(crate::error::FieldError::NotFound(_))));
+        assert_eq!(
+            field.log.read().last_seqno(), seqno_before,
+            "WAL must not grow when ID is invalid"
+        );
+    }
 }
