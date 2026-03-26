@@ -865,6 +865,9 @@ impl ChittaField {
         // Update semantic index
         self.semantic_idx.write().upsert(memory_id, embedding.to_vec());
 
+        // Re-encode cortical sparse index (non-fatal)
+        let _ = self.encode_memory(memory_id);
+
         // Clear embed_pending in state
         {
             let mut states = self.states.write();
