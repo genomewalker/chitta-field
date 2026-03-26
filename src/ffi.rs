@@ -3978,12 +3978,17 @@ pub unsafe extern "C" fn cf_record_recall_batch(
     ts_ms: i64,
     base_assoc_delta: f32,
 ) -> i32 {
-    if handle.is_null() || ids.is_null() || centroid_q.is_null() {
+    if handle.is_null() || ids.is_null() {
         return -1;
     }
     let h = &mut *handle;
     let id_slice = std::slice::from_raw_parts(ids, ids_len);
-    let cq_slice = std::slice::from_raw_parts(centroid_q, centroid_q_len);
+    // centroid_q is optional: null/zero-len → empty slice
+    let cq_slice: &[i8] = if centroid_q.is_null() || centroid_q_len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(centroid_q, centroid_q_len)
+    };
 
     let op = Op::RecordRecallBatch(RecordRecallBatchOp {
         memory_ids: id_slice.to_vec(),

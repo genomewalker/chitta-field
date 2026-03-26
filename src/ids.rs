@@ -3,21 +3,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type InstanceId = u32;
 
+/// Generate a temporally-ordered instance ID.
+/// High 20 bits = seconds since 2020-01-01 (sufficient until ~2053).
+/// Low 12 bits = random suffix for uniqueness within the same second.
+/// Alphabetical segment sort preserves temporal order across instances.
 pub fn new_instance_id() -> InstanceId {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    const EPOCH_2020: u64 = 1577836800; // 2020-01-01 00:00:00 UTC
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs().saturating_sub(EPOCH_2020))
+        .unwrap_or(0);
+    let ts_bits = (secs & 0xFFFFF) as u32; // 20-bit seconds
+
+    let mut rand_bits = 0u32;
     use std::fs::File;
     use std::io::Read;
-    let mut buf = [0u8; 4];
+    let mut buf = [0u8; 2];
     if let Ok(mut f) = File::open("/dev/urandom") {
         let _ = f.read_exact(&mut buf);
-    } else {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let t = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        buf.copy_from_slice(&(t as u32).to_le_bytes());
+        rand_bits = u16::from_le_bytes(buf) as u32 & 0xFFF; // 12-bit random
     }
-    u32::from_le_bytes(buf)
+    (ts_bits << 12) | rand_bits
 }
 
 pub type MemoryId = u64;
