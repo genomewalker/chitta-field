@@ -88,7 +88,11 @@ impl TaskRegistry {
     ) -> bool {
         if let Some(t) = self.tasks.get_mut(task_id) {
             if fencing_token > 0 && fencing_token < t.fencing_token {
-                return false;
+                return false; // stale writer: reject
+            }
+            // Same token: use timestamp as tie-breaker (last-write-wins at ms granularity)
+            if fencing_token > 0 && fencing_token == t.fencing_token && now_ms <= t.updated_at_ms {
+                return false; // concurrent write with same token but older/equal timestamp
             }
             t.status = TaskStatus::from_str(new_status);
             t.updated_at_ms = now_ms;
@@ -125,6 +129,10 @@ impl TaskRegistry {
 
     pub fn update_payload(&mut self, task_id: &str, payload_json: String, now_ms: i64) -> bool {
         if let Some(t) = self.tasks.get_mut(task_id) {
+            // Reject stale payload updates (older timestamp = concurrent writer lost the race)
+            if now_ms <= t.updated_at_ms {
+                return false;
+            }
             t.payload_json = payload_json;
             t.updated_at_ms = now_ms;
             true
