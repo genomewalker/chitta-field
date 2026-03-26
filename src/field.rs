@@ -713,7 +713,11 @@ pub(crate) fn apply_op(
         Op::UpdateState(delta) => {
             let memory_id = delta.memory_id;
             if let Some(state) = states.get_mut(&memory_id) {
-                state.apply_delta(&delta, 0);
+                // Use op_ts_ms as the reference time during replay so that
+                // last_accessed_ms / last_strengthened_ms are set to the
+                // wall-clock time of the original operation, not epoch 0.
+                let replay_now = if delta.op_ts_ms > 0 { delta.op_ts_ms } else { state.created_at_ms };
+                state.apply_delta(&delta, replay_now);
             }
         }
         Op::DeleteMemory(del) => {
@@ -1028,6 +1032,11 @@ pub(crate) fn apply_op(
             }
             if !umc.embedding.is_empty() {
                 semantic_idx.upsert(umc.memory_id, umc.embedding);
+                // An UpdateMemoryContent with a real embedding means the backfill
+                // completed. Clear embed_pending so replayed state matches live state.
+                if let Some(st) = states.get_mut(&umc.memory_id) {
+                    st.embed_pending = false;
+                }
             }
             keyword_idx.index(umc.memory_id, &content_str);
         }
