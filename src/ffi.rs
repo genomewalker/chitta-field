@@ -5015,3 +5015,15 @@ pub extern "C" fn cf_set_memory_status(h: *mut CfHandle, memory_id: u64, status:
         Err(e) => handle.err(e),
     }
 }
+
+/// Compact WAL: save full snapshot then delete segments covered by it.
+/// Returns number of deleted segments, or -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_compact_wal(h: *mut CfHandle) -> i64 {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    match handle.field.compact_wal() {
+        Ok(n) => n as i64,
+        Err(e) => { handle.err(e); -1 }
+    }
+}

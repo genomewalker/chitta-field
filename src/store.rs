@@ -1251,6 +1251,43 @@ impl ChittaField {
         snap.save(&path)
     }
 
+
+    /// Compact WAL: save full snapshot then delete WAL segments covered by it.
+    /// After compaction, only segments with seqno >= snapshot_seqno are kept.
+    /// This bounds WAL growth and speeds up startup replay.
+    pub fn compact_wal(&self) -> Result<usize> {
+        self.save_full_snapshot()?;
+        let snapshot_seqno = self.log.read().last_seqno();
+        
+        let seg_dir = self.data_dir.join("segments");
+        let mut deleted = 0usize;
+        
+        if let Ok(entries) = std::fs::read_dir(&seg_dir) {
+            let mut paths: Vec<std::path::PathBuf> = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().map(|e| e == "seg").unwrap_or(false))
+                .collect();
+            paths.sort();
+            
+            // Keep the last segment (may be partially covered) — delete only fully-covered ones
+            // A segment is covered if its max seqno < snapshot_seqno
+            // Since seqno is in the filename ({instance_id}_{first_seqno}.seg), we can use it
+            for path in &paths[..paths.len().saturating_sub(1)] {
+                // Extract first_seqno from filename
+                let fname = path.file_stem().and_then(|f| f.to_str()).unwrap_or("");
+                let first_seqno: u64 = fname.split('_').nth(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(u64::MAX);
+                if first_seqno < snapshot_seqno {
+                    if std::fs::remove_file(path).is_ok() {
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Run a single tier demotion pass over all memories.
     /// Returns `(demoted_count, deleted_count)`.
     ///
