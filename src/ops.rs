@@ -91,6 +91,9 @@ pub struct StateDeltaOp {
     pub pin: Option<bool>,
     #[serde(default)]
     pub op_ts_ms: i64,
+    /// Status change (0=Active, 1=Superseded, 2=Contradicted, 3=Archived); None = no change
+    #[serde(default)]
+    pub status: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

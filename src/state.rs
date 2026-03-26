@@ -140,6 +140,14 @@ impl MemoryState {
         if let Some(p) = delta.pin {
             self.pinned = p;
         }
+        if let Some(s) = delta.status {
+            self.status = match s {
+                1 => MemoryStatus::Superseded,
+                2 => MemoryStatus::Contradicted,
+                3 => MemoryStatus::Archived,
+                _ => MemoryStatus::Active,
+            };
+        }
     }
 
     /// Compute effective strength accounting for time-based decay.
