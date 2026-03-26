@@ -3646,6 +3646,9 @@ pub extern "C" fn cf_get_memory_metadata(
         _ => return 1,
     };
 
+    let status_str = format!("{:?}", state.status);
+    let epistemic_str = format!("{:?}", state.epistemic_status);
+
     let json_str = match serde_json::to_string(&serde_json::json!({
         "id": memory_id,
         "kind": payload.kind,
@@ -3657,6 +3660,12 @@ pub extern "C" fn cf_get_memory_metadata(
         "tier": state.tier,
         "access_count": state.access_count,
         "decay_rate": state.decay_rate,
+        "status": status_str,
+        "epistemic_status": epistemic_str,
+        "last_accessed_ms": state.last_accessed_ms,
+        "last_strengthened_ms": state.last_strengthened_ms,
+        "created_at_ms": state.created_at_ms,
+        "last_state_op_ts_ms": state.last_state_op_ts_ms,
     })) {
         Ok(s) => s,
         Err(e) => {
