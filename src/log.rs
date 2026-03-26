@@ -70,6 +70,7 @@ pub struct OpLog {
     current_segment_path: PathBuf,
     current_segment_size: u64,
     next_seqno: u64,
+    ops_since_sync: u32,  // for batch fsync: sync_data() every N appends
 }
 
 impl OpLog {
@@ -95,6 +96,7 @@ impl OpLog {
                     current_segment_path: last_path.clone(),
                     current_segment_size: size,
                     next_seqno,
+                    ops_since_sync: 0,
                 });
             }
         }
@@ -109,6 +111,7 @@ impl OpLog {
             current_segment_path: path,
             current_segment_size: header_size,
             next_seqno,
+            ops_since_sync: 0,
         })
     }
 
@@ -137,12 +140,26 @@ impl OpLog {
         self.current_segment.write_all(&payload)?;
         self.current_segment.write_all(&crc.to_be_bytes())?;
         self.current_segment.flush()?;
+        // Batch fsync: sync_data() every 32 appends (fdatasync, cheaper than sync_all)
+        self.ops_since_sync += 1;
+        if self.ops_since_sync >= 32 {
+            let _ = self.current_segment.get_ref().sync_data();
+            self.ops_since_sync = 0;
+        }
 
         let entry_size = 4 + 8 + 1 + payload.len() as u64 + 4;
         self.current_segment_size += entry_size;
         self.next_seqno += 1;
 
         Ok(seqno)
+    }
+
+    /// Force fsync — call after critical mutations (put_memory, forget, etc.)
+    pub fn sync(&mut self) -> Result<()> {
+        self.current_segment.flush()?;
+        self.current_segment.get_ref().sync_data()?;
+        self.ops_since_sync = 0;
+        Ok(())
     }
 
     /// Replay ALL segment files in data_dir/segments/ (from all instances).

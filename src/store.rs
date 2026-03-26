@@ -87,6 +87,8 @@ impl ChittaField {
 
         let op_enum = Op::PutPayload(op.clone());
         let _seqno = self.log.write().append(&op_enum)?;
+        // Sync after durable write
+        let _ = self.log.write().sync();
 
         let payload = MemoryPayload::from(op);
         let mut state = MemoryState::new(memory_id, chunk_hash, ts);
@@ -185,6 +187,7 @@ impl ChittaField {
             touch: true,
             pin: None,
             op_ts_ms: ts,
+            status: None,
         };
         let _seqno = self.log.write().append(&Op::UpdateState(delta.clone()))?;
 
@@ -240,6 +243,7 @@ impl ChittaField {
             touch,
             pin,
             op_ts_ms: ts,
+            status: None,
         };
         let _seqno = self.log.write().append(&Op::UpdateState(delta.clone()))?;
 
@@ -268,6 +272,7 @@ impl ChittaField {
             deleted_at_ms: ts,
         });
         let _seqno = self.log.write().append(&op)?;
+        let _ = self.log.write().sync(); // forget is irreversible — sync immediately
 
         {
             let mut states = self.states.write();
@@ -816,10 +821,31 @@ impl ChittaField {
     }
 
     /// Set the lifecycle status of a memory (Active/Superseded/Contradicted/Archived).
+    /// Durable: writes UpdateState op to WAL.
     pub fn set_memory_status(&self, memory_id: MemoryId, status: crate::state::MemoryStatus) -> Result<()> {
+        use crate::state::MemoryStatus;
+        let status_u8: u8 = match status {
+            MemoryStatus::Active      => 0,
+            MemoryStatus::Superseded  => 1,
+            MemoryStatus::Contradicted => 2,
+            MemoryStatus::Archived    => 3,
+        };
+        // Write to WAL first for durability
+        let delta = crate::ops::StateDeltaOp {
+            memory_id,
+            strength_delta: None,
+            confidence_delta: None,
+            decay_rate: None,
+            touch: false,
+            pin: None,
+            op_ts_ms: now_ms(),
+            status: Some(status_u8),
+        };
+        self.log.write().append(&Op::UpdateState(delta.clone()))?;
+        // Apply to in-memory state
         let mut states = self.states.write();
         if let Some(st) = states.get_mut(&memory_id) {
-            st.status = status;
+            st.apply_delta(&delta, now_ms());
             Ok(())
         } else {
             Err(FieldError::NotFound(memory_id))
