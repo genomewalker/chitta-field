@@ -59,6 +59,12 @@ impl TaskRegistry {
         now_ms: i64,
         fencing_token: u64,
     ) {
+        // Fencing: do not overwrite a record with a higher (newer) token.
+        if let Some(existing) = self.tasks.get(&task_id) {
+            if existing.fencing_token >= fencing_token {
+                return;
+            }
+        }
         self.tasks.insert(
             task_id.clone(),
             TaskRecord {

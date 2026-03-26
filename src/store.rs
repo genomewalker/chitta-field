@@ -828,19 +828,47 @@ impl ChittaField {
 
     /// Invalidate a triplet (marks it as expired at the current time).
     /// Backfill embedding for a memory stored with embed_pending=true.
+    /// Durable: writes UpdateMemoryContent op to WAL (content unchanged, new embedding).
     pub fn backfill_embedding(&self, memory_id: MemoryId, embedding: &[f32]) -> Result<()> {
         if embedding.len() != EMBED_DIM {
             return Err(FieldError::InvalidEmbedDim { expected: EMBED_DIM, actual: embedding.len() });
         }
-        let pending = {
-            let s = self.states.read();
-            s.get(&memory_id).map(|st| st.embed_pending).unwrap_or(false)
+        let (pending, existing_content) = {
+            let states = self.states.read();
+            let pending = states.get(&memory_id).map(|st| st.embed_pending).unwrap_or(false);
+            let content = if pending {
+                self.payloads.read().get(&memory_id).map(|p| p.content.clone()).unwrap_or_default()
+            } else {
+                vec![]
+            };
+            (pending, content)
         };
         if !pending { return Ok(()); }
-        self.semantic_idx.write().upsert(memory_id, embedding.to_vec());
+
+        // Persist to WAL via UpdateMemoryContent (empty content = reuse existing)
+        let op = Op::UpdateMemoryContent(crate::ops::UpdateMemoryContentOp {
+            memory_id,
+            content: existing_content.clone(),
+            embedding: embedding.to_vec(),
+        });
+        self.log.write().append(&op)?;
+
+        // Update payload embedding in memory
         {
-            let mut s = self.states.write();
-            if let Some(st) = s.get_mut(&memory_id) {
+            let mut payloads = self.payloads.write();
+            if let Some(p) = payloads.get_mut(&memory_id) {
+                p.embedding = embedding.to_vec();
+                p.embedding_model = "bge-base-en-v1.5".to_string();
+            }
+        }
+
+        // Update semantic index
+        self.semantic_idx.write().upsert(memory_id, embedding.to_vec());
+
+        // Clear embed_pending in state
+        {
+            let mut states = self.states.write();
+            if let Some(st) = states.get_mut(&memory_id) {
                 st.embed_pending = false;
             }
         }
