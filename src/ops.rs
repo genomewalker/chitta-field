@@ -32,6 +32,7 @@ pub enum Op {
     UpdateMemoryContent(UpdateMemoryContentOp),
     RecordRecallBatch(RecordRecallBatchOp),
     StrengthenAssocEdge(StrengthenAssocEdgeOp),
+    MsgEvent(MsgEventOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -45,6 +46,7 @@ pub const OP_UPDATE_SYMBOL_DESCRIPTION: u8 = 23;
 pub const OP_UPDATE_MEMORY_CONTENT: u8 = 24;
 pub const OP_RECORD_RECALL_BATCH: u8 = 25;
 pub const OP_STRENGTHEN_ASSOC_EDGE: u8 = 26;
+pub const OP_MSG_EVENT: u8 = 27;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -337,4 +339,19 @@ pub struct StrengthenAssocEdgeOp {
     pub dst: MemoryId,
     pub edge_type: EdgeType,
     pub delta: f32,
+}
+
+/// Domain event for cross-session messaging.
+/// domain: always "msg"
+/// kind: "send", "ack", "ack_all"
+/// target: recipient session_id (or message_id for ack)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MsgEventOp {
+    pub event_id: u64,
+    pub domain: String,
+    pub kind: String,
+    pub target: String,
+    pub payload_json: Vec<u8>,
+    pub realm: String,
+    pub ts_ms: i64,
 }

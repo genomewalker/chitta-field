@@ -14,6 +14,7 @@ use crate::organ::codefile::CodeFileIndex;
 use crate::organ::cortex::{CorticalIndex, SparseCode, SparseEncoder};
 use crate::organ::keyword::KeywordIndex;
 use crate::organ::lite_encoder::LiteEncoder;
+use crate::organ::msg::MsgRegistry;
 use crate::organ::pq::ProductQuantizer;
 use crate::organ::session::SessionRegistry;
 use crate::organ::symbol::{SymbolEntry, SymbolIndex};
@@ -116,6 +117,7 @@ pub struct ChittaField {
     pub(crate) user_model_registry: RwLock<UserModelRegistry>,
     pub(crate) theme_organ: RwLock<ThemeOrgan>,
     pub(crate) analytics_registry: RwLock<AnalyticsRegistry>,
+    pub(crate) msg_registry: RwLock<MsgRegistry>,
     pub(crate) lite_encoder: RwLock<Option<LiteEncoder>>,
     /// Byte offsets for each foreign segment file, used by sync_foreign().
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
@@ -172,6 +174,7 @@ impl ChittaField {
         let mut user_model_registry = UserModelRegistry::new();
         let mut theme_organ = ThemeOrgan::new();
         let mut analytics_registry = AnalyticsRegistry::new();
+        let mut msg_registry = MsgRegistry::new();
         let mut chunk_hash_idx: HashMap<crate::ids::ChunkHash, MemoryId> = HashMap::new();
         let mut snapshot_coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats> = HashMap::new();
 
@@ -337,6 +340,7 @@ impl ChittaField {
                 &mut user_model_registry,
                 &mut theme_organ,
                 &mut analytics_registry,
+                &mut msg_registry,
                 &mut chunk_hash_idx,
                 &mut replay_realm_members,
                 &mut replay_coactivation_stats,
@@ -422,6 +426,7 @@ impl ChittaField {
             user_model_registry: RwLock::new(user_model_registry),
             theme_organ: RwLock::new(theme_organ),
             analytics_registry: RwLock::new(analytics_registry),
+            msg_registry: RwLock::new(msg_registry),
             lite_encoder: RwLock::new(loaded_lite_encoder),
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
@@ -488,6 +493,7 @@ impl ChittaField {
         let mut user_model_reg = self.user_model_registry.write();
         let mut theme_organ = self.theme_organ.write();
         let mut analytics_reg = self.analytics_registry.write();
+        let mut msg_reg = self.msg_registry.write();
         let mut chunk_hash_idx = self.chunk_hash_idx.write();
         let mut realm_members = self.realm_members.write();
         let mut coactivation_stats = self.coactivation_stats.write();
@@ -515,6 +521,7 @@ impl ChittaField {
                 &mut *user_model_reg,
                 &mut *theme_organ,
                 &mut *analytics_reg,
+                &mut *msg_reg,
                 &mut *chunk_hash_idx,
                 &mut *realm_members,
                 &mut *coactivation_stats,
@@ -659,6 +666,7 @@ pub(crate) fn apply_op(
     user_model_registry: &mut UserModelRegistry,
     theme_organ: &mut ThemeOrgan,
     analytics_registry: &mut AnalyticsRegistry,
+    msg_registry: &mut MsgRegistry,
     chunk_hash_idx: &mut HashMap<crate::ids::ChunkHash, MemoryId>,
     realm_members: &mut HashMap<String, HashSet<MemoryId>>,
     coactivation_stats: &mut HashMap<(MemoryId, MemoryId), CoActivationStats>,
@@ -1070,6 +1078,19 @@ pub(crate) fn apply_op(
         }
         Op::StrengthenAssocEdge(op) => {
             strengthen_assoc_edge_map(assoc_edges, op.src, op.dst, op.edge_type, op.delta);
+        }
+        Op::MsgEvent(ev) => {
+            use crate::organ::msg::MsgEvent;
+            let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
+            msg_registry.insert(MsgEvent {
+                event_id: ev.event_id,
+                domain: ev.domain,
+                kind: ev.kind,
+                target: ev.target,
+                payload_json: payload_str,
+                realm: ev.realm,
+                ts_ms: ev.ts_ms,
+            });
         }
     }
 }

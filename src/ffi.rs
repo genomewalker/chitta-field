@@ -5,8 +5,8 @@
 
 use crate::field::ChittaField;
 use crate::ops::{
-    AnalyticsEventOp, ClearProjectOp, EdgeType, Op, RecordRecallBatchOp, SessionEventOp,
-    TaskEventOp, ThemeEventOp, TranscriptEventOp, UpdateMemoryContentOp,
+    AnalyticsEventOp, ClearProjectOp, EdgeType, MsgEventOp, Op, RecordRecallBatchOp,
+    SessionEventOp, TaskEventOp, ThemeEventOp, TranscriptEventOp, UpdateMemoryContentOp,
     UpdateSymbolDescriptionOp, UserModelEventOp,
 };
 use crate::recall::RecallHit;
@@ -1657,6 +1657,15 @@ pub extern "C" fn cf_emit_event(
             payload_json: payload,
             ts_ms,
         }),
+        "msg" => Op::MsgEvent(MsgEventOp {
+            event_id,
+            domain: domain_str.to_string(),
+            kind: kind_str.to_string(),
+            target: entity_id_str.to_string(),
+            payload_json: payload,
+            realm: realm_str.to_string(),
+            ts_ms,
+        }),
         "user_model" => {
             return handle.err("cf_emit_event: use cf_user_model_upsert/cf_user_model_observe for user_model events");
         }
@@ -1672,8 +1681,20 @@ pub extern "C" fn cf_emit_event(
                 handle.field.transcript_registry.write().set_session_event(
                     entity_id_str,
                     kind_str,
-                    payload_str_for_apply,
+                    payload_str_for_apply.clone(),
                 );
+            }
+            if domain_str == "msg" {
+                use crate::organ::msg::MsgEvent;
+                handle.field.msg_registry.write().insert(MsgEvent {
+                    event_id,
+                    domain: domain_str.to_string(),
+                    kind: kind_str.to_string(),
+                    target: entity_id_str.to_string(),
+                    payload_json: payload_str_for_apply,
+                    realm: realm_str.to_string(),
+                    ts_ms,
+                });
             }
             unsafe {
                 *out_event_id = event_id;
@@ -1755,6 +1776,69 @@ pub extern "C" fn cf_get_latest_event(
         Some(p) => write_json_buf(&p, buf, buf_cap, written),
         None => 1,
     }
+}
+
+/// Query events by domain, kind, and target (e.g. session_id for msg delivery).
+/// Returns JSON array of event objects into buf: `[{"event_id":..., "kind":..., "target":..., "payload_json":..., "realm":..., "ts_ms":...}, ...]`
+/// Returns 0 on success, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_get_events_by_target(
+    h: *mut CfHandle,
+    domain: *const c_char,
+    kind: *const c_char,
+    target: *const c_char,
+    limit: usize,
+    out_buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || domain.is_null() || kind.is_null() || target.is_null()
+        || out_buf.is_null() || written.is_null()
+    {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+
+    let domain_str = unsafe {
+        match CStr::from_ptr(domain).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let kind_str = unsafe {
+        match CStr::from_ptr(kind).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let target_str = unsafe {
+        match CStr::from_ptr(target).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let registry = handle.field.msg_registry.read();
+    let events = registry.get_events(domain_str, kind_str, target_str, limit);
+
+    let json_arr: Vec<serde_json::Value> = events
+        .iter()
+        .map(|ev| {
+            let payload: serde_json::Value =
+                serde_json::from_str(&ev.payload_json).unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "event_id": ev.event_id,
+                "kind": ev.kind,
+                "target": ev.target,
+                "payload": payload,
+                "realm": ev.realm,
+                "ts_ms": ev.ts_ms,
+            })
+        })
+        .collect();
+
+    let json_str = serde_json::to_string(&json_arr).unwrap_or_else(|_| "[]".to_string());
+    write_json_buf(&json_str, out_buf, buf_cap, written)
 }
 
 // ── Session high-level FFI ────────────────────────────────────────────────────

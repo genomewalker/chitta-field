@@ -5,6 +5,7 @@ pub mod codefile;
 pub mod cortex;
 pub mod keyword;
 pub mod lite_encoder;
+pub mod msg;
 pub mod pq;
 pub mod prototype;
 pub mod session;
