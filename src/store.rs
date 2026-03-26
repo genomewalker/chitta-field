@@ -13,7 +13,7 @@ use crate::organ::symbol::SymbolEntry;
 use crate::organ::triplet::TripletEntry;
 use crate::payload::MemoryPayload;
 use crate::recall::RecallHit;
-use crate::state::MemoryState;
+use crate::state::{EpistemicStatus, MemoryState, MemoryStatus};
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +22,32 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// Score multiplier derived from memory status.
+/// Superseded/Contradicted/Archived return None → excluded from recall.
+/// Active=1.0, Verified=1.15, Observed=0.85, Proposed=0.65.
+fn status_score_multiplier(status: &MemoryStatus) -> Option<f32> {
+    match status {
+        MemoryStatus::Active       => Some(1.00),
+        MemoryStatus::Verified     => Some(1.15),
+        MemoryStatus::Observed     => Some(0.85),
+        MemoryStatus::Proposed     => Some(0.65),
+        MemoryStatus::Superseded   => None,
+        MemoryStatus::Contradicted => None,
+        MemoryStatus::Archived     => None,
+    }
+}
+
+/// Score multiplier derived from epistemic status.
+/// UserStated=1.0, ToolDerived=0.95, ModelInferred=0.85, AutonomousSynthesis=0.75.
+fn epistemic_score_multiplier(es: &EpistemicStatus) -> f32 {
+    match es {
+        EpistemicStatus::UserStated          => 1.00,
+        EpistemicStatus::ToolDerived         => 0.95,
+        EpistemicStatus::ModelInferred       => 0.85,
+        EpistemicStatus::AutonomousSynthesis => 0.75,
+    }
 }
 
 impl ChittaField {
@@ -484,13 +510,17 @@ impl ChittaField {
                 if state.deleted {
                     return None;
                 }
+                // Exclude semantically invalidated statuses; apply score modifiers for the rest.
+                let status_mul = status_score_multiplier(&state.status)?;
+                let epistemic_mul = epistemic_score_multiplier(&state.epistemic_status);
                 let payload = payloads.get(&memory_id)?;
                 let eff_strength = state.effective_strength(now);
                 let semantic_score = hit.cosine_similarity;
                 let semantic_weight = ((semantic_score + 1.0) / 2.0).max(0.0);
+                let base = semantic_weight * (0.5 + 0.5 * eff_strength) * state.confidence;
                 Some(RecallHit {
                     memory_id,
-                    score: semantic_weight * (0.5 + 0.5 * eff_strength) * state.confidence,
+                    score: base * status_mul * epistemic_mul,
                     semantic_score,
                     ts_ms: payload.authored_at_ms,
                     kind: payload.kind.clone(),
@@ -716,12 +746,14 @@ impl ChittaField {
                 if state.deleted {
                     return None;
                 }
+                let status_mul = status_score_multiplier(&state.status)?;
+                let epistemic_mul = epistemic_score_multiplier(&state.epistemic_status);
                 let payload = payloads.get(&hit.memory_id)?;
                 let eff_strength = state.effective_strength(now);
-                let score = hit.bm25_score * (0.5 + 0.5 * eff_strength) * state.confidence;
+                let base = hit.bm25_score * (0.5 + 0.5 * eff_strength) * state.confidence;
                 Some(RecallHit {
                     memory_id: hit.memory_id,
-                    score,
+                    score: base * status_mul * epistemic_mul,
                     semantic_score: 0.0,
                     ts_ms: payload.authored_at_ms,
                     kind: payload.kind.clone(),
@@ -1900,6 +1932,52 @@ mod tests {
         field.flush().unwrap();
         assert!(field.log.read().last_seqno() > seqno_before);
         assert!(field.pending_recall.lock().strengthen.is_empty());
+    }
+
+    // ── Status-aware recall tests ─────────────────────────────────────────────
+
+    /// Superseded/Contradicted/Archived memories must be excluded from semantic recall.
+    #[test]
+    fn test_recall_excludes_invalidated_statuses() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.5f32; 768];
+
+        let (id_active, _)     = field.put_memory("wisdom", "test", b"active memory",     &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+        let (id_superseded, _) = field.put_memory("wisdom", "test", b"superseded memory", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+        let (id_contradicted,_)= field.put_memory("wisdom", "test", b"contradicted memory",&emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+        let (id_archived, _)   = field.put_memory("wisdom", "test", b"archived memory",   &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+
+        field.set_memory_status(id_superseded,    crate::state::MemoryStatus::Superseded).unwrap();
+        field.set_memory_status(id_contradicted,  crate::state::MemoryStatus::Contradicted).unwrap();
+        field.set_memory_status(id_archived,      crate::state::MemoryStatus::Archived).unwrap();
+
+        let hits = field.recall_semantic(&emb, 20, None).unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.memory_id).collect();
+
+        assert!(ids.contains(&id_active),        "active memory must be recalled");
+        assert!(!ids.contains(&id_superseded),   "superseded must be excluded");
+        assert!(!ids.contains(&id_contradicted), "contradicted must be excluded");
+        assert!(!ids.contains(&id_archived),     "archived must be excluded");
+    }
+
+    /// Verified memories score higher than Active; Proposed score lower.
+    #[test]
+    fn test_recall_status_score_ordering() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.5f32; 768];
+
+        let (id_active,   _) = field.put_memory("wisdom", "test", b"active",   &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+        let (id_verified, _) = field.put_memory("wisdom", "test", b"verified", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+        let (id_proposed, _) = field.put_memory("wisdom", "test", b"proposed", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+
+        field.set_memory_status(id_verified, crate::state::MemoryStatus::Verified).unwrap();
+        field.set_memory_status(id_proposed, crate::state::MemoryStatus::Proposed).unwrap();
+
+        let hits = field.recall_semantic(&emb, 20, None).unwrap();
+        let score = |id: MemoryId| hits.iter().find(|h| h.memory_id == id).map(|h| h.score).unwrap_or(0.0);
+
+        assert!(score(id_verified) > score(id_active),  "verified must outscore active");
+        assert!(score(id_active)   > score(id_proposed), "active must outscore proposed");
     }
 
     // ── Regression tests for replay/contract correctness ─────────────────────
