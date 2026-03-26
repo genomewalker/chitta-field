@@ -1085,6 +1085,73 @@ impl ChittaField {
             .collect())
     }
 
+    /// Get memory IDs that contradict the given memory (bidirectional).
+    pub fn get_conflicts(&self, memory_id: MemoryId) -> Result<Vec<MemoryId>> {
+        let id_str = memory_id.to_string();
+        let at_ms = now_ms();
+        let store = self.triplet_store.read();
+        let mut result = Vec::new();
+        for entry in store.query_subject(&id_str, at_ms) {
+            if entry.predicate == "contradicts" {
+                if let Ok(id) = entry.object.parse::<u64>() {
+                    result.push(id);
+                }
+            }
+        }
+        for entry in store.query_object(&id_str, at_ms) {
+            if entry.predicate == "contradicts" {
+                if let Ok(id) = entry.subject.parse::<u64>() {
+                    result.push(id);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Follow "supersedes" edges to build the full supersession chain.
+    /// Chain starts with memory_id itself. Max depth 20, cycle-safe.
+    pub fn get_supersession_chain(&self, memory_id: MemoryId) -> Result<Vec<MemoryId>> {
+        let at_ms = now_ms();
+        let store = self.triplet_store.read();
+        let mut chain = vec![memory_id];
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(memory_id);
+        let mut current = memory_id;
+        for _ in 0..20 {
+            let id_str = current.to_string();
+            let next = store
+                .query_object(&id_str, at_ms)
+                .into_iter()
+                .find(|e| e.predicate == "supersedes")
+                .and_then(|e| e.subject.parse::<u64>().ok());
+            match next {
+                Some(n) if !visited.contains(&n) => {
+                    visited.insert(n);
+                    chain.push(n);
+                    current = n;
+                }
+                _ => break,
+            }
+        }
+        Ok(chain)
+    }
+
+    /// Get memory IDs that confirm the given memory.
+    pub fn get_confirmations(&self, memory_id: MemoryId) -> Result<Vec<MemoryId>> {
+        let id_str = memory_id.to_string();
+        let at_ms = now_ms();
+        let store = self.triplet_store.read();
+        let mut result = Vec::new();
+        for entry in store.query_object(&id_str, at_ms) {
+            if entry.predicate == "confirms" {
+                if let Ok(id) = entry.subject.parse::<u64>() {
+                    result.push(id);
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// Apply feedback for a recall episode (route learning).
     pub fn feedback(&self, episode_id: u64, reward: f32) -> Result<()> {
         self.learners.write().route.feedback(episode_id, reward);
@@ -2054,6 +2121,79 @@ mod tests {
         assert!(hit.status_mul > 0.0, "status_mul must be populated");
         assert!(hit.epistemic_mul > 0.0, "epistemic_mul must be populated");
         assert!(hit.strength_factor >= 0.5, "strength_factor must be >= 0.5");
+    }
+
+    // ── Contradiction engine tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_get_conflicts_bidirectional() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.1f32; 768];
+        let (id_a, _) = field.put_memory("wisdom", "test", b"memory A", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+        let (id_b, _) = field.put_memory("wisdom", "test", b"memory B", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+
+        field.add_triplet(id_a.to_string(), "contradicts".to_string(), id_b.to_string(), 1.0, None, None).unwrap();
+
+        let conflicts_a = field.get_conflicts(id_a).unwrap();
+        let conflicts_b = field.get_conflicts(id_b).unwrap();
+        assert!(conflicts_a.contains(&id_b), "A must see B as conflict");
+        assert!(conflicts_b.contains(&id_a), "B must see A as conflict");
+    }
+
+    #[test]
+    fn test_get_supersession_chain_follows_edges() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.1f32; 768];
+        let (id_a, _) = field.put_memory("wisdom", "test", b"original", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+        let (id_b, _) = field.put_memory("wisdom", "test", b"revision 1", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+        let (id_c, _) = field.put_memory("wisdom", "test", b"revision 2", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+
+        // "B supersedes A" means subject=B, predicate="supersedes", object=A
+        field.add_triplet(id_b.to_string(), "supersedes".to_string(), id_a.to_string(), 1.0, None, None).unwrap();
+        field.add_triplet(id_c.to_string(), "supersedes".to_string(), id_b.to_string(), 1.0, None, None).unwrap();
+
+        let chain = field.get_supersession_chain(id_a).unwrap();
+        assert_eq!(chain, vec![id_a, id_b, id_c], "chain must follow A -> B -> C");
+    }
+
+    #[test]
+    fn test_get_supersession_chain_cycle_safe() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.1f32; 768];
+        let (id_a, _) = field.put_memory("wisdom", "test", b"cycle A", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+        let (id_b, _) = field.put_memory("wisdom", "test", b"cycle B", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+
+        // Create a cycle: B supersedes A, A supersedes B
+        field.add_triplet(id_b.to_string(), "supersedes".to_string(), id_a.to_string(), 1.0, None, None).unwrap();
+        field.add_triplet(id_a.to_string(), "supersedes".to_string(), id_b.to_string(), 1.0, None, None).unwrap();
+
+        let chain = field.get_supersession_chain(id_a).unwrap();
+        assert!(chain.len() <= 21, "cycle must terminate within max depth");
+        assert_eq!(chain[0], id_a, "chain must start with self");
+    }
+
+    #[test]
+    fn test_get_confirmations() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.1f32; 768];
+        let (id_x, _) = field.put_memory("wisdom", "test", b"confirmer", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+        let (id_y, _) = field.put_memory("wisdom", "test", b"confirmed", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+
+        // "X confirms Y" means subject=X, predicate="confirms", object=Y
+        field.add_triplet(id_x.to_string(), "confirms".to_string(), id_y.to_string(), 1.0, None, None).unwrap();
+
+        let confs = field.get_confirmations(id_y).unwrap();
+        assert_eq!(confs, vec![id_x], "Y must show X as confirmer");
+    }
+
+    #[test]
+    fn test_get_conflicts_empty() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.1f32; 768];
+        let (id, _) = field.put_memory("wisdom", "test", b"lonely memory", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+
+        let conflicts = field.get_conflicts(id).unwrap();
+        assert!(conflicts.is_empty(), "no contradictions should return empty vec");
     }
 
     // ── Regression tests for replay/contract correctness ─────────────────────
