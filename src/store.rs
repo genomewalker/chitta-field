@@ -518,6 +518,7 @@ impl ChittaField {
                 let semantic_score = hit.cosine_similarity;
                 let semantic_weight = ((semantic_score + 1.0) / 2.0).max(0.0);
                 let base = semantic_weight * (0.5 + 0.5 * eff_strength) * state.confidence;
+                let strength_factor = 0.5 + 0.5 * eff_strength;
                 Some(RecallHit {
                     memory_id,
                     score: base * status_mul * epistemic_mul,
@@ -529,6 +530,10 @@ impl ChittaField {
                     confidence: state.confidence,
                     access_count: state.access_count,
                     content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
+                    semantic_weight,
+                    status_mul,
+                    epistemic_mul,
+                    strength_factor,
                 })
             })
             .collect();
@@ -639,6 +644,10 @@ impl ChittaField {
                     confidence: state.confidence,
                     access_count: state.access_count,
                     content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
+                    semantic_weight: 0.0,
+                    status_mul: 0.0,
+                    epistemic_mul: 0.0,
+                    strength_factor: 0.0,
                 })
             })
             .collect();
@@ -724,6 +733,10 @@ impl ChittaField {
                     confidence: state.confidence,
                     access_count: state.access_count,
                     content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
+                    semantic_weight: 0.0,
+                    status_mul: 0.0,
+                    epistemic_mul: 0.0,
+                    strength_factor: 0.0,
                 })
             })
             .collect();
@@ -750,7 +763,8 @@ impl ChittaField {
                 let epistemic_mul = epistemic_score_multiplier(&state.epistemic_status);
                 let payload = payloads.get(&hit.memory_id)?;
                 let eff_strength = state.effective_strength(now);
-                let base = hit.bm25_score * (0.5 + 0.5 * eff_strength) * state.confidence;
+                let strength_factor = 0.5 + 0.5 * eff_strength;
+                let base = hit.bm25_score * strength_factor * state.confidence;
                 Some(RecallHit {
                     memory_id: hit.memory_id,
                     score: base * status_mul * epistemic_mul,
@@ -762,6 +776,10 @@ impl ChittaField {
                     confidence: state.confidence,
                     access_count: state.access_count,
                     content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
+                    semantic_weight: hit.bm25_score,
+                    status_mul,
+                    epistemic_mul,
+                    strength_factor,
                 })
             })
             .collect();
@@ -808,6 +826,10 @@ impl ChittaField {
                     confidence: state.confidence,
                     access_count: state.access_count,
                     content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
+                    semantic_weight: 0.0,
+                    status_mul: 0.0,
+                    epistemic_mul: 0.0,
+                    strength_factor: 0.0,
                 })
             })
             .collect();
@@ -1978,6 +2000,60 @@ mod tests {
 
         assert!(score(id_verified) > score(id_active),  "verified must outscore active");
         assert!(score(id_active)   > score(id_proposed), "active must outscore proposed");
+    }
+
+    // ── Recall explainability tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_recall_explain_fields_populated() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.5f32; 768];
+
+        let (id, _) = field.put_memory("wisdom", "test", b"tool derived memory", &emb, 0.9, 0.001, 0, vec![], None, None).unwrap();
+        field.set_epistemic_status(id, crate::state::EpistemicStatus::ToolDerived).unwrap();
+
+        let hits = field.recall_semantic(&emb, 5, Some("test")).unwrap();
+        let hit = hits.iter().find(|h| h.memory_id == id).expect("memory must be recalled");
+
+        assert!(hit.semantic_weight > 0.0, "semantic_weight must be > 0");
+        assert!((hit.status_mul - 1.0).abs() < f32::EPSILON, "Active status_mul must be 1.0");
+        assert!((hit.epistemic_mul - 0.95).abs() < f32::EPSILON, "ToolDerived epistemic_mul must be 0.95");
+        assert!(hit.strength_factor >= 0.5 && hit.strength_factor <= 1.0, "strength_factor must be in [0.5, 1.0]");
+    }
+
+    #[test]
+    fn test_recall_explain_score_decomposition() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.5f32; 768];
+
+        let (id, _) = field.put_memory("wisdom", "test", b"decomposition test", &emb, 0.8, 0.001, 0, vec![], None, None).unwrap();
+
+        let hits = field.recall_semantic(&emb, 5, Some("test")).unwrap();
+        let hit = hits.iter().find(|h| h.memory_id == id).expect("memory must be recalled");
+
+        let expected = hit.semantic_weight * hit.strength_factor * hit.confidence * hit.status_mul * hit.epistemic_mul;
+        assert!(
+            (hit.score - expected).abs() < 1e-5,
+            "score ({}) must equal semantic_weight * strength_factor * confidence * status_mul * epistemic_mul ({})",
+            hit.score, expected
+        );
+    }
+
+    #[test]
+    fn test_recall_keyword_explain_fields() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.1f32; 768];
+
+        field.put_memory("wisdom", "test", b"rust ownership borrow checker lifetime", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
+
+        let hits = field.recall_keyword("rust ownership", 5).unwrap();
+        assert!(!hits.is_empty(), "keyword recall must return results");
+        let hit = &hits[0];
+
+        assert!(hit.semantic_weight > 0.0, "semantic_weight must be bm25_score > 0");
+        assert!(hit.status_mul > 0.0, "status_mul must be populated");
+        assert!(hit.epistemic_mul > 0.0, "epistemic_mul must be populated");
+        assert!(hit.strength_factor >= 0.5, "strength_factor must be >= 0.5");
     }
 
     // ── Regression tests for replay/contract correctness ─────────────────────

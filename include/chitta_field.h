@@ -17,6 +17,10 @@ typedef struct {
     float    strength;
     float    confidence;
     uint32_t access_count;
+    float    semantic_weight;
+    float    status_mul;
+    float    epistemic_mul;
+    float    strength_factor;
 } CfRecallHit;
 
 /* Lifecycle */
