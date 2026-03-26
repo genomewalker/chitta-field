@@ -1684,6 +1684,21 @@ pub extern "C" fn cf_emit_event(
                     payload_str_for_apply.clone(),
                 );
             }
+            if domain_str == "session" {
+                let mut reg = handle.field.session_registry.write();
+                match kind_str {
+                    "register" => {
+                        let session_kind = serde_json::from_str::<serde_json::Value>(&payload_str_for_apply)
+                            .ok()
+                            .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(|s| s.to_string()))
+                            .unwrap_or_default();
+                        reg.register(entity_id_str.to_string(), session_kind, realm_str.to_string(), ts_ms);
+                    }
+                    "heartbeat" => reg.heartbeat(entity_id_str, ts_ms),
+                    "deregister" => reg.deregister(entity_id_str),
+                    _ => {}
+                }
+            }
             if domain_str == "msg" {
                 use crate::organ::msg::MsgEvent;
                 handle.field.msg_registry.write().insert(MsgEvent {
