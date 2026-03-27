@@ -11,6 +11,280 @@ const MAX_CANDIDATES: usize = 16384;
 const LSH_TABLES: usize = 4;
 const LSH_BITS: usize = 12;
 
+// HNSW kicks in above this many memories — below it IVF+LSH is fast enough.
+const HNSW_THRESHOLD: usize = 2000;
+// HNSW build/search parameters
+const HNSW_M: usize = 16;        // neighbors per non-zero layer
+const HNSW_M0: usize = 32;       // neighbors at layer 0 (2×M)
+const HNSW_EF_CONSTRUCTION: usize = 200; // candidates during insert
+const HNSW_EF_SEARCH: usize = 64;        // candidates during search
+// 1/ln(M) — controls layer probability distribution
+const HNSW_ML: f64 = 0.36067; // 1/ln(16)
+
+// ── HNSW graph ────────────────────────────────────────────────────────────────
+
+/// A layered navigable small-world graph for approximate nearest-neighbour
+/// search. Purely in-RAM; rebuilt from `SemanticIndex::embeddings` after load.
+///
+/// All vectors stored in the parent `SemanticIndex` are unit-normalised, so
+/// inner product == cosine similarity throughout.
+#[derive(Default, Clone)]
+pub(crate) struct HnswGraph {
+    /// Per-node adjacency lists, indexed by layer.
+    /// `neighbors[id][layer]` = Vec of neighbour MemoryIds.
+    neighbors: HashMap<MemoryId, Vec<Vec<MemoryId>>>,
+    /// Entry point: (node_id, max_layer_of_that_node).
+    entry_point: Option<(MemoryId, usize)>,
+}
+
+impl HnswGraph {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.neighbors.is_empty()
+    }
+
+    /// Insert `id` with pre-normalised `embedding`.
+    /// `embeddings` is the full store (used to look up neighbour vectors).
+    fn insert(&mut self, id: MemoryId, embedding: &[f32], embeddings: &HashMap<MemoryId, Vec<f32>>) {
+        let node_level = self.random_level();
+
+        // Determine current max layer
+        let current_top = self.entry_point.map(|(_, l)| l).unwrap_or(0);
+
+        // Initialise adjacency list for new node
+        self.neighbors.insert(id, vec![Vec::new(); node_level + 1]);
+
+        let ep = match self.entry_point {
+            None => {
+                // First node
+                self.entry_point = Some((id, node_level));
+                return;
+            }
+            Some((ep, _)) => ep,
+        };
+
+        // Phase 1: descend from top of graph down to node_level+1
+        let mut ep_set = vec![ep];
+        for layer in (node_level + 1..=current_top).rev() {
+            ep_set = self.search_layer(embedding, &ep_set, 1, layer, embeddings);
+        }
+
+        // Phase 2: insert at each layer from min(node_level, current_top) down to 0
+        for layer in (0..=node_level.min(current_top)).rev() {
+            let candidates = self.search_layer(embedding, &ep_set, HNSW_EF_CONSTRUCTION, layer, embeddings);
+            let m = if layer == 0 { HNSW_M0 } else { HNSW_M };
+            let selected = self.select_neighbors(embedding, &candidates, m, embeddings);
+
+            // Connect new node to its selected neighbours
+            if let Some(node_neighbors) = self.neighbors.get_mut(&id) {
+                if layer < node_neighbors.len() {
+                    node_neighbors[layer] = selected.clone();
+                }
+            }
+
+            // Connect each selected neighbour back to new node (shrink if needed)
+            for &neighbor_id in &selected {
+                let m_max = if layer == 0 { HNSW_M0 } else { HNSW_M };
+                // Push new node into neighbour's list, then check if shrink needed
+                let needs_shrink = {
+                    if let Some(nbr_layers) = self.neighbors.get_mut(&neighbor_id) {
+                        if layer < nbr_layers.len() {
+                            nbr_layers[layer].push(id);
+                            nbr_layers[layer].len() > m_max
+                        } else { false }
+                    } else { false }
+                };
+                if needs_shrink {
+                    // Compute shrunk list without holding mutable borrow
+                    let shrunk = if let (Some(nbr_layers), Some(nbr_emb)) =
+                        (self.neighbors.get(&neighbor_id), embeddings.get(&neighbor_id))
+                    {
+                        if layer < nbr_layers.len() {
+                            Some(self.select_neighbors(nbr_emb, &nbr_layers[layer].clone(), m_max, embeddings))
+                        } else { None }
+                    } else { None };
+                    if let (Some(shrunk), Some(nbr_layers)) = (shrunk, self.neighbors.get_mut(&neighbor_id)) {
+                        if layer < nbr_layers.len() {
+                            nbr_layers[layer] = shrunk;
+                        }
+                    }
+                }
+            }
+
+            ep_set = candidates;
+        }
+
+        // Update entry point if new node has higher layer
+        if node_level > current_top {
+            self.entry_point = Some((id, node_level));
+        }
+    }
+
+    /// Remove a node by clearing its adjacency lists and removing it from
+    /// neighbours' lists. This is O(M × L) and acceptable for soft-delete
+    /// rates typical in a memory store.
+    fn remove(&mut self, id: MemoryId) {
+        let Some(node_neighbors) = self.neighbors.remove(&id) else { return };
+        // Unlink from neighbours' adjacency lists
+        for layer_neighbors in &node_neighbors {
+            for &neighbor_id in layer_neighbors {
+                if let Some(nbr_layers) = self.neighbors.get_mut(&neighbor_id) {
+                    for layer_list in nbr_layers.iter_mut() {
+                        layer_list.retain(|&n| n != id);
+                    }
+                }
+            }
+        }
+        // If this was the entry point, pick any remaining node at the highest layer
+        if self.entry_point.map(|(ep, _)| ep) == Some(id) {
+            self.entry_point = self
+                .neighbors
+                .iter()
+                .map(|(&nid, layers)| (nid, layers.len().saturating_sub(1)))
+                .max_by_key(|&(_, l)| l);
+        }
+    }
+
+    /// Greedy k-NN search. Returns up to k MemoryIds, filtered by `allowed`.
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        allowed: Option<&HashSet<MemoryId>>,
+        deleted: &HashSet<MemoryId>,
+        embeddings: &HashMap<MemoryId, Vec<f32>>,
+    ) -> Vec<(MemoryId, f32)> {
+        let Some((ep, top_layer)) = self.entry_point else { return vec![] };
+
+        let mut ep_set = vec![ep];
+
+        // Descend from top layer to layer 1 with ef=1
+        for layer in (1..=top_layer).rev() {
+            ep_set = self.search_layer(query, &ep_set, 1, layer, embeddings);
+        }
+
+        // Final search at layer 0 with ef_search
+        let candidates = self.search_layer(query, &ep_set, HNSW_EF_SEARCH.max(k), 0, embeddings);
+
+        // Filter deleted / not-allowed, compute similarities, take top k
+        let mut scored: Vec<(MemoryId, f32)> = candidates
+            .into_iter()
+            .filter(|id| !deleted.contains(id))
+            .filter(|id| allowed.map(|a| a.contains(id)).unwrap_or(true))
+            .filter_map(|id| embeddings.get(&id).map(|e| (id, dot(query, e))))
+            .collect();
+
+        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        scored.truncate(k);
+        scored
+    }
+
+    /// Greedy beam search within one layer. Returns ef best candidates.
+    fn search_layer(
+        &self,
+        query: &[f32],
+        entry_points: &[MemoryId],
+        ef: usize,
+        layer: usize,
+        embeddings: &HashMap<MemoryId, Vec<f32>>,
+    ) -> Vec<MemoryId> {
+        let mut visited: HashSet<MemoryId> = entry_points.iter().copied().collect();
+        // candidates: min-heap by score (worst-best at top, so we can prune)
+        let mut candidates: BinaryHeap<(OrderedF32, MemoryId)> = entry_points
+            .iter()
+            .filter_map(|&id| {
+                embeddings.get(&id).map(|e| (OrderedF32(-dot(query, e)), id))
+            })
+            .collect();
+        // result: max-heap by score (best at top)
+        let mut result: BinaryHeap<(OrderedF32, MemoryId)> = entry_points
+            .iter()
+            .filter_map(|&id| {
+                embeddings.get(&id).map(|e| (OrderedF32(dot(query, e)), id))
+            })
+            .collect();
+
+        while let Some((neg_score, cid)) = candidates.pop() {
+            let c_score = -neg_score.0;
+            // Early stop: if worst result is better than best candidate, done
+            if result.len() >= ef {
+                if let Some(&(OrderedF32(best_result_score), _)) = result.peek() {
+                    if c_score < best_result_score {
+                        break;
+                    }
+                }
+            }
+            // Expand neighbours at this layer
+            let Some(node_layers) = self.neighbors.get(&cid) else { continue };
+            let Some(layer_neighbors) = node_layers.get(layer) else { continue };
+            for &neighbor_id in layer_neighbors {
+                if visited.insert(neighbor_id) {
+                    let Some(emb) = embeddings.get(&neighbor_id) else { continue };
+                    let sim = dot(query, emb);
+                    candidates.push((OrderedF32(-sim), neighbor_id));
+                    result.push((OrderedF32(sim), neighbor_id));
+                    // Trim result to ef
+                    while result.len() > ef {
+                        result.pop(); // pops the *highest* score because max-heap
+                    }
+                }
+            }
+        }
+
+        result.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Simple greedy neighbour selection (no heuristic pruning for now).
+    fn select_neighbors(
+        &self,
+        query: &[f32],
+        candidates: &[MemoryId],
+        m: usize,
+        embeddings: &HashMap<MemoryId, Vec<f32>>,
+    ) -> Vec<MemoryId> {
+        let mut scored: Vec<(f32, MemoryId)> = candidates
+            .iter()
+            .filter_map(|&id| embeddings.get(&id).map(|e| (dot(query, e), id)))
+            .collect();
+        scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        scored.truncate(m);
+        scored.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Draw a random layer for a new node using the standard HNSW distribution.
+    /// Uses a simple LCG so there's no rand dependency.
+    fn random_level(&self) -> usize {
+        // Seed from number of nodes for deterministic but varied levels
+        let n = self.neighbors.len() as u64;
+        let mut s = n
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        s ^= s >> 33;
+        s = s.wrapping_mul(0xff51afd7ed558ccd);
+        s ^= s >> 33;
+        let f = (s >> 11) as f64 / (1u64 << 53) as f64; // uniform [0,1)
+        if f < 1e-15 {
+            return 0;
+        }
+        let level = (-f.ln() * HNSW_ML).floor() as usize;
+        level.min(16) // cap at 16 layers
+    }
+}
+
+/// Newtype for f32 that implements Ord via total_cmp. Used in BinaryHeap.
+#[derive(Clone, Copy, PartialEq)]
+struct OrderedF32(f32);
+impl Eq for OrderedF32 {}
+impl PartialOrd for OrderedF32 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for OrderedF32 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.0.total_cmp(&other.0) }
+}
+
 /// A recall hit from semantic search.
 #[derive(Debug, Clone)]
 pub struct SemanticHit {
@@ -41,6 +315,10 @@ pub struct SemanticIndex {
     lsh_buckets: Vec<HashMap<u16, Vec<MemoryId>>>,
     #[serde(skip)]
     mem_lsh: HashMap<MemoryId, Vec<u16>>,
+    /// HNSW graph — rebuilt from `embeddings` after snapshot load.
+    /// Active when `embeddings.len() >= HNSW_THRESHOLD`.
+    #[serde(skip)]
+    hnsw: HnswGraph,
 }
 
 impl SemanticIndex {
@@ -54,7 +332,14 @@ impl SemanticIndex {
             lsh_planes: default_lsh_planes(),
             lsh_buckets: vec![HashMap::new(); LSH_TABLES],
             mem_lsh: HashMap::new(),
+            hnsw: HnswGraph::new(),
         }
+    }
+
+    /// True when the HNSW graph is the active search path.
+    #[inline]
+    fn use_hnsw(&self) -> bool {
+        self.embeddings.len() >= HNSW_THRESHOLD
     }
 
     /// Add or update an embedding. Un-deletes the entry if it was soft-deleted.
@@ -79,10 +364,18 @@ impl SemanticIndex {
         }
         self.mem_lsh.insert(memory_id, lsh_ids);
         self.embeddings.insert(memory_id, embedding);
+
+        // Insert into HNSW if it is already active, or activate it now that
+        // we've just crossed the threshold.
+        if self.use_hnsw() {
+            let emb = self.embeddings[&memory_id].clone();
+            self.hnsw.insert(memory_id, &emb, &self.embeddings);
+        }
     }
 
     /// Mark a memory as deleted — excluded from future search results.
     pub fn remove(&mut self, memory_id: MemoryId) {
+        self.hnsw.remove(memory_id);
         self.deleted.insert(memory_id);
         self.embeddings.remove(&memory_id);
         if let Some(coarse_ids) = self.mem_coarse.remove(&memory_id) {
@@ -136,6 +429,15 @@ impl SemanticIndex {
             if allowed_ids.len() <= MIN_CANDIDATES {
                 return self.search_candidates(query, allowed_ids.iter().copied(), k);
             }
+        }
+
+        // Use HNSW when the graph is active (>= HNSW_THRESHOLD memories)
+        if self.use_hnsw() && !self.hnsw.is_empty() {
+            let hits = self.hnsw.search(&query_unit, k, allowed, &self.deleted, &self.embeddings);
+            return hits
+                .into_iter()
+                .map(|(memory_id, cosine_similarity)| SemanticHit { memory_id, cosine_similarity })
+                .collect();
         }
 
         let mut candidates = self.collect_lsh_candidates(&query_unit, allowed, k);
@@ -314,6 +616,22 @@ impl SemanticIndex {
                     .push(memory_id);
             }
             self.mem_lsh.insert(memory_id, signatures);
+        }
+
+        // Rebuild HNSW if collection is large enough
+        if self.use_hnsw() {
+            self.rebuild_hnsw();
+        }
+    }
+
+    fn rebuild_hnsw(&mut self) {
+        self.hnsw = HnswGraph::new();
+        // Insert in insertion order (by id for determinism) to build graph
+        let mut ids: Vec<MemoryId> = self.embeddings.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let emb = self.embeddings[&id].clone();
+            self.hnsw.insert(id, &emb, &self.embeddings);
         }
     }
 
