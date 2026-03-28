@@ -1,18 +1,21 @@
 pub mod bandit;
 pub mod context;
+pub mod domain_reliability;
 pub mod plasticity;
 pub mod route;
 
 pub use bandit::{BetaPrior, GaussianPrior};
 pub use context::ContextLearner;
+pub use domain_reliability::DomainReliability;
 pub use plasticity::PlasticityLearner;
 pub use route::{QueryIntent, Route, RouteLearner};
 
-/// Manages all three learners together.
+/// Manages all learners together.
 pub struct LearnerSet {
     pub plasticity: PlasticityLearner,
     pub route: RouteLearner,
     pub context: ContextLearner,
+    pub domain_reliability: DomainReliability,
 }
 
 impl LearnerSet {
@@ -21,6 +24,7 @@ impl LearnerSet {
             plasticity: PlasticityLearner::new(),
             route: RouteLearner::new(),
             context: ContextLearner::new(),
+            domain_reliability: DomainReliability::new(),
         }
     }
 }

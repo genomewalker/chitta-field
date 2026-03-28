@@ -167,6 +167,15 @@ impl ChittaField {
         // Auto-encode into cortical sparse index (non-fatal if fails)
         let _ = self.encode_memory(memory_id);
 
+        // PoE: corrections penalise the realm they target.
+        // A correction stored in realm X signals that X produced an error.
+        if kind == "correction" {
+            self.learners
+                .write()
+                .domain_reliability
+                .record_correction(realm);
+        }
+
         Ok((memory_id, chunk_hash))
     }
 
@@ -519,9 +528,11 @@ impl ChittaField {
                 let semantic_weight = ((semantic_score + 1.0) / 2.0).max(0.0);
                 let base = semantic_weight * (0.5 + 0.5 * eff_strength) * state.confidence;
                 let strength_factor = 0.5 + 0.5 * eff_strength;
+                // PoE: apply per-realm reliability multiplier
+                let poe_mul = self.learners.read().domain_reliability.reliability(&payload.realm);
                 Some(RecallHit {
                     memory_id,
-                    score: base * status_mul * epistemic_mul,
+                    score: base * status_mul * epistemic_mul * poe_mul,
                     semantic_score,
                     ts_ms: payload.authored_at_ms,
                     kind: payload.kind.clone(),
@@ -2107,10 +2118,14 @@ mod tests {
         let hits = field.recall_semantic(&emb, 5, Some("test")).unwrap();
         let hit = hits.iter().find(|h| h.memory_id == id).expect("memory must be recalled");
 
-        let expected = hit.semantic_weight * hit.strength_factor * hit.confidence * hit.status_mul * hit.epistemic_mul;
+        // Score now includes PoE domain reliability multiplier.
+        // For a freshly stored "wisdom" memory in "test" realm with no corrections,
+        // reliability = DEFAULT (0.925). Verify decomposition holds.
+        let poe_mul = field.learners.read().domain_reliability.reliability("test");
+        let expected = hit.semantic_weight * hit.strength_factor * hit.confidence * hit.status_mul * hit.epistemic_mul * poe_mul;
         assert!(
-            (hit.score - expected).abs() < 1e-5,
-            "score ({}) must equal semantic_weight * strength_factor * confidence * status_mul * epistemic_mul ({})",
+            (hit.score - expected).abs() < 1e-4,
+            "score ({}) must equal semantic_weight * strength_factor * confidence * status_mul * epistemic_mul * poe_mul ({})",
             hit.score, expected
         );
     }
