@@ -31,3 +31,4 @@ pub use organ::triplet::{TripletEntry, TripletStore};
 pub use payload::{ArtifactRef, ArtifactRelation, MemoryPayload};
 pub use recall::RecallHit;
 pub use state::MemoryState;
+pub use store::FilterLevel;
