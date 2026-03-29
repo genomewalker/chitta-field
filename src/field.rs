@@ -125,6 +125,7 @@ pub struct ChittaField {
     pub(crate) realm_members: RwLock<HashMap<String, HashSet<MemoryId>>>,
     pub(crate) pending_recall: Mutex<PendingRecallEffects>,
     pub(crate) coactivation_stats: RwLock<HashMap<(MemoryId, MemoryId), CoActivationStats>>,
+    pub(crate) filter_level: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Drop for ChittaField {
@@ -433,7 +434,22 @@ impl ChittaField {
             realm_members: RwLock::new(realm_members),
             pending_recall: Mutex::new(PendingRecallEffects::default()),
             coactivation_stats: RwLock::new(replay_coactivation_stats),
+            filter_level: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         })
+    }
+}
+
+impl ChittaField {
+    pub fn set_filter_level(&self, level: crate::store::FilterLevel) {
+        self.filter_level.store(level as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn filter_level(&self) -> crate::store::FilterLevel {
+        match self.filter_level.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => crate::store::FilterLevel::Signatures,
+            2 => crate::store::FilterLevel::MinimalContext,
+            _ => crate::store::FilterLevel::None,
+        }
     }
 }
 

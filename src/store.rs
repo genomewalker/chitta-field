@@ -17,6 +17,57 @@ use crate::state::{EpistemicStatus, MemoryState, MemoryStatus};
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FilterLevel {
+    #[default]
+    None,
+    Signatures,
+    MinimalContext,
+}
+
+pub fn extract_bm25_text(content: &str, level: FilterLevel) -> String {
+    match level {
+        FilterLevel::None => content.to_string(),
+        FilterLevel::Signatures => extract_signatures(content),
+        FilterLevel::MinimalContext => extract_signatures_with_docs(content),
+    }
+}
+
+fn is_signature_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("pub fn ") || t.starts_with("fn ") ||
+    t.starts_with("pub struct ") || t.starts_with("struct ") ||
+    t.starts_with("pub enum ") || t.starts_with("enum ") ||
+    t.starts_with("pub trait ") || t.starts_with("trait ") ||
+    t.starts_with("impl ") || t.starts_with("pub impl ") ||
+    t.starts_with("pub type ") || t.starts_with("type ") ||
+    t.starts_with("pub const ") || t.starts_with("const ") ||
+    t.starts_with("def ") || t.starts_with("class ") ||
+    t.starts_with("function ") || t.starts_with("async fn ") ||
+    t.starts_with("pub async fn ")
+}
+
+fn extract_signatures(content: &str) -> String {
+    content.lines().filter(|l| is_signature_line(l)).collect::<Vec<_>>().join("\n")
+}
+
+fn extract_signatures_with_docs(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut result = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if is_signature_line(line) {
+            if i > 0 {
+                let prev = lines[i - 1].trim();
+                if prev.starts_with("///") || prev.starts_with("//") || prev.starts_with('#') {
+                    result.push(lines[i - 1]);
+                }
+            }
+            result.push(line);
+        }
+    }
+    result.join("\n")
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -139,7 +190,8 @@ impl ChittaField {
                 .upsert(memory_id, embedding.to_vec());
         }
         let content_str = std::str::from_utf8(content).unwrap_or("").to_string();
-        self.keyword_idx.write().index(memory_id, &content_str);
+        let index_text = extract_bm25_text(&content_str, self.filter_level());
+        self.keyword_idx.write().index(memory_id, &index_text);
 
         // Update temporal index.
         {
@@ -808,6 +860,37 @@ impl ChittaField {
         self.enqueue_recall_effects(&hit_ids);
 
         Ok(hits)
+    }
+
+    pub fn recall_with_fallback(
+        &self,
+        query_embedding: &[f32],
+        query_text: &str,
+        k: usize,
+        realm: Option<&str>,
+    ) -> Result<Vec<RecallHit>> {
+        let hits = self.recall_semantic(query_embedding, k, realm)?;
+        if !hits.is_empty() {
+            return Ok(hits);
+        }
+
+        let store_size = self.memory_count();
+        if store_size < 10 {
+            return Ok(vec![]);
+        }
+
+        log::warn!(
+            "recall_semantic returned empty with {} memories, falling back to BM25",
+            store_size
+        );
+        let bm25_hits = self.recall_keyword(query_text, k)?;
+        if !bm25_hits.is_empty() {
+            return Ok(bm25_hits);
+        }
+
+        log::warn!("BM25 fallback also empty, falling back to recency");
+        let now = now_ms();
+        self.recall_temporal(0, now, realm, k)
     }
 
     /// Recall memories associated with a file path (exact match).
@@ -2360,5 +2443,44 @@ mod tests {
         }
         let result = field.compact_wal();
         assert!(result.is_ok(), "compact_wal should succeed with 100+ memories, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_filter_level_signatures_reduces_terms() {
+        let (field, _tmp) = open_test_field();
+        field.set_filter_level(FilterLevel::Signatures);
+        let code = b"fn foo(x: i32) -> i32 {\n    let y = x + 1;\n    y\n}";
+        let (id, _) = field
+            .put_memory("code", "test", code, &[], 0.8, 0.001, 0, vec![], None, None)
+            .unwrap();
+        let hits = field.recall_keyword("fn foo", 5).unwrap();
+        assert!(hits.iter().any(|h| h.memory_id == id));
+        let body_hits = field.recall_keyword("let y", 5).unwrap();
+        assert!(!body_hits.iter().any(|h| h.memory_id == id));
+    }
+
+    #[test]
+    fn test_recall_fallback_to_bm25() {
+        let (field, _tmp) = open_test_field();
+        for i in 0..15 {
+            field
+                .put_memory(
+                    "wisdom",
+                    "test",
+                    format!("unique_term_{i} content here").as_bytes(),
+                    &[],
+                    0.8,
+                    0.001,
+                    0,
+                    vec![],
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let hits = field
+            .recall_with_fallback(&vec![0.0f32; 768], "unique_term_0", 5, None)
+            .unwrap();
+        assert!(!hits.is_empty(), "fallback should return results");
     }
 }
