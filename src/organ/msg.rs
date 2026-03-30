@@ -50,4 +50,31 @@ impl MsgRegistry {
             .take(limit)
             .collect()
     }
+
+    /// Query all events matching domain+kind across all targets.
+    /// Returns up to `limit` events sorted by ts_ms descending (newest first).
+    pub fn get_events_by_domain_kind(
+        &self,
+        domain: &str,
+        kind: &str,
+        limit: usize,
+    ) -> Vec<&MsgEvent> {
+        let mut result: Vec<&MsgEvent> = self
+            .by_target
+            .values()
+            .flat_map(|events| events.iter())
+            .filter(|e| e.domain == domain && e.kind == kind)
+            .collect();
+        result.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+        result.truncate(limit);
+        result
+    }
+
+    /// Check whether any event for `target` matches domain+kind.
+    pub fn has_event(&self, domain: &str, kind: &str, target: &str) -> bool {
+        self.by_target
+            .get(target)
+            .map(|events| events.iter().any(|e| e.domain == domain && e.kind == kind))
+            .unwrap_or(false)
+    }
 }

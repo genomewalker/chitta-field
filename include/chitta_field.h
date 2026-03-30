@@ -215,6 +215,13 @@ int cf_get_events_by_target(CfHandle* h,
     size_t limit,
     uint8_t* out_buf, size_t buf_cap, size_t* written);
 
+/* Query all events matching domain+kind across all targets. Returns JSON array (newest-first).
+ * Returns 0=ok, -2=buf too small, -1=error. */
+int cf_get_events_by_domain_kind(CfHandle* h,
+    const char* domain, const char* kind,
+    size_t limit,
+    uint8_t* out_buf, size_t buf_cap, size_t* written);
+
 /* Session management */
 int cf_session_register(CfHandle* h,
     const char* session_id, const char* kind, const char* realm, int64_t now_ms);
