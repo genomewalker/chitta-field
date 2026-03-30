@@ -1698,6 +1698,17 @@ pub extern "C" fn cf_emit_event(
                     "deregister" => reg.deregister(entity_id_str),
                     _ => {}
                 }
+                // Mirror session events into msg_registry so get_events_by_domain_kind works.
+                use crate::organ::msg::MsgEvent;
+                handle.field.msg_registry.write().insert(MsgEvent {
+                    event_id,
+                    domain: domain_str.to_string(),
+                    kind: kind_str.to_string(),
+                    target: entity_id_str.to_string(),
+                    payload_json: payload_str_for_apply.clone(),
+                    realm: realm_str.to_string(),
+                    ts_ms,
+                });
             }
             if domain_str == "msg" {
                 use crate::organ::msg::MsgEvent;
@@ -1835,6 +1846,60 @@ pub extern "C" fn cf_get_events_by_target(
 
     let registry = handle.field.msg_registry.read();
     let events = registry.get_events(domain_str, kind_str, target_str, limit);
+
+    let json_arr: Vec<serde_json::Value> = events
+        .iter()
+        .map(|ev| {
+            let payload: serde_json::Value =
+                serde_json::from_str(&ev.payload_json).unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "event_id": ev.event_id,
+                "kind": ev.kind,
+                "target": ev.target,
+                "payload": payload,
+                "realm": ev.realm,
+                "ts_ms": ev.ts_ms,
+            })
+        })
+        .collect();
+
+    let json_str = serde_json::to_string(&json_arr).unwrap_or_else(|_| "[]".to_string());
+    write_json_buf(&json_str, out_buf, buf_cap, written)
+}
+
+/// Query all events matching domain+kind across all targets.
+/// Returns a JSON array sorted by ts_ms descending (newest first), up to `limit` entries.
+/// Each element: {event_id, kind, target, payload, realm, ts_ms}
+#[no_mangle]
+pub extern "C" fn cf_get_events_by_domain_kind(
+    h: *mut CfHandle,
+    domain: *const c_char,
+    kind: *const c_char,
+    limit: usize,
+    out_buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || domain.is_null() || kind.is_null() || out_buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+
+    let domain_str = unsafe {
+        match CStr::from_ptr(domain).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let kind_str = unsafe {
+        match CStr::from_ptr(kind).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let registry = handle.field.msg_registry.read();
+    let events = registry.get_events_by_domain_kind(domain_str, kind_str, limit);
 
     let json_arr: Vec<serde_json::Value> = events
         .iter()

@@ -864,22 +864,36 @@ pub(crate) fn apply_op(
                 cortical_idx.index_pq(u.memory_id, codes);
             }
         }
-        Op::SessionEvent(ev) => match ev.kind.as_str() {
-            "register" => {
-                let kind = serde_json::from_slice::<serde_json::Value>(&ev.payload_json)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("kind")
-                            .and_then(|k| k.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .unwrap_or_default();
-                session_registry.register(ev.session_id, kind, ev.realm, ev.ts_ms);
+        Op::SessionEvent(ev) => {
+            let payload_str = String::from_utf8(ev.payload_json.clone()).unwrap_or_default();
+            match ev.kind.as_str() {
+                "register" => {
+                    let kind = serde_json::from_slice::<serde_json::Value>(&ev.payload_json)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("kind")
+                                .and_then(|k| k.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or_default();
+                    session_registry.register(ev.session_id.clone(), kind, ev.realm.clone(), ev.ts_ms);
+                }
+                "heartbeat" => session_registry.heartbeat(&ev.session_id, ev.ts_ms),
+                "deregister" => session_registry.deregister(&ev.session_id),
+                _ => {}
             }
-            "heartbeat" => session_registry.heartbeat(&ev.session_id, ev.ts_ms),
-            "deregister" => session_registry.deregister(&ev.session_id),
-            _ => {}
-        },
+            // Mirror into msg_registry for get_events_by_domain_kind queries.
+            use crate::organ::msg::MsgEvent;
+            msg_registry.insert(MsgEvent {
+                event_id: ev.event_id,
+                domain: "session".to_string(),
+                kind: ev.kind,
+                target: ev.session_id,
+                payload_json: payload_str,
+                realm: ev.realm,
+                ts_ms: ev.ts_ms,
+            });
+        }
         Op::TranscriptEvent(ev) => {
             // Always store the raw payload for cf_get_latest_event("transcript", kind, session_id)
             let payload_str = String::from_utf8(ev.payload_json.clone()).unwrap_or_default();
