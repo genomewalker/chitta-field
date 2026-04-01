@@ -1433,12 +1433,27 @@ impl ChittaField {
             return Ok(());
         }
 
-        let code = self.sparse_encoder.read().encode(&embedding);
+        let encoder = self.sparse_encoder.read();
+        let code = encoder.encode(&embedding);
         if code.is_empty() {
             return Ok(());
         }
 
-        // Hebbian update
+        // Compute surprise (reconstruction error) before updating encoder
+        let surprise = encoder.reconstruction_error(&embedding, &code);
+        drop(encoder);
+
+        // Update surprise in memory state and plasticity learner
+        {
+            let mut states = self.states.write();
+            if let Some(state) = states.get_mut(&memory_id) {
+                state.surprise = surprise;
+            }
+            let mut learners = self.learners.write();
+            learners.plasticity.update_surprise(memory_id, surprise);
+        }
+
+        // FEP-derived update (accuracy + complexity + orthogonalization)
         self.sparse_encoder.write().update(&embedding, &code);
 
         let ts_ms = now_ms();

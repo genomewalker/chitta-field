@@ -656,6 +656,7 @@ pub extern "C" fn cf_select_route(
         Route::Artifact  => 3,
         Route::Hybrid    => 4,
         Route::Full      => 5,
+        Route::Attractor => 6,
     };
     unsafe { *out_episode_id = episode_id; *out_route = route_int; }
     handle.ok()
@@ -5328,4 +5329,125 @@ pub extern "C" fn cf_compact_wal(h: *mut CfHandle) -> i64 {
         Ok(n) => n as i64,
         Err(e) => { handle.err(e); -1 }
     }
+}
+
+// ── FEP Attractor Network FFI ────────────────────────────────────────────────
+
+/// Get reconstruction error (surprise) for a memory. Returns value in [0,1].
+/// -1.0 on error. Used by C++ consolidation for free-energy merge criterion.
+#[no_mangle]
+pub extern "C" fn cf_reconstruction_error(h: *const CfHandle, memory_id: u64) -> f32 {
+    if h.is_null() { return -1.0; }
+    let handle = unsafe { &*h };
+    let embedding = {
+        let payloads = handle.field.payloads.read();
+        match payloads.get(&memory_id) {
+            Some(p) if p.embedding.len() == crate::ops::EMBED_DIM => p.embedding.clone(),
+            _ => return -1.0,
+        }
+    };
+    let encoder = handle.field.sparse_encoder.read();
+    let code = encoder.encode(&embedding);
+    encoder.reconstruction_error(&embedding, &code)
+}
+
+/// Get the surprise score cached in memory state. Returns -1.0 if not found.
+#[no_mangle]
+pub extern "C" fn cf_memory_surprise(h: *const CfHandle, memory_id: u64) -> f32 {
+    if h.is_null() { return -1.0; }
+    let handle = unsafe { &*h };
+    handle.field.states.read()
+        .get(&memory_id)
+        .map(|s| s.surprise)
+        .unwrap_or(-1.0)
+}
+
+/// Cortical attractor search: settle query embedding then search.
+/// Writes results to buf, returns count written.
+#[no_mangle]
+pub extern "C" fn cf_search_attractor(
+    h: *const CfHandle,
+    embedding: *const f32,
+    dim: usize,
+    k: usize,
+    settle_steps: usize,
+    buf: *mut CfRecallHit,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || embedding.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    if dim != crate::ops::EMBED_DIM { return -1; }
+    let emb = unsafe { std::slice::from_raw_parts(embedding, dim) };
+
+    let encoder = handle.field.sparse_encoder.read();
+    let code = encoder.encode(emb);
+    drop(encoder);
+
+    let cortical = handle.field.cortical_idx.read();
+    let results = cortical.search_attractor(&code, k, None, settle_steps);
+    drop(cortical);
+
+    let states = handle.field.states.read();
+    let n = results.len().min(buf_cap);
+    for (i, (mem_id, score)) in results.iter().take(n).enumerate() {
+        let state = states.get(mem_id);
+        unsafe {
+            *buf.add(i) = CfRecallHit {
+                memory_id: *mem_id,
+                score: *score,
+                semantic_score: *score,
+                ts_ms: state.map(|s| s.last_accessed_ms).unwrap_or(0),
+                strength: state.map(|s| s.strength).unwrap_or(0.0),
+                confidence: state.map(|s| s.confidence).unwrap_or(0.0),
+                access_count: state.map(|s| s.access_count).unwrap_or(0),
+                semantic_weight: 1.0,
+                status_mul: 1.0,
+                epistemic_mul: 1.0,
+                strength_factor: 1.0,
+            };
+        }
+    }
+    unsafe { *written = n; }
+    0
+}
+
+/// Record co-retrieval in the Hopfield network.
+#[no_mangle]
+pub extern "C" fn cf_hopfield_co_retrieval(
+    h: *mut CfHandle,
+    ids: *const u64,
+    count: usize,
+    ts_ms: i64,
+) -> c_int {
+    if h.is_null() || ids.is_null() || count == 0 { return -1; }
+    let handle = unsafe { &mut *h };
+    let id_slice = unsafe { std::slice::from_raw_parts(ids, count) };
+    handle.field.hopfield.write().record_co_retrieval(id_slice, ts_ms);
+    0
+}
+
+/// Get Hopfield network statistics as JSON string.
+#[no_mangle]
+pub extern "C" fn cf_hopfield_stats(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let net = handle.field.hopfield.read();
+    let json = format!(
+        r#"{{"couplings":{},"settles":{}}}"#,
+        net.coupling_count(),
+        net.settle_count()
+    );
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Adapt cortical vigilance based on aggregate reconstruction error.
+#[no_mangle]
+pub extern "C" fn cf_adapt_vigilance(h: *mut CfHandle, avg_error: f32) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    handle.field.cortical_idx.write().adapt_vigilance(avg_error);
+    0
 }

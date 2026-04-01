@@ -3,6 +3,7 @@ pub mod artifact;
 pub mod callgraph;
 pub mod codefile;
 pub mod cortex;
+pub mod hopfield;
 pub mod keyword;
 pub mod lite_encoder;
 pub mod msg;

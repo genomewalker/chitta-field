@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// A single subject-predicate-object fact.
+/// `weight` is the forward (subject→object) strength.
+/// `reverse_weight` is the backward (object→subject) strength.
+/// Asymmetric weights emerge from sequential observations (FEP §3.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TripletEntry {
     pub id: u64,
@@ -10,10 +13,27 @@ pub struct TripletEntry {
     pub predicate: String,
     pub object: String,
     pub weight: f32,
+    #[serde(default = "default_reverse_weight")]
+    pub reverse_weight: f32,
     pub valid_from_ms: i64,
     pub valid_to_ms: i64, // 0 = still valid
     pub source_memory_id: Option<MemoryId>,
     pub source_file: Option<String>,
+}
+
+fn default_reverse_weight() -> f32 {
+    -1.0 // sentinel: -1 means "use weight" (backward compat)
+}
+
+impl TripletEntry {
+    /// Forward weight (subject→object).
+    pub fn forward_weight(&self) -> f32 {
+        self.weight
+    }
+    /// Reverse weight (object→subject). Falls back to weight for legacy entries.
+    pub fn reverse_weight(&self) -> f32 {
+        if self.reverse_weight < 0.0 { self.weight } else { self.reverse_weight }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +133,7 @@ impl TripletStore {
             predicate: predicate.clone(),
             object: object.clone(),
             weight,
+            reverse_weight: weight * 0.3, // asymmetric by default: reverse is attenuated
             valid_from_ms,
             valid_to_ms: 0,
             source_memory_id,

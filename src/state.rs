@@ -104,6 +104,10 @@ pub struct MemoryState {
     pub status: MemoryStatus,
     #[serde(default)]
     pub epistemic_status: EpistemicStatus,
+    /// Reconstruction surprise: how poorly the sparse encoder predicts this memory.
+    /// High surprise = unique information, low surprise = redundant. FEP §2.3.
+    #[serde(default)]
+    pub surprise: f32,
 }
 
 impl MemoryState {
@@ -127,6 +131,7 @@ impl MemoryState {
             embed_pending: false,
             status: MemoryStatus::Active,
             epistemic_status: EpistemicStatus::ToolDerived,
+            surprise: 0.0,
         }
     }
 

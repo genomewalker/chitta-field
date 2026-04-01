@@ -12,6 +12,7 @@ use crate::organ::artifact::ArtifactIndex;
 use crate::organ::callgraph::CallGraph;
 use crate::organ::codefile::CodeFileIndex;
 use crate::organ::cortex::{CorticalIndex, SparseCode, SparseEncoder};
+use crate::organ::hopfield::HopfieldNetwork;
 use crate::organ::keyword::KeywordIndex;
 use crate::organ::lite_encoder::LiteEncoder;
 use crate::organ::msg::MsgRegistry;
@@ -125,6 +126,8 @@ pub struct ChittaField {
     pub(crate) realm_members: RwLock<HashMap<String, HashSet<MemoryId>>>,
     pub(crate) pending_recall: Mutex<PendingRecallEffects>,
     pub(crate) coactivation_stats: RwLock<HashMap<(MemoryId, MemoryId), CoActivationStats>>,
+    /// Asymmetric Hopfield network for energy-based attractor recall. FEP §3.2.
+    pub(crate) hopfield: RwLock<HopfieldNetwork>,
     pub(crate) filter_level: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
@@ -434,6 +437,7 @@ impl ChittaField {
             realm_members: RwLock::new(realm_members),
             pending_recall: Mutex::new(PendingRecallEffects::default()),
             coactivation_stats: RwLock::new(replay_coactivation_stats),
+            hopfield: RwLock::new(HopfieldNetwork::new()),
             filter_level: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         })
     }
