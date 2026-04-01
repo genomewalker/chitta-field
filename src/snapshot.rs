@@ -79,6 +79,7 @@ impl LegacyMemoryStateV4 {
             embed_pending: false,
             status: MemoryStatus::Active,
             epistemic_status: EpistemicStatus::ToolDerived,
+            surprise: 0.0,
         }
     }
 }
@@ -126,6 +127,7 @@ impl LegacyMemoryStateV5 {
             embed_pending: false,
             status: MemoryStatus::Active,
             epistemic_status: EpistemicStatus::ToolDerived,
+            surprise: 0.0,
         }
     }
 }

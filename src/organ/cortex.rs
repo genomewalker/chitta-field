@@ -153,31 +153,106 @@ impl SparseEncoder {
         out
     }
 
-    /// Online Hebbian update: adjust atoms toward the encoded memory.
-    /// Called after put_memory to adapt the dictionary.
+    /// Compute reconstruction error: ||original - decode(encode(original))||².
+    /// Normalized to [0, 1] range. Used as surprise signal for FEP plasticity.
+    pub fn reconstruction_error(&self, embedding: &[f32], code: &SparseCode) -> f32 {
+        if code.is_empty() || embedding.len() != EMBED_DIM {
+            return 1.0; // maximally surprising if we can't encode
+        }
+        let reconstructed = self.decode(code);
+        let mut sse = 0.0f32;
+        let mut norm = 0.0f32;
+        for (i, (&orig, &recon)) in embedding.iter().zip(reconstructed.iter()).enumerate() {
+            let _ = i;
+            let diff = orig - recon;
+            sse += diff * diff;
+            norm += orig * orig;
+        }
+        if norm < 1e-9 { return 0.0; }
+        (sse / norm).min(1.0)
+    }
+
+    /// Online FEP-derived update: accuracy (Hebbian) + complexity penalty (orthogonalization).
+    /// The complexity term pushes underused atom weights toward zero,
+    /// while the Gram-Schmidt step decorrelates active atoms. FEP §4.2.
     pub fn update(&mut self, embedding: &[f32], code: &SparseCode) {
         if code.is_empty() {
             return;
         }
         let (e_left, e_right) = embedding.split_at(HALF_DIM);
 
+        // Complexity penalty weight (λ in F = accuracy - λ·complexity)
+        const COMPLEXITY_LAMBDA: f32 = 1e-4;
+
         for (&fid, &act) in code.feature_ids.iter().zip(code.activations.iter()) {
             let li = (fid as usize) / N_RIGHT;
             let ri = (fid as usize) % N_RIGHT;
 
-            // Left atom update
+            // Left atom: prediction error + complexity penalty
             let la = &mut self.left_atoms[li];
             for (w, &x) in la.iter_mut().zip(e_left) {
-                *w += ENCODER_LR * act * (x - act * *w);
+                let pred_error = x - act * *w;
+                let complexity = -COMPLEXITY_LAMBDA * *w;
+                *w += ENCODER_LR * act * (pred_error + complexity);
             }
             normalize(la);
 
-            // Right atom update
+            // Right atom: prediction error + complexity penalty
             let ra = &mut self.right_atoms[ri];
             for (w, &x) in ra.iter_mut().zip(e_right) {
-                *w += ENCODER_LR * act * (x - act * *w);
+                let pred_error = x - act * *w;
+                let complexity = -COMPLEXITY_LAMBDA * *w;
+                *w += ENCODER_LR * act * (pred_error + complexity);
             }
             normalize(ra);
+        }
+
+        // Gram-Schmidt orthogonalization pass on active atom pairs.
+        // Decorrelates representations to maximize mutual information. FEP §5.1.
+        self.orthogonalize_active(code);
+    }
+
+    /// Partial Gram-Schmidt: for each pair of active atoms in the same half,
+    /// subtract the projection of one onto the other, then renormalize.
+    fn orthogonalize_active(&mut self, code: &SparseCode) {
+        const ORTHO_RATE: f32 = 0.01; // gentle: 1% of projection removed per step
+
+        // Collect unique left and right indices from active features
+        let mut left_indices: Vec<usize> = Vec::new();
+        let mut right_indices: Vec<usize> = Vec::new();
+        for &fid in &code.feature_ids {
+            let li = fid as usize / N_RIGHT;
+            let ri = fid as usize % N_RIGHT;
+            if !left_indices.contains(&li) { left_indices.push(li); }
+            if !right_indices.contains(&ri) { right_indices.push(ri); }
+        }
+
+        // Orthogonalize left atoms
+        for i in 0..left_indices.len() {
+            for j in (i + 1)..left_indices.len() {
+                let (li, lj) = (left_indices[i], left_indices[j]);
+                let proj = dot(&self.left_atoms[li], &self.left_atoms[lj]);
+                if proj.abs() > 0.01 {
+                    for d in 0..HALF_DIM {
+                        self.left_atoms[lj][d] -= ORTHO_RATE * proj * self.left_atoms[li][d];
+                    }
+                    normalize(&mut self.left_atoms[lj]);
+                }
+            }
+        }
+
+        // Orthogonalize right atoms
+        for i in 0..right_indices.len() {
+            for j in (i + 1)..right_indices.len() {
+                let (ri, rj) = (right_indices[i], right_indices[j]);
+                let proj = dot(&self.right_atoms[ri], &self.right_atoms[rj]);
+                if proj.abs() > 0.01 {
+                    for d in 0..HALF_DIM {
+                        self.right_atoms[rj][d] -= ORTHO_RATE * proj * self.right_atoms[ri][d];
+                    }
+                    normalize(&mut self.right_atoms[rj]);
+                }
+            }
         }
     }
 }
@@ -418,6 +493,58 @@ impl CorticalIndex {
         results
     }
 
+    /// Attractor-based pattern completion: iteratively settle a query code
+    /// by blending with prototype centroids and following asymmetric transitions.
+    /// Partial cues converge to stored attractor basins. FEP §3.1.
+    pub fn attractor_settle(&self, query_code: &SparseCode, max_steps: usize) -> SparseCode {
+        if query_code.is_empty() {
+            return query_code.clone();
+        }
+
+        let mut current = query_code.clone();
+        let blend_rate = 0.3f32; // how much to pull toward prototype centroid
+
+        for _step in 0..max_steps {
+            let Some((proto_id, sim)) = self.prototype_idx.nearest_proto_with_sim(&current) else {
+                break;
+            };
+
+            // Already well-matched — settled
+            if sim > 0.95 {
+                break;
+            }
+
+            // Blend current code with prototype centroid (pattern completion)
+            if let Some(centroid) = self.prototype_idx.get_centroid(proto_id) {
+                current = blend_sparse_codes(&current, centroid, blend_rate);
+            }
+
+            // Follow strongest outgoing transition (asymmetric flow)
+            let transitions = self.prototype_idx.top_transitions(proto_id, 3);
+            if let Some(&(next_proto, tw)) = transitions.first() {
+                if tw > 0.1 {
+                    if let Some(next_centroid) = self.prototype_idx.get_centroid(next_proto) {
+                        // Lightly blend toward the transition target
+                        current = blend_sparse_codes(&current, next_centroid, blend_rate * tw * 0.5);
+                    }
+                }
+            }
+        }
+        current
+    }
+
+    /// Search with attractor settling: settle the query first, then search.
+    pub fn search_attractor(
+        &self,
+        query_code: &SparseCode,
+        k: usize,
+        allowed: Option<&HashSet<MemoryId>>,
+        settle_steps: usize,
+    ) -> Vec<(MemoryId, f32)> {
+        let settled = self.attractor_settle(query_code, settle_steps);
+        self.search(&settled, k, allowed)
+    }
+
     pub fn len(&self) -> usize {
         self.n_memories as usize
     }
@@ -447,6 +574,16 @@ impl CorticalIndex {
 
     pub fn is_pq_trained(&self) -> bool {
         self.pq.is_some()
+    }
+
+    /// Adapt vigilance threshold based on aggregate prediction error.
+    /// High error → lower vigilance (create more prototypes).
+    /// Low error → higher vigilance (fewer, coarser prototypes). FEP §4.1.
+    pub fn adapt_vigilance(&mut self, avg_reconstruction_error: f32) {
+        // Map error [0,1] to vigilance [0.001, 0.01]
+        // High error → low vigilance (more prototypes needed)
+        let v = 0.01 - avg_reconstruction_error * 0.009;
+        self.prototype_idx.set_vigilance(v);
     }
 
     /// Strengthen prototype transitions for a set of co-retrieved memory IDs.
@@ -559,6 +696,31 @@ fn normalize(v: &mut Vec<f32>) {
         for x in v.iter_mut() {
             *x /= norm;
         }
+    }
+}
+
+/// Blend two sparse codes: result = (1-alpha)*a + alpha*b, keeping top-K features.
+fn blend_sparse_codes(a: &SparseCode, b: &SparseCode, alpha: f32) -> SparseCode {
+    let mut merged: HashMap<u32, f32> = HashMap::new();
+    for (&fid, &act) in a.feature_ids.iter().zip(a.activations.iter()) {
+        *merged.entry(fid).or_insert(0.0) += (1.0 - alpha) * act;
+    }
+    for (&fid, &act) in b.feature_ids.iter().zip(b.activations.iter()) {
+        *merged.entry(fid).or_insert(0.0) += alpha * act;
+    }
+    let mut features: Vec<(u32, f32)> = merged.into_iter().filter(|(_, a)| *a > 0.0).collect();
+    if features.len() > K_ACTIVE {
+        features.select_nth_unstable_by(K_ACTIVE, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        features.truncate(K_ACTIVE);
+    }
+    features.sort_by_key(|(fid, _)| *fid);
+    let sum: f32 = features.iter().map(|(_, a)| *a).sum();
+    if sum < 1e-9 { return SparseCode::default(); }
+    SparseCode {
+        feature_ids: features.iter().map(|(fid, _)| *fid).collect(),
+        activations: features.iter().map(|(_, a)| a / sum).collect(),
     }
 }
 

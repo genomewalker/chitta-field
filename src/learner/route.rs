@@ -3,12 +3,13 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Route {
-    Semantic, // HNSW only
-    Keyword,  // BM25 only
-    Temporal, // Time-based
-    Artifact, // File-based
-    Hybrid,   // Semantic + BM25
-    Full,     // All channels
+    Semantic,  // HNSW only
+    Keyword,   // BM25 only
+    Temporal,  // Time-based
+    Artifact,  // File-based
+    Hybrid,    // Semantic + BM25
+    Full,      // All channels
+    Attractor, // Cortical attractor settling + search (FEP §3.1)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -64,6 +65,7 @@ impl RouteLearner {
             Route::Artifact,
             Route::Hybrid,
             Route::Full,
+            Route::Attractor,
         ];
         let seed = now_ms ^ (self.next_episode_id * 2654435761);
 
@@ -110,6 +112,7 @@ impl RouteLearner {
             Route::Artifact,
             Route::Hybrid,
             Route::Full,
+            Route::Attractor,
         ];
         routes
             .iter()

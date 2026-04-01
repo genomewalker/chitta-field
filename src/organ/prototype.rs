@@ -166,15 +166,19 @@ impl PrototypeIndex {
         entry.centroid.activations = features.iter().map(|(_, a)| a / norm).collect();
     }
 
+    /// Strengthen directed transition a→b.
+    /// Asymmetric: a→b gets full delta, b→a gets attenuated (0.3×).
+    /// Sequential data naturally produces asymmetric couplings (FEP §3.2).
     pub fn strengthen_transition(&mut self, a: ProtoId, b: ProtoId, delta: f32) {
         if a == b {
             return;
         }
         let key_ab = (a, b);
         let key_ba = (b, a);
-        let val = (self.transitions.get(&key_ab).copied().unwrap_or(0.0) + delta).min(1.0);
-        self.transitions.insert(key_ab, val);
-        self.transitions.insert(key_ba, val);
+        let fwd = (self.transitions.get(&key_ab).copied().unwrap_or(0.0) + delta).min(1.0);
+        let rev = (self.transitions.get(&key_ba).copied().unwrap_or(0.0) + delta * 0.3).min(1.0);
+        self.transitions.insert(key_ab, fwd);
+        self.transitions.insert(key_ba, rev);
     }
 
     pub fn get_proto(&self, memory_id: MemoryId) -> Option<ProtoId> {
@@ -187,6 +191,41 @@ impl PrototypeIndex {
 
     pub fn transition(&self, a: ProtoId, b: ProtoId) -> f32 {
         self.transitions.get(&(a, b)).copied().unwrap_or(0.0)
+    }
+
+    /// Get nearest prototype and its similarity score.
+    pub fn nearest_proto_with_sim(&self, code: &SparseCode) -> Option<(ProtoId, f32)> {
+        if self.protos.is_empty() || code.is_empty() {
+            return None;
+        }
+        let (best_idx, best_sim) = self.best_match(code);
+        Some((self.protos[best_idx].id, best_sim))
+    }
+
+    /// Get the top-N outgoing transitions from a prototype, sorted by weight desc.
+    pub fn top_transitions(&self, from: ProtoId, n: usize) -> Vec<(ProtoId, f32)> {
+        let mut out: Vec<(ProtoId, f32)> = self.transitions.iter()
+            .filter(|&(&(a, _), _)| a == from)
+            .map(|(&(_, b), &w)| (b, w))
+            .collect();
+        out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        out.truncate(n);
+        out
+    }
+
+    /// Get centroid for a prototype.
+    pub fn get_centroid(&self, proto_id: ProtoId) -> Option<&SparseCode> {
+        self.protos.iter().find(|p| p.id == proto_id).map(|p| &p.centroid)
+    }
+
+    /// Adaptive vigilance: lower when prediction error is high (more prototypes),
+    /// higher when model is accurate (fewer prototypes). FEP §4.1.
+    pub fn set_vigilance(&mut self, v: f32) {
+        self.vigilance = v.clamp(0.001, 0.01);
+    }
+
+    pub fn vigilance(&self) -> f32 {
+        self.vigilance
     }
 
     pub fn remove_memory(&mut self, memory_id: MemoryId) {
