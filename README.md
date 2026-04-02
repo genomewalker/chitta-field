@@ -280,6 +280,12 @@ chitta-field separates fast episodic storage (op log, segment files, analogous t
 
 > McClelland, J. L., McNaughton, B. L., & O'Reilly, R. C. (1995). Why there are complementary learning systems in the hippocampus and neocortex: Insights from the successes and failures of connectionist models of learning and memory. *Psychological Review*, 102(3), 419-457. https://doi.org/10.1037/0033-295X.102.3.419
 
+### Free Energy Principle attractor network
+
+`hopfield.rs` implements an asymmetric Hopfield network over memory co-activations. Directed couplings encode retrieval order (A→B weighted at 1.0, B→A at 0.3), enabling non-equilibrium steady-state dynamics. The sparse encoder (`cortex.rs`) uses a FEP-derived Hebbian update: prediction error + complexity penalty + Gram-Schmidt decorrelation between active atoms. This produces self-orthogonalizing representations that resist catastrophic forgetting. Deduplication uses a free-energy merge criterion — a principled accuracy-vs-complexity tradeoff — instead of a pure cosine threshold. Surprise-modulated plasticity ties `decay_rate` to reconstruction error: memories that are poorly predicted by the current encoder resist forgetting; redundant, well-predicted memories fade faster.
+
+> Spisak, T., & Friston, K. J. (2026). Free-energy principle for memory: self-orthogonalizing sparse codes, asymmetric Hopfield attractors, and surprise-modulated plasticity. *Neurocomputing*. https://doi.org/10.1016/j.neucom.2026.08696
+
 ### Decay and the spacing effect
 
 Each memory has a per-instance `decay_rate` (strength loss per unit time). `PlasticityLearner` in `plasticity.rs` adjusts this rate using an exponentially weighted moving average of inter-access intervals: frequently accessed memories earn lower decay rates. This models the spacing effect, where repeated retrieval at spaced intervals strengthens retention.
