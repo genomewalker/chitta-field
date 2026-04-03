@@ -108,6 +108,13 @@ pub struct MemoryState {
     /// High surprise = unique information, low surprise = redundant. FEP §2.3.
     #[serde(default)]
     pub surprise: f32,
+    /// Affect valence: -1.0 (negative/frustration) to +1.0 (positive/eureka). 0 = neutral.
+    /// Inspired by Anthropic's emotion vector research (2026).
+    #[serde(default)]
+    pub affect_valence: f32,
+    /// Affect arousal: 0.0 (calm) to 1.0 (intense). High arousal = flashbulb memory effect.
+    #[serde(default)]
+    pub affect_arousal: f32,
 }
 
 impl MemoryState {
@@ -132,6 +139,8 @@ impl MemoryState {
             status: MemoryStatus::Active,
             epistemic_status: EpistemicStatus::ToolDerived,
             surprise: 0.0,
+            affect_valence: 0.0,
+            affect_arousal: 0.0,
         }
     }
 

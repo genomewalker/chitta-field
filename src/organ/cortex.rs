@@ -265,6 +265,10 @@ pub struct PostingEntry {
     pub activation_q: u8,  // activation quantized to u8 (0.0-1.0 → 0-255)
     pub strength_q: u8,    // strength quantized to u8
     pub proto_id: ProtoId, // prototype cluster assignment
+    /// Affect arousal quantized: 0=calm, 255=intense. High arousal boosts retrieval
+    /// (flashbulb memory effect, inspired by Anthropic emotion vectors 2026).
+    #[serde(default)]
+    pub affect_q: u8,
 }
 
 /// Inverted posting index over sparse codes. O(K) posting lookups per query.
@@ -319,6 +323,18 @@ impl CorticalIndex {
         ts_ms: i64,
         kind: &str,
     ) {
+        self.index_with_affect(mem_id, code, strength, ts_ms, kind, 0.0);
+    }
+
+    pub fn index_with_affect(
+        &mut self,
+        mem_id: MemoryId,
+        code: &SparseCode,
+        strength: f32,
+        ts_ms: i64,
+        kind: &str,
+        affect_arousal: f32,
+    ) {
         if code.is_empty() {
             return;
         }
@@ -328,6 +344,7 @@ impl CorticalIndex {
         }
 
         let strength_q = (strength.clamp(0.0, 1.0) * 255.0) as u8;
+        let affect_q = (affect_arousal.clamp(0.0, 1.0) * 255.0) as u8;
         let proto_id = self.prototype_idx.assign(mem_id, code);
 
         for (&fid, &act) in code.feature_ids.iter().zip(code.activations.iter()) {
@@ -336,6 +353,7 @@ impl CorticalIndex {
                 activation_q: (act * 255.0) as u8,
                 strength_q,
                 proto_id,
+                affect_q,
             };
             self.postings.entry(fid).or_default().push(entry);
             *self.df.entry(fid).or_insert(0) += 1;
@@ -482,7 +500,18 @@ impl CorticalIndex {
                     _ => 0.0,
                 };
 
-                let score = 0.70 * sparse + 0.15 * proto_bonus + 0.10 * strength + 0.05 * recency;
+                // Affect arousal boost: high-arousal memories get flashbulb retrieval bonus
+                // (Anthropic emotion vectors 2026: arousal correlates with behavioral salience)
+                let affect_boost = self
+                    .mem_codes
+                    .get(&mem_id)
+                    .and_then(|code| code.feature_ids.first())
+                    .and_then(|&fid| self.postings.get(&fid))
+                    .and_then(|list| list.iter().find(|e| e.mem_id == mem_id))
+                    .map(|e| e.affect_q as f32 / 255.0)
+                    .unwrap_or(0.0);
+
+                let score = 0.65 * sparse + 0.13 * proto_bonus + 0.10 * strength + 0.05 * recency + 0.07 * affect_boost;
                 (mem_id, score)
             })
             .collect();

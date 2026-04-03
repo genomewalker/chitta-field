@@ -80,6 +80,8 @@ impl LegacyMemoryStateV4 {
             status: MemoryStatus::Active,
             epistemic_status: EpistemicStatus::ToolDerived,
             surprise: 0.0,
+            affect_valence: 0.0,
+            affect_arousal: 0.0,
         }
     }
 }
@@ -128,6 +130,8 @@ impl LegacyMemoryStateV5 {
             status: MemoryStatus::Active,
             epistemic_status: EpistemicStatus::ToolDerived,
             surprise: 0.0,
+            affect_valence: 0.0,
+            affect_arousal: 0.0,
         }
     }
 }
