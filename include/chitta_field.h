@@ -224,6 +224,12 @@ int cf_get_events_by_domain_kind(CfHandle* h,
     size_t limit,
     uint8_t* out_buf, size_t buf_cap, size_t* written);
 
+/* Look up a single event by event_id. Returns JSON object, or "{}" if not found.
+ * Returns 0=ok, -2=buf too small, -1=error. */
+int cf_get_event_by_id(CfHandle* h,
+    uint64_t event_id,
+    uint8_t* out_buf, size_t buf_cap, size_t* written);
+
 /* Session management */
 int cf_session_register(CfHandle* h,
     const char* session_id, const char* kind, const char* realm, int64_t now_ms);

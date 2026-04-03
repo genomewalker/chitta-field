@@ -1926,6 +1926,41 @@ pub extern "C" fn cf_get_events_by_domain_kind(
     write_json_buf(&json_str, out_buf, buf_cap, written)
 }
 
+/// Look up a single event by event_id. Returns JSON object: {event_id, kind, target, payload, realm, ts_ms}
+/// or empty object {} if not found.
+#[no_mangle]
+pub extern "C" fn cf_get_event_by_id(
+    h: *mut CfHandle,
+    event_id: u64,
+    out_buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || out_buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+
+    let registry = handle.field.msg_registry.read();
+    let json_str = match registry.get_event_by_id(event_id) {
+        Some(ev) => {
+            let payload: serde_json::Value =
+                serde_json::from_str(&ev.payload_json).unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "event_id": ev.event_id,
+                "kind": ev.kind,
+                "target": ev.target,
+                "payload": payload,
+                "realm": ev.realm,
+                "ts_ms": ev.ts_ms,
+            })
+            .to_string()
+        }
+        None => "{}".to_string(),
+    };
+    write_json_buf(&json_str, out_buf, buf_cap, written)
+}
+
 // ── Session high-level FFI ────────────────────────────────────────────────────
 
 /// Register a new session. kind is the session type (e.g. "claude", "sadhana").
