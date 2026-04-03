@@ -129,8 +129,8 @@ impl TaskRegistry {
 
     pub fn update_payload(&mut self, task_id: &str, payload_json: String, now_ms: i64) -> bool {
         if let Some(t) = self.tasks.get_mut(task_id) {
-            // Reject stale payload updates (older timestamp = concurrent writer lost the race)
-            if now_ms <= t.updated_at_ms {
+            // Reject stale payload updates (strictly older timestamp = concurrent writer lost the race)
+            if now_ms < t.updated_at_ms {
                 return false;
             }
             t.payload_json = payload_json;
