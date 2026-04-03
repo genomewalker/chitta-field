@@ -62,6 +62,8 @@ fn write_hits(hits: Vec<RecallHit>, buf: *mut CfRecallHit, cap: usize, written: 
                 status_mul: h.status_mul,
                 epistemic_mul: h.epistemic_mul,
                 strength_factor: h.strength_factor,
+                affect_valence: h.affect_valence,
+                affect_arousal: h.affect_arousal,
             };
         }
     }
@@ -305,6 +307,8 @@ pub struct CfRecallHit {
     pub status_mul: f32,
     pub epistemic_mul: f32,
     pub strength_factor: f32,
+    pub affect_valence: f32,
+    pub affect_arousal: f32,
 }
 
 /// Output buffer for recall results. Caller allocates hits_buf with capacity hits_cap.
@@ -4483,6 +4487,8 @@ mod tests {
                     status_mul: 0.0,
                     epistemic_mul: 0.0,
                     strength_factor: 0.0,
+                    affect_valence: 0.0,
+                    affect_arousal: 0.0,
                 };
                 10
             ];
@@ -4545,6 +4551,8 @@ mod tests {
                     status_mul: 0.0,
                     epistemic_mul: 0.0,
                     strength_factor: 0.0,
+                    affect_valence: 0.0,
+                    affect_arousal: 0.0,
                 };
                 10
             ];
@@ -4727,6 +4735,8 @@ mod tests {
                     status_mul: 0.0,
                     epistemic_mul: 0.0,
                     strength_factor: 0.0,
+                    affect_valence: 0.0,
+                    affect_arousal: 0.0,
                 };
                 10
             ];
@@ -4884,6 +4894,8 @@ mod tests {
                     status_mul: 0.0,
                     epistemic_mul: 0.0,
                     strength_factor: 0.0,
+                    affect_valence: 0.0,
+                    affect_arousal: 0.0,
                 };
                 10
             ];
@@ -5104,6 +5116,8 @@ mod tests {
                     status_mul: 0.0,
                     epistemic_mul: 0.0,
                     strength_factor: 0.0,
+                    affect_valence: 0.0,
+                    affect_arousal: 0.0,
                 };
                 10
             ];
@@ -5319,6 +5333,17 @@ pub extern "C" fn cf_set_epistemic_status(h: *mut CfHandle, memory_id: u64, es: 
     }
 }
 
+/// Set affect dimensions on a memory. valence: -1.0 to +1.0, arousal: 0.0 to 1.0.
+#[no_mangle]
+pub extern "C" fn cf_set_affect(h: *mut CfHandle, memory_id: u64, valence: f32, arousal: f32) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    match handle.field.set_affect(memory_id, valence, arousal) {
+        Ok(()) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
 /// Compact WAL: save full snapshot then delete segments covered by it.
 /// Returns number of deleted segments, or -1 on error.
 #[no_mangle]
@@ -5407,6 +5432,8 @@ pub extern "C" fn cf_search_attractor(
                 status_mul: 1.0,
                 epistemic_mul: 1.0,
                 strength_factor: 1.0,
+                affect_valence: 0.0,
+                affect_arousal: 0.0,
             };
         }
     }

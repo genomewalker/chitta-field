@@ -597,6 +597,8 @@ impl ChittaField {
                     status_mul,
                     epistemic_mul,
                     strength_factor,
+                    affect_valence: state.affect_valence,
+                    affect_arousal: state.affect_arousal,
                 })
             })
             .collect();
@@ -711,6 +713,8 @@ impl ChittaField {
                     status_mul: 0.0,
                     epistemic_mul: 0.0,
                     strength_factor: 0.0,
+                    affect_valence: 0.0,
+                    affect_arousal: 0.0,
                 })
             })
             .collect();
@@ -800,6 +804,8 @@ impl ChittaField {
                     status_mul: 0.0,
                     epistemic_mul: 0.0,
                     strength_factor: 0.0,
+                    affect_valence: 0.0,
+                    affect_arousal: 0.0,
                 })
             })
             .collect();
@@ -843,6 +849,8 @@ impl ChittaField {
                     status_mul,
                     epistemic_mul,
                     strength_factor,
+                    affect_valence: state.affect_valence,
+                    affect_arousal: state.affect_arousal,
                 })
             })
             .collect();
@@ -924,6 +932,8 @@ impl ChittaField {
                     status_mul: 0.0,
                     epistemic_mul: 0.0,
                     strength_factor: 0.0,
+                    affect_valence: 0.0,
+                    affect_arousal: 0.0,
                 })
             })
             .collect();
@@ -1045,6 +1055,19 @@ impl ChittaField {
         let mut states = self.states.write();
         if let Some(st) = states.get_mut(&memory_id) {
             st.apply_delta(&delta, now_ms());
+            Ok(())
+        } else {
+            Err(FieldError::NotFound(memory_id))
+        }
+    }
+
+    /// Set affect dimensions on a memory (valence: -1..+1, arousal: 0..1).
+    /// In-memory only (not WAL-persisted) — affect is re-derived from content on reload.
+    pub fn set_affect(&self, memory_id: MemoryId, valence: f32, arousal: f32) -> Result<()> {
+        let mut states = self.states.write();
+        if let Some(st) = states.get_mut(&memory_id) {
+            st.affect_valence = valence.clamp(-1.0, 1.0);
+            st.affect_arousal = arousal.clamp(0.0, 1.0);
             Ok(())
         } else {
             Err(FieldError::NotFound(memory_id))

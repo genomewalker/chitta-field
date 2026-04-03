@@ -18,4 +18,7 @@ pub struct RecallHit {
     pub status_mul: f32,
     pub epistemic_mul: f32,
     pub strength_factor: f32,
+    /// Affect dimensions (Anthropic emotion vectors 2026)
+    pub affect_valence: f32,
+    pub affect_arousal: f32,
 }

@@ -21,6 +21,8 @@ typedef struct {
     float    status_mul;
     float    epistemic_mul;
     float    strength_factor;
+    float    affect_valence;
+    float    affect_arousal;
 } CfRecallHit;
 
 /* Lifecycle */
@@ -392,6 +394,7 @@ int cf_get_assoc_edges(CfHandle* h, uint64_t memory_id, size_t limit,
     char* buf, size_t buf_cap, size_t* written);
 
 int cf_set_epistemic_status(CfHandle* h, uint64_t memory_id, uint8_t epistemic_status);
+int cf_set_affect(CfHandle* h, uint64_t memory_id, float valence, float arousal);
 
 /* Contradiction engine */
 int cf_get_conflicts(CfHandle* h, uint64_t memory_id,
