@@ -70,6 +70,14 @@ impl MsgRegistry {
         result
     }
 
+    /// Look up a single event by its event_id across all targets.
+    pub fn get_event_by_id(&self, event_id: u64) -> Option<&MsgEvent> {
+        self.by_target
+            .values()
+            .flat_map(|events| events.iter())
+            .find(|e| e.event_id == event_id)
+    }
+
     /// Check whether any event for `target` matches domain+kind.
     pub fn has_event(&self, domain: &str, kind: &str, target: &str) -> bool {
         self.by_target
