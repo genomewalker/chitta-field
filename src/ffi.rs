@@ -1926,6 +1926,25 @@ pub extern "C" fn cf_get_events_by_domain_kind(
     write_json_buf(&json_str, out_buf, buf_cap, written)
 }
 
+/// Check whether any event exists for (domain, kind, target). Returns 1 if found, 0 if not, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_has_event(
+    h: *mut CfHandle,
+    domain: *const c_char,
+    kind: *const c_char,
+    target: *const c_char,
+) -> c_int {
+    if h.is_null() || domain.is_null() || kind.is_null() || target.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let domain_str = unsafe { CStr::from_ptr(domain).to_str().unwrap_or("") };
+    let kind_str   = unsafe { CStr::from_ptr(kind).to_str().unwrap_or("") };
+    let target_str = unsafe { CStr::from_ptr(target).to_str().unwrap_or("") };
+    let registry = handle.field.msg_registry.read();
+    if registry.has_event(domain_str, kind_str, target_str) { 1 } else { 0 }
+}
+
 /// Look up a single event by event_id. Returns JSON object: {event_id, kind, target, payload, realm, ts_ms}
 /// or empty object {} if not found.
 #[no_mangle]

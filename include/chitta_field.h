@@ -224,6 +224,10 @@ int cf_get_events_by_domain_kind(CfHandle* h,
     size_t limit,
     uint8_t* out_buf, size_t buf_cap, size_t* written);
 
+/* Check whether any event exists for (domain, kind, target). Returns 1 if found, 0 if not. */
+int cf_has_event(CfHandle* h,
+    const char* domain, const char* kind, const char* target);
+
 /* Look up a single event by event_id. Returns JSON object, or "{}" if not found.
  * Returns 0=ok, -2=buf too small, -1=error. */
 int cf_get_event_by_id(CfHandle* h,
