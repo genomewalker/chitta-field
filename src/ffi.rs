@@ -1662,7 +1662,7 @@ pub extern "C" fn cf_emit_event(
             payload_json: payload,
             ts_ms,
         }),
-        "msg" => Op::MsgEvent(MsgEventOp {
+        "msg" | "sadhana" | "dream" => Op::MsgEvent(MsgEventOp {
             event_id,
             domain: domain_str.to_string(),
             kind: kind_str.to_string(),
