@@ -137,6 +137,20 @@ impl ChittaField {
             }
         }
 
+        // Semantic novelty gate (Omni-SimpleMem selective ingestion):
+        // If a near-duplicate already exists (cosine_sim ≥ 0.88), skip storage and
+        // lightly reinforce the existing memory instead of creating a new node.
+        // This prevents [thought] and synthesis memories from accumulating near-duplicates.
+        if !embed_pending {
+            let neighbors = self.semantic_idx.read().search(embedding, 1, None);
+            if let Some(top) = neighbors.first() {
+                if top.cosine_similarity >= 0.88 {
+                    let _ = self.update_state(top.memory_id, Some(0.0), Some(0.02), None, true, None);
+                    return Ok((top.memory_id, chunk_hash));
+                }
+            }
+        }
+
         let memory_id = self.id_alloc.next_id();
         let ts = now_ms();
 
