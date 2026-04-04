@@ -144,7 +144,7 @@ impl ChittaField {
         if !embed_pending {
             let neighbors = self.semantic_idx.read().search(embedding, 1, None);
             if let Some(top) = neighbors.first() {
-                if top.cosine_similarity >= 0.88 {
+                if top.cosine_similarity >= 0.88 && top.cosine_similarity < 0.9999 {
                     let _ = self.update_state(top.memory_id, Some(0.0), Some(0.02), None, true, None);
                     return Ok((top.memory_id, chunk_hash));
                 }
