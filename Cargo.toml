@@ -1,6 +1,6 @@
 [package]
 name = "chitta-field"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 description = "Organic associative memory substrate for cognitive AI companions"
 license = "MIT"
