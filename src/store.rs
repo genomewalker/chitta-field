@@ -585,6 +585,13 @@ impl ChittaField {
                 if state.deleted {
                     return None;
                 }
+                // soul:* realms are internal synthesis artifacts — exclude from unscoped
+                // queries so they never compete with domain memories in brahman recall.
+                // Only surfaced when the caller explicitly targets a soul:* realm.
+                let payload_realm = payloads.get(&memory_id).map(|p| p.realm.as_str()).unwrap_or("");
+                if payload_realm.starts_with("soul:") && realm.map(|r| !r.starts_with("soul:")).unwrap_or(true) {
+                    return None;
+                }
                 // Exclude semantically invalidated statuses; apply score modifiers for the rest.
                 let status_mul = status_score_multiplier(&state.status)?;
                 let epistemic_mul = epistemic_score_multiplier(&state.epistemic_status);
@@ -842,9 +849,13 @@ impl ChittaField {
                 if state.deleted {
                     return None;
                 }
+                // soul:* realms are internal synthesis artifacts — exclude from unscoped recall.
+                let payload = payloads.get(&hit.memory_id)?;
+                if payload.realm.starts_with("soul:") {
+                    return None;
+                }
                 let status_mul = status_score_multiplier(&state.status)?;
                 let epistemic_mul = epistemic_score_multiplier(&state.epistemic_status);
-                let payload = payloads.get(&hit.memory_id)?;
                 let eff_strength = state.effective_strength(now);
                 let strength_factor = 0.5 + 0.5 * eff_strength;
                 let base = hit.bm25_score * strength_factor * state.confidence;
