@@ -82,6 +82,8 @@ int cf_get_kind(CfHandle* h, uint64_t memory_id,
 int cf_get_realm(CfHandle* h, uint64_t memory_id,
     uint8_t* buf, size_t buf_cap);
 
+int32_t cf_set_realm(CfHandle* h, uint64_t memory_id, const char* new_realm);
+
 /* Triplets */
 int cf_add_triplet(CfHandle* h,
     const char* subject, const char* predicate, const char* object,
