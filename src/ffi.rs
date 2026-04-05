@@ -3910,6 +3910,48 @@ pub extern "C" fn cf_get_memory_metadata(
 
 /// 9. Update memory kind field (returns 0=ok, -1=not found/error).
 #[no_mangle]
+pub extern "C" fn cf_set_realm(
+    h: *mut CfHandle,
+    memory_id: u64,
+    new_realm: *const c_char,
+) -> i32 {
+    if h.is_null() || new_realm.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let realm_str = unsafe {
+        match CStr::from_ptr(new_realm).to_str() {
+            Ok(s) => s.to_string(),
+            Err(e) => { handle.err(e); return -1; }
+        }
+    };
+    let old_realm = {
+        let payloads = handle.field.payloads.read();
+        match payloads.get(&memory_id) {
+            Some(p) => p.realm.clone(),
+            None => { drop(payloads); handle.err("memory not found"); return -1; }
+        }
+    };
+    // Update payload realm
+    {
+        let mut payloads = handle.field.payloads.write();
+        if let Some(p) = payloads.get_mut(&memory_id) {
+            p.realm = realm_str.clone();
+        }
+    }
+    // Update realm_members: remove from old, insert into new
+    {
+        let mut rm = handle.field.realm_members.write();
+        if let Some(set) = rm.get_mut(&old_realm) {
+            set.remove(&memory_id);
+        }
+        rm.entry(realm_str).or_default().insert(memory_id);
+    }
+    handle.ok();
+    0
+}
+
+#[no_mangle]
 pub extern "C" fn cf_update_memory_kind(
     h: *mut CfHandle,
     memory_id: u64,

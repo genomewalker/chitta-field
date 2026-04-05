@@ -90,6 +90,18 @@ fn status_score_multiplier(status: &MemoryStatus) -> Option<f32> {
     }
 }
 
+/// Score multiplier based on memory kind for tiered recall prioritization.
+/// Corrections and preferences are high-signal; episodes are low-signal noise.
+fn realm_kind_multiplier(kind: &str) -> f32 {
+    match kind {
+        "correction" | "preference" => 1.3,
+        "wisdom"                    => 1.1,
+        "insight"                   => 1.05,
+        "episode"                   => 0.7,
+        _                           => 1.0,
+    }
+}
+
 /// Score multiplier derived from epistemic status.
 /// UserStated=1.0, ToolDerived=0.95, ModelInferred=0.85, AutonomousSynthesis=0.75.
 fn epistemic_score_multiplier(es: &EpistemicStatus) -> f32 {
@@ -140,13 +152,20 @@ impl ChittaField {
         // Semantic novelty gate (Omni-SimpleMem selective ingestion):
         // If a near-duplicate already exists (cosine_sim ≥ 0.88), skip storage and
         // lightly reinforce the existing memory instead of creating a new node.
-        // This prevents [thought] and synthesis memories from accumulating near-duplicates.
+        // Only deduplicates within the same realm — cross-realm near-matches must
+        // produce independent nodes to prevent silent cross-realm reinforcement.
         if !embed_pending {
             let neighbors = self.semantic_idx.read().search(embedding, 1, None);
             if let Some(top) = neighbors.first() {
                 if top.cosine_similarity >= 0.88 && top.cosine_similarity < 0.9999 {
-                    let _ = self.update_state(top.memory_id, Some(0.0), Some(0.02), None, true, None);
-                    return Ok((top.memory_id, chunk_hash));
+                    let candidate_realm = self.payloads.read()
+                        .get(&top.memory_id)
+                        .map(|p| p.realm.clone())
+                        .unwrap_or_default();
+                    if candidate_realm == realm {
+                        let _ = self.update_state(top.memory_id, Some(0.0), Some(0.02), None, true, None);
+                        return Ok((top.memory_id, chunk_hash));
+                    }
                 }
             }
         }
@@ -603,9 +622,10 @@ impl ChittaField {
                 let strength_factor = 0.5 + 0.5 * eff_strength;
                 // PoE: apply per-realm reliability multiplier
                 let poe_mul = self.learners.read().domain_reliability.reliability(&payload.realm);
+                let kind_mul = realm_kind_multiplier(&payload.kind);
                 Some(RecallHit {
                     memory_id,
-                    score: base * status_mul * epistemic_mul * poe_mul,
+                    score: base * status_mul * epistemic_mul * poe_mul * kind_mul,
                     semantic_score,
                     ts_ms: payload.authored_at_ms,
                     kind: payload.kind.clone(),
@@ -856,12 +876,13 @@ impl ChittaField {
                 }
                 let status_mul = status_score_multiplier(&state.status)?;
                 let epistemic_mul = epistemic_score_multiplier(&state.epistemic_status);
+                let kind_mul = realm_kind_multiplier(&payload.kind);
                 let eff_strength = state.effective_strength(now);
                 let strength_factor = 0.5 + 0.5 * eff_strength;
                 let base = hit.bm25_score * strength_factor * state.confidence;
                 Some(RecallHit {
                     memory_id: hit.memory_id,
-                    score: base * status_mul * epistemic_mul,
+                    score: base * status_mul * epistemic_mul * kind_mul,
                     semantic_score: 0.0,
                     ts_ms: payload.authored_at_ms,
                     kind: payload.kind.clone(),
