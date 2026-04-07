@@ -33,6 +33,10 @@ pub enum Op {
     RecordRecallBatch(RecordRecallBatchOp),
     StrengthenAssocEdge(StrengthenAssocEdgeOp),
     MsgEvent(MsgEventOp),
+    SkillUpload(SkillUploadOp),
+    SkillDeprecate(SkillDeprecateOp),
+    AgentUpsert(AgentUpsertOp),
+    AgentDisable(AgentDisableOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -47,6 +51,10 @@ pub const OP_UPDATE_MEMORY_CONTENT: u8 = 24;
 pub const OP_RECORD_RECALL_BATCH: u8 = 25;
 pub const OP_STRENGTHEN_ASSOC_EDGE: u8 = 26;
 pub const OP_MSG_EVENT: u8 = 27;
+pub const OP_SKILL_UPLOAD: u8 = 28;
+pub const OP_SKILL_DEPRECATE: u8 = 29;
+pub const OP_AGENT_UPSERT: u8 = 30;
+pub const OP_AGENT_DISABLE: u8 = 31;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -354,4 +362,35 @@ pub struct MsgEventOp {
     pub payload_json: Vec<u8>,
     pub realm: String,
     pub ts_ms: i64,
+}
+
+/// Upload a new version of a skill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillUploadOp {
+    pub skill_id: String,
+    pub content: String,
+    pub uploaded_by: String,
+    pub tags: Vec<String>,
+    pub ts_ms: i64,
+}
+
+/// Deprecate a skill (marks latest version).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillDeprecateOp {
+    pub skill_id: String,
+}
+
+/// Register or update an agent identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentUpsertOp {
+    pub agent_id: String,
+    pub display_name: String,
+    pub description: String,
+    pub ts_ms: i64,
+}
+
+/// Disable (revoke) an agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentDisableOp {
+    pub agent_id: String,
 }

@@ -18,6 +18,13 @@ pub enum FieldError {
     #[error("Truncated entry at seqno {seqno}")]
     TruncatedEntry { seqno: u64 },
 
+    #[error("Chain hash mismatch at seqno {seqno}: expected {expected}, got {actual}")]
+    ChainMismatch {
+        seqno: u64,
+        expected: String,
+        actual: String,
+    },
+
     #[error("Memory {0} not found")]
     NotFound(u64),
 
