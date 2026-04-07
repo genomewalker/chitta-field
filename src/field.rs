@@ -15,7 +15,9 @@ use crate::organ::cortex::{CorticalIndex, SparseCode, SparseEncoder};
 use crate::organ::hopfield::HopfieldNetwork;
 use crate::organ::keyword::KeywordIndex;
 use crate::organ::lite_encoder::LiteEncoder;
+use crate::organ::agent::AgentRegistry;
 use crate::organ::msg::MsgRegistry;
+use crate::organ::skill::SkillRegistry;
 use crate::organ::pq::ProductQuantizer;
 use crate::organ::session::SessionRegistry;
 use crate::organ::symbol::{SymbolEntry, SymbolIndex};
@@ -119,6 +121,8 @@ pub struct ChittaField {
     pub(crate) theme_organ: RwLock<ThemeOrgan>,
     pub(crate) analytics_registry: RwLock<AnalyticsRegistry>,
     pub(crate) msg_registry: RwLock<MsgRegistry>,
+    pub(crate) skill_registry: RwLock<SkillRegistry>,
+    pub(crate) agent_registry: RwLock<AgentRegistry>,
     pub(crate) lite_encoder: RwLock<Option<LiteEncoder>>,
     /// Byte offsets for each foreign segment file, used by sync_foreign().
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
@@ -144,6 +148,11 @@ impl ChittaField {
         self.log.write().flush_buf()
     }
 
+    /// Return the current chain tip hash (SHA256). Zero if only V1 data.
+    pub fn chain_head(&self) -> crate::log::ChainHash {
+        self.log.read().chain_head()
+    }
+
     pub fn open(data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
         std::fs::create_dir_all(data_dir.join("segments"))?;
@@ -152,7 +161,7 @@ impl ChittaField {
         let instance_id = new_instance_id();
 
         // Open this instance's write log.
-        let log = OpLog::open(&data_dir, instance_id, 1)?;
+        let mut log = OpLog::open(&data_dir, instance_id, 1)?;
 
         // Allocators are partitioned by instance_id — no collision with other instances.
         let id_alloc = Arc::new(MemoryIdAllocator::with_instance(instance_id));
@@ -179,6 +188,8 @@ impl ChittaField {
         let mut theme_organ = ThemeOrgan::new();
         let mut analytics_registry = AnalyticsRegistry::new();
         let mut msg_registry = MsgRegistry::new();
+        let mut skill_registry = SkillRegistry::new();
+        let mut agent_registry = AgentRegistry::new();
         let mut chunk_hash_idx: HashMap<crate::ids::ChunkHash, MemoryId> = HashMap::new();
         let mut snapshot_coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats> = HashMap::new();
 
@@ -345,6 +356,8 @@ impl ChittaField {
                 &mut theme_organ,
                 &mut analytics_registry,
                 &mut msg_registry,
+                &mut skill_registry,
+                &mut agent_registry,
                 &mut chunk_hash_idx,
                 &mut replay_realm_members,
                 &mut replay_coactivation_stats,
@@ -431,6 +444,8 @@ impl ChittaField {
             theme_organ: RwLock::new(theme_organ),
             analytics_registry: RwLock::new(analytics_registry),
             msg_registry: RwLock::new(msg_registry),
+            skill_registry: RwLock::new(skill_registry),
+            agent_registry: RwLock::new(agent_registry),
             lite_encoder: RwLock::new(loaded_lite_encoder),
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
@@ -514,6 +529,8 @@ impl ChittaField {
         let mut theme_organ = self.theme_organ.write();
         let mut analytics_reg = self.analytics_registry.write();
         let mut msg_reg = self.msg_registry.write();
+        let mut skill_reg = self.skill_registry.write();
+        let mut agent_reg = self.agent_registry.write();
         let mut chunk_hash_idx = self.chunk_hash_idx.write();
         let mut realm_members = self.realm_members.write();
         let mut coactivation_stats = self.coactivation_stats.write();
@@ -542,6 +559,8 @@ impl ChittaField {
                 &mut *theme_organ,
                 &mut *analytics_reg,
                 &mut *msg_reg,
+                &mut *skill_reg,
+                &mut *agent_reg,
                 &mut *chunk_hash_idx,
                 &mut *realm_members,
                 &mut *coactivation_stats,
@@ -687,6 +706,8 @@ pub(crate) fn apply_op(
     theme_organ: &mut ThemeOrgan,
     analytics_registry: &mut AnalyticsRegistry,
     msg_registry: &mut MsgRegistry,
+    skill_registry: &mut SkillRegistry,
+    agent_registry: &mut AgentRegistry,
     chunk_hash_idx: &mut HashMap<crate::ids::ChunkHash, MemoryId>,
     realm_members: &mut HashMap<String, HashSet<MemoryId>>,
     coactivation_stats: &mut HashMap<(MemoryId, MemoryId), CoActivationStats>,
@@ -1125,6 +1146,18 @@ pub(crate) fn apply_op(
                 realm: ev.realm,
                 ts_ms: ev.ts_ms,
             });
+        }
+        Op::SkillUpload(s) => {
+            skill_registry.upload(&s.skill_id, &s.content, &s.uploaded_by, &s.tags, s.ts_ms);
+        }
+        Op::SkillDeprecate(s) => {
+            skill_registry.deprecate(&s.skill_id);
+        }
+        Op::AgentUpsert(a) => {
+            agent_registry.upsert(&a.agent_id, &a.display_name, &a.description, a.ts_ms);
+        }
+        Op::AgentDisable(a) => {
+            agent_registry.disable(&a.agent_id);
         }
     }
 }

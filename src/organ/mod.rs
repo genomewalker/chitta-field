@@ -17,3 +17,5 @@ pub mod theme_organ;
 pub mod transcript;
 pub mod triplet;
 pub mod user_model;
+pub mod skill;
+pub mod agent;

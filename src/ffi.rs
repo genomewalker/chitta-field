@@ -5,9 +5,10 @@
 
 use crate::field::ChittaField;
 use crate::ops::{
-    AnalyticsEventOp, ClearProjectOp, EdgeType, MsgEventOp, Op, RecordRecallBatchOp,
-    SessionEventOp, TaskEventOp, ThemeEventOp, TranscriptEventOp, UpdateMemoryContentOp,
-    UpdateSymbolDescriptionOp, UserModelEventOp,
+    AgentDisableOp, AgentUpsertOp, AnalyticsEventOp, ClearProjectOp, EdgeType, MsgEventOp, Op,
+    RecordRecallBatchOp, SessionEventOp, SkillDeprecateOp, SkillUploadOp, TaskEventOp,
+    ThemeEventOp, TranscriptEventOp, UpdateMemoryContentOp, UpdateSymbolDescriptionOp,
+    UserModelEventOp,
 };
 use crate::recall::RecallHit;
 use serde_json;
@@ -109,6 +110,31 @@ pub extern "C" fn cf_last_error(h: *const CfHandle) -> *const c_char {
             .as_ref()
             .map(|s| s.as_ptr())
             .unwrap_or(std::ptr::null())
+    }
+}
+
+// ── Chain integrity ──────────────────────────────────────────────────────────
+
+/// Copy the current chain tip hash (32 bytes) into `out`.
+/// Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn cf_chain_head(h: *const CfHandle, out: *mut u8) -> c_int {
+    if h.is_null() || out.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let head = handle.field.chain_head();
+    unsafe {
+        std::ptr::copy_nonoverlapping(head.as_ptr(), out, 32);
+    }
+    0
+}
+
+/// Free a string returned by cf_* functions (e.g. cf_skill_read, cf_agent_get).
+#[no_mangle]
+pub extern "C" fn cf_free_string(s: *mut c_char) {
+    if !s.is_null() {
+        unsafe { drop(CString::from_raw(s)); }
     }
 }
 
@@ -1540,7 +1566,7 @@ pub extern "C" fn cf_iterate_log(
         return -1;
     }
     let handle = unsafe { &mut *h };
-    let result = handle.field.log.read().replay(from_seqno, |seqno, op| {
+    let result = handle.field.log.write().replay(from_seqno, |seqno, op| {
         let json = serde_json::to_vec(&op).unwrap_or_default();
         callback(json.as_ptr(), json.len(), seqno, ctx);
         Ok(())
@@ -5573,4 +5599,223 @@ pub extern "C" fn cf_adapt_vigilance(h: *mut CfHandle, avg_error: f32) -> c_int 
     let handle = unsafe { &mut *h };
     handle.field.cortical_idx.write().adapt_vigilance(avg_error);
     0
+}
+
+// ── Skill Registry FFI ──────────────────────────────────────────────────────
+
+/// Upload a new skill version. Returns the assigned version number, or -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_skill_upload(
+    h: *mut CfHandle,
+    skill_id: *const c_char,
+    content: *const c_char,
+    uploaded_by: *const c_char,
+    tags_json: *const c_char,
+    ts_ms: i64,
+) -> c_int {
+    if h.is_null() || skill_id.is_null() || content.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let skill_id_str = unsafe { match CStr::from_ptr(skill_id).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+    let content_str = unsafe { match CStr::from_ptr(content).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+    let uploaded_by_str = if uploaded_by.is_null() { "" } else {
+        unsafe { match CStr::from_ptr(uploaded_by).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } }
+    };
+    let tags: Vec<String> = if tags_json.is_null() {
+        Vec::new()
+    } else {
+        let tags_str = unsafe { match CStr::from_ptr(tags_json).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+        serde_json::from_str(tags_str).unwrap_or_default()
+    };
+
+    let op = Op::SkillUpload(SkillUploadOp {
+        skill_id: skill_id_str.to_string(),
+        content: content_str.to_string(),
+        uploaded_by: uploaded_by_str.to_string(),
+        tags: tags.clone(),
+        ts_ms,
+    });
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    let version = handle.field.skill_registry.write().upload(skill_id_str, content_str, uploaded_by_str, &tags, ts_ms);
+    version as c_int
+}
+
+/// Read a skill version as JSON. version=0 means latest.
+#[no_mangle]
+pub extern "C" fn cf_skill_read(
+    h: *const CfHandle,
+    skill_id: *const c_char,
+    version: u32,
+) -> *mut c_char {
+    if h.is_null() || skill_id.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let skill_id_str = unsafe { match CStr::from_ptr(skill_id).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let reg = handle.field.skill_registry.read();
+    match reg.read(skill_id_str, version) {
+        Some(sv) => {
+            let json = serde_json::to_string(sv).unwrap_or_default();
+            CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// List all skills as JSON array of {skill_id, latest_version}.
+#[no_mangle]
+pub extern "C" fn cf_skill_list(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let reg = handle.field.skill_registry.read();
+    let list: Vec<serde_json::Value> = reg.list().iter().map(|(id, ver)| {
+        serde_json::json!({"skill_id": id, "latest_version": ver})
+    }).collect();
+    let json = serde_json::to_string(&list).unwrap_or_default();
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Search skills by query. Returns JSON array.
+#[no_mangle]
+pub extern "C" fn cf_skill_search(
+    h: *const CfHandle,
+    query: *const c_char,
+    limit: usize,
+) -> *mut c_char {
+    if h.is_null() || query.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let query_str = unsafe { match CStr::from_ptr(query).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let reg = handle.field.skill_registry.read();
+    let results = reg.search(query_str, if limit == 0 { 20 } else { limit });
+    let json = serde_json::to_string(&results).unwrap_or_default();
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Deprecate a skill.
+#[no_mangle]
+pub extern "C" fn cf_skill_deprecate(
+    h: *mut CfHandle,
+    skill_id: *const c_char,
+) -> c_int {
+    if h.is_null() || skill_id.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let skill_id_str = unsafe { match CStr::from_ptr(skill_id).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+    let op = Op::SkillDeprecate(SkillDeprecateOp { skill_id: skill_id_str.to_string() });
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    if handle.field.skill_registry.write().deprecate(skill_id_str) { 0 } else { -1 }
+}
+
+// ── Agent Registry FFI ──────────────────────────────────────────────────────
+
+/// Register or update an agent. Returns 1 if newly created, 0 if updated, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_agent_upsert(
+    h: *mut CfHandle,
+    agent_id: *const c_char,
+    display_name: *const c_char,
+    description: *const c_char,
+    ts_ms: i64,
+) -> c_int {
+    if h.is_null() || agent_id.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let agent_id_str = unsafe { match CStr::from_ptr(agent_id).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+    let name_str = if display_name.is_null() { "" } else {
+        unsafe { match CStr::from_ptr(display_name).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } }
+    };
+    let desc_str = if description.is_null() { "" } else {
+        unsafe { match CStr::from_ptr(description).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } }
+    };
+
+    let op = Op::AgentUpsert(AgentUpsertOp {
+        agent_id: agent_id_str.to_string(),
+        display_name: name_str.to_string(),
+        description: desc_str.to_string(),
+        ts_ms,
+    });
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    let is_new = handle.field.agent_registry.write().upsert(agent_id_str, name_str, desc_str, ts_ms);
+    if is_new { 1 } else { 0 }
+}
+
+/// Record activity for an agent (increments memory count).
+#[no_mangle]
+pub extern "C" fn cf_agent_record_activity(
+    h: *mut CfHandle,
+    agent_id: *const c_char,
+    ts_ms: i64,
+) -> c_int {
+    if h.is_null() || agent_id.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let agent_id_str = unsafe { match CStr::from_ptr(agent_id).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+    handle.field.agent_registry.write().record_activity(agent_id_str, ts_ms);
+    handle.ok()
+}
+
+/// Record a new session for an agent.
+#[no_mangle]
+pub extern "C" fn cf_agent_record_session(
+    h: *mut CfHandle,
+    agent_id: *const c_char,
+    ts_ms: i64,
+) -> c_int {
+    if h.is_null() || agent_id.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let agent_id_str = unsafe { match CStr::from_ptr(agent_id).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+    handle.field.agent_registry.write().record_session(agent_id_str, ts_ms);
+    handle.ok()
+}
+
+/// Get an agent record as JSON. Returns null if not found.
+#[no_mangle]
+pub extern "C" fn cf_agent_get(
+    h: *const CfHandle,
+    agent_id: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || agent_id.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let agent_id_str = unsafe { match CStr::from_ptr(agent_id).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let reg = handle.field.agent_registry.read();
+    match reg.get(agent_id_str) {
+        Some(rec) => {
+            let json = serde_json::to_string(rec).unwrap_or_default();
+            CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// List all agents as JSON array.
+#[no_mangle]
+pub extern "C" fn cf_agent_list(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let reg = handle.field.agent_registry.read();
+    let list = reg.list();
+    let json = serde_json::to_string(&list).unwrap_or_default();
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Disable (revoke) an agent.
+#[no_mangle]
+pub extern "C" fn cf_agent_disable(
+    h: *mut CfHandle,
+    agent_id: *const c_char,
+) -> c_int {
+    if h.is_null() || agent_id.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let agent_id_str = unsafe { match CStr::from_ptr(agent_id).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+    let op = Op::AgentDisable(AgentDisableOp { agent_id: agent_id_str.to_string() });
+    let result = handle.field.log.write().append(&op);
+    if let Err(e) = result {
+        return handle.err(e);
+    }
+    if handle.field.agent_registry.write().disable(agent_id_str) { 0 } else { -1 }
 }
