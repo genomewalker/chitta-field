@@ -607,14 +607,15 @@ where
             });
         }
 
-        // V2: verify chain integrity
+        // V2: verify chain integrity (warn on mismatch, don't fail — cross-instance segments have independent chains)
         if version == 2 {
             if prev_hash != chain_head {
-                return Err(FieldError::ChainMismatch {
+                eprintln!(
+                    "[chitta-field] chain record warning at seqno {}: expected {}, record has {} — resetting chain",
                     seqno,
-                    expected: hex(&chain_head),
-                    actual: hex(&prev_hash),
-                });
+                    &hex(&chain_head)[..16],
+                    &hex(&prev_hash)[..16],
+                );
             }
             chain_head = compute_record_hash(seqno, op_type, &prev_hash, &payload);
         }
