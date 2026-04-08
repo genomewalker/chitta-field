@@ -2285,14 +2285,14 @@ mod tests {
         let hits = field.recall_semantic(&emb, 5, Some("test")).unwrap();
         let hit = hits.iter().find(|h| h.memory_id == id).expect("memory must be recalled");
 
-        // Score now includes PoE domain reliability multiplier.
-        // For a freshly stored "wisdom" memory in "test" realm with no corrections,
-        // reliability = DEFAULT (0.925). Verify decomposition holds.
+        // Score includes PoE domain reliability and kind-based multipliers.
+        // "wisdom" kind → kind_mul = 1.1, "test" realm with no corrections → default reliability.
         let poe_mul = field.learners.read().domain_reliability.reliability("test");
-        let expected = hit.semantic_weight * hit.strength_factor * hit.confidence * hit.status_mul * hit.epistemic_mul * poe_mul;
+        let kind_mul = 1.1f32; // realm_kind_multiplier("wisdom")
+        let expected = hit.semantic_weight * hit.strength_factor * hit.confidence * hit.status_mul * hit.epistemic_mul * poe_mul * kind_mul;
         assert!(
             (hit.score - expected).abs() < 1e-4,
-            "score ({}) must equal semantic_weight * strength_factor * confidence * status_mul * epistemic_mul * poe_mul ({})",
+            "score ({}) must equal semantic_weight * strength_factor * confidence * status_mul * epistemic_mul * poe_mul * kind_mul ({})",
             hit.score, expected
         );
     }
