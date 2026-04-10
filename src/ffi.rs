@@ -68,6 +68,8 @@ fn write_hits(hits: Vec<RecallHit>, buf: *mut CfRecallHit, cap: usize, written: 
                 actr_activation: h.actr_activation,
                 surprise_boost: h.surprise_boost,
                 arousal_boost: h.arousal_boost,
+                mood_congruence: h.mood_congruence,
+                frustration_boost: h.frustration_boost,
             };
         }
     }
@@ -341,6 +343,8 @@ pub struct CfRecallHit {
     pub actr_activation: f32,
     pub surprise_boost: f32,
     pub arousal_boost: f32,
+    pub mood_congruence: f32,
+    pub frustration_boost: f32,
 }
 
 /// Output buffer for recall results. Caller allocates hits_buf with capacity hits_cap.
@@ -374,6 +378,48 @@ pub extern "C" fn cf_recall_semantic(
     };
 
     match handle.field.recall_semantic(embedding, k, realm_str) {
+        Ok(hits) => {
+            write_hits(hits, hits_buf, hits_cap, hits_written);
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Semantic recall with affective context for mood-congruent retrieval.
+/// `query_valence` and `query_arousal` are NaN to disable affect matching.
+#[no_mangle]
+pub extern "C" fn cf_recall_semantic_ctx(
+    h: *mut CfHandle,
+    query_embedding: *const f32,
+    embedding_len: usize,
+    realm: *const c_char,
+    k: usize,
+    query_valence: f32,
+    query_arousal: f32,
+    hits_buf: *mut CfRecallHit,
+    hits_cap: usize,
+    hits_written: *mut usize,
+) -> c_int {
+    if h.is_null() || hits_buf.is_null() || hits_written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let embedding = unsafe { std::slice::from_raw_parts(query_embedding, embedding_len) };
+    let realm_str = if realm.is_null() {
+        None
+    } else {
+        unsafe {
+            match CStr::from_ptr(realm).to_str() {
+                Ok(s) => Some(s),
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+    let qv = if query_valence.is_nan() { None } else { Some(query_valence) };
+    let qa = if query_arousal.is_nan() { None } else { Some(query_arousal) };
+
+    match handle.field.recall_semantic_ctx(embedding, k, realm_str, qv, qa) {
         Ok(hits) => {
             write_hits(hits, hits_buf, hits_cap, hits_written);
             handle.ok()
@@ -5627,6 +5673,8 @@ pub extern "C" fn cf_search_attractor(
                 actr_activation: 0.0,
                 surprise_boost: 1.0,
                 arousal_boost: 1.0,
+                mood_congruence: 1.0,
+                frustration_boost: 1.0,
             };
         }
     }
