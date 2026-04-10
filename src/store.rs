@@ -13,7 +13,8 @@ use crate::organ::symbol::SymbolEntry;
 use crate::organ::triplet::TripletEntry;
 use crate::payload::MemoryPayload;
 use crate::recall::RecallHit;
-use crate::state::{EpistemicStatus, MemoryState, MemoryStatus};
+use crate::scoring::{RecallMode, ScoringContext};
+use crate::state::MemoryState;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,43 +76,9 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// Score multiplier derived from memory status.
-/// Superseded/Contradicted/Archived return None → excluded from recall.
-/// Active=1.0, Verified=1.15, Observed=0.85, Proposed=0.65.
-fn status_score_multiplier(status: &MemoryStatus) -> Option<f32> {
-    match status {
-        MemoryStatus::Active       => Some(1.00),
-        MemoryStatus::Verified     => Some(1.15),
-        MemoryStatus::Observed     => Some(0.85),
-        MemoryStatus::Proposed     => Some(0.65),
-        MemoryStatus::Superseded   => None,
-        MemoryStatus::Contradicted => None,
-        MemoryStatus::Archived     => None,
-    }
-}
-
-/// Score multiplier based on memory kind for tiered recall prioritization.
-/// Corrections and preferences are high-signal; episodes are low-signal noise.
-fn realm_kind_multiplier(kind: &str) -> f32 {
-    match kind {
-        "correction" | "preference" => 1.3,
-        "wisdom"                    => 1.1,
-        "insight"                   => 1.05,
-        "episode"                   => 0.7,
-        _                           => 1.0,
-    }
-}
-
-/// Score multiplier derived from epistemic status.
-/// UserStated=1.0, ToolDerived=0.95, ModelInferred=0.85, AutonomousSynthesis=0.75.
-fn epistemic_score_multiplier(es: &EpistemicStatus) -> f32 {
-    match es {
-        EpistemicStatus::UserStated          => 1.00,
-        EpistemicStatus::ToolDerived         => 0.95,
-        EpistemicStatus::ModelInferred       => 0.85,
-        EpistemicStatus::AutonomousSynthesis => 0.75,
-    }
-}
+// Score multipliers are now driven by the ScoringPipeline (see scoring/mod.rs).
+// Status, kind, and epistemic multipliers live in scoring/config.rs and are
+// configurable via scoring.json at runtime.
 
 /// Compute embedding geometry stats for a group of embeddings.
 /// Returns JSON value with group name, count, effective_dim, isotropy, mean_cosine_sim.
@@ -708,6 +675,8 @@ impl ChittaField {
 
         let states = self.states.read();
         let payloads = self.payloads.read();
+        let pipeline = self.scoring_pipeline.read();
+        let learners = self.learners.read();
 
         let mut hits: Vec<RecallHit> = semantic_hits
             .into_iter()
@@ -717,62 +686,28 @@ impl ChittaField {
                 if state.deleted {
                     return None;
                 }
-                // soul:* realms are internal synthesis artifacts — exclude from unscoped
-                // queries so they never compete with domain memories in brahman recall.
-                // Only surfaced when the caller explicitly targets a soul:* realm.
-                let payload_realm = payloads.get(&memory_id).map(|p| p.realm.as_str()).unwrap_or("");
-                if payload_realm.starts_with("soul:") && realm.map(|r| !r.starts_with("soul:")).unwrap_or(true) {
+                let payload = payloads.get(&memory_id)?;
+                // soul:* realms are internal — exclude from unscoped queries.
+                if payload.realm.starts_with("soul:") && realm.map(|r| !r.starts_with("soul:")).unwrap_or(true) {
                     return None;
                 }
-                // Exclude semantically invalidated statuses; apply score modifiers for the rest.
-                let status_mul = status_score_multiplier(&state.status)?;
-                let epistemic_mul = epistemic_score_multiplier(&state.epistemic_status);
-                let payload = payloads.get(&memory_id)?;
+                let ctx = ScoringContext {
+                    relevance_score: hit.cosine_similarity,
+                    recall_mode: RecallMode::Semantic,
+                    state,
+                    kind: &payload.kind,
+                    realm: &payload.realm,
+                    realm_reliability: learners.domain_reliability.reliability(&payload.realm),
+                    now_ms: now,
+                    query_valence,
+                    query_arousal,
+                };
+                let (score, decomp) = pipeline.score(&ctx)?;
                 let eff_strength = state.effective_strength(now);
-                let semantic_score = hit.cosine_similarity;
-                let semantic_weight = ((semantic_score + 1.0) / 2.0).max(0.0);
-                let strength_factor = 0.5 + 0.5 * eff_strength;
-                // ACT-R: power-law base-level activation (Anderson & Schooler 1991)
-                let actr_activation = state.actr_base_level_activation(now);
-                let actr_factor = 0.3 + 0.7 * actr_activation; // [0.3, 1.0]
-                // FEP: prediction error weighting — high-surprise memories are novel
-                let surprise_boost = 1.0 + 0.25 * state.surprise; // [1.0, 1.25]
-                // Flashbulb: high-arousal memories resist forgetting
-                let arousal_boost = 1.0 + 0.15 * state.affect_arousal; // [1.0, 1.15]
-                // Mood-congruent recall (Bower 1981): memories matching the
-                // query's affect get boosted. Valence match weighted by the
-                // max arousal of query and memory (intense moods amplify).
-                let mood_congruence = match (query_valence, query_arousal) {
-                    (Some(qv), Some(qa)) if qa > 0.1 => {
-                        let valence_match = 1.0 - (qv - state.affect_valence).abs(); // [0, 2] → [-1, 1]
-                        let intensity = qa.max(state.affect_arousal);
-                        1.0 + 0.2 * valence_match.max(0.0) * intensity // [1.0, 1.2]
-                    }
-                    _ => 1.0,
-                };
-                // Frustration-escalation: negative valence + high arousal =
-                // frustrated caller. Boost corrections/preferences to surface
-                // fixes for repeated mistakes.
-                let frustration_boost = match (query_valence, query_arousal) {
-                    (Some(qv), Some(qa)) if qv < -0.3 && qa > 0.4 => {
-                        let frustration = (-qv - 0.3).min(0.7) * (qa - 0.4).min(0.6);
-                        match payload.kind.as_str() {
-                            "correction" => 1.0 + 1.5 * frustration, // up to ~1.63
-                            "preference" => 1.0 + 1.0 * frustration, // up to ~1.42
-                            _ => 1.0,
-                        }
-                    }
-                    _ => 1.0,
-                };
-                let base = semantic_weight * actr_factor * state.confidence
-                    * surprise_boost * arousal_boost * mood_congruence * frustration_boost;
-                // PoE: apply per-realm reliability multiplier
-                let poe_mul = self.learners.read().domain_reliability.reliability(&payload.realm);
-                let kind_mul = realm_kind_multiplier(&payload.kind);
                 Some(RecallHit {
                     memory_id,
-                    score: base * status_mul * epistemic_mul * poe_mul * kind_mul,
-                    semantic_score,
+                    score,
+                    semantic_score: hit.cosine_similarity,
                     ts_ms: payload.authored_at_ms,
                     kind: payload.kind.clone(),
                     realm: payload.realm.clone(),
@@ -780,17 +715,17 @@ impl ChittaField {
                     confidence: state.confidence,
                     access_count: state.access_count,
                     content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
-                    semantic_weight,
-                    status_mul,
-                    epistemic_mul,
-                    strength_factor,
+                    semantic_weight: decomp.semantic_weight,
+                    status_mul: decomp.status_mul,
+                    epistemic_mul: decomp.epistemic_mul,
+                    strength_factor: decomp.strength_factor,
                     affect_valence: state.affect_valence,
                     affect_arousal: state.affect_arousal,
-                    actr_activation,
-                    surprise_boost,
-                    arousal_boost,
-                    mood_congruence,
-                    frustration_boost,
+                    actr_activation: decomp.actr_activation,
+                    surprise_boost: decomp.surprise_boost,
+                    arousal_boost: decomp.arousal_boost,
+                    mood_congruence: decomp.mood_congruence,
+                    frustration_boost: decomp.frustration_boost,
                 })
             })
             .collect();
@@ -805,6 +740,8 @@ impl ChittaField {
         let hit_ids: Vec<MemoryId> = hits.iter().map(|h| h.memory_id).collect();
         drop(states);
         drop(payloads);
+        drop(pipeline);
+        drop(learners);
         self.enqueue_recall_effects(&hit_ids);
 
         Ok(hits)
@@ -1033,6 +970,8 @@ impl ChittaField {
         let now = now_ms();
         let states = self.states.read();
         let payloads = self.payloads.read();
+        let pipeline = self.scoring_pipeline.read();
+        let learners = self.learners.read();
 
         let mut hits: Vec<RecallHit> = keyword_hits
             .into_iter()
@@ -1041,45 +980,26 @@ impl ChittaField {
                 if state.deleted {
                     return None;
                 }
-                // soul:* realms are internal synthesis artifacts — exclude from unscoped recall.
                 let payload = payloads.get(&hit.memory_id)?;
                 if payload.realm.starts_with("soul:") {
                     return None;
                 }
-                let status_mul = status_score_multiplier(&state.status)?;
-                let epistemic_mul = epistemic_score_multiplier(&state.epistemic_status);
-                let kind_mul = realm_kind_multiplier(&payload.kind);
+                let ctx = ScoringContext {
+                    relevance_score: hit.bm25_score,
+                    recall_mode: RecallMode::Keyword,
+                    state,
+                    kind: &payload.kind,
+                    realm: &payload.realm,
+                    realm_reliability: learners.domain_reliability.reliability(&payload.realm),
+                    now_ms: now,
+                    query_valence,
+                    query_arousal,
+                };
+                let (score, decomp) = pipeline.score(&ctx)?;
                 let eff_strength = state.effective_strength(now);
-                let strength_factor = 0.5 + 0.5 * eff_strength;
-                // ACT-R + FEP + flashbulb (same as semantic path)
-                let actr_activation = state.actr_base_level_activation(now);
-                let actr_factor = 0.3 + 0.7 * actr_activation;
-                let surprise_boost = 1.0 + 0.25 * state.surprise;
-                let arousal_boost = 1.0 + 0.15 * state.affect_arousal;
-                let mood_congruence = match (query_valence, query_arousal) {
-                    (Some(qv), Some(qa)) if qa > 0.1 => {
-                        let valence_match = 1.0 - (qv - state.affect_valence).abs();
-                        let intensity = qa.max(state.affect_arousal);
-                        1.0 + 0.2 * valence_match.max(0.0) * intensity
-                    }
-                    _ => 1.0,
-                };
-                let frustration_boost = match (query_valence, query_arousal) {
-                    (Some(qv), Some(qa)) if qv < -0.3 && qa > 0.4 => {
-                        let frustration = (-qv - 0.3).min(0.7) * (qa - 0.4).min(0.6);
-                        match payload.kind.as_str() {
-                            "correction" => 1.0 + 1.5 * frustration,
-                            "preference" => 1.0 + 1.0 * frustration,
-                            _ => 1.0,
-                        }
-                    }
-                    _ => 1.0,
-                };
-                let base = hit.bm25_score * actr_factor * state.confidence
-                    * surprise_boost * arousal_boost * mood_congruence * frustration_boost;
                 Some(RecallHit {
                     memory_id: hit.memory_id,
-                    score: base * status_mul * epistemic_mul * kind_mul,
+                    score,
                     semantic_score: 0.0,
                     ts_ms: payload.authored_at_ms,
                     kind: payload.kind.clone(),
@@ -1088,17 +1008,17 @@ impl ChittaField {
                     confidence: state.confidence,
                     access_count: state.access_count,
                     content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
-                    semantic_weight: hit.bm25_score,
-                    status_mul,
-                    epistemic_mul,
-                    strength_factor,
+                    semantic_weight: decomp.semantic_weight,
+                    status_mul: decomp.status_mul,
+                    epistemic_mul: decomp.epistemic_mul,
+                    strength_factor: decomp.strength_factor,
                     affect_valence: state.affect_valence,
                     affect_arousal: state.affect_arousal,
-                    actr_activation,
-                    surprise_boost,
-                    arousal_boost,
-                    mood_congruence,
-                    frustration_boost,
+                    actr_activation: decomp.actr_activation,
+                    surprise_boost: decomp.surprise_boost,
+                    arousal_boost: decomp.arousal_boost,
+                    mood_congruence: decomp.mood_congruence,
+                    frustration_boost: decomp.frustration_boost,
                 })
             })
             .collect();
@@ -1113,6 +1033,8 @@ impl ChittaField {
         let hit_ids: Vec<MemoryId> = hits.iter().map(|h| h.memory_id).collect();
         drop(states);
         drop(payloads);
+        drop(pipeline);
+        drop(learners);
         self.enqueue_recall_effects(&hit_ids);
 
         Ok(hits)

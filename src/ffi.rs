@@ -5592,6 +5592,32 @@ pub extern "C" fn cf_compact_wal(h: *mut CfHandle) -> i64 {
     }
 }
 
+// ── Scoring Pipeline Config FFI ───────────────────────────────────────────────
+
+/// Reload scoring config from scoring.json in the data directory.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_reload_scoring_config(h: *mut CfHandle) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let config = crate::scoring::config::ScoringConfig::load(&handle.field.data_dir);
+    handle.field.scoring_pipeline.write().reload_config(config);
+    0
+}
+
+/// Save current scoring config to scoring.json for inspection/editing.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_save_scoring_config(h: *const CfHandle) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let pipeline = handle.field.scoring_pipeline.read();
+    match pipeline.config.save(&handle.field.data_dir) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
 // ── FEP Attractor Network FFI ────────────────────────────────────────────────
 
 /// Get reconstruction error (surprise) for a memory. Returns value in [0,1].
