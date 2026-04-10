@@ -21,4 +21,8 @@ pub struct RecallHit {
     /// Affect dimensions (Anthropic emotion vectors 2026)
     pub affect_valence: f32,
     pub affect_arousal: f32,
+    /// Cognitive scoring decomposition (ACT-R / FEP / flashbulb)
+    pub actr_activation: f32,
+    pub surprise_boost: f32,
+    pub arousal_boost: f32,
 }

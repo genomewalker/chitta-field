@@ -23,6 +23,9 @@ typedef struct {
     float    strength_factor;
     float    affect_valence;
     float    affect_arousal;
+    float    actr_activation;
+    float    surprise_boost;
+    float    arousal_boost;
 } CfRecallHit;
 
 /* Lifecycle */

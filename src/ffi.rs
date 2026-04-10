@@ -65,6 +65,9 @@ fn write_hits(hits: Vec<RecallHit>, buf: *mut CfRecallHit, cap: usize, written: 
                 strength_factor: h.strength_factor,
                 affect_valence: h.affect_valence,
                 affect_arousal: h.affect_arousal,
+                actr_activation: h.actr_activation,
+                surprise_boost: h.surprise_boost,
+                arousal_boost: h.arousal_boost,
             };
         }
     }
@@ -335,6 +338,9 @@ pub struct CfRecallHit {
     pub strength_factor: f32,
     pub affect_valence: f32,
     pub affect_arousal: f32,
+    pub actr_activation: f32,
+    pub surprise_boost: f32,
+    pub arousal_boost: f32,
 }
 
 /// Output buffer for recall results. Caller allocates hits_buf with capacity hits_cap.
@@ -5618,6 +5624,9 @@ pub extern "C" fn cf_search_attractor(
                 strength_factor: 1.0,
                 affect_valence: 0.0,
                 affect_arousal: 0.0,
+                actr_activation: 0.0,
+                surprise_boost: 1.0,
+                arousal_boost: 1.0,
             };
         }
     }
