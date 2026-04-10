@@ -133,6 +133,7 @@ pub struct ChittaField {
     /// Asymmetric Hopfield network for energy-based attractor recall. FEP §3.2.
     pub(crate) hopfield: RwLock<HopfieldNetwork>,
     pub(crate) filter_level: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    pub(crate) scoring_pipeline: RwLock<crate::scoring::ScoringPipeline>,
 }
 
 impl Drop for ChittaField {
@@ -410,6 +411,7 @@ impl ChittaField {
 
         let loaded_lite_encoder = Self::load_lite_encoder(&data_dir);
         let loaded_seen_offsets = Self::load_seen_offsets(&data_dir, instance_id);
+        let scoring_config = crate::scoring::config::ScoringConfig::load(&data_dir);
 
         Ok(Self {
             data_dir,
@@ -454,6 +456,7 @@ impl ChittaField {
             coactivation_stats: RwLock::new(replay_coactivation_stats),
             hopfield: RwLock::new(HopfieldNetwork::new()),
             filter_level: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            scoring_pipeline: RwLock::new(crate::scoring::ScoringPipeline::new(scoring_config)),
         })
     }
 }

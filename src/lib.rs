@@ -10,6 +10,7 @@ pub mod ops;
 pub mod organ;
 pub mod payload;
 pub mod recall;
+pub mod scoring;
 pub mod snapshot;
 pub mod state;
 pub mod store;
