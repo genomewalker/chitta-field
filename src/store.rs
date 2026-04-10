@@ -113,6 +113,103 @@ fn epistemic_score_multiplier(es: &EpistemicStatus) -> f32 {
     }
 }
 
+/// Compute embedding geometry stats for a group of embeddings.
+/// Returns JSON value with group name, count, effective_dim, isotropy, mean_cosine_sim.
+fn compute_geometry(embeddings: &[&[f32]], group_name: &str) -> Option<serde_json::Value> {
+    let n = embeddings.len();
+    if n < 2 {
+        return None;
+    }
+    let dim = EMBED_DIM;
+    let n_f = n as f64;
+
+    // Per-dimension mean
+    let mut mean = vec![0.0f64; dim];
+    for emb in embeddings {
+        for (i, &v) in emb.iter().enumerate() {
+            mean[i] += v as f64;
+        }
+    }
+    for m in &mut mean {
+        *m /= n_f;
+    }
+
+    // Per-dimension variance
+    let mut variance = vec![0.0f64; dim];
+    for emb in embeddings {
+        for (i, &v) in emb.iter().enumerate() {
+            let d = v as f64 - mean[i];
+            variance[i] += d * d;
+        }
+    }
+    for v in &mut variance {
+        *v /= n_f;
+    }
+
+    // Participation ratio: effective dimensionality
+    let sum_var: f64 = variance.iter().sum();
+    let sum_var_sq: f64 = variance.iter().map(|v| v * v).sum();
+    let effective_dim = if sum_var_sq > 1e-30 {
+        (sum_var * sum_var) / sum_var_sq
+    } else {
+        0.0
+    };
+    let isotropy = effective_dim / dim as f64;
+
+    // Mean pairwise cosine similarity (sample if large)
+    let max_pairs = 500usize;
+    let mut cos_sum = 0.0f64;
+    let mut pair_count = 0u64;
+    if n <= 32 {
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let dot: f64 = embeddings[i]
+                    .iter()
+                    .zip(embeddings[j].iter())
+                    .map(|(&a, &b)| a as f64 * b as f64)
+                    .sum();
+                cos_sum += dot;
+                pair_count += 1;
+            }
+        }
+    } else {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        group_name.hash(&mut h);
+        let mut seed = h.finish();
+        for _ in 0..max_pairs {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let i = (seed >> 32) as usize % n;
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let j = (seed >> 32) as usize % n;
+            if i == j {
+                continue;
+            }
+            let dot: f64 = embeddings[i]
+                .iter()
+                .zip(embeddings[j].iter())
+                .map(|(&a, &b)| a as f64 * b as f64)
+                .sum();
+            cos_sum += dot;
+            pair_count += 1;
+        }
+    }
+    let mean_cosine = if pair_count > 0 {
+        cos_sum / pair_count as f64
+    } else {
+        0.0
+    };
+
+    Some(serde_json::json!({
+        "group": group_name,
+        "count": n,
+        "effective_dim": (effective_dim * 10.0).round() / 10.0,
+        "isotropy": (isotropy * 1000.0).round() / 1000.0,
+        "mean_cosine_sim": (mean_cosine * 1000.0).round() / 1000.0,
+    }))
+}
+
 impl ChittaField {
     /// Store a new memory. Returns `(MemoryId, ChunkHash)`.
     pub fn put_memory(
@@ -1486,6 +1583,247 @@ impl ChittaField {
 
     pub fn prototype_count(&self) -> usize {
         self.cortical_idx.read().prototype_count()
+    }
+
+    /// Per-realm embedding geometry stats (inspired by "Geometry of Forgetting").
+    /// Returns JSON: `{"by_realm": [...], "by_kind": [...], "anomalies": [...]}`
+    pub fn spectral_stats_by_realm(&self) -> String {
+        let realm_members = self.realm_members.read();
+        let semantic_idx = self.semantic_idx.read();
+        let payloads = self.payloads.read();
+        let states = self.states.read();
+
+        // By realm
+        let mut realm_results: Vec<serde_json::Value> = Vec::new();
+        let mut realms: Vec<&String> = realm_members.keys().collect();
+        realms.sort();
+        for realm in realms {
+            let ids = match realm_members.get(realm.as_str()) {
+                Some(ids) if ids.len() >= 2 => ids,
+                _ => continue,
+            };
+            let embeddings: Vec<&[f32]> = ids
+                .iter()
+                .filter_map(|id| semantic_idx.get_embedding(*id))
+                .collect();
+            if let Some(stats) = compute_geometry(&embeddings, realm) {
+                realm_results.push(stats);
+            }
+        }
+
+        // By kind
+        let mut kind_ids: std::collections::HashMap<&str, Vec<MemoryId>> =
+            std::collections::HashMap::new();
+        for (mid, payload) in payloads.iter() {
+            if states.get(mid).map(|s| s.deleted).unwrap_or(true) {
+                continue;
+            }
+            kind_ids.entry(&payload.kind).or_default().push(*mid);
+        }
+        let mut kind_results: Vec<serde_json::Value> = Vec::new();
+        let mut kinds: Vec<&&str> = kind_ids.keys().collect();
+        kinds.sort();
+        for kind in kinds {
+            let ids = &kind_ids[*kind];
+            if ids.len() < 2 {
+                continue;
+            }
+            let embeddings: Vec<&[f32]> = ids
+                .iter()
+                .filter_map(|id| semantic_idx.get_embedding(*id))
+                .collect();
+            if let Some(stats) = compute_geometry(&embeddings, *kind) {
+                kind_results.push(stats);
+            }
+        }
+
+        // Anomalies
+        let mut anomalies: Vec<serde_json::Value> = Vec::new();
+        for entry in realm_results.iter().chain(kind_results.iter()) {
+            let label = entry["group"].as_str().unwrap_or("?");
+            let cos = entry["mean_cosine_sim"].as_f64().unwrap_or(0.0);
+            let iso = entry["isotropy"].as_f64().unwrap_or(1.0);
+            let count = entry["count"].as_u64().unwrap_or(0);
+            let has_newline = label.contains('\n') || label.contains('\r');
+            if cos > 0.95 && count >= 5 {
+                anomalies.push(serde_json::json!({
+                    "group": label, "issue": "high_similarity",
+                    "detail": format!("cos={:.3} across {} memories — likely duplicates", cos, count)
+                }));
+            }
+            if iso < 0.3 && count >= 5 {
+                anomalies.push(serde_json::json!({
+                    "group": label, "issue": "collapsed_embeddings",
+                    "detail": format!("isotropy={:.3} — embeddings occupy narrow subspace", iso)
+                }));
+            }
+            if has_newline {
+                anomalies.push(serde_json::json!({
+                    "group": label.trim(), "issue": "dirty_realm_name",
+                    "detail": "realm contains trailing whitespace/newline"
+                }));
+            }
+        }
+
+        serde_json::to_string(&serde_json::json!({
+            "by_realm": realm_results,
+            "by_kind": kind_results,
+            "anomalies": anomalies,
+        }))
+        .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Fix realm names that contain trailing whitespace/newlines.
+    /// Returns the number of memories whose realm was trimmed.
+    pub fn trim_realm_names(&self) -> usize {
+        // Collect dirty memories: (memory_id, old_realm, trimmed_realm)
+        let dirty: Vec<(MemoryId, String, String)> = {
+            let payloads = self.payloads.read();
+            let states = self.states.read();
+            payloads
+                .iter()
+                .filter_map(|(mid, p)| {
+                    if states.get(mid).map(|s| s.deleted).unwrap_or(true) {
+                        return None;
+                    }
+                    let trimmed = p.realm.trim().to_string();
+                    if trimmed != p.realm {
+                        Some((*mid, p.realm.clone(), trimmed))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        let count = dirty.len();
+        for (mid, old_realm, new_realm) in dirty {
+            // Update payload realm
+            if let Some(p) = self.payloads.write().get_mut(&mid) {
+                p.realm = new_realm.clone();
+            }
+            // Update realm_members index
+            let mut rm = self.realm_members.write();
+            if let Some(set) = rm.get_mut(&old_realm) {
+                set.remove(&mid);
+                if set.is_empty() {
+                    rm.remove(&old_realm);
+                }
+            }
+            rm.entry(new_realm).or_default().insert(mid);
+        }
+        count
+    }
+
+    /// Save a spectral stats snapshot for temporal drift tracking.
+    /// Writes `spectral_snapshot_{timestamp}.json` to the data dir.
+    pub fn save_spectral_snapshot(&self) -> Result<String> {
+        let stats_json = self.spectral_stats_by_realm();
+        let ts = now_ms();
+        let filename = format!("spectral_snapshot_{}.json", ts);
+        let path = self.data_dir.join(&filename);
+        let wrapped = serde_json::json!({
+            "ts_ms": ts,
+            "stats": serde_json::from_str::<serde_json::Value>(&stats_json).unwrap_or_default(),
+        });
+        let content = serde_json::to_string_pretty(&wrapped)
+            .map_err(|e| FieldError::Serialization(e.to_string()))?;
+        std::fs::write(&path, content)
+            .map_err(|e| FieldError::Io(e))?;
+        Ok(filename)
+    }
+
+    /// Load spectral drift: compare current stats with most recent snapshot.
+    /// Returns JSON with per-realm/kind delta for isotropy and mean_cosine_sim.
+    pub fn spectral_drift(&self) -> String {
+        // Find most recent snapshot
+        let entries = match std::fs::read_dir(&self.data_dir) {
+            Ok(e) => e,
+            Err(_) => return "{}".to_string(),
+        };
+        let mut snapshots: Vec<(i64, std::path::PathBuf)> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("spectral_snapshot_") && name.ends_with(".json") {
+                    let ts_str = name
+                        .strip_prefix("spectral_snapshot_")?
+                        .strip_suffix(".json")?;
+                    let ts: i64 = ts_str.parse().ok()?;
+                    Some((ts, e.path()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        snapshots.sort_by_key(|(ts, _)| -*ts);
+
+        let prev_snap = match snapshots.first() {
+            Some((_, path)) => {
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => return "{}".to_string(),
+                };
+                match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(v) => v,
+                    Err(_) => return "{}".to_string(),
+                }
+            }
+            None => return serde_json::json!({"error": "no previous snapshot"}).to_string(),
+        };
+
+        let prev_ts = prev_snap["ts_ms"].as_i64().unwrap_or(0);
+        let prev_stats = &prev_snap["stats"];
+
+        // Current stats
+        let current_json = self.spectral_stats_by_realm();
+        let current: serde_json::Value =
+            serde_json::from_str(&current_json).unwrap_or_default();
+
+        let mut drifts: Vec<serde_json::Value> = Vec::new();
+
+        for section in &["by_realm", "by_kind"] {
+            let prev_arr = prev_stats[section].as_array();
+            let curr_arr = current[section].as_array();
+            if let (Some(prev_items), Some(curr_items)) = (prev_arr, curr_arr) {
+                let prev_map: std::collections::HashMap<&str, &serde_json::Value> = prev_items
+                    .iter()
+                    .filter_map(|v| v["group"].as_str().map(|g| (g, v)))
+                    .collect();
+                for curr in curr_items {
+                    let group = match curr["group"].as_str() {
+                        Some(g) => g,
+                        None => continue,
+                    };
+                    if let Some(prev) = prev_map.get(group) {
+                        let iso_prev = prev["isotropy"].as_f64().unwrap_or(0.0);
+                        let iso_curr = curr["isotropy"].as_f64().unwrap_or(0.0);
+                        let cos_prev = prev["mean_cosine_sim"].as_f64().unwrap_or(0.0);
+                        let cos_curr = curr["mean_cosine_sim"].as_f64().unwrap_or(0.0);
+                        let iso_delta = iso_curr - iso_prev;
+                        let cos_delta = cos_curr - cos_prev;
+                        if iso_delta.abs() > 0.005 || cos_delta.abs() > 0.005 {
+                            drifts.push(serde_json::json!({
+                                "section": section,
+                                "group": group,
+                                "isotropy_delta": (iso_delta * 1000.0).round() / 1000.0,
+                                "cosine_delta": (cos_delta * 1000.0).round() / 1000.0,
+                                "isotropy_now": iso_curr,
+                                "cosine_now": cos_curr,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
+        let hours_since = (now_ms() - prev_ts) as f64 / 3_600_000.0;
+        serde_json::to_string(&serde_json::json!({
+            "snapshot_age_hours": (hours_since * 10.0).round() / 10.0,
+            "drifts": drifts,
+            "total_drifted": drifts.len(),
+        }))
+        .unwrap_or_else(|_| "{}".to_string())
     }
 
     /// Encode a memory's embedding into sparse codes and index into the cortical index.
