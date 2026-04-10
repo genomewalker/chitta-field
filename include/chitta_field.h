@@ -26,6 +26,8 @@ typedef struct {
     float    actr_activation;
     float    surprise_boost;
     float    arousal_boost;
+    float    mood_congruence;
+    float    frustration_boost;
 } CfRecallHit;
 
 /* Lifecycle */
@@ -57,6 +59,12 @@ int cf_upsert_artifact(CfHandle* h,
 int cf_recall_semantic(CfHandle* h,
     const float* query_embedding, size_t embedding_len,
     const char* realm, size_t k,
+    CfRecallHit* hits_buf, size_t hits_cap, size_t* hits_written);
+
+int cf_recall_semantic_ctx(CfHandle* h,
+    const float* query_embedding, size_t embedding_len,
+    const char* realm, size_t k,
+    float query_valence, float query_arousal,
     CfRecallHit* hits_buf, size_t hits_cap, size_t* hits_written);
 
 int cf_recall_temporal(CfHandle* h,

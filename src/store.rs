@@ -673,6 +673,22 @@ impl ChittaField {
         k: usize,
         realm: Option<&str>,
     ) -> Result<Vec<RecallHit>> {
+        self.recall_semantic_ctx(query_embedding, k, realm, None, None)
+    }
+
+    /// Semantic recall with affective context.
+    ///
+    /// `query_valence` / `query_arousal`: caller's current affect state.
+    /// Enables mood-congruent recall (Bower 1981) and frustration-escalation
+    /// detection (boost corrections when caller is frustrated).
+    pub fn recall_semantic_ctx(
+        &self,
+        query_embedding: &[f32],
+        k: usize,
+        realm: Option<&str>,
+        query_valence: Option<f32>,
+        query_arousal: Option<f32>,
+    ) -> Result<Vec<RecallHit>> {
         if query_embedding.len() != EMBED_DIM {
             return Err(FieldError::InvalidEmbedDim {
                 expected: EMBED_DIM,
@@ -723,8 +739,33 @@ impl ChittaField {
                 let surprise_boost = 1.0 + 0.25 * state.surprise; // [1.0, 1.25]
                 // Flashbulb: high-arousal memories resist forgetting
                 let arousal_boost = 1.0 + 0.15 * state.affect_arousal; // [1.0, 1.15]
+                // Mood-congruent recall (Bower 1981): memories matching the
+                // query's affect get boosted. Valence match weighted by the
+                // max arousal of query and memory (intense moods amplify).
+                let mood_congruence = match (query_valence, query_arousal) {
+                    (Some(qv), Some(qa)) if qa > 0.1 => {
+                        let valence_match = 1.0 - (qv - state.affect_valence).abs(); // [0, 2] → [-1, 1]
+                        let intensity = qa.max(state.affect_arousal);
+                        1.0 + 0.2 * valence_match.max(0.0) * intensity // [1.0, 1.2]
+                    }
+                    _ => 1.0,
+                };
+                // Frustration-escalation: negative valence + high arousal =
+                // frustrated caller. Boost corrections/preferences to surface
+                // fixes for repeated mistakes.
+                let frustration_boost = match (query_valence, query_arousal) {
+                    (Some(qv), Some(qa)) if qv < -0.3 && qa > 0.4 => {
+                        let frustration = (-qv - 0.3).min(0.7) * (qa - 0.4).min(0.6);
+                        match payload.kind.as_str() {
+                            "correction" => 1.0 + 1.5 * frustration, // up to ~1.63
+                            "preference" => 1.0 + 1.0 * frustration, // up to ~1.42
+                            _ => 1.0,
+                        }
+                    }
+                    _ => 1.0,
+                };
                 let base = semantic_weight * actr_factor * state.confidence
-                    * surprise_boost * arousal_boost;
+                    * surprise_boost * arousal_boost * mood_congruence * frustration_boost;
                 // PoE: apply per-realm reliability multiplier
                 let poe_mul = self.learners.read().domain_reliability.reliability(&payload.realm);
                 let kind_mul = realm_kind_multiplier(&payload.kind);
@@ -748,6 +789,8 @@ impl ChittaField {
                     actr_activation,
                     surprise_boost,
                     arousal_boost,
+                    mood_congruence,
+                    frustration_boost,
                 })
             })
             .collect();
@@ -867,6 +910,8 @@ impl ChittaField {
                     actr_activation: 0.0,
                     surprise_boost: 1.0,
                     arousal_boost: 1.0,
+                    mood_congruence: 1.0,
+                    frustration_boost: 1.0,
                 })
             })
             .collect();
@@ -961,6 +1006,8 @@ impl ChittaField {
                     actr_activation: 0.0,
                     surprise_boost: 1.0,
                     arousal_boost: 1.0,
+                    mood_congruence: 1.0,
+                    frustration_boost: 1.0,
                 })
             })
             .collect();
@@ -970,6 +1017,17 @@ impl ChittaField {
 
     /// Keyword (BM25) recall.
     pub fn recall_keyword(&self, query: &str, k: usize) -> Result<Vec<RecallHit>> {
+        self.recall_keyword_ctx(query, k, None, None)
+    }
+
+    /// Keyword (BM25) recall with affective context.
+    pub fn recall_keyword_ctx(
+        &self,
+        query: &str,
+        k: usize,
+        query_valence: Option<f32>,
+        query_arousal: Option<f32>,
+    ) -> Result<Vec<RecallHit>> {
         let keyword_hits = self.keyword_idx.read().search(query, k * 3);
 
         let now = now_ms();
@@ -998,8 +1056,27 @@ impl ChittaField {
                 let actr_factor = 0.3 + 0.7 * actr_activation;
                 let surprise_boost = 1.0 + 0.25 * state.surprise;
                 let arousal_boost = 1.0 + 0.15 * state.affect_arousal;
+                let mood_congruence = match (query_valence, query_arousal) {
+                    (Some(qv), Some(qa)) if qa > 0.1 => {
+                        let valence_match = 1.0 - (qv - state.affect_valence).abs();
+                        let intensity = qa.max(state.affect_arousal);
+                        1.0 + 0.2 * valence_match.max(0.0) * intensity
+                    }
+                    _ => 1.0,
+                };
+                let frustration_boost = match (query_valence, query_arousal) {
+                    (Some(qv), Some(qa)) if qv < -0.3 && qa > 0.4 => {
+                        let frustration = (-qv - 0.3).min(0.7) * (qa - 0.4).min(0.6);
+                        match payload.kind.as_str() {
+                            "correction" => 1.0 + 1.5 * frustration,
+                            "preference" => 1.0 + 1.0 * frustration,
+                            _ => 1.0,
+                        }
+                    }
+                    _ => 1.0,
+                };
                 let base = hit.bm25_score * actr_factor * state.confidence
-                    * surprise_boost * arousal_boost;
+                    * surprise_boost * arousal_boost * mood_congruence * frustration_boost;
                 Some(RecallHit {
                     memory_id: hit.memory_id,
                     score: base * status_mul * epistemic_mul * kind_mul,
@@ -1020,6 +1097,8 @@ impl ChittaField {
                     actr_activation,
                     surprise_boost,
                     arousal_boost,
+                    mood_congruence,
+                    frustration_boost,
                 })
             })
             .collect();
@@ -1106,6 +1185,8 @@ impl ChittaField {
                     actr_activation: 0.0,
                     surprise_boost: 1.0,
                     arousal_boost: 1.0,
+                    mood_congruence: 1.0,
+                    frustration_boost: 1.0,
                 })
             })
             .collect();

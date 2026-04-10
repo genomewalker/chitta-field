@@ -25,4 +25,8 @@ pub struct RecallHit {
     pub actr_activation: f32,
     pub surprise_boost: f32,
     pub arousal_boost: f32,
+    /// Mood-congruent recall (Bower 1981): boost when query affect matches memory affect
+    pub mood_congruence: f32,
+    /// Frustration-escalation: extra boost for corrections when caller is frustrated
+    pub frustration_boost: f32,
 }
