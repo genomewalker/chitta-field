@@ -3655,6 +3655,68 @@ pub extern "C" fn cf_memory_stats(
     write_json_buf(&json_str, buf, buf_cap, written)
 }
 
+/// Per-realm embedding geometry stats (effective dimensionality, isotropy, mean cosine sim).
+/// Returns JSON array into buf. Returns 0 on success, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_spectral_stats_by_realm(
+    h: *mut CfHandle,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let json_str = handle.field.spectral_stats_by_realm();
+    write_json_buf(&json_str, buf, buf_cap, written)
+}
+
+/// Save spectral snapshot for temporal drift tracking.
+/// Returns 0 on success. Writes filename into buf.
+#[no_mangle]
+pub extern "C" fn cf_save_spectral_snapshot(
+    h: *mut CfHandle,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    match handle.field.save_spectral_snapshot() {
+        Ok(filename) => write_json_buf(&format!("\"{}\"", filename), buf, buf_cap, written),
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Get spectral drift since last snapshot. Returns JSON into buf.
+#[no_mangle]
+pub extern "C" fn cf_spectral_drift(
+    h: *mut CfHandle,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let json_str = handle.field.spectral_drift();
+    write_json_buf(&json_str, buf, buf_cap, written)
+}
+
+/// Trim trailing whitespace from realm names. Returns count of fixed memories.
+#[no_mangle]
+pub extern "C" fn cf_trim_realm_names(h: *mut CfHandle) -> i64 {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    handle.field.trim_realm_names() as i64
+}
+
 /// 4. Get single task by ID (JSON payload).
 /// Returns 0 on success, 1 if not found, -2 if buf too small, -1 on error.
 #[no_mangle]

@@ -342,6 +342,11 @@ impl SemanticIndex {
         self.embeddings.len() >= HNSW_THRESHOLD
     }
 
+    /// Read-only access to an embedding by memory ID.
+    pub fn get_embedding(&self, id: MemoryId) -> Option<&[f32]> {
+        self.embeddings.get(&id).map(|v| v.as_slice())
+    }
+
     /// Add or update an embedding. Un-deletes the entry if it was soft-deleted.
     pub fn upsert(&mut self, memory_id: MemoryId, mut embedding: Vec<f32>) {
         self.remove(memory_id);
