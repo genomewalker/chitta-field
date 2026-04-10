@@ -115,6 +115,10 @@ pub struct MemoryState {
     /// Affect arousal: 0.0 (calm) to 1.0 (intense). High arousal = flashbulb memory effect.
     #[serde(default)]
     pub affect_arousal: f32,
+    /// ACT-R access timestamps: last 16 retrieval wall-clock times (ms since epoch).
+    /// Used for power-law base-level activation: B_i = ln(Σ t_j^(-d)).
+    #[serde(default)]
+    pub access_timestamps: Vec<i64>,
 }
 
 impl MemoryState {
@@ -141,6 +145,7 @@ impl MemoryState {
             surprise: 0.0,
             affect_valence: 0.0,
             affect_arousal: 0.0,
+            access_timestamps: Vec::new(),
         }
     }
 
@@ -166,6 +171,11 @@ impl MemoryState {
         if delta.touch {
             self.access_count += 1;
             self.last_accessed_ms = now_ms;
+            // ACT-R: record access timestamp for power-law decay
+            if self.access_timestamps.len() >= 16 {
+                self.access_timestamps.remove(0);
+            }
+            self.access_timestamps.push(now_ms);
         }
         if let Some(p) = delta.pin {
             self.pinned = p;
@@ -196,5 +206,48 @@ impl MemoryState {
         let age_days = (now_ms - self.last_strengthened_ms).max(0) as f64 / 86_400_000.0;
         let decayed = self.strength as f64 * (-self.decay_rate as f64 * age_days).exp();
         decayed.clamp(0.0, 1.0) as f32
+    }
+
+    /// ACT-R base-level activation: B_i = ln(Σ_j t_j^(-d))
+    ///
+    /// Power-law decay over access history (Anderson & Schooler 1991).
+    /// For recorded timestamps: exact sum. For older unrecorded accesses:
+    /// uniform-distribution approximation over memory lifetime.
+    /// Returns [0, 1] via sigmoid transform.
+    pub fn actr_base_level_activation(&self, now_ms: i64) -> f32 {
+        const D: f64 = 0.5;          // power-law decay exponent
+        const TAU: f64 = 1.5;        // sigmoid temperature
+        const THRESHOLD: f64 = -1.0; // sigmoid midpoint
+        const MIN_AGE_MS: i64 = 60_000; // 1 minute floor to avoid singularity
+
+        let mut sum = 0.0f64;
+
+        // Exact power-law sum over recorded access timestamps
+        for &ts in &self.access_timestamps {
+            let age_ms = (now_ms - ts).max(MIN_AGE_MS);
+            let age_days = age_ms as f64 / 86_400_000.0;
+            sum += age_days.powf(-D);
+        }
+
+        // Approximate older unrecorded accesses (uniform over lifetime)
+        let n_exact = self.access_timestamps.len() as u32;
+        let n_missing = self.access_count.saturating_sub(n_exact);
+        if n_missing > 0 {
+            let lifetime_ms = (now_ms - self.created_at_ms).max(MIN_AGE_MS);
+            let lifetime_days = lifetime_ms as f64 / 86_400_000.0;
+            // ∫_0^L (n/L) × t^(-d) dt = n × L^(-d) / (1-d)
+            sum += (n_missing as f64) * lifetime_days.powf(-D) / (1.0 - D);
+        }
+
+        // Ensure at least creation event contributes
+        if sum <= 0.0 {
+            let age_ms = (now_ms - self.created_at_ms).max(MIN_AGE_MS);
+            let age_days = age_ms as f64 / 86_400_000.0;
+            sum = age_days.powf(-D);
+        }
+
+        let activation = sum.ln();
+        let factor = 1.0 / (1.0 + (-(activation - THRESHOLD) / TAU).exp());
+        (factor as f32).clamp(0.0, 1.0)
     }
 }

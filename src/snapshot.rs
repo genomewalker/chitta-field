@@ -82,6 +82,7 @@ impl LegacyMemoryStateV4 {
             surprise: 0.0,
             affect_valence: 0.0,
             affect_arousal: 0.0,
+            access_timestamps: Vec::new(),
         }
     }
 }
@@ -132,6 +133,7 @@ impl LegacyMemoryStateV5 {
             surprise: 0.0,
             affect_valence: 0.0,
             affect_arousal: 0.0,
+            access_timestamps: Vec::new(),
         }
     }
 }

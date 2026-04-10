@@ -715,8 +715,16 @@ impl ChittaField {
                 let eff_strength = state.effective_strength(now);
                 let semantic_score = hit.cosine_similarity;
                 let semantic_weight = ((semantic_score + 1.0) / 2.0).max(0.0);
-                let base = semantic_weight * (0.5 + 0.5 * eff_strength) * state.confidence;
                 let strength_factor = 0.5 + 0.5 * eff_strength;
+                // ACT-R: power-law base-level activation (Anderson & Schooler 1991)
+                let actr_activation = state.actr_base_level_activation(now);
+                let actr_factor = 0.3 + 0.7 * actr_activation; // [0.3, 1.0]
+                // FEP: prediction error weighting — high-surprise memories are novel
+                let surprise_boost = 1.0 + 0.25 * state.surprise; // [1.0, 1.25]
+                // Flashbulb: high-arousal memories resist forgetting
+                let arousal_boost = 1.0 + 0.15 * state.affect_arousal; // [1.0, 1.15]
+                let base = semantic_weight * actr_factor * state.confidence
+                    * surprise_boost * arousal_boost;
                 // PoE: apply per-realm reliability multiplier
                 let poe_mul = self.learners.read().domain_reliability.reliability(&payload.realm);
                 let kind_mul = realm_kind_multiplier(&payload.kind);
@@ -737,6 +745,9 @@ impl ChittaField {
                     strength_factor,
                     affect_valence: state.affect_valence,
                     affect_arousal: state.affect_arousal,
+                    actr_activation,
+                    surprise_boost,
+                    arousal_boost,
                 })
             })
             .collect();
@@ -853,6 +864,9 @@ impl ChittaField {
                     strength_factor: 0.0,
                     affect_valence: 0.0,
                     affect_arousal: 0.0,
+                    actr_activation: 0.0,
+                    surprise_boost: 1.0,
+                    arousal_boost: 1.0,
                 })
             })
             .collect();
@@ -944,6 +958,9 @@ impl ChittaField {
                     strength_factor: 0.0,
                     affect_valence: 0.0,
                     affect_arousal: 0.0,
+                    actr_activation: 0.0,
+                    surprise_boost: 1.0,
+                    arousal_boost: 1.0,
                 })
             })
             .collect();
@@ -976,7 +993,13 @@ impl ChittaField {
                 let kind_mul = realm_kind_multiplier(&payload.kind);
                 let eff_strength = state.effective_strength(now);
                 let strength_factor = 0.5 + 0.5 * eff_strength;
-                let base = hit.bm25_score * strength_factor * state.confidence;
+                // ACT-R + FEP + flashbulb (same as semantic path)
+                let actr_activation = state.actr_base_level_activation(now);
+                let actr_factor = 0.3 + 0.7 * actr_activation;
+                let surprise_boost = 1.0 + 0.25 * state.surprise;
+                let arousal_boost = 1.0 + 0.15 * state.affect_arousal;
+                let base = hit.bm25_score * actr_factor * state.confidence
+                    * surprise_boost * arousal_boost;
                 Some(RecallHit {
                     memory_id: hit.memory_id,
                     score: base * status_mul * epistemic_mul * kind_mul,
@@ -994,6 +1017,9 @@ impl ChittaField {
                     strength_factor,
                     affect_valence: state.affect_valence,
                     affect_arousal: state.affect_arousal,
+                    actr_activation,
+                    surprise_boost,
+                    arousal_boost,
                 })
             })
             .collect();
@@ -1077,6 +1103,9 @@ impl ChittaField {
                     strength_factor: 0.0,
                     affect_valence: 0.0,
                     affect_arousal: 0.0,
+                    actr_activation: 0.0,
+                    surprise_boost: 1.0,
+                    arousal_boost: 1.0,
                 })
             })
             .collect();
