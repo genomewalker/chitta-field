@@ -26,6 +26,7 @@ use crate::organ::epistemic_debt::EpistemicDebtStore;
 use crate::organ::integration::IntegrationKernel;
 use crate::organ::surprise_learning::SurpriseLearningStore;
 use crate::organ::wisdom_promotion::WisdomPromotionStore;
+use crate::organ::intervention::InterventionStore;
 use crate::scoring::learned::LearnedScoringModel;
 use crate::organ::pq::ProductQuantizer;
 use crate::organ::session::SessionRegistry;
@@ -141,6 +142,7 @@ pub struct ChittaField {
     pub(crate) surprise_learning: RwLock<SurpriseLearningStore>,
     pub(crate) wisdom_promotion: RwLock<WisdomPromotionStore>,
     pub(crate) learned_scorer: RwLock<LearnedScoringModel>,
+    pub(crate) intervention_store: RwLock<InterventionStore>,
     pub(crate) lite_encoder: RwLock<Option<LiteEncoder>>,
     /// Byte offsets for each foreign segment file, used by sync_foreign().
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
@@ -218,6 +220,7 @@ impl ChittaField {
         let mut surprise_learning = SurpriseLearningStore::new();
         let mut wisdom_promotion = WisdomPromotionStore::new();
         let mut learned_scorer = LearnedScoringModel::new("v5.14".to_string());
+        let mut intervention_store = InterventionStore::new();
         let mut chunk_hash_idx: HashMap<crate::ids::ChunkHash, MemoryId> = HashMap::new();
         let mut snapshot_coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats> = HashMap::new();
 
@@ -437,6 +440,7 @@ impl ChittaField {
                 &mut surprise_learning,
                 &mut wisdom_promotion,
                 &mut learned_scorer,
+                &mut intervention_store,
                 &mut chunk_hash_idx,
                 &mut replay_realm_members,
                 &mut replay_coactivation_stats,
@@ -535,6 +539,7 @@ impl ChittaField {
             surprise_learning: RwLock::new(surprise_learning),
             wisdom_promotion: RwLock::new(wisdom_promotion),
             learned_scorer: RwLock::new(learned_scorer),
+            intervention_store: RwLock::new(intervention_store),
             lite_encoder: RwLock::new(loaded_lite_encoder),
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
@@ -629,6 +634,7 @@ impl ChittaField {
         let mut surprise_learning_reg = self.surprise_learning.write();
         let mut wisdom_promotion_reg = self.wisdom_promotion.write();
         let mut learned_scorer_reg = self.learned_scorer.write();
+        let mut intervention_store_reg = self.intervention_store.write();
         let mut chunk_hash_idx = self.chunk_hash_idx.write();
         let mut realm_members = self.realm_members.write();
         let mut coactivation_stats = self.coactivation_stats.write();
@@ -667,6 +673,7 @@ impl ChittaField {
                 &mut *surprise_learning_reg,
                 &mut *wisdom_promotion_reg,
                 &mut *learned_scorer_reg,
+                &mut *intervention_store_reg,
                 &mut *chunk_hash_idx,
                 &mut *realm_members,
                 &mut *coactivation_stats,
@@ -822,6 +829,7 @@ pub(crate) fn apply_op(
     surprise_learning: &mut SurpriseLearningStore,
     wisdom_promotion: &mut WisdomPromotionStore,
     learned_scorer: &mut LearnedScoringModel,
+    intervention_store: &mut InterventionStore,
     chunk_hash_idx: &mut HashMap<crate::ids::ChunkHash, MemoryId>,
     realm_members: &mut HashMap<String, HashSet<MemoryId>>,
     coactivation_stats: &mut HashMap<(MemoryId, MemoryId), CoActivationStats>,
@@ -1425,6 +1433,61 @@ pub(crate) fn apply_op(
                 e.note,
                 e.attached_ms,
             );
+        }
+        Op::StartIntervention(s) => {
+            use crate::organ::intervention::{ActionType, InterventionRecord, InterventionStatus, ReversalCost};
+            intervention_store.replay_start(InterventionRecord {
+                id: s.id,
+                realm: s.realm,
+                session_id: s.session_id,
+                task_id: s.task_id,
+                agent_id: s.agent_id,
+                domain: s.domain,
+                intent: s.intent,
+                action_type: ActionType::from_u8(s.action_type),
+                action_ref: s.action_ref,
+                preconditions: s.preconditions,
+                expected_observables: s.expected_observables,
+                reversal_cost: ReversalCost::from_u8(s.reversal_cost),
+                started_ms: s.started_ms,
+                closed_ms: None,
+                status: InterventionStatus::Open,
+            });
+        }
+        Op::AddObservation(o) => {
+            use crate::organ::intervention::{ObservationKind, ObservationRecord};
+            intervention_store.replay_observation(ObservationRecord {
+                id: o.id,
+                intervention_id: o.intervention_id,
+                kind: ObservationKind::from_u8(o.kind),
+                evidence_refs: o.evidence_refs,
+                summary: o.summary,
+                confidence: o.confidence,
+                timestamp_ms: o.timestamp_ms,
+            });
+        }
+        Op::CloseIntervention(c) => {
+            use crate::organ::intervention::InterventionStatus;
+            intervention_store.replay_close(
+                c.intervention_id,
+                InterventionStatus::from_u8(c.status),
+                c.closed_ms,
+            );
+        }
+        Op::RecordAttribution(a) => {
+            use crate::organ::intervention::{AttributionClass, AttributionRecord};
+            intervention_store.replay_attribution(AttributionRecord {
+                intervention_id: a.intervention_id,
+                primary_class: AttributionClass::from_u8(a.primary_class),
+                secondary_class: a.secondary_class.map(AttributionClass::from_u8),
+                confidence_delta: a.confidence_delta,
+                surprise_id: a.surprise_id,
+                debt_ids: a.debt_ids,
+                source_memory_ids: a.source_memory_ids,
+                skill_memory_ids: a.skill_memory_ids,
+                note: a.note,
+                timestamp_ms: a.timestamp_ms,
+            });
         }
     }
 }

@@ -54,6 +54,10 @@ pub enum Op {
     UpdateWisdomLifecycle(UpdateWisdomLifecycleOp),
     UpdateScorerModel(UpdateScorerModelOp),
     AttachDebtEvidence(AttachDebtEvidenceOp),
+    StartIntervention(StartInterventionOp),
+    AddObservation(AddObservationOp),
+    CloseIntervention(CloseInterventionOp),
+    RecordAttribution(RecordAttributionOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -89,6 +93,10 @@ pub const OP_UPSERT_WISDOM_CANDIDATE: u8 = 45;
 pub const OP_UPDATE_WISDOM_LIFECYCLE: u8 = 46;
 pub const OP_UPDATE_SCORER_MODEL: u8 = 47;
 pub const OP_ATTACH_DEBT_EVIDENCE: u8 = 48;
+pub const OP_START_INTERVENTION: u8 = 49;
+pub const OP_ADD_OBSERVATION: u8 = 50;
+pub const OP_CLOSE_INTERVENTION: u8 = 51;
+pub const OP_RECORD_ATTRIBUTION: u8 = 52;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -609,4 +617,55 @@ pub struct AttachDebtEvidenceOp {
     pub confidence: f32,
     pub note: Option<String>,
     pub attached_ms: i64,
+}
+
+// ── Layer 7: Intervention Ledger ──────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartInterventionOp {
+    pub id: u64,
+    pub realm: String,
+    pub session_id: String,
+    pub task_id: Option<u64>,
+    pub agent_id: String,
+    pub domain: String,
+    pub intent: String,
+    pub action_type: u8,
+    pub action_ref: String,
+    pub preconditions: Vec<String>,
+    pub expected_observables: Vec<String>,
+    pub reversal_cost: u8,
+    pub started_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddObservationOp {
+    pub id: u64,
+    pub intervention_id: u64,
+    pub kind: u8,
+    pub evidence_refs: Vec<u64>,
+    pub summary: String,
+    pub confidence: f32,
+    pub timestamp_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloseInterventionOp {
+    pub intervention_id: u64,
+    pub status: u8,
+    pub closed_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordAttributionOp {
+    pub intervention_id: u64,
+    pub primary_class: u8,
+    pub secondary_class: Option<u8>,
+    pub confidence_delta: f32,
+    pub surprise_id: Option<u64>,
+    pub debt_ids: Vec<u64>,
+    pub source_memory_ids: Vec<u64>,
+    pub skill_memory_ids: Vec<u64>,
+    pub note: Option<String>,
+    pub timestamp_ms: i64,
 }

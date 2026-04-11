@@ -2674,6 +2674,214 @@ impl ChittaField {
         self.learned_scorer.read().effective_weight(factor_name, baseline)
     }
 
+    // ── Layer 7: Intervention Ledger ─────────────────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_intervention(
+        &self,
+        realm: String,
+        session_id: String,
+        task_id: Option<u64>,
+        agent_id: String,
+        domain: String,
+        intent: String,
+        action_type: crate::organ::intervention::ActionType,
+        action_ref: String,
+        preconditions: Vec<String>,
+        expected_observables: Vec<String>,
+        reversal_cost: crate::organ::intervention::ReversalCost,
+    ) -> Result<u64> {
+        let now = now_ms();
+        let id = self.intervention_store.write().start_intervention(
+            realm.clone(), session_id.clone(), task_id, agent_id.clone(),
+            domain.clone(), intent.clone(), action_type, action_ref.clone(),
+            preconditions.clone(), expected_observables.clone(), reversal_cost, now,
+        );
+        self.log.write().append(&crate::ops::Op::StartIntervention(
+            crate::ops::StartInterventionOp {
+                id, realm, session_id, task_id, agent_id, domain, intent,
+                action_type: action_type.to_u8(), action_ref,
+                preconditions, expected_observables,
+                reversal_cost: reversal_cost.to_u8(), started_ms: now,
+            }
+        ))?;
+        Ok(id)
+    }
+
+    pub fn add_observation(
+        &self,
+        intervention_id: u64,
+        kind: crate::organ::intervention::ObservationKind,
+        evidence_refs: Vec<u64>,
+        summary: String,
+        confidence: f32,
+    ) -> Result<Option<u64>> {
+        let now = now_ms();
+        let obs_id = self.intervention_store.write().add_observation(
+            intervention_id, kind, evidence_refs.clone(), summary.clone(), confidence, now,
+        );
+        if let Some(oid) = obs_id {
+            self.log.write().append(&crate::ops::Op::AddObservation(
+                crate::ops::AddObservationOp {
+                    id: oid, intervention_id, kind: kind.to_u8(),
+                    evidence_refs, summary, confidence, timestamp_ms: now,
+                }
+            ))?;
+        }
+        Ok(obs_id)
+    }
+
+    pub fn close_intervention(
+        &self,
+        intervention_id: u64,
+        status: crate::organ::intervention::InterventionStatus,
+    ) -> Result<bool> {
+        let now = now_ms();
+        let ok = self.intervention_store.write().close_intervention(intervention_id, status, now);
+        if ok {
+            self.log.write().append(&crate::ops::Op::CloseIntervention(
+                crate::ops::CloseInterventionOp {
+                    intervention_id, status: status.to_u8(), closed_ms: now,
+                }
+            ))?;
+        }
+        Ok(ok)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_attribution(
+        &self,
+        intervention_id: u64,
+        primary_class: crate::organ::intervention::AttributionClass,
+        secondary_class: Option<crate::organ::intervention::AttributionClass>,
+        confidence_delta: f32,
+        surprise_id: Option<u64>,
+        debt_ids: Vec<u64>,
+        source_memory_ids: Vec<u64>,
+        skill_memory_ids: Vec<u64>,
+        note: Option<String>,
+    ) -> Result<bool> {
+        let now = now_ms();
+        // Look up intervention domain before releasing write lock
+        let domain = {
+            let store = self.intervention_store.read();
+            store.get(intervention_id).map(|r| r.domain.clone()).unwrap_or_default()
+        };
+        let ok = self.intervention_store.write().record_attribution(
+            intervention_id, primary_class, secondary_class,
+            confidence_delta, surprise_id, debt_ids.clone(),
+            source_memory_ids.clone(), skill_memory_ids.clone(), note.clone(), now,
+        );
+        if !ok { return Ok(false); }
+        self.log.write().append(&crate::ops::Op::RecordAttribution(
+            crate::ops::RecordAttributionOp {
+                intervention_id,
+                primary_class: primary_class.to_u8(),
+                secondary_class: secondary_class.map(|c| c.to_u8()),
+                confidence_delta, surprise_id,
+                debt_ids: debt_ids.clone(),
+                source_memory_ids: source_memory_ids.clone(),
+                skill_memory_ids: skill_memory_ids.clone(),
+                note, timestamp_ms: now,
+            }
+        ))?;
+        // Route to learning subsystems
+        self.route_attribution(&domain, primary_class, confidence_delta,
+            surprise_id, &source_memory_ids, &skill_memory_ids);
+        if let Some(sec) = secondary_class {
+            self.route_attribution(&domain, sec, confidence_delta * 0.5,
+                surprise_id, &source_memory_ids, &skill_memory_ids);
+        }
+        Ok(true)
+    }
+
+    fn route_attribution(
+        &self,
+        domain: &str,
+        class: crate::organ::intervention::AttributionClass,
+        confidence_delta: f32,
+        surprise_id: Option<u64>,
+        source_memory_ids: &[u64],
+        skill_memory_ids: &[u64],
+    ) {
+        use crate::organ::intervention::AttributionClass::*;
+        let now = now_ms();
+        match class {
+            MemoryRecallError => {
+                if let Some(sid) = surprise_id {
+                    let mut sl = self.surprise_learning.write();
+                    for &mid in source_memory_ids {
+                        let _ = sl.update_credit(mid, sid, confidence_delta.abs(), -1, now);
+                    }
+                }
+            }
+            SourceTrustError => {
+                let _ = self.integration_kernel.write().record_feedback(domain, "memory", false);
+            }
+            ProcedureError => {
+                for &mid in skill_memory_ids {
+                    let _ = self.update_state(
+                        mid, Some(-confidence_delta.abs()), None, None, false, None,
+                    );
+                }
+            }
+            ToolExecutionError | EnvironmentShift | HiddenPrecondition
+            | AmbiguousState | GoalSpecError | UserOverride | ExternalNondeterminism => {
+                // No automatic side-effect; caller handles debt/task repair at MCP layer
+            }
+        }
+    }
+
+    pub fn get_intervention(
+        &self, id: u64,
+    ) -> Option<crate::organ::intervention::InterventionRecord> {
+        self.intervention_store.read().get(id).cloned()
+    }
+
+    pub fn query_interventions(
+        &self,
+        realm: Option<&str>,
+        session_id: Option<&str>,
+        status: Option<crate::organ::intervention::InterventionStatus>,
+        limit: usize,
+    ) -> Vec<crate::organ::intervention::InterventionRecord> {
+        self.intervention_store.read()
+            .query(realm, session_id, status, limit)
+            .into_iter().cloned().collect()
+    }
+
+    pub fn list_open_interventions(
+        &self,
+    ) -> Vec<crate::organ::intervention::InterventionRecord> {
+        self.intervention_store.read().list_open().into_iter().cloned().collect()
+    }
+
+    pub fn intervention_stats(&self) -> crate::organ::intervention::InterventionStats {
+        self.intervention_store.read().stats()
+    }
+
+    pub fn close_stale_interventions(&self, threshold_ms: i64) -> Result<usize> {
+        let now = now_ms();
+        let stale_ids = self.intervention_store.read().stale_open(threshold_ms, now);
+        let mut closed = 0usize;
+        for id in stale_ids {
+            let ok = self.intervention_store.write().close_intervention(
+                id, crate::organ::intervention::InterventionStatus::Aborted, now,
+            );
+            if ok {
+                self.log.write().append(&crate::ops::Op::CloseIntervention(
+                    crate::ops::CloseInterventionOp {
+                        intervention_id: id,
+                        status: crate::organ::intervention::InterventionStatus::Aborted.to_u8(),
+                        closed_ms: now,
+                    }
+                ))?;
+                closed += 1;
+            }
+        }
+        Ok(closed)
+    }
+
     /// Save full in-memory state to a binary snapshot (chitta.snapshot).
     /// After this, on next open only ops after snapshot_seqno need to be replayed.
     pub fn save_full_snapshot(&self) -> Result<()> {

@@ -57,6 +57,7 @@ use crate::ops::{
     OP_UPDATE_SOURCE_WEIGHT, OP_RECORD_FEEDBACK,
     OP_UPDATE_SURPRISE_CREDIT, OP_UPSERT_WISDOM_CANDIDATE,
     OP_UPDATE_WISDOM_LIFECYCLE, OP_UPDATE_SCORER_MODEL, OP_ATTACH_DEBT_EVIDENCE,
+    OP_START_INTERVENTION, OP_ADD_OBSERVATION, OP_CLOSE_INTERVENTION, OP_RECORD_ATTRIBUTION,
 };
 
 fn op_type_byte(op: &Op) -> u8 {
@@ -110,6 +111,10 @@ fn op_type_byte(op: &Op) -> u8 {
         Op::UpdateWisdomLifecycle(_) => OP_UPDATE_WISDOM_LIFECYCLE,
         Op::UpdateScorerModel(_) => OP_UPDATE_SCORER_MODEL,
         Op::AttachDebtEvidence(_) => OP_ATTACH_DEBT_EVIDENCE,
+        Op::StartIntervention(_) => OP_START_INTERVENTION,
+        Op::AddObservation(_) => OP_ADD_OBSERVATION,
+        Op::CloseIntervention(_) => OP_CLOSE_INTERVENTION,
+        Op::RecordAttribution(_) => OP_RECORD_ATTRIBUTION,
     }
 }
 

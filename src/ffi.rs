@@ -6712,6 +6712,196 @@ pub extern "C" fn cf_effective_scorer_weights(h: *const CfHandle) -> *mut c_char
     CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
+// ── Layer 7: Intervention Ledger ─────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn cf_start_intervention(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
+        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+    }};
+    let p: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+    };
+    use crate::organ::intervention::{ActionType, ReversalCost};
+    let realm = p["realm"].as_str().unwrap_or("coding").to_string();
+    let session_id = p["session_id"].as_str().unwrap_or("").to_string();
+    let task_id = p["task_id"].as_u64();
+    let agent_id = p["agent_id"].as_str().unwrap_or("").to_string();
+    let domain = p["domain"].as_str().unwrap_or("").to_string();
+    let intent = p["intent"].as_str().unwrap_or("").to_string();
+    let action_type = ActionType::from_u8(p["action_type"].as_u64().unwrap_or(0) as u8);
+    let action_ref = p["action_ref"].as_str().unwrap_or("").to_string();
+    let preconditions = p["preconditions"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let expected_observables = p["expected_observables"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let reversal_cost = ReversalCost::from_u8(p["reversal_cost"].as_u64().unwrap_or(0) as u8);
+    match handle.field.start_intervention(
+        realm, session_id, task_id, agent_id, domain, intent,
+        action_type, action_ref, preconditions, expected_observables, reversal_cost,
+    ) {
+        Ok(id) => {
+            let json = serde_json::json!({ "intervention_id": id });
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_add_observation(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
+        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+    }};
+    let p: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+    };
+    use crate::organ::intervention::ObservationKind;
+    let intervention_id = match p["intervention_id"].as_u64() {
+        Some(id) => id, None => return std::ptr::null_mut()
+    };
+    let kind = ObservationKind::from_u8(p["kind"].as_u64().unwrap_or(0) as u8);
+    let evidence_refs = p["evidence_refs"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect()).unwrap_or_default();
+    let summary = p["summary"].as_str().unwrap_or("").to_string();
+    let confidence = p["confidence"].as_f64().unwrap_or(1.0) as f32;
+    match handle.field.add_observation(intervention_id, kind, evidence_refs, summary, confidence) {
+        Ok(Some(oid)) => {
+            let json = serde_json::json!({ "observation_id": oid });
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_close_intervention(
+    h: *mut CfHandle, intervention_id: u64, status: u8,
+) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    use crate::organ::intervention::InterventionStatus;
+    match handle.field.close_intervention(intervention_id, InterventionStatus::from_u8(status)) {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_record_attribution(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> c_int {
+    if h.is_null() || params_json.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
+        Ok(s) => s, Err(_) => return -1
+    }};
+    let p: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v, Err(_) => return -1
+    };
+    use crate::organ::intervention::AttributionClass;
+    let intervention_id = match p["intervention_id"].as_u64() { Some(id) => id, None => return -1 };
+    let primary_class = AttributionClass::from_u8(p["primary_class"].as_u64().unwrap_or(9) as u8);
+    let secondary_class = p["secondary_class"].as_u64().map(|v| AttributionClass::from_u8(v as u8));
+    let confidence_delta = p["confidence_delta"].as_f64().unwrap_or(0.5) as f32;
+    let surprise_id = p["surprise_id"].as_u64();
+    let debt_ids = p["debt_ids"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect()).unwrap_or_default();
+    let source_memory_ids = p["source_memory_ids"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect()).unwrap_or_default();
+    let skill_memory_ids = p["skill_memory_ids"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect()).unwrap_or_default();
+    let note = p["note"].as_str().map(|s| s.to_string());
+    match handle.field.record_attribution(
+        intervention_id, primary_class, secondary_class, confidence_delta,
+        surprise_id, debt_ids, source_memory_ids, skill_memory_ids, note,
+    ) {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_query_interventions(
+    h: *const CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let p: serde_json::Value = if params_json.is_null() {
+        serde_json::Value::Null
+    } else {
+        let s = unsafe { match CStr::from_ptr(params_json).to_str() {
+            Ok(s) => s, Err(_) => return std::ptr::null_mut()
+        }};
+        serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
+    };
+    use crate::organ::intervention::InterventionStatus;
+    let realm = p["realm"].as_str();
+    let session_id = p["session_id"].as_str();
+    let status = p["status"].as_u64().map(|v| InterventionStatus::from_u8(v as u8));
+    let limit = p["limit"].as_u64().unwrap_or(50) as usize;
+    let results = handle.field.query_interventions(realm, session_id, status, limit);
+    let json = serde_json::to_value(&results).unwrap_or(serde_json::Value::Array(vec![]));
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_get_intervention(
+    h: *const CfHandle, intervention_id: u64,
+) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    match handle.field.get_intervention(intervention_id) {
+        Some(rec) => {
+            let json = serde_json::to_value(&rec).unwrap_or(serde_json::Value::Null);
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_intervention_stats(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let stats = handle.field.intervention_stats();
+    let json = serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null);
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_list_open_interventions(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let results = handle.field.list_open_interventions();
+    let json = serde_json::to_value(&results).unwrap_or(serde_json::Value::Array(vec![]));
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_close_stale_interventions(
+    h: *mut CfHandle, threshold_ms: i64,
+) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    match handle.field.close_stale_interventions(threshold_ms) {
+        Ok(count) => count as c_int,
+        Err(_) => -1,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cf_auto_resolve_debts(h: *mut CfHandle, threshold: f32) -> *mut c_char {
     if h.is_null() { return std::ptr::null_mut(); }
