@@ -41,7 +41,10 @@ chitta-field/
     ├── PredictorStore   (Markov chain access predictor — Layer 3)
     ├── SurpriseStore    (prediction error tuples — Layer 4)
     ├── EpistemicDebtStore (uncertainty boundaries — Layer 5)
-    └── IntegrationKernel  (recall source weights — Layer 6)
+    ├── IntegrationKernel  (recall source weights — Layer 6)
+    ├── SurpriseLearningStore (hysteresis-gated strength credit — Move 1/2)
+    ├── WisdomPromotionStore  (candidate lifecycle FSM — Move 5)
+    └── LearnedScoringModel   (outcome-calibrated weight deltas — Move 6)
 ```
 
 ### Multi-writer design (Upanishads model)
@@ -89,6 +92,26 @@ After the final pass, `cf_record_recall_batch` atomically commits all learning:
 - **Session / transcript / task registries** — first-class domain objects for AI session management
 - **Snapshot acceleration** — `cf_save_full_snapshot` / `cf_save_snapshot` skip log replay on next open
 - **Meta-memory layers** — six organ stores beyond core recall: executable constraints (Prolog-style logic), trigger tissue (event-condition-action), predictive memory (Markov chain), surprise memory (prediction error tracking with blind spot detection), epistemic debt (uncertainty boundaries with fragility scoring), and integration kernel (learned recall source weights via Bayesian feedback)
+
+## Why not flat files?
+
+The natural question when building agent memory: why not just write a `MEMORY.md`?
+
+Flat files work up to a few hundred entries. Beyond that they fail on five axes that chitta-field is built to solve:
+
+**1. Retrieval requires selection, not ingestion.** A markdown file must be read in full to be searched. At 10,000+ memories the context window is the binding constraint — you cannot afford to inject everything. chitta-field selects the 5-15 most relevant memories from 24,000+ in under a millisecond using hybrid recall (semantic ANN + BM25 + cortical SDR bitset intersection + graph spreading activation). The context window receives a distilled signal, not a dump.
+
+**2. Relevance is not the same as recency.** A flat file is ordered by insertion time. chitta-field scores each candidate on 18 composable factors — semantic similarity, ACT-R base-level activation, memory strength, confidence, epistemic status, affect valence, surprise, mood congruence, frustration escalation, prediction boost, constraint satisfaction, integration kernel weight, and more. A memory written two months ago that perfectly matches the current query beats a memory written five minutes ago that only partially matches.
+
+**3. Memory needs a lifecycle.** Flat files grow forever. chitta-field implements per-memory decay (configurable `decay_rate`), tiered demotion, auto-deduplication by embedding similarity, contradiction tracking, and distillation from episodic memories into durable wisdom nodes. The field actively forgets what no longer matters and strengthens what repeatedly proves useful.
+
+**4. Contradiction is a graph structure, not a text flag.** Conflicting beliefs need operational representation — `contradicts`, `supersedes`, and `confirms` edges that are queryable and that block contradicted memories from scoring well. Markdown can describe a contradiction; it cannot query or enforce one.
+
+**5. Multi-writer without merge conflicts.** Multiple Claude windows sharing one `MEMORY.md` produce merge conflicts. chitta-field uses one segment file per writer process — each instance appends to its own `{instance_id}.seg`, readers replay all segments in sequence-number order. No locking, no conflicts, no D-state on NFS.
+
+The flat-file approach remains useful as a **human-readable interface and import surface** — cc-soul syncs bidirectionally with Claude Code's `MEMORY.md`, absorbing what the user writes there and injecting relevant chitta memories back. But the authoritative substrate is always chitta-field.
+
+---
 
 ## Memory model
 
@@ -248,6 +271,91 @@ Train the bag-of-words lite encoder from existing memories and save it to disk. 
 ├── chitta.snapshot              (full state snapshot, optional, speeds startup)
 └── cortex.snapshot              (cortical index snapshot, optional)
 ```
+
+## Cognitive organs
+
+chitta-field's in-RAM state is organized into independent **organs** — each a self-contained store with its own data model, WAL replay method, and query interface. The coordinator wires them together; no organ imports another.
+
+### ThemeOrgan
+
+Maintains named, embedding-clustered themes that group memory IDs by semantic coherence. Each `ThemeRecord` holds a centroid vector (mean of member embeddings), a `coherence` score (average cosine similarity of members to centroid), and a `HashSet<u64>` of member IDs partitioned by realm.
+
+Queries use `recall_by_embedding` — given a query embedding, returns top-k `(theme_id, cosine_score)` pairs. Periodic `maintain()` splits themes with >100 members (naive k-means, k=2, 5 iterations) and merges pairs whose centroids exceed 0.9 cosine similarity.
+
+**WAL ops:** `ThemeEvent` (byte 20) — create, update_centroid, assign_member, remove_member.
+
+### SurpriseLearningStore (Move 1 & 2)
+
+Per-memory rolling credit accumulator that translates surprise signal magnitude into strength adjustments, gated by hysteresis to prevent noise from triggering updates.
+
+**Credit computation** (quadratic, ignores low surprise):
+```
+evidence = ((magnitude − 0.20) / 0.80)²  if magnitude ≥ 0.20, else 0
+credit   = 0.85 × credit + dir × evidence     (dir = ±1)
+```
+
+**Hysteresis gate** — both conditions must hold before a delta is emitted:
+- `|credit| ≥ 0.75`
+- `same_dir_streak ≥ 2`  (consecutive same-direction signals)
+
+**Strength delta** when gate passes:
+```
+excess = clamp(|credit| − 0.75, 0, 1)
+delta  = ±min(0.08,  0.02 + 0.06 × excess)
+```
+Post-apply bleed: `credit *= 0.35` — prevents immediate re-triggering while preserving momentum.
+
+**Move 2 — Integration kernel feedback:** a separate `failure_tracker` maps `(domain, source)` to a rolling window of surprise IDs. Negative feedback fires when `magnitude ≥ 0.55` (hard) or `magnitude ≥ 0.25` with ≥2 failures in the last 8 (soft). Positive feedback fires when `magnitude ≥ 0.30`.
+
+**WAL ops:** `UpdateSurpriseCredit` (byte 44) — per-memory state snapshot replayed on restart.
+
+### WisdomPromotionStore (Move 5)
+
+Tracks recurring behavioral patterns as *wisdom candidates* through a four-state lifecycle FSM:
+
+```
+Candidate (0) → Provisional (1) → Trusted (2)
+      ↘                                  ↓
+         Demoted (3) ←──────────────────┘
+```
+
+Candidates are keyed by `cluster_key` (domain+action+signature) — upserts are idempotent. Evidence accumulates across sessions: `support_count`, `cross_session_count`, `mean_surprise`, `promotion_score`, `debt_ids`, `episode_ids`.
+
+**Promotion thresholds** — all four must hold:
+- `support_count ≥ 4`
+- `cross_session_count ≥ 2`
+- `promotion_score ≥ 0.72`
+- `contradiction_count == 0`
+
+When a candidate reaches Trusted, a full memory is written and its ID stored in `memory_id`. `contradiction_count` is a hard gate — a single contradiction blocks promotion and is never auto-cleared.
+
+**WAL ops:** `UpsertWisdomCandidate` (byte 45), `UpdateWisdomLifecycle` (byte 46).
+
+### LearnedScoringModel (Move 6)
+
+An online overlay layer on top of the static `ScoringConfig`. Stores per-factor `LearnedFactorWeight` deltas (additive, clamped to `[−0.5, +0.5]` by default) calibrated from outcome signals. The scorer calls `effective_weight(factor_name, baseline_value)` = `clamp(baseline + delta, min, max)`.
+
+Tracks `model_version` (monotonically increasing), `baseline_version` (validated before applying calibration to detect stale deltas after a baseline bump), `ewma_loss`, and `outcome_count`. Updates are applied as full model snapshots — `replay_update` replaces the entire struct atomically.
+
+**WAL ops:** `UpdateScorerModel` (byte 47).
+
+### EpistemicDebtStore + evidence (Move 3)
+
+`EpistemicDebt` records now carry `evidence: Vec<DebtEvidence>` — each evidence entry has `memory_ids`, `confidence`, and an optional `note`. `auto_resolve_if_ready(threshold)` resolves a debt when any evidence entry meets the confidence threshold, writing a `UpdateDebt` WAL op with `status=1` and a human-readable resolution string.
+
+The subconscious learning cycle calls `cf_auto_resolve_debts(threshold=0.70)` every 30 minutes, scanning all open debts with attached evidence.
+
+**WAL ops:** `AttachDebtEvidence` (byte 48).
+
+### SkillRegistry
+
+Append-only, versioned registry of named skill blobs (procedural instruction content). Each skill maps to an ordered `Vec<SkillVersion>` — version numbers are 1-based positional indices. `deprecate()` marks only the latest version; `search(query)` does case-insensitive substring matching across ID, tags, and content of non-deprecated latest versions. New uploads are immutable; revision requires uploading a new version.
+
+### UserModelRegistry
+
+Key-value registry of typed entity records (`user`, `org`, `person`) with opaque JSON payloads and observation counting. `upsert()` performs a full overwrite (resetting `observation_count`); `observe()` increments the count without touching the payload. No WAL replay variants — state is considered reconstructable from higher-level WAL events.
+
+---
 
 ## Theoretical foundations
 
