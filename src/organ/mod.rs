@@ -27,3 +27,4 @@ pub mod epistemic_debt;
 pub mod integration;
 pub mod surprise_learning;
 pub mod wisdom_promotion;
+pub mod intervention;
