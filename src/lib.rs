@@ -28,6 +28,8 @@ pub use ops::{
     AddTriggerOp, UpdateTriggerOp, FireTriggerOp,
     OP_ASSERT_CONSTRAINT, OP_RETRACT_CONSTRAINT, OP_CREATE_BRANCH, OP_RESOLVE_BRANCH,
     OP_ADD_TRIGGER, OP_UPDATE_TRIGGER, OP_FIRE_TRIGGER,
+    RecordSurpriseOp, RegisterDebtOp, UpdateDebtOp, UpdateSourceWeightOp, RecordFeedbackOp,
+    OP_RECORD_SURPRISE, OP_REGISTER_DEBT, OP_UPDATE_DEBT, OP_UPDATE_SOURCE_WEIGHT, OP_RECORD_FEEDBACK,
 };
 pub use organ::cortex::{CorticalIndex, SparseCode, SparseEncoder};
 pub use organ::pq::{ProductQuantizer, PQ_BYTES};
@@ -35,6 +37,9 @@ pub use organ::prototype::{ProtoId, PrototypeEntry, PrototypeIndex};
 pub use organ::constraint::{ConstraintStore, Constraint, Provenance, Branch, BranchStatus};
 pub use organ::predictor::AccessPredictor;
 pub use organ::trigger::{TriggerStore, TriggerAutomaton, TriggerCondition, TriggerAction, TriggerStatus};
+pub use organ::surprise::{SurpriseStore, SurpriseEvent, BlindSpot};
+pub use organ::epistemic_debt::{EpistemicDebtStore, EpistemicDebt, DebtStatus};
+pub use organ::integration::{IntegrationKernel, SourceWeight, IntegrationTrace};
 pub use organ::triplet::{TripletEntry, TripletStore};
 pub use payload::{ArtifactRef, ArtifactRelation, MemoryPayload};
 pub use recall::RecallHit;

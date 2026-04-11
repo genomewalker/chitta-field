@@ -102,12 +102,26 @@ pub struct ScoringConfig {
     /// Prediction boost weight: factor = 1 + weight * prediction_probability.
     pub prediction_weight: f32,
 
+    // ── Surprise domain (Layer 4) ──────────────────────────────────────
+    #[serde(default = "default_surprise_domain_actual_weight")]
+    pub surprise_domain_actual_weight: f32,
+    #[serde(default = "default_surprise_domain_expected_weight")]
+    pub surprise_domain_expected_weight: f32,
+
+    // ── Epistemic debt (Layer 5) ───────────────────────────────────────
+    #[serde(default = "default_epistemic_debt_boost")]
+    pub epistemic_debt_boost: f32,
+
     // ── Lure detection (post-pipeline) ─────────────────────────────────
     /// Lure risk threshold above which candidates may be suppressed.
     pub lure_risk_threshold: f32,
     /// Maximum number of lure-flagged candidates to suppress per query.
     pub lure_max_suppressed: usize,
 }
+
+fn default_surprise_domain_actual_weight() -> f32 { 0.15 }
+fn default_surprise_domain_expected_weight() -> f32 { 0.10 }
+fn default_epistemic_debt_boost() -> f32 { 1.1 }
 
 impl Default for ScoringConfig {
     fn default() -> Self {
@@ -175,6 +189,13 @@ impl Default for ScoringConfig {
 
             // Prediction
             prediction_weight: 0.3,
+
+            // Surprise domain
+            surprise_domain_actual_weight: 0.15,
+            surprise_domain_expected_weight: 0.10,
+
+            // Epistemic debt
+            epistemic_debt_boost: 1.1,
 
             // Lure detection
             lure_risk_threshold: 0.7,

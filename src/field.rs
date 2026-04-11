@@ -21,6 +21,9 @@ use crate::organ::msg::MsgRegistry;
 use crate::organ::predictor::AccessPredictor;
 use crate::organ::skill::SkillRegistry;
 use crate::organ::trigger::TriggerStore;
+use crate::organ::surprise::SurpriseStore;
+use crate::organ::epistemic_debt::EpistemicDebtStore;
+use crate::organ::integration::IntegrationKernel;
 use crate::organ::pq::ProductQuantizer;
 use crate::organ::session::SessionRegistry;
 use crate::organ::symbol::{SymbolEntry, SymbolIndex};
@@ -129,6 +132,9 @@ pub struct ChittaField {
     pub(crate) constraint_store: RwLock<ConstraintStore>,
     pub(crate) trigger_store: RwLock<TriggerStore>,
     pub(crate) predictor: RwLock<AccessPredictor>,
+    pub(crate) surprise_store: RwLock<SurpriseStore>,
+    pub(crate) epistemic_debt_store: RwLock<EpistemicDebtStore>,
+    pub(crate) integration_kernel: RwLock<IntegrationKernel>,
     pub(crate) lite_encoder: RwLock<Option<LiteEncoder>>,
     /// Byte offsets for each foreign segment file, used by sync_foreign().
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
@@ -200,6 +206,9 @@ impl ChittaField {
         let mut constraint_store = ConstraintStore::new();
         let mut trigger_store = TriggerStore::new();
         let predictor = AccessPredictor::new();
+        let mut surprise_store = SurpriseStore::new();
+        let mut epistemic_debt_store = EpistemicDebtStore::new();
+        let mut integration_kernel = IntegrationKernel::new();
         let mut chunk_hash_idx: HashMap<crate::ids::ChunkHash, MemoryId> = HashMap::new();
         let mut snapshot_coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats> = HashMap::new();
 
@@ -413,6 +422,9 @@ impl ChittaField {
                 &mut agent_registry,
                 &mut constraint_store,
                 &mut trigger_store,
+                &mut surprise_store,
+                &mut epistemic_debt_store,
+                &mut integration_kernel,
                 &mut chunk_hash_idx,
                 &mut replay_realm_members,
                 &mut replay_coactivation_stats,
@@ -505,6 +517,9 @@ impl ChittaField {
             constraint_store: RwLock::new(constraint_store),
             trigger_store: RwLock::new(trigger_store),
             predictor: RwLock::new(predictor),
+            surprise_store: RwLock::new(surprise_store),
+            epistemic_debt_store: RwLock::new(epistemic_debt_store),
+            integration_kernel: RwLock::new(integration_kernel),
             lite_encoder: RwLock::new(loaded_lite_encoder),
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
@@ -593,6 +608,9 @@ impl ChittaField {
         let mut agent_reg = self.agent_registry.write();
         let mut constraint_reg = self.constraint_store.write();
         let mut trigger_reg = self.trigger_store.write();
+        let mut surprise_reg = self.surprise_store.write();
+        let mut epistemic_debt_reg = self.epistemic_debt_store.write();
+        let mut integration_reg = self.integration_kernel.write();
         let mut chunk_hash_idx = self.chunk_hash_idx.write();
         let mut realm_members = self.realm_members.write();
         let mut coactivation_stats = self.coactivation_stats.write();
@@ -625,6 +643,9 @@ impl ChittaField {
                 &mut *agent_reg,
                 &mut *constraint_reg,
                 &mut *trigger_reg,
+                &mut *surprise_reg,
+                &mut *epistemic_debt_reg,
+                &mut *integration_reg,
                 &mut *chunk_hash_idx,
                 &mut *realm_members,
                 &mut *coactivation_stats,
@@ -774,6 +795,9 @@ pub(crate) fn apply_op(
     agent_registry: &mut AgentRegistry,
     constraint_store: &mut ConstraintStore,
     trigger_store: &mut TriggerStore,
+    surprise_store: &mut SurpriseStore,
+    epistemic_debt_store: &mut EpistemicDebtStore,
+    integration_kernel: &mut IntegrationKernel,
     chunk_hash_idx: &mut HashMap<crate::ids::ChunkHash, MemoryId>,
     realm_members: &mut HashMap<String, HashSet<MemoryId>>,
     coactivation_stats: &mut HashMap<(MemoryId, MemoryId), CoActivationStats>,
@@ -1266,6 +1290,53 @@ pub(crate) fn apply_op(
                 f.trigger_id,
                 crate::organ::trigger::TriggerStatus::Fired,
                 f.fired_ms,
+            );
+        }
+        Op::RecordSurprise(s) => {
+            surprise_store.replay_record(crate::organ::surprise::SurpriseEvent {
+                id: s.event_id,
+                context_sketch: s.context_sketch,
+                action: s.action,
+                expected: s.expected,
+                actual: s.actual,
+                surprise_magnitude: s.surprise_magnitude,
+                domain: s.domain,
+                timestamp_ms: s.timestamp_ms,
+                realm: s.realm,
+                session_id: s.session_id,
+                source_memory_id: s.source_memory_id,
+            });
+        }
+        Op::RegisterDebt(d) => {
+            epistemic_debt_store.replay_register(crate::organ::epistemic_debt::EpistemicDebt {
+                id: d.debt_id,
+                pattern: d.pattern,
+                competing_hypotheses: d.competing_hypotheses,
+                discriminating_test: d.discriminating_test,
+                fragility_score: d.fragility_score,
+                domain: d.domain,
+                status: crate::organ::epistemic_debt::DebtStatus::Open,
+                created_ms: d.created_ms,
+                resolved_ms: 0,
+                resolution: None,
+                realm: d.realm,
+                source_session: d.source_session,
+            });
+        }
+        Op::UpdateDebt(u) => {
+            let status = crate::organ::epistemic_debt::DebtStatus::from_u8(u.status);
+            epistemic_debt_store.replay_update(u.debt_id, status, u.resolved_ms, u.resolution);
+        }
+        Op::UpdateSourceWeight(w) => {
+            integration_kernel.replay_update_weight(w.source, w.query_domain, w.weight);
+        }
+        Op::RecordFeedback(f) => {
+            integration_kernel.replay_feedback(
+                f.source,
+                f.query_domain,
+                f.new_weight,
+                f.success_count,
+                f.total_count,
             );
         }
     }

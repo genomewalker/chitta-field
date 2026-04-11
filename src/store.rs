@@ -748,6 +748,9 @@ impl ChittaField {
                     query_valence,
                     query_arousal,
                     prediction_prob: None,
+                    surprise_role: None,
+                    has_open_debt: false,
+                    integration_weight: None,
                 };
                 let (score, decomp) = pipeline.score(&ctx)?;
                 let eff_strength = state.effective_strength(now);
@@ -1075,6 +1078,9 @@ impl ChittaField {
                     query_valence,
                     query_arousal,
                     prediction_prob: None,
+                    surprise_role: None,
+                    has_open_debt: false,
+                    integration_weight: None,
                 };
                 let (score, decomp) = pipeline.score(&ctx)?;
                 let eff_strength = state.effective_strength(now);
@@ -2208,6 +2214,225 @@ impl ChittaField {
     pub fn predictor_stats(&self) -> (u64, usize, usize) {
         let p = self.predictor.read();
         (p.total_transitions(), p.transition_count(), p.recent_access_len())
+    }
+
+    // ── Layer 4: Surprise Memory ──────────────────────────────────────
+
+    pub fn record_surprise(
+        &self,
+        context_sketch: String,
+        action: String,
+        expected: Option<String>,
+        actual: String,
+        surprise_magnitude: f32,
+        domain: String,
+        realm: String,
+        session_id: Option<String>,
+        source_memory_id: Option<u64>,
+    ) -> Result<u64> {
+        let now = now_ms();
+        let event_id = {
+            let mut store = self.surprise_store.write();
+            store.record(
+                context_sketch.clone(), action.clone(), expected.clone(),
+                actual.clone(), surprise_magnitude, domain.clone(),
+                realm.clone(), session_id.clone(), source_memory_id, now,
+            )
+        };
+        let op = Op::RecordSurprise(crate::ops::RecordSurpriseOp {
+            event_id,
+            context_sketch,
+            action,
+            expected,
+            actual,
+            surprise_magnitude,
+            domain,
+            timestamp_ms: now,
+            realm,
+            session_id,
+            source_memory_id,
+        });
+        self.log.write().append(&op)?;
+        Ok(event_id)
+    }
+
+    pub fn query_surprises(
+        &self,
+        domain: Option<&str>,
+        realm: Option<&str>,
+        min_magnitude: Option<f32>,
+        since_ms: Option<i64>,
+        limit: usize,
+    ) -> Vec<crate::organ::surprise::SurpriseEvent> {
+        self.surprise_store
+            .read()
+            .query(domain, realm, min_magnitude, since_ms, limit)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn get_blind_spots(
+        &self,
+        realm: Option<&str>,
+        limit: usize,
+    ) -> Vec<crate::organ::surprise::BlindSpot> {
+        self.surprise_store.read().get_blind_spots(realm, limit)
+    }
+
+    pub fn surprise_stats(&self) -> crate::organ::surprise::SurpriseStats {
+        self.surprise_store.read().stats()
+    }
+
+    // ── Layer 5: Epistemic Debt ───────────────────────────────────────
+
+    pub fn register_debt(
+        &self,
+        pattern: String,
+        competing_hypotheses: Vec<String>,
+        discriminating_test: Option<String>,
+        fragility_score: f32,
+        domain: String,
+        realm: String,
+        source_session: Option<String>,
+    ) -> Result<u64> {
+        let now = now_ms();
+        let debt_id = {
+            let mut store = self.epistemic_debt_store.write();
+            store.register(
+                pattern.clone(), competing_hypotheses.clone(),
+                discriminating_test.clone(), fragility_score,
+                domain.clone(), realm.clone(), source_session.clone(), now,
+            )
+        };
+        let op = Op::RegisterDebt(crate::ops::RegisterDebtOp {
+            debt_id,
+            pattern,
+            competing_hypotheses,
+            discriminating_test,
+            fragility_score,
+            domain,
+            created_ms: now,
+            realm,
+            source_session,
+        });
+        self.log.write().append(&op)?;
+        Ok(debt_id)
+    }
+
+    pub fn resolve_debt(&self, debt_id: u64, resolution: String) -> Result<bool> {
+        let now = now_ms();
+        let ok = self.epistemic_debt_store.write().resolve(debt_id, resolution.clone(), now);
+        if ok {
+            let op = Op::UpdateDebt(crate::ops::UpdateDebtOp {
+                debt_id,
+                status: 1,
+                resolved_ms: now,
+                resolution: Some(resolution),
+            });
+            self.log.write().append(&op)?;
+        }
+        Ok(ok)
+    }
+
+    pub fn defer_debt(&self, debt_id: u64) -> Result<bool> {
+        let ok = self.epistemic_debt_store.write().defer(debt_id);
+        if ok {
+            let op = Op::UpdateDebt(crate::ops::UpdateDebtOp {
+                debt_id,
+                status: 2,
+                resolved_ms: 0,
+                resolution: None,
+            });
+            self.log.write().append(&op)?;
+        }
+        Ok(ok)
+    }
+
+    pub fn query_debts(
+        &self,
+        status: Option<crate::organ::epistemic_debt::DebtStatus>,
+        domain: Option<&str>,
+        realm: Option<&str>,
+        min_fragility: Option<f32>,
+        limit: usize,
+    ) -> Vec<crate::organ::epistemic_debt::EpistemicDebt> {
+        self.epistemic_debt_store
+            .read()
+            .query(status, domain, realm, min_fragility, limit)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn get_fragile_decisions(
+        &self,
+        threshold: f32,
+        limit: usize,
+    ) -> Vec<crate::organ::epistemic_debt::EpistemicDebt> {
+        self.epistemic_debt_store
+            .read()
+            .get_fragile_decisions(threshold, limit)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn debt_stats(&self) -> crate::organ::epistemic_debt::DebtStats {
+        self.epistemic_debt_store.read().stats()
+    }
+
+    // ── Layer 6: Integration Kernel ───────────────────────────────────
+
+    pub fn record_feedback(
+        &self,
+        query_domain: &str,
+        source: &str,
+        was_useful: bool,
+    ) -> Result<crate::organ::integration::SourceWeight> {
+        let sw = self.integration_kernel.write().record_feedback(query_domain, source, was_useful);
+        let op = Op::RecordFeedback(crate::ops::RecordFeedbackOp {
+            source: sw.source.clone(),
+            query_domain: sw.query_domain.clone(),
+            was_useful,
+            new_weight: sw.weight,
+            success_count: sw.success_count,
+            total_count: sw.total_count,
+        });
+        self.log.write().append(&op)?;
+        Ok(sw)
+    }
+
+    pub fn get_source_weights(
+        &self,
+        domain: Option<&str>,
+    ) -> Vec<crate::organ::integration::SourceWeight> {
+        self.integration_kernel
+            .read()
+            .get_source_weights(domain)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn update_source_weight(
+        &self,
+        source: &str,
+        domain: &str,
+        weight: f32,
+    ) -> Result<bool> {
+        let ok = self.integration_kernel.write().update_source_weight(source, domain, weight);
+        let op = Op::UpdateSourceWeight(crate::ops::UpdateSourceWeightOp {
+            source: source.to_string(),
+            query_domain: domain.to_string(),
+            weight,
+        });
+        self.log.write().append(&op)?;
+        Ok(ok)
+    }
+
+    pub fn integration_stats(&self) -> crate::organ::integration::IntegrationStats {
+        self.integration_kernel.read().stats()
     }
 
     /// Save full in-memory state to a binary snapshot (chitta.snapshot).

@@ -35,7 +35,13 @@ chitta-field/
     ├── ArtifactIndex  (file path to memory mapping)
     ├── ThemeOrgan     (cluster centroids)
     ├── SessionRegistry / TranscriptRegistry / TaskRegistry
-    └── LearnerSet     (resonance / route learners)
+    ├── LearnerSet     (resonance / route learners)
+    ├── ConstraintStore  (Prolog-style logic — Layer 1)
+    ├── TriggerStore     (event-condition-action rules — Layer 2)
+    ├── PredictorStore   (Markov chain access predictor — Layer 3)
+    ├── SurpriseStore    (prediction error tuples — Layer 4)
+    ├── EpistemicDebtStore (uncertainty boundaries — Layer 5)
+    └── IntegrationKernel  (recall source weights — Layer 6)
 ```
 
 ### Multi-writer design (Upanishads model)
@@ -82,6 +88,7 @@ After the final pass, `cf_record_recall_batch` atomically commits all learning:
 - **Resonance learning** — feedback signal updates retrieval weights via `LearnerSet`
 - **Session / transcript / task registries** — first-class domain objects for AI session management
 - **Snapshot acceleration** — `cf_save_full_snapshot` / `cf_save_snapshot` skip log replay on next open
+- **Meta-memory layers** — six organ stores beyond core recall: executable constraints (Prolog-style logic), trigger tissue (event-condition-action), predictive memory (Markov chain), surprise memory (prediction error tracking with blind spot detection), epistemic debt (uncertainty boundaries with fragility scoring), and integration kernel (learned recall source weights via Bayesian feedback)
 
 ## Memory model
 
