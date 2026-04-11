@@ -44,6 +44,11 @@ pub enum Op {
     AddTrigger(AddTriggerOp),
     UpdateTrigger(UpdateTriggerOp),
     FireTrigger(FireTriggerOp),
+    RecordSurprise(RecordSurpriseOp),
+    RegisterDebt(RegisterDebtOp),
+    UpdateDebt(UpdateDebtOp),
+    UpdateSourceWeight(UpdateSourceWeightOp),
+    RecordFeedback(RecordFeedbackOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -69,6 +74,11 @@ pub const OP_RESOLVE_BRANCH: u8 = 35;
 pub const OP_ADD_TRIGGER: u8 = 36;
 pub const OP_UPDATE_TRIGGER: u8 = 37;
 pub const OP_FIRE_TRIGGER: u8 = 38;
+pub const OP_RECORD_SURPRISE: u8 = 39;
+pub const OP_REGISTER_DEBT: u8 = 40;
+pub const OP_UPDATE_DEBT: u8 = 41;
+pub const OP_UPDATE_SOURCE_WEIGHT: u8 = 42;
+pub const OP_RECORD_FEEDBACK: u8 = 43;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -473,4 +483,63 @@ pub struct UpdateTriggerOp {
 pub struct FireTriggerOp {
     pub trigger_id: u64,
     pub fired_ms: i64,
+}
+
+// ── Layer 4: Surprise Memory ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordSurpriseOp {
+    pub event_id: u64,
+    pub context_sketch: String,
+    pub action: String,
+    pub expected: Option<String>,
+    pub actual: String,
+    pub surprise_magnitude: f32,
+    pub domain: String,
+    pub timestamp_ms: i64,
+    pub realm: String,
+    pub session_id: Option<String>,
+    pub source_memory_id: Option<u64>,
+}
+
+// ── Layer 5: Epistemic Debt ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterDebtOp {
+    pub debt_id: u64,
+    pub pattern: String,
+    pub competing_hypotheses: Vec<String>,
+    pub discriminating_test: Option<String>,
+    pub fragility_score: f32,
+    pub domain: String,
+    pub created_ms: i64,
+    pub realm: String,
+    pub source_session: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateDebtOp {
+    pub debt_id: u64,
+    pub status: u8,
+    pub resolved_ms: i64,
+    pub resolution: Option<String>,
+}
+
+// ── Layer 6: Integration Kernel ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSourceWeightOp {
+    pub source: String,
+    pub query_domain: String,
+    pub weight: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordFeedbackOp {
+    pub source: String,
+    pub query_domain: String,
+    pub was_useful: bool,
+    pub new_weight: f32,
+    pub success_count: u64,
+    pub total_count: u64,
 }

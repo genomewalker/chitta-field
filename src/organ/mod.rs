@@ -22,3 +22,6 @@ pub mod agent;
 pub mod constraint;
 pub mod trigger;
 pub mod predictor;
+pub mod surprise;
+pub mod epistemic_debt;
+pub mod integration;

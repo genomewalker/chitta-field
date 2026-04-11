@@ -53,6 +53,8 @@ use crate::ops::{
     OP_UPDATE_MEMORY_CONTENT, OP_UPDATE_SYMBOL_DESCRIPTION, OP_USER_MODEL_EVENT,
     OP_ASSERT_CONSTRAINT, OP_RETRACT_CONSTRAINT, OP_CREATE_BRANCH, OP_RESOLVE_BRANCH,
     OP_ADD_TRIGGER, OP_UPDATE_TRIGGER, OP_FIRE_TRIGGER,
+    OP_RECORD_SURPRISE, OP_REGISTER_DEBT, OP_UPDATE_DEBT,
+    OP_UPDATE_SOURCE_WEIGHT, OP_RECORD_FEEDBACK,
 };
 
 fn op_type_byte(op: &Op) -> u8 {
@@ -96,6 +98,11 @@ fn op_type_byte(op: &Op) -> u8 {
         Op::AddTrigger(_) => OP_ADD_TRIGGER,
         Op::UpdateTrigger(_) => OP_UPDATE_TRIGGER,
         Op::FireTrigger(_) => OP_FIRE_TRIGGER,
+        Op::RecordSurprise(_) => OP_RECORD_SURPRISE,
+        Op::RegisterDebt(_) => OP_REGISTER_DEBT,
+        Op::UpdateDebt(_) => OP_UPDATE_DEBT,
+        Op::UpdateSourceWeight(_) => OP_UPDATE_SOURCE_WEIGHT,
+        Op::RecordFeedback(_) => OP_RECORD_FEEDBACK,
     }
 }
 

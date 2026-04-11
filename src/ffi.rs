@@ -6247,10 +6247,292 @@ pub extern "C" fn cf_constraint_stats(h: *const CfHandle) -> *mut c_char {
     let (facts, branches) = handle.field.constraint_stats();
     let armed = handle.field.trigger_stats();
     let (transitions, transition_sources, recent_accesses) = handle.field.predictor_stats();
+    let surprise = handle.field.surprise_stats();
+    let debt = handle.field.debt_stats();
+    let integration = handle.field.integration_stats();
     let json = serde_json::json!({
         "constraints": {"facts": facts, "branches": branches},
         "triggers": {"armed": armed},
         "predictor": {"transitions": transitions, "sources": transition_sources, "recent_accesses": recent_accesses},
+        "surprise": {"events": surprise.total_events, "avg_magnitude": surprise.avg_magnitude},
+        "epistemic_debt": {"total": debt.total, "open": debt.open, "resolved": debt.resolved, "deferred": debt.deferred, "avg_fragility_open": debt.avg_fragility_open},
+        "integration": {"total_queries": integration.total_queries, "sources": integration.source_rates.len()},
+    });
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+// ── Layer 4: Surprise Memory ──────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn cf_record_surprise(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+
+    let context_sketch = params["context_sketch"].as_str().unwrap_or("").to_string();
+    let action = params["action"].as_str().unwrap_or("").to_string();
+    let expected = params["expected"].as_str().map(|s| s.to_string());
+    let actual = params["actual"].as_str().unwrap_or("").to_string();
+    let surprise_magnitude = params["surprise_magnitude"].as_f64().unwrap_or(0.5) as f32;
+    let domain = params["domain"].as_str().unwrap_or("general").to_string();
+    let realm = params["realm"].as_str().unwrap_or("global").to_string();
+    let session_id = params["session_id"].as_str().map(|s| s.to_string());
+    let source_memory_id = params["source_memory_id"].as_u64();
+
+    match handle.field.record_surprise(
+        context_sketch, action, expected, actual,
+        surprise_magnitude, domain, realm, session_id, source_memory_id,
+    ) {
+        Ok(event_id) => {
+            let json = serde_json::json!({"event_id": event_id});
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_query_surprises(
+    h: *const CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+
+    let domain = params["domain"].as_str();
+    let realm = params["realm"].as_str();
+    let min_magnitude = params["min_magnitude"].as_f64().map(|v| v as f32);
+    let since_ms = params["since_ms"].as_i64();
+    let limit = params["limit"].as_u64().unwrap_or(50) as usize;
+
+    let events = handle.field.query_surprises(domain, realm, min_magnitude, since_ms, limit);
+    let json = serde_json::to_string(&events).unwrap_or_else(|_| "[]".to_string());
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_get_blind_spots(
+    h: *const CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+
+    let realm = params["realm"].as_str();
+    let limit = params["limit"].as_u64().unwrap_or(10) as usize;
+
+    let spots = handle.field.get_blind_spots(realm, limit);
+    let json = serde_json::to_string(&spots).unwrap_or_else(|_| "[]".to_string());
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_surprise_stats(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let stats = handle.field.surprise_stats();
+    let json = serde_json::json!({
+        "total_events": stats.total_events,
+        "avg_magnitude": stats.avg_magnitude,
+        "by_domain": stats.by_domain,
+    });
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+// ── Layer 5: Epistemic Debt ───────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn cf_register_debt(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+
+    let pattern = params["pattern"].as_str().unwrap_or("").to_string();
+    let competing_hypotheses: Vec<String> = params["competing_hypotheses"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let discriminating_test = params["discriminating_test"].as_str().map(|s| s.to_string());
+    let fragility_score = params["fragility_score"].as_f64().unwrap_or(0.5) as f32;
+    let domain = params["domain"].as_str().unwrap_or("general").to_string();
+    let realm = params["realm"].as_str().unwrap_or("global").to_string();
+    let source_session = params["session_id"].as_str().map(|s| s.to_string());
+
+    match handle.field.register_debt(
+        pattern, competing_hypotheses, discriminating_test,
+        fragility_score, domain, realm, source_session,
+    ) {
+        Ok(debt_id) => {
+            let json = serde_json::json!({"debt_id": debt_id});
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_resolve_debt(
+    h: *mut CfHandle, debt_id: u64, resolution_json: *const c_char,
+) -> c_int {
+    if h.is_null() || resolution_json.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let resolution = unsafe { match CStr::from_ptr(resolution_json).to_str() { Ok(s) => s.to_string(), Err(_) => return -1 } };
+    match handle.field.resolve_debt(debt_id, resolution) {
+        Ok(true) => handle.ok(),
+        Ok(false) => handle.err("debt not found"),
+        Err(e) => handle.err(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_defer_debt(h: *mut CfHandle, debt_id: u64) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    match handle.field.defer_debt(debt_id) {
+        Ok(true) => handle.ok(),
+        Ok(false) => handle.err("debt not found"),
+        Err(e) => handle.err(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_query_debts(
+    h: *const CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+
+    let status = params["status"].as_str().map(|s| match s {
+        "open" | "Open" => crate::organ::epistemic_debt::DebtStatus::Open,
+        "resolved" | "Resolved" => crate::organ::epistemic_debt::DebtStatus::Resolved,
+        _ => crate::organ::epistemic_debt::DebtStatus::Deferred,
+    });
+    let domain = params["domain"].as_str();
+    let realm = params["realm"].as_str();
+    let min_fragility = params["min_fragility"].as_f64().map(|v| v as f32);
+    let limit = params["limit"].as_u64().unwrap_or(50) as usize;
+
+    let debts = handle.field.query_debts(status, domain, realm, min_fragility, limit);
+    let json = serde_json::to_string(&debts).unwrap_or_else(|_| "[]".to_string());
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_get_fragile_decisions(
+    h: *const CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+
+    let threshold = params["threshold"].as_f64().unwrap_or(0.5) as f32;
+    let limit = params["limit"].as_u64().unwrap_or(20) as usize;
+
+    let debts = handle.field.get_fragile_decisions(threshold, limit);
+    let json = serde_json::to_string(&debts).unwrap_or_else(|_| "[]".to_string());
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_debt_stats(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let stats = handle.field.debt_stats();
+    let json = serde_json::json!({
+        "total": stats.total,
+        "open": stats.open,
+        "resolved": stats.resolved,
+        "deferred": stats.deferred,
+        "avg_fragility_open": stats.avg_fragility_open,
+    });
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+// ── Layer 6: Integration Kernel ───────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn cf_record_feedback(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+
+    let query_domain = params["query_domain"].as_str().unwrap_or("general");
+    let source = params["source"].as_str().unwrap_or("");
+    let was_useful = params["was_useful"].as_bool().unwrap_or(true);
+
+    match handle.field.record_feedback(query_domain, source, was_useful) {
+        Ok(sw) => {
+            let json = serde_json::json!({
+                "source": sw.source,
+                "query_domain": sw.query_domain,
+                "weight": sw.weight,
+                "success_count": sw.success_count,
+                "total_count": sw.total_count,
+            });
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_get_source_weights(
+    h: *const CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+
+    let domain = params["domain"].as_str();
+    let weights = handle.field.get_source_weights(domain);
+    let json = serde_json::to_string(&weights).unwrap_or_else(|_| "[]".to_string());
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_update_source_weight(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> c_int {
+    if h.is_null() || params_json.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return -1 } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return -1 };
+
+    let source = params["source"].as_str().unwrap_or("");
+    let domain = params["domain"].as_str().unwrap_or("general");
+    let weight = params["weight"].as_f64().unwrap_or(1.0) as f32;
+
+    match handle.field.update_source_weight(source, domain, weight) {
+        Ok(_) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_integration_stats(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let stats = handle.field.integration_stats();
+    let json = serde_json::json!({
+        "total_queries": stats.total_queries,
+        "source_rates": stats.source_rates.iter().map(|(source, domain, rate, count)| {
+            serde_json::json!({"source": source, "domain": domain, "success_rate": rate, "total_count": count})
+        }).collect::<Vec<_>>(),
     });
     CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }

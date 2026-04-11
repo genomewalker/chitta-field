@@ -26,6 +26,18 @@ pub struct ScoringContext<'a> {
     pub query_arousal: Option<f32>,
     /// Prediction probability from Markov chain predictor (None = not predicted).
     pub prediction_prob: Option<f32>,
+    /// Surprise role: was this memory involved in a surprise event? (Layer 4)
+    pub surprise_role: Option<SurpriseRole>,
+    /// Does this memory's domain have open epistemic debt? (Layer 5)
+    pub has_open_debt: bool,
+    /// Learned source weight from integration kernel (Layer 6)
+    pub integration_weight: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SurpriseRole {
+    WasActual(f32),
+    WasExpected(f32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +60,9 @@ pub struct ScoreDecomposition {
     pub frustration_boost: f32,
     pub interference_factor: f32,
     pub spacing_boost: f32,
+    pub surprise_domain_factor: f32,
+    pub epistemic_debt_factor: f32,
+    pub integration_weight_factor: f32,
 }
 
 /// A single scoring factor in the pipeline.
@@ -92,6 +107,9 @@ impl ScoringPipeline {
             Box::new(InterferenceDensityFactor),
             Box::new(SpacingBoostFactor),
             Box::new(PredictionFactor),
+            Box::new(SurpriseDomainFactor),
+            Box::new(EpistemicDebtFactor),
+            Box::new(IntegrationWeightFactor),
         ];
         Self { factors, config }
     }

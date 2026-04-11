@@ -314,3 +314,72 @@ impl ScoringFactor for PredictionFactor {
         Some(boost)
     }
 }
+
+// ── Surprise domain factor (Layer 4) ──────────────────────────────────────
+
+pub struct SurpriseDomainFactor;
+
+impl ScoringFactor for SurpriseDomainFactor {
+    fn name(&self) -> &'static str { "surprise_domain" }
+
+    fn compute(
+        &self,
+        ctx: &ScoringContext,
+        config: &ScoringConfig,
+        decomp: &mut ScoreDecomposition,
+    ) -> Option<f32> {
+        let factor = match &ctx.surprise_role {
+            Some(super::SurpriseRole::WasActual(mag)) => {
+                1.0 + config.surprise_domain_actual_weight * mag
+            }
+            Some(super::SurpriseRole::WasExpected(mag)) => {
+                (1.0 - config.surprise_domain_expected_weight * mag).max(0.1)
+            }
+            None => 1.0,
+        };
+        decomp.surprise_domain_factor = factor;
+        Some(factor)
+    }
+}
+
+// ── Epistemic debt factor (Layer 5) ───────────────────────────────────────
+
+pub struct EpistemicDebtFactor;
+
+impl ScoringFactor for EpistemicDebtFactor {
+    fn name(&self) -> &'static str { "epistemic_debt" }
+
+    fn compute(
+        &self,
+        ctx: &ScoringContext,
+        config: &ScoringConfig,
+        decomp: &mut ScoreDecomposition,
+    ) -> Option<f32> {
+        let factor = if ctx.has_open_debt {
+            config.epistemic_debt_boost
+        } else {
+            1.0
+        };
+        decomp.epistemic_debt_factor = factor;
+        Some(factor)
+    }
+}
+
+// ── Integration weight factor (Layer 6) ───────────────────────────────────
+
+pub struct IntegrationWeightFactor;
+
+impl ScoringFactor for IntegrationWeightFactor {
+    fn name(&self) -> &'static str { "integration_weight" }
+
+    fn compute(
+        &self,
+        ctx: &ScoringContext,
+        _config: &ScoringConfig,
+        decomp: &mut ScoreDecomposition,
+    ) -> Option<f32> {
+        let factor = ctx.integration_weight.unwrap_or(1.0);
+        decomp.integration_weight_factor = factor;
+        Some(factor)
+    }
+}
