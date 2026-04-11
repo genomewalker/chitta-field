@@ -167,6 +167,37 @@ impl MemoryState {
         }
     }
 
+    /// Clamp all float fields to valid ranges. Fixes corrupt data from V7→V8 migration.
+    pub fn sanitize(&mut self) {
+        if !self.confidence.is_finite() || self.confidence < 0.0 || self.confidence > 1.0 {
+            self.confidence = 0.5;
+        }
+        if !self.strength.is_finite() || self.strength < 0.0 || self.strength > 1.0 {
+            self.strength = 0.5;
+        }
+        if !self.affect_valence.is_finite() || self.affect_valence < -1.0 || self.affect_valence > 1.0 {
+            self.affect_valence = 0.0;
+        }
+        if !self.affect_arousal.is_finite() || self.affect_arousal < 0.0 || self.affect_arousal > 1.0 {
+            self.affect_arousal = 0.0;
+        }
+        if !self.surprise.is_finite() || self.surprise < 0.0 || self.surprise > 1.0 {
+            self.surprise = 0.0;
+        }
+        if !self.decay_rate.is_finite() || self.decay_rate < 0.0 {
+            self.decay_rate = 0.001;
+        }
+        if !self.competitive_weight.is_finite() {
+            self.competitive_weight = 0.0;
+        }
+        if !self.lure_risk.is_finite() {
+            self.lure_risk = 0.0;
+        }
+        if !self.spacing_quality.is_finite() {
+            self.spacing_quality = 0.0;
+        }
+    }
+
     pub fn apply_delta(&mut self, delta: &StateDeltaOp, now_ms: i64) {
         if delta.op_ts_ms > 0 && delta.op_ts_ms <= self.last_state_op_ts_ms {
             return;

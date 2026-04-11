@@ -443,10 +443,14 @@ impl FullSnapshot {
         let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
 
         if magic == FULL_SNAPSHOT_MAGIC {
-            // Current format (v7): full MemoryState with access_timestamps.
+            // Current format (v8): full MemoryState with interference fields.
             let r = BufReader::new(&bytes[8..]);
-            return bincode::deserialize_from(r)
-                .map_err(|e| FieldError::Serialization(e.to_string()));
+            let mut snap: Self = bincode::deserialize_from(r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            for state in snap.states.values_mut() {
+                state.sanitize();
+            }
+            return Ok(snap);
         }
 
         if magic == FULL_SNAPSHOT_MAGIC_V7 {
@@ -455,7 +459,7 @@ impl FullSnapshot {
             let r = BufReader::new(&bytes[8..]);
             let v7: LegacyFullSnapshotV7 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
-            let states = v7.states.into_iter().map(|(id, s)| (id, s.upgrade())).collect();
+            let states = v7.states.into_iter().map(|(id, s)| { let mut m = s.upgrade(); m.sanitize(); (id, m) }).collect();
             return Ok(FullSnapshot {
                 snapshot_seqno: v7.snapshot_seqno,
                 payloads: v7.payloads,
@@ -481,7 +485,7 @@ impl FullSnapshot {
             let r = BufReader::new(&bytes[8..]);
             let v6: LegacyFullSnapshotV6 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
-            let states = v6.states.into_iter().map(|(id, s)| (id, s.upgrade())).collect();
+            let states = v6.states.into_iter().map(|(id, s)| { let mut m = s.upgrade(); m.sanitize(); (id, m) }).collect();
             return Ok(FullSnapshot {
                 snapshot_seqno: v6.snapshot_seqno,
                 payloads: v6.payloads,
@@ -507,7 +511,7 @@ impl FullSnapshot {
             let r = BufReader::new(&bytes[8..]);
             let v5: LegacyFullSnapshotV5 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
-            let states = v5.states.into_iter().map(|(id, s)| (id, s.upgrade())).collect();
+            let states = v5.states.into_iter().map(|(id, s)| { let mut m = s.upgrade(); m.sanitize(); (id, m) }).collect();
             return Ok(FullSnapshot {
                 snapshot_seqno: v5.snapshot_seqno,
                 payloads: v5.payloads,
@@ -533,7 +537,7 @@ impl FullSnapshot {
             let r = BufReader::new(&bytes[8..]);
             let v4: LegacyFullSnapshotV4 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
-            let states = v4.states.into_iter().map(|(id, s)| (id, s.upgrade())).collect();
+            let states = v4.states.into_iter().map(|(id, s)| { let mut m = s.upgrade(); m.sanitize(); (id, m) }).collect();
             return Ok(FullSnapshot {
                 snapshot_seqno: v4.snapshot_seqno,
                 payloads: v4.payloads,
