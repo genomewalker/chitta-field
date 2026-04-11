@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{FieldError, Result};
 use crate::hnsw::SemanticIndex;
 use crate::ids::{
     new_instance_id, ArtifactId, ArtifactIdAllocator, InstanceId, MemoryId, MemoryIdAllocator,
@@ -272,8 +272,24 @@ impl ChittaField {
                 }
             }
         }
+        let had_full_snapshots = best_full_path.is_some() || !stale_full_paths.is_empty();
+        let mut full_snapshot_loaded = false;
+        // Try best snapshot first, then fall back to stale ones (sorted by seqno descending).
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
         if let Some(ref path) = best_full_path {
-            match FullSnapshot::load(path) {
+            candidates.push(path.clone());
+        }
+        // Sort stale paths by seqno descending so we try the most recent first.
+        let mut stale_with_seqno: Vec<(u64, std::path::PathBuf)> = stale_full_paths
+            .iter()
+            .filter_map(|p| FullSnapshot::peek_seqno(p).ok().map(|s| (s, p.clone())))
+            .collect();
+        stale_with_seqno.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, p) in stale_with_seqno {
+            candidates.push(p);
+        }
+        for candidate in &candidates {
+            match FullSnapshot::load(candidate) {
                 Ok(snap) => {
                     full_snapshot_seqno = snap.snapshot_seqno;
                     payloads = snap.payloads;
@@ -291,18 +307,32 @@ impl ChittaField {
                     semantic_idx = snap.semantic_idx;
                     snapshot_coactivation_stats = snap.coactivation_stats;
                     eprintln!(
-                        "[chitta-field] loaded full snapshot seqno={} from {:?}",
-                        full_snapshot_seqno, path
+                        "[chitta-field] loaded full snapshot seqno={} ({} memories) from {:?}",
+                        full_snapshot_seqno, payloads.len(), candidate
                     );
+                    full_snapshot_loaded = true;
+                    break;
                 }
                 Err(e) => eprintln!(
                     "[chitta-field] failed to load full snapshot {:?}: {}",
-                    path, e
+                    candidate, e
                 ),
             }
         }
-        for path in &stale_full_paths {
-            let _ = std::fs::remove_file(path);
+        if had_full_snapshots && !full_snapshot_loaded {
+            return Err(FieldError::Manifest(
+                "all full snapshots failed to load — refusing to start with empty store \
+                 (this prevents data loss; fix the snapshot format or restore from backup)"
+                    .to_string(),
+            ));
+        }
+        // Only clean up stale snapshots if we successfully loaded one.
+        if full_snapshot_loaded {
+            for path in &stale_full_paths {
+                if best_full_path.as_ref() != Some(path) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
         }
 
         // Replay ALL segment files to rebuild in-memory state.
