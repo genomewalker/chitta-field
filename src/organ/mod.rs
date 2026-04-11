@@ -28,3 +28,4 @@ pub mod integration;
 pub mod surprise_learning;
 pub mod wisdom_promotion;
 pub mod intervention;
+pub mod agent_protocol;

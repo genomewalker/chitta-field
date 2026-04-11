@@ -2882,6 +2882,194 @@ impl ChittaField {
         Ok(closed)
     }
 
+    // ── Agent Protocol Memory (Layer 8) ──────────────────────────────────────
+
+    pub fn register_task(
+        &self,
+        goal: String,
+        constraints: Vec<String>,
+        acceptance_criteria: Vec<String>,
+        realm: String,
+        session_id: String,
+        priority: u8,
+        parent_task_id: Option<u64>,
+        deadline_ms: Option<i64>,
+        tags: Vec<String>,
+    ) -> Result<u64> {
+        let now = now_ms();
+        let id = self.agent_protocol_store.write().register_task(
+            goal.clone(), constraints.clone(), acceptance_criteria.clone(),
+            realm.clone(), session_id.clone(), priority, parent_task_id,
+            deadline_ms, tags.clone(), now,
+        );
+        self.log.write().append(&crate::ops::Op::RegisterTask(crate::ops::RegisterTaskOp {
+            id, session_id, realm, goal, constraints, acceptance_criteria,
+            priority, parent_task_id, tags, deadline_ms, created_ms: now,
+        }))?;
+        Ok(id)
+    }
+
+    pub fn update_task(
+        &self,
+        task_id: u64,
+        status: Option<u8>,
+        add_intervention_id: Option<u64>,
+        add_tag: Option<String>,
+    ) -> Result<bool> {
+        use crate::organ::agent_protocol::TaskStatus;
+        let now = now_ms();
+        let status_enum = status.map(TaskStatus::from_u8);
+        let ok = self.agent_protocol_store.write().update_task(
+            task_id, status_enum, add_intervention_id, add_tag.clone(), now,
+        );
+        if ok {
+            self.log.write().append(&crate::ops::Op::UpdateTask(crate::ops::UpdateTaskOp {
+                task_id,
+                status: status.unwrap_or(0),
+                add_intervention_id,
+                add_tag,
+                updated_ms: now,
+            }))?;
+        }
+        Ok(ok)
+    }
+
+    pub fn add_delegation(
+        &self,
+        task_id: u64,
+        from_agent: String,
+        to_agent: String,
+        handoff_note: Option<String>,
+    ) -> Result<Option<u64>> {
+        let now = now_ms();
+        let opt_id = self.agent_protocol_store.write().add_delegation(
+            task_id, from_agent.clone(), to_agent.clone(), handoff_note.clone(), now,
+        );
+        if let Some(id) = opt_id {
+            self.log.write().append(&crate::ops::Op::AddDelegation(crate::ops::AddDelegationOp {
+                id, task_id, from_agent, to_agent, handoff_note, delegated_at: now,
+            }))?;
+        }
+        Ok(opt_id)
+    }
+
+    pub fn link_evidence(
+        &self,
+        task_id: u64,
+        memory_id: u64,
+        produced_by: String,
+        evidence_kind: u8,
+        relevance: f32,
+    ) -> Result<Option<u64>> {
+        use crate::organ::agent_protocol::EvidenceKind;
+        let now = now_ms();
+        let opt_id = self.agent_protocol_store.write().link_evidence(
+            task_id, memory_id, produced_by.clone(),
+            EvidenceKind::from_u8(evidence_kind), relevance, now,
+        );
+        if let Some(id) = opt_id {
+            self.log.write().append(&crate::ops::Op::LinkEvidence(crate::ops::LinkEvidenceOp {
+                id, task_id, memory_id, produced_by, evidence_kind, relevance, created_ms: now,
+            }))?;
+        }
+        Ok(opt_id)
+    }
+
+    pub fn add_probe(
+        &self,
+        task_id: u64,
+        question: String,
+        expected_answerer: Option<String>,
+        priority: u8,
+    ) -> Result<Option<u64>> {
+        let now = now_ms();
+        let opt_id = self.agent_protocol_store.write().add_probe(
+            task_id, question.clone(), expected_answerer.clone(), priority, now,
+        );
+        if let Some(id) = opt_id {
+            self.log.write().append(&crate::ops::Op::AddProbe(crate::ops::AddProbeOp {
+                id, task_id, question, expected_answerer, priority, created_ms: now,
+            }))?;
+        }
+        Ok(opt_id)
+    }
+
+    pub fn resolve_probe(
+        &self,
+        probe_id: u64,
+        status: u8,
+        answer: Option<String>,
+    ) -> Result<bool> {
+        use crate::organ::agent_protocol::ProbeStatus;
+        let now = now_ms();
+        let ok = self.agent_protocol_store.write().resolve_probe(
+            probe_id, ProbeStatus::from_u8(status), answer.clone(), now,
+        );
+        if ok {
+            self.log.write().append(&crate::ops::Op::ResolveProbe(crate::ops::ResolveProbeOp {
+                probe_id, status, answer, resolved_ms: now,
+            }))?;
+        }
+        Ok(ok)
+    }
+
+    pub fn set_criterion(
+        &self,
+        task_id: u64,
+        criterion: String,
+        is_met: bool,
+        evidence_note: Option<String>,
+    ) -> Result<Option<u64>> {
+        let now = now_ms();
+        let opt_id = self.agent_protocol_store.write().set_criterion(
+            task_id, criterion.clone(), is_met, evidence_note.clone(), now,
+        );
+        if let Some(id) = opt_id {
+            self.log.write().append(&crate::ops::Op::SetCriterion(crate::ops::SetCriterionOp {
+                id, task_id, criterion, is_met, evidence_note, checked_ms: now,
+            }))?;
+        }
+        Ok(opt_id)
+    }
+
+    pub fn get_task_full(&self, task_id: u64)
+        -> Option<crate::organ::agent_protocol::TaskFullView>
+    {
+        self.agent_protocol_store.read().get_task_full(task_id)
+    }
+
+    pub fn query_tasks(
+        &self,
+        realm: Option<&str>,
+        session_id: Option<&str>,
+        status: Option<u8>,
+        priority: Option<u8>,
+        limit: usize,
+    ) -> Vec<crate::organ::agent_protocol::TaskContract> {
+        use crate::organ::agent_protocol::TaskStatus;
+        self.agent_protocol_store
+            .read()
+            .query_tasks(realm, session_id, status.map(TaskStatus::from_u8), priority, limit)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn agent_protocol_stats(&self) -> crate::organ::agent_protocol::AgentProtocolStats {
+        self.agent_protocol_store.read().stats()
+    }
+
+    pub fn auto_complete_tasks(&self) -> Result<usize> {
+        let task_ids = self.agent_protocol_store.read().tasks_with_all_criteria_met();
+        let mut completed = 0usize;
+        for tid in task_ids {
+            if self.update_task(tid, Some(2), None, None)? {
+                completed += 1;
+            }
+        }
+        Ok(completed)
+    }
+
     /// Save full in-memory state to a binary snapshot (chitta.snapshot).
     /// After this, on next open only ops after snapshot_seqno need to be replayed.
     pub fn save_full_snapshot(&self) -> Result<()> {

@@ -58,6 +58,8 @@ use crate::ops::{
     OP_UPDATE_SURPRISE_CREDIT, OP_UPSERT_WISDOM_CANDIDATE,
     OP_UPDATE_WISDOM_LIFECYCLE, OP_UPDATE_SCORER_MODEL, OP_ATTACH_DEBT_EVIDENCE,
     OP_START_INTERVENTION, OP_ADD_OBSERVATION, OP_CLOSE_INTERVENTION, OP_RECORD_ATTRIBUTION,
+    OP_REGISTER_TASK, OP_UPDATE_TASK, OP_ADD_DELEGATION, OP_LINK_EVIDENCE,
+    OP_ADD_PROBE, OP_RESOLVE_PROBE, OP_SET_CRITERION,
 };
 
 fn op_type_byte(op: &Op) -> u8 {
@@ -115,6 +117,13 @@ fn op_type_byte(op: &Op) -> u8 {
         Op::AddObservation(_) => OP_ADD_OBSERVATION,
         Op::CloseIntervention(_) => OP_CLOSE_INTERVENTION,
         Op::RecordAttribution(_) => OP_RECORD_ATTRIBUTION,
+        Op::RegisterTask(_) => OP_REGISTER_TASK,
+        Op::UpdateTask(_) => OP_UPDATE_TASK,
+        Op::AddDelegation(_) => OP_ADD_DELEGATION,
+        Op::LinkEvidence(_) => OP_LINK_EVIDENCE,
+        Op::AddProbe(_) => OP_ADD_PROBE,
+        Op::ResolveProbe(_) => OP_RESOLVE_PROBE,
+        Op::SetCriterion(_) => OP_SET_CRITERION,
     }
 }
 

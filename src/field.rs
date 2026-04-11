@@ -22,6 +22,7 @@ use crate::organ::predictor::AccessPredictor;
 use crate::organ::skill::SkillRegistry;
 use crate::organ::trigger::TriggerStore;
 use crate::organ::surprise::SurpriseStore;
+use crate::organ::agent_protocol::AgentProtocolStore;
 use crate::organ::epistemic_debt::EpistemicDebtStore;
 use crate::organ::integration::IntegrationKernel;
 use crate::organ::surprise_learning::SurpriseLearningStore;
@@ -143,6 +144,7 @@ pub struct ChittaField {
     pub(crate) wisdom_promotion: RwLock<WisdomPromotionStore>,
     pub(crate) learned_scorer: RwLock<LearnedScoringModel>,
     pub(crate) intervention_store: RwLock<InterventionStore>,
+    pub(crate) agent_protocol_store: RwLock<AgentProtocolStore>,
     pub(crate) lite_encoder: RwLock<Option<LiteEncoder>>,
     /// Byte offsets for each foreign segment file, used by sync_foreign().
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
@@ -221,6 +223,7 @@ impl ChittaField {
         let mut wisdom_promotion = WisdomPromotionStore::new();
         let mut learned_scorer = LearnedScoringModel::new("v5.14".to_string());
         let mut intervention_store = InterventionStore::new();
+        let mut agent_protocol_store = AgentProtocolStore::new();
         let mut chunk_hash_idx: HashMap<crate::ids::ChunkHash, MemoryId> = HashMap::new();
         let mut snapshot_coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats> = HashMap::new();
 
@@ -441,6 +444,7 @@ impl ChittaField {
                 &mut wisdom_promotion,
                 &mut learned_scorer,
                 &mut intervention_store,
+                &mut agent_protocol_store,
                 &mut chunk_hash_idx,
                 &mut replay_realm_members,
                 &mut replay_coactivation_stats,
@@ -540,6 +544,7 @@ impl ChittaField {
             wisdom_promotion: RwLock::new(wisdom_promotion),
             learned_scorer: RwLock::new(learned_scorer),
             intervention_store: RwLock::new(intervention_store),
+            agent_protocol_store: RwLock::new(agent_protocol_store),
             lite_encoder: RwLock::new(loaded_lite_encoder),
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
@@ -635,6 +640,7 @@ impl ChittaField {
         let mut wisdom_promotion_reg = self.wisdom_promotion.write();
         let mut learned_scorer_reg = self.learned_scorer.write();
         let mut intervention_store_reg = self.intervention_store.write();
+        let mut agent_protocol_store_reg = self.agent_protocol_store.write();
         let mut chunk_hash_idx = self.chunk_hash_idx.write();
         let mut realm_members = self.realm_members.write();
         let mut coactivation_stats = self.coactivation_stats.write();
@@ -674,6 +680,7 @@ impl ChittaField {
                 &mut *wisdom_promotion_reg,
                 &mut *learned_scorer_reg,
                 &mut *intervention_store_reg,
+                &mut *agent_protocol_store_reg,
                 &mut *chunk_hash_idx,
                 &mut *realm_members,
                 &mut *coactivation_stats,
@@ -830,6 +837,7 @@ pub(crate) fn apply_op(
     wisdom_promotion: &mut WisdomPromotionStore,
     learned_scorer: &mut LearnedScoringModel,
     intervention_store: &mut InterventionStore,
+    agent_protocol_store: &mut AgentProtocolStore,
     chunk_hash_idx: &mut HashMap<crate::ids::ChunkHash, MemoryId>,
     realm_members: &mut HashMap<String, HashSet<MemoryId>>,
     coactivation_stats: &mut HashMap<(MemoryId, MemoryId), CoActivationStats>,
@@ -1487,6 +1495,93 @@ pub(crate) fn apply_op(
                 skill_memory_ids: a.skill_memory_ids,
                 note: a.note,
                 timestamp_ms: a.timestamp_ms,
+            });
+        }
+        // ── Layer 8: Agent Protocol Memory ──────────────────────────────────
+        Op::RegisterTask(t) => {
+            use crate::organ::agent_protocol::TaskContract;
+            use crate::organ::agent_protocol::TaskStatus;
+            agent_protocol_store.replay_register_task(TaskContract {
+                id: t.id,
+                session_id: t.session_id,
+                realm: t.realm,
+                goal: t.goal,
+                constraints: t.constraints,
+                acceptance_criteria: t.acceptance_criteria,
+                priority: t.priority,
+                status: TaskStatus::Active,
+                parent_task_id: t.parent_task_id,
+                intervention_ids: Vec::new(),
+                tags: t.tags,
+                created_ms: t.created_ms,
+                updated_ms: t.created_ms,
+                deadline_ms: t.deadline_ms,
+            });
+        }
+        Op::UpdateTask(u) => {
+            agent_protocol_store.replay_update_task(
+                u.task_id,
+                u.status,
+                u.add_intervention_id,
+                u.add_tag,
+                u.updated_ms,
+            );
+        }
+        Op::AddDelegation(d) => {
+            use crate::organ::agent_protocol::{DelegationEdge, DelegationStatus};
+            agent_protocol_store.replay_delegation(DelegationEdge {
+                id: d.id,
+                task_id: d.task_id,
+                from_agent: d.from_agent,
+                to_agent: d.to_agent,
+                delegated_at: d.delegated_at,
+                handoff_note: d.handoff_note,
+                status: DelegationStatus::Active,
+            });
+        }
+        Op::LinkEvidence(e) => {
+            use crate::organ::agent_protocol::{EvidenceKind, EvidenceLink};
+            agent_protocol_store.replay_evidence(EvidenceLink {
+                id: e.id,
+                task_id: e.task_id,
+                memory_id: e.memory_id,
+                produced_by: e.produced_by,
+                evidence_kind: EvidenceKind::from_u8(e.evidence_kind),
+                relevance: e.relevance,
+                created_ms: e.created_ms,
+            });
+        }
+        Op::AddProbe(p) => {
+            use crate::organ::agent_protocol::{PendingProbe, ProbeStatus};
+            agent_protocol_store.replay_probe(PendingProbe {
+                id: p.id,
+                task_id: p.task_id,
+                question: p.question,
+                expected_answerer: p.expected_answerer,
+                priority: p.priority,
+                status: ProbeStatus::Open,
+                created_ms: p.created_ms,
+                resolved_ms: None,
+                answer: None,
+            });
+        }
+        Op::ResolveProbe(r) => {
+            agent_protocol_store.replay_resolve_probe(
+                r.probe_id,
+                r.status,
+                r.answer,
+                r.resolved_ms,
+            );
+        }
+        Op::SetCriterion(c) => {
+            use crate::organ::agent_protocol::CompletionCriterion;
+            agent_protocol_store.replay_criterion(CompletionCriterion {
+                id: c.id,
+                task_id: c.task_id,
+                criterion: c.criterion,
+                is_met: c.is_met,
+                checked_ms: Some(c.checked_ms),
+                evidence_note: c.evidence_note,
             });
         }
     }
