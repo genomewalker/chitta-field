@@ -44,6 +44,8 @@ pub struct ScoreDecomposition {
     pub arousal_boost: f32,
     pub mood_congruence: f32,
     pub frustration_boost: f32,
+    pub interference_factor: f32,
+    pub spacing_boost: f32,
 }
 
 /// A single scoring factor in the pipeline.
@@ -85,6 +87,8 @@ impl ScoringPipeline {
             Box::new(EpistemicFactor),
             Box::new(KindFactor),
             Box::new(RealmReliabilityFactor),
+            Box::new(InterferenceDensityFactor),
+            Box::new(SpacingBoostFactor),
         ];
         Self { factors, config }
     }

@@ -119,6 +119,21 @@ pub struct MemoryState {
     /// Used for power-law base-level activation: B_i = ln(Σ t_j^(-d)).
     #[serde(default)]
     pub access_timestamps: Vec<i64>,
+
+    // ── Interference-aware fields (Price of Meaning / Geometry of Forgetting) ──
+    /// Local competitor density: mean cosine similarity to k-nearest neighbors [0,1].
+    /// High = crowded neighborhood → more interference-driven forgetting.
+    /// Precomputed on write path; O(1) read during scoring.
+    #[serde(default)]
+    pub competitive_weight: f32,
+    /// False-recall risk: competitive_weight weighted by same-kind neighbor ratio [0,1].
+    /// Used by post-pipeline LureDetector to suppress confusable candidates.
+    #[serde(default)]
+    pub lure_risk: f32,
+    /// Retrieval spacing regularity [0,1]. Derived from coefficient of variation
+    /// of inter-retrieval intervals in access_timestamps. Well-spaced = high quality.
+    #[serde(default)]
+    pub spacing_quality: f32,
 }
 
 impl MemoryState {
@@ -146,6 +161,9 @@ impl MemoryState {
             affect_valence: 0.0,
             affect_arousal: 0.0,
             access_timestamps: Vec::new(),
+            competitive_weight: 0.0,
+            lure_risk: 0.0,
+            spacing_quality: 0.0,
         }
     }
 
@@ -206,6 +224,30 @@ impl MemoryState {
         let age_days = (now_ms - self.last_strengthened_ms).max(0) as f64 / 86_400_000.0;
         let decayed = self.strength as f64 * (-self.decay_rate as f64 * age_days).exp();
         decayed.clamp(0.0, 1.0) as f32
+    }
+
+    /// Recompute spacing_quality from access_timestamps.
+    /// Uses coefficient of variation of inter-retrieval intervals.
+    /// Well-spaced (regular intervals) → high quality; bursty → low quality.
+    pub fn recompute_spacing_quality(&mut self) {
+        if self.access_timestamps.len() < 3 {
+            self.spacing_quality = 0.0;
+            return;
+        }
+        let intervals: Vec<f64> = self.access_timestamps.windows(2)
+            .map(|w| (w[1] - w[0]).max(1) as f64)
+            .collect();
+        let n = intervals.len() as f64;
+        let mean = intervals.iter().sum::<f64>() / n;
+        if mean < 1.0 {
+            self.spacing_quality = 0.0;
+            return;
+        }
+        let var = intervals.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
+        let cv = var.sqrt() / mean; // coefficient of variation
+        // Low CV = regular spacing = high quality. CV→0 means perfect spacing → 1.0
+        // High CV = bursty = low quality → 0.0
+        self.spacing_quality = (1.0 / (1.0 + cv)).min(1.0) as f32;
     }
 
     /// ACT-R base-level activation: B_i = ln(Σ_j t_j^(-d))

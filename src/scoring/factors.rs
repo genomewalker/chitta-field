@@ -234,6 +234,49 @@ impl ScoringFactor for StrengthFactor {
     }
 }
 
+// ── Interference density (Price of Meaning no-escape theorem) ───────────────
+
+pub struct InterferenceDensityFactor;
+
+impl ScoringFactor for InterferenceDensityFactor {
+    fn name(&self) -> &'static str { "interference" }
+
+    fn compute(
+        &self,
+        ctx: &ScoringContext,
+        config: &ScoringConfig,
+        decomp: &mut ScoreDecomposition,
+    ) -> Option<f32> {
+        let cw = ctx.state.competitive_weight;
+        let factor = 1.0 / (1.0 + config.interference_penalty * cw);
+        decomp.interference_factor = factor;
+        Some(factor)
+    }
+}
+
+// ── Spacing boost (Geometry of Forgetting) ──────────────────────────────────
+
+pub struct SpacingBoostFactor;
+
+impl ScoringFactor for SpacingBoostFactor {
+    fn name(&self) -> &'static str { "spacing" }
+
+    fn compute(
+        &self,
+        ctx: &ScoringContext,
+        config: &ScoringConfig,
+        decomp: &mut ScoreDecomposition,
+    ) -> Option<f32> {
+        if ctx.state.access_count < 2 {
+            decomp.spacing_boost = 1.0;
+            return Some(1.0);
+        }
+        let factor = config.spacing_floor + config.spacing_range * ctx.state.spacing_quality;
+        decomp.spacing_boost = factor;
+        Some(factor)
+    }
+}
+
 // ── Realm reliability (Product of Experts) ──────────────────────────────────
 
 pub struct RealmReliabilityFactor;

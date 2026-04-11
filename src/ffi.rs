@@ -70,6 +70,8 @@ fn write_hits(hits: Vec<RecallHit>, buf: *mut CfRecallHit, cap: usize, written: 
                 arousal_boost: h.arousal_boost,
                 mood_congruence: h.mood_congruence,
                 frustration_boost: h.frustration_boost,
+                interference_factor: h.interference_factor,
+                spacing_boost: h.spacing_boost,
             };
         }
     }
@@ -345,6 +347,8 @@ pub struct CfRecallHit {
     pub arousal_boost: f32,
     pub mood_congruence: f32,
     pub frustration_boost: f32,
+    pub interference_factor: f32,
+    pub spacing_boost: f32,
 }
 
 /// Output buffer for recall results. Caller allocates hits_buf with capacity hits_cap.
@@ -4730,6 +4734,8 @@ mod tests {
                     arousal_boost: 0.0,
                     mood_congruence: 0.0,
                     frustration_boost: 0.0,
+                    interference_factor: 0.0,
+                    spacing_boost: 0.0,
                 };
                 10
             ];
@@ -4799,6 +4805,8 @@ mod tests {
                     arousal_boost: 0.0,
                     mood_congruence: 0.0,
                     frustration_boost: 0.0,
+                    interference_factor: 0.0,
+                    spacing_boost: 0.0,
                 };
                 10
             ];
@@ -4988,6 +4996,8 @@ mod tests {
                     arousal_boost: 0.0,
                     mood_congruence: 0.0,
                     frustration_boost: 0.0,
+                    interference_factor: 0.0,
+                    spacing_boost: 0.0,
                 };
                 10
             ];
@@ -5152,6 +5162,8 @@ mod tests {
                     arousal_boost: 0.0,
                     mood_congruence: 0.0,
                     frustration_boost: 0.0,
+                    interference_factor: 0.0,
+                    spacing_boost: 0.0,
                 };
                 10
             ];
@@ -5379,6 +5391,8 @@ mod tests {
                     arousal_boost: 0.0,
                     mood_congruence: 0.0,
                     frustration_boost: 0.0,
+                    interference_factor: 0.0,
+                    spacing_boost: 0.0,
                 };
                 10
             ];
@@ -5726,6 +5740,8 @@ pub extern "C" fn cf_search_attractor(
                 arousal_boost: 1.0,
                 mood_congruence: 1.0,
                 frustration_boost: 1.0,
+                interference_factor: 0.0,
+                spacing_boost: 0.0,
             };
         }
     }

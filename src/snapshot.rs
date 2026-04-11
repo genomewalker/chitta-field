@@ -85,6 +85,9 @@ impl LegacyMemoryStateV4 {
             affect_valence: 0.0,
             affect_arousal: 0.0,
             access_timestamps: Vec::new(),
+            competitive_weight: 0.0,
+            lure_risk: 0.0,
+            spacing_quality: 0.0,
         }
     }
 }
@@ -136,6 +139,9 @@ impl LegacyMemoryStateV5 {
             affect_valence: 0.0,
             affect_arousal: 0.0,
             access_timestamps: Vec::new(),
+            competitive_weight: 0.0,
+            lure_risk: 0.0,
+            spacing_quality: 0.0,
         }
     }
 }
@@ -192,6 +198,9 @@ impl LegacyMemoryStateV6 {
             affect_valence: self.affect_valence,
             affect_arousal: self.affect_arousal,
             access_timestamps: Vec::new(),
+            competitive_weight: 0.0,
+            lure_risk: 0.0,
+            spacing_quality: 0.0,
         }
     }
 }
