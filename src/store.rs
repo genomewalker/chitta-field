@@ -723,6 +723,9 @@ impl ChittaField {
                     return None;
                 }
                 let payload = payloads.get(&memory_id)?;
+                if payload.content.is_empty() {
+                    return None;
+                }
                 // soul:* realms are internal — exclude from unscoped queries.
                 if payload.realm.starts_with("soul:") && realm.map(|r| !r.starts_with("soul:")).unwrap_or(true) {
                     return None;
@@ -983,6 +986,9 @@ impl ChittaField {
                     return None;
                 }
                 let payload = payloads.get(&entry.memory_id)?;
+                if payload.content.is_empty() {
+                    return None;
+                }
                 let eff_strength = state.effective_strength(now);
                 Some(RecallHit {
                     memory_id: entry.memory_id,
@@ -1044,6 +1050,9 @@ impl ChittaField {
                     return None;
                 }
                 let payload = payloads.get(&hit.memory_id)?;
+                if payload.content.is_empty() {
+                    return None;
+                }
                 if payload.realm.starts_with("soul:") {
                     return None;
                 }
@@ -1151,6 +1160,9 @@ impl ChittaField {
                     return None;
                 }
                 let payload = payloads.get(&entry.memory_id)?;
+                if payload.content.is_empty() {
+                    return None;
+                }
                 let eff_strength = state.effective_strength(now);
                 Some(RecallHit {
                     memory_id: entry.memory_id,
