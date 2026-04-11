@@ -4725,6 +4725,11 @@ mod tests {
                     strength_factor: 0.0,
                     affect_valence: 0.0,
                     affect_arousal: 0.0,
+                    actr_activation: 0.0,
+                    surprise_boost: 0.0,
+                    arousal_boost: 0.0,
+                    mood_congruence: 0.0,
+                    frustration_boost: 0.0,
                 };
                 10
             ];
@@ -4789,6 +4794,11 @@ mod tests {
                     strength_factor: 0.0,
                     affect_valence: 0.0,
                     affect_arousal: 0.0,
+                    actr_activation: 0.0,
+                    surprise_boost: 0.0,
+                    arousal_boost: 0.0,
+                    mood_congruence: 0.0,
+                    frustration_boost: 0.0,
                 };
                 10
             ];
@@ -4973,6 +4983,11 @@ mod tests {
                     strength_factor: 0.0,
                     affect_valence: 0.0,
                     affect_arousal: 0.0,
+                    actr_activation: 0.0,
+                    surprise_boost: 0.0,
+                    arousal_boost: 0.0,
+                    mood_congruence: 0.0,
+                    frustration_boost: 0.0,
                 };
                 10
             ];
@@ -5132,6 +5147,11 @@ mod tests {
                     strength_factor: 0.0,
                     affect_valence: 0.0,
                     affect_arousal: 0.0,
+                    actr_activation: 0.0,
+                    surprise_boost: 0.0,
+                    arousal_boost: 0.0,
+                    mood_congruence: 0.0,
+                    frustration_boost: 0.0,
                 };
                 10
             ];
@@ -5354,6 +5374,11 @@ mod tests {
                     strength_factor: 0.0,
                     affect_valence: 0.0,
                     affect_arousal: 0.0,
+                    actr_activation: 0.0,
+                    surprise_boost: 0.0,
+                    arousal_boost: 0.0,
+                    mood_congruence: 0.0,
+                    frustration_boost: 0.0,
                 };
                 10
             ];

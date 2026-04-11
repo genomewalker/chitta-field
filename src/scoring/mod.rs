@@ -75,6 +75,7 @@ impl ScoringPipeline {
         let factors: Vec<Box<dyn ScoringFactor>> = vec![
             Box::new(RelevanceFactor),
             Box::new(ACTRActivationFactor),
+            Box::new(StrengthFactor),
             Box::new(ConfidenceFactor),
             Box::new(SurpriseFactor),
             Box::new(ArousalFactor),
