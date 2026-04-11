@@ -6536,3 +6536,187 @@ pub extern "C" fn cf_integration_stats(h: *const CfHandle) -> *mut c_char {
     });
     CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
+
+// ── Autonomous Learning FFI ───────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn cf_surprise_learning_stats(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let stats = handle.field.surprise_learning_stats();
+    let json = serde_json::json!({
+        "tracked_memories": stats.tracked_memories,
+        "tracked_failure_pairs": stats.tracked_failure_pairs,
+        "total_gates_passed": stats.total_gates_passed,
+        "total_credits_updated": stats.total_credits_updated,
+    });
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_upsert_wisdom_candidate(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
+        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+    }};
+    let params: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+    };
+    let cluster_key = params["cluster_key"].as_str().unwrap_or("").to_string();
+    let domain = params["domain"].as_str().unwrap_or("").to_string();
+    let action = params["action"].as_str().unwrap_or("").to_string();
+    let summary = params["summary"].as_str().unwrap_or("").to_string();
+    let episode_ids: Vec<u64> = params["episode_ids"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+        .unwrap_or_default();
+    let debt_ids: Vec<u64> = params["debt_ids"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+        .unwrap_or_default();
+    let support_count = params["support_count"].as_u64().unwrap_or(0) as u32;
+    let cross_session_count = params["cross_session_count"].as_u64().unwrap_or(0) as u32;
+    let mean_surprise = params["mean_surprise"].as_f64().unwrap_or(0.0) as f32;
+    let promotion_score = params["promotion_score"].as_f64().unwrap_or(0.0) as f32;
+
+    match handle.field.upsert_wisdom_candidate(
+        cluster_key, domain, action, summary, episode_ids, debt_ids,
+        support_count, cross_session_count, mean_surprise, promotion_score,
+    ) {
+        Ok(candidate_id) => {
+            let json = serde_json::json!({"candidate_id": candidate_id});
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_update_wisdom_lifecycle(
+    h: *mut CfHandle, candidate_id: u64, new_state: u8,
+) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let lifecycle = crate::organ::wisdom_promotion::WisdomLifecycle::from_u8(new_state);
+    match handle.field.update_wisdom_lifecycle(candidate_id, lifecycle, None, 0) {
+        Ok(true) => 0,
+        _ => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_query_wisdom_candidates(
+    h: *const CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let params: serde_json::Value = if params_json.is_null() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
+            Ok(s) => s, Err(_) => return std::ptr::null_mut()
+        }};
+        serde_json::from_str(json_str).unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
+    };
+    let lifecycle = params["lifecycle"].as_u64()
+        .map(|v| crate::organ::wisdom_promotion::WisdomLifecycle::from_u8(v as u8));
+    let domain = params["domain"].as_str();
+    let limit = params["limit"].as_u64().unwrap_or(50) as usize;
+    let results = handle.field.query_wisdom_candidates(lifecycle, domain, limit);
+    let json = serde_json::to_value(&results).unwrap_or(serde_json::Value::Array(vec![]));
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_wisdom_promotion_stats(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let stats = handle.field.wisdom_promotion_stats();
+    let json = serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null);
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_attach_debt_evidence(
+    h: *mut CfHandle, debt_id: u64, evidence_json: *const c_char,
+) -> c_int {
+    if h.is_null() || evidence_json.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(evidence_json).to_str() {
+        Ok(s) => s, Err(_) => return -1
+    }};
+    let params: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v, Err(_) => return -1
+    };
+    let memory_ids: Vec<u64> = params["memory_ids"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+        .unwrap_or_default();
+    let confidence = params["confidence"].as_f64().unwrap_or(0.5) as f32;
+    let note = params["note"].as_str().map(|s| s.to_string());
+    match handle.field.attach_debt_evidence(debt_id, memory_ids, confidence, note) {
+        Ok(true) => 0,
+        _ => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_update_scorer_model(
+    h: *mut CfHandle, model_json: *const c_char,
+) -> c_int {
+    if h.is_null() || model_json.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(model_json).to_str() {
+        Ok(s) => s, Err(_) => return -1
+    }};
+    let params: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v, Err(_) => return -1
+    };
+    let weights_json = params["weights"].to_string();
+    let model_version = params["model_version"].as_u64().unwrap_or(0);
+    let mean_loss = params["mean_loss"].as_f64().unwrap_or(0.0) as f32;
+    let outcome_count = params["outcome_count"].as_u64().unwrap_or(0);
+    match handle.field.update_scorer_model(weights_json, model_version, mean_loss, outcome_count) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_learned_scorer_stats(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let stats = handle.field.learned_scorer_stats();
+    let json = serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null);
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_effective_scorer_weights(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let stats = handle.field.learned_scorer_stats();
+    let mut weights = serde_json::Map::new();
+    for f in &stats.factors {
+        weights.insert(f.name.clone(), serde_json::json!({
+            "delta": f.delta,
+            "min_delta": f.min_delta,
+            "max_delta": f.max_delta,
+        }));
+    }
+    let json = serde_json::json!({
+        "model_version": stats.model_version,
+        "baseline_version": stats.baseline_version,
+        "factors": weights,
+    });
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_auto_resolve_debts(h: *mut CfHandle, threshold: f32) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let resolved = handle.field.auto_resolve_debts(threshold).unwrap_or(0);
+    let json = serde_json::json!({ "resolved_count": resolved });
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}

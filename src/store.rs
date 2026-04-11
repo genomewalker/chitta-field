@@ -2239,6 +2239,7 @@ impl ChittaField {
                 realm.clone(), session_id.clone(), source_memory_id, now,
             )
         };
+        let domain_ref = domain.clone();
         let op = Op::RecordSurprise(crate::ops::RecordSurpriseOp {
             event_id,
             context_sketch,
@@ -2253,6 +2254,62 @@ impl ChittaField {
             source_memory_id,
         });
         self.log.write().append(&op)?;
+
+        // ── Move 1: auto-strengthen/weaken via surprise credit ────────
+        if let Some(source_id) = source_memory_id {
+            // source_memory_id was the "expected" memory → weaken direction
+            let credit_result = self.surprise_learning.write().update_credit(
+                source_id, event_id, surprise_magnitude, -1, now,
+            );
+            if let Some(cr) = credit_result {
+                // Apply strength delta via existing UpdateState
+                let delta_op = crate::ops::StateDeltaOp {
+                    memory_id: cr.memory_id,
+                    strength_delta: Some(cr.strength_delta),
+                    confidence_delta: None,
+                    decay_rate: None,
+                    touch: false,
+                    pin: None,
+                    op_ts_ms: now,
+                    status: None,
+                    epistemic_status: None,
+                };
+                if let Some(state) = self.states.write().get_mut(&cr.memory_id) {
+                    state.apply_delta(&delta_op, now);
+                }
+                self.log.write().append(&Op::UpdateState(delta_op))?;
+                // WAL the credit state
+                let sl = self.surprise_learning.read();
+                if let Some(st) = sl.get_state(cr.memory_id) {
+                    self.log.write().append(&Op::UpdateSurpriseCredit(
+                        crate::ops::UpdateSurpriseCreditOp {
+                            memory_id: st.memory_id,
+                            credit: st.credit,
+                            last_dir: st.last_dir,
+                            same_dir_streak: st.same_dir_streak,
+                            last_surprise_id: st.last_surprise_id,
+                            updated_ms: st.updated_ms,
+                        },
+                    ))?;
+                }
+            }
+        }
+
+        // ── Move 2: auto-feed integration kernel ──────────────────────
+        {
+            let should_neg = self.surprise_learning.read()
+                .should_send_negative_feedback(&domain_ref, "semantic", surprise_magnitude);
+            if should_neg {
+                self.surprise_learning.write().record_failure(&domain_ref, "semantic", event_id);
+                let _ = self.record_feedback(&domain_ref, "semantic", false);
+            }
+            let should_pos = self.surprise_learning.read()
+                .should_send_positive_feedback(surprise_magnitude);
+            if should_pos {
+                let _ = self.record_feedback(&domain_ref, "keyword", true);
+            }
+        }
+
         Ok(event_id)
     }
 
@@ -2433,6 +2490,188 @@ impl ChittaField {
 
     pub fn integration_stats(&self) -> crate::organ::integration::IntegrationStats {
         self.integration_kernel.read().stats()
+    }
+
+    // ── Surprise Learning (Moves 1-2) ────────────────────────────────
+
+    pub fn surprise_learning_stats(&self) -> crate::organ::surprise_learning::SurpriseLearningStats {
+        self.surprise_learning.read().stats()
+    }
+
+    // ── Wisdom Promotion (Move 5) ────────────────────────────────────
+
+    pub fn upsert_wisdom_candidate(
+        &self,
+        cluster_key: String,
+        domain: String,
+        action: String,
+        summary: String,
+        episode_ids: Vec<u64>,
+        debt_ids: Vec<u64>,
+        support_count: u32,
+        cross_session_count: u32,
+        mean_surprise: f32,
+        promotion_score: f32,
+    ) -> Result<u64> {
+        let now = now_ms();
+        let candidate_id = {
+            let mut store = self.wisdom_promotion.write();
+            store.upsert_candidate(
+                cluster_key.clone(), domain.clone(), action.clone(), summary.clone(),
+                episode_ids.clone(), debt_ids.clone(), support_count,
+                cross_session_count, mean_surprise, promotion_score, now,
+            )
+        };
+        let op = Op::UpsertWisdomCandidate(crate::ops::UpsertWisdomCandidateOp {
+            candidate_id,
+            cluster_key,
+            domain,
+            action,
+            summary,
+            episode_ids,
+            debt_ids,
+            support_count,
+            cross_session_count,
+            mean_surprise,
+            promotion_score,
+            created_ms: now,
+        });
+        self.log.write().append(&op)?;
+        Ok(candidate_id)
+    }
+
+    pub fn update_wisdom_lifecycle(
+        &self,
+        candidate_id: u64,
+        new_state: crate::organ::wisdom_promotion::WisdomLifecycle,
+        memory_id: Option<u64>,
+        contradiction_count: u32,
+    ) -> Result<bool> {
+        let now = now_ms();
+        let old_state = self.wisdom_promotion.read()
+            .get(candidate_id)
+            .map(|c| c.lifecycle.as_u8())
+            .unwrap_or(0);
+        let ok = self.wisdom_promotion.write().update_lifecycle(
+            candidate_id, new_state, memory_id, contradiction_count, now,
+        );
+        if ok {
+            let op = Op::UpdateWisdomLifecycle(crate::ops::UpdateWisdomLifecycleOp {
+                candidate_id,
+                memory_id,
+                old_state,
+                new_state: new_state.as_u8(),
+                contradiction_count,
+                updated_ms: now,
+            });
+            self.log.write().append(&op)?;
+        }
+        Ok(ok)
+    }
+
+    pub fn query_wisdom_candidates(
+        &self,
+        lifecycle: Option<crate::organ::wisdom_promotion::WisdomLifecycle>,
+        domain: Option<&str>,
+        limit: usize,
+    ) -> Vec<crate::organ::wisdom_promotion::WisdomCandidate> {
+        self.wisdom_promotion
+            .read()
+            .query(lifecycle, domain, limit)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn wisdom_promotion_stats(&self) -> crate::organ::wisdom_promotion::WisdomPromotionStats {
+        self.wisdom_promotion.read().stats()
+    }
+
+    // ── Debt Evidence (Move 3) ───────────────────────────────────────
+
+    pub fn attach_debt_evidence(
+        &self,
+        debt_id: u64,
+        evidence_memory_ids: Vec<u64>,
+        confidence: f32,
+        note: Option<String>,
+    ) -> Result<bool> {
+        let now = now_ms();
+        let ok = self.epistemic_debt_store.write().attach_evidence(
+            debt_id, evidence_memory_ids.clone(), confidence, note.clone(), now,
+        );
+        if ok {
+            let op = Op::AttachDebtEvidence(crate::ops::AttachDebtEvidenceOp {
+                debt_id,
+                evidence_memory_ids,
+                confidence,
+                note,
+                attached_ms: now,
+            });
+            self.log.write().append(&op)?;
+        }
+        Ok(ok)
+    }
+
+    /// Auto-resolve debts with sufficient evidence. Returns count resolved.
+    pub fn auto_resolve_debts(&self, threshold: f32) -> Result<usize> {
+        let open_ids: Vec<u64> = self.epistemic_debt_store.read()
+            .open_debts_with_evidence()
+            .iter()
+            .filter(|d| !d.evidence.is_empty())
+            .map(|d| d.id)
+            .collect();
+
+        let now = now_ms();
+        let mut resolved_count = 0usize;
+        for id in open_ids {
+            let resolved = self.epistemic_debt_store.write()
+                .auto_resolve_if_ready(id, threshold, now);
+            if resolved {
+                let op = Op::UpdateDebt(crate::ops::UpdateDebtOp {
+                    debt_id: id,
+                    status: 1,
+                    resolved_ms: now,
+                    resolution: Some(format!("auto-resolved: evidence >= {:.2}", threshold)),
+                });
+                self.log.write().append(&op)?;
+                resolved_count += 1;
+            }
+        }
+        Ok(resolved_count)
+    }
+
+    // ── Learned Scorer (Move 6) ──────────────────────────────────────
+
+    pub fn update_scorer_model(
+        &self,
+        weights_json: String,
+        model_version: u64,
+        mean_loss: f32,
+        outcome_count: u64,
+    ) -> Result<()> {
+        let now = now_ms();
+        self.learned_scorer.write().apply_update(
+            &weights_json, model_version, mean_loss, outcome_count, now,
+        );
+        let op = Op::UpdateScorerModel(crate::ops::UpdateScorerModelOp {
+            model_version,
+            baseline_version: self.learned_scorer.read().baseline_version.clone(),
+            weights_json,
+            applied_at_ms: now,
+            outcome_count,
+            mean_loss,
+        });
+        self.log.write().append(&op)?;
+        Ok(())
+    }
+
+    pub fn learned_scorer_stats(&self) -> crate::scoring::learned::LearnedScoringStats {
+        self.learned_scorer.read().stats()
+    }
+
+    pub fn effective_scorer_weight(&self, factor_name: &str, baseline: f32) -> f32 {
+        self.learned_scorer.read().effective_weight(factor_name, baseline)
     }
 
     /// Save full in-memory state to a binary snapshot (chitta.snapshot).

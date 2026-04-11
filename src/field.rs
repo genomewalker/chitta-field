@@ -24,6 +24,9 @@ use crate::organ::trigger::TriggerStore;
 use crate::organ::surprise::SurpriseStore;
 use crate::organ::epistemic_debt::EpistemicDebtStore;
 use crate::organ::integration::IntegrationKernel;
+use crate::organ::surprise_learning::SurpriseLearningStore;
+use crate::organ::wisdom_promotion::WisdomPromotionStore;
+use crate::scoring::learned::LearnedScoringModel;
 use crate::organ::pq::ProductQuantizer;
 use crate::organ::session::SessionRegistry;
 use crate::organ::symbol::{SymbolEntry, SymbolIndex};
@@ -135,6 +138,9 @@ pub struct ChittaField {
     pub(crate) surprise_store: RwLock<SurpriseStore>,
     pub(crate) epistemic_debt_store: RwLock<EpistemicDebtStore>,
     pub(crate) integration_kernel: RwLock<IntegrationKernel>,
+    pub(crate) surprise_learning: RwLock<SurpriseLearningStore>,
+    pub(crate) wisdom_promotion: RwLock<WisdomPromotionStore>,
+    pub(crate) learned_scorer: RwLock<LearnedScoringModel>,
     pub(crate) lite_encoder: RwLock<Option<LiteEncoder>>,
     /// Byte offsets for each foreign segment file, used by sync_foreign().
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
@@ -209,6 +215,9 @@ impl ChittaField {
         let mut surprise_store = SurpriseStore::new();
         let mut epistemic_debt_store = EpistemicDebtStore::new();
         let mut integration_kernel = IntegrationKernel::new();
+        let mut surprise_learning = SurpriseLearningStore::new();
+        let mut wisdom_promotion = WisdomPromotionStore::new();
+        let mut learned_scorer = LearnedScoringModel::new("v5.14".to_string());
         let mut chunk_hash_idx: HashMap<crate::ids::ChunkHash, MemoryId> = HashMap::new();
         let mut snapshot_coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats> = HashMap::new();
 
@@ -425,6 +434,9 @@ impl ChittaField {
                 &mut surprise_store,
                 &mut epistemic_debt_store,
                 &mut integration_kernel,
+                &mut surprise_learning,
+                &mut wisdom_promotion,
+                &mut learned_scorer,
                 &mut chunk_hash_idx,
                 &mut replay_realm_members,
                 &mut replay_coactivation_stats,
@@ -520,6 +532,9 @@ impl ChittaField {
             surprise_store: RwLock::new(surprise_store),
             epistemic_debt_store: RwLock::new(epistemic_debt_store),
             integration_kernel: RwLock::new(integration_kernel),
+            surprise_learning: RwLock::new(surprise_learning),
+            wisdom_promotion: RwLock::new(wisdom_promotion),
+            learned_scorer: RwLock::new(learned_scorer),
             lite_encoder: RwLock::new(loaded_lite_encoder),
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
@@ -611,6 +626,9 @@ impl ChittaField {
         let mut surprise_reg = self.surprise_store.write();
         let mut epistemic_debt_reg = self.epistemic_debt_store.write();
         let mut integration_reg = self.integration_kernel.write();
+        let mut surprise_learning_reg = self.surprise_learning.write();
+        let mut wisdom_promotion_reg = self.wisdom_promotion.write();
+        let mut learned_scorer_reg = self.learned_scorer.write();
         let mut chunk_hash_idx = self.chunk_hash_idx.write();
         let mut realm_members = self.realm_members.write();
         let mut coactivation_stats = self.coactivation_stats.write();
@@ -646,6 +664,9 @@ impl ChittaField {
                 &mut *surprise_reg,
                 &mut *epistemic_debt_reg,
                 &mut *integration_reg,
+                &mut *surprise_learning_reg,
+                &mut *wisdom_promotion_reg,
+                &mut *learned_scorer_reg,
                 &mut *chunk_hash_idx,
                 &mut *realm_members,
                 &mut *coactivation_stats,
@@ -798,6 +819,9 @@ pub(crate) fn apply_op(
     surprise_store: &mut SurpriseStore,
     epistemic_debt_store: &mut EpistemicDebtStore,
     integration_kernel: &mut IntegrationKernel,
+    surprise_learning: &mut SurpriseLearningStore,
+    wisdom_promotion: &mut WisdomPromotionStore,
+    learned_scorer: &mut LearnedScoringModel,
     chunk_hash_idx: &mut HashMap<crate::ids::ChunkHash, MemoryId>,
     realm_members: &mut HashMap<String, HashSet<MemoryId>>,
     coactivation_stats: &mut HashMap<(MemoryId, MemoryId), CoActivationStats>,
@@ -1321,6 +1345,8 @@ pub(crate) fn apply_op(
                 resolution: None,
                 realm: d.realm,
                 source_session: d.source_session,
+                evidence: Vec::new(),
+                auto_resolved: false,
             });
         }
         Op::UpdateDebt(u) => {
@@ -1337,6 +1363,67 @@ pub(crate) fn apply_op(
                 f.new_weight,
                 f.success_count,
                 f.total_count,
+            );
+        }
+        Op::UpdateSurpriseCredit(c) => {
+            surprise_learning.replay_credit(
+                crate::organ::surprise_learning::SurpriseLearningState {
+                    memory_id: c.memory_id,
+                    credit: c.credit,
+                    last_dir: c.last_dir,
+                    same_dir_streak: c.same_dir_streak,
+                    last_surprise_id: c.last_surprise_id,
+                    updated_ms: c.updated_ms,
+                },
+            );
+        }
+        Op::UpsertWisdomCandidate(w) => {
+            wisdom_promotion.replay_upsert(
+                crate::organ::wisdom_promotion::WisdomCandidate {
+                    id: w.candidate_id,
+                    cluster_key: w.cluster_key,
+                    domain: w.domain,
+                    action: w.action,
+                    summary: w.summary,
+                    episode_ids: w.episode_ids,
+                    debt_ids: w.debt_ids,
+                    support_count: w.support_count,
+                    cross_session_count: w.cross_session_count,
+                    mean_surprise: w.mean_surprise,
+                    promotion_score: w.promotion_score,
+                    contradiction_count: 0,
+                    lifecycle: crate::organ::wisdom_promotion::WisdomLifecycle::Candidate,
+                    memory_id: None,
+                    created_ms: w.created_ms,
+                    updated_ms: w.created_ms,
+                },
+            );
+        }
+        Op::UpdateWisdomLifecycle(l) => {
+            wisdom_promotion.replay_lifecycle(
+                l.candidate_id,
+                l.new_state,
+                l.memory_id,
+                l.contradiction_count,
+                l.updated_ms,
+            );
+        }
+        Op::UpdateScorerModel(m) => {
+            learned_scorer.apply_update(
+                &m.weights_json,
+                m.model_version,
+                m.mean_loss,
+                m.outcome_count,
+                m.applied_at_ms,
+            );
+        }
+        Op::AttachDebtEvidence(e) => {
+            epistemic_debt_store.replay_attach_evidence(
+                e.debt_id,
+                e.evidence_memory_ids,
+                e.confidence,
+                e.note,
+                e.attached_ms,
             );
         }
     }
