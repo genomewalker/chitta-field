@@ -34,6 +34,14 @@ impl DebtStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebtEvidence {
+    pub memory_ids: Vec<u64>,
+    pub confidence: f32,
+    pub note: Option<String>,
+    pub attached_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpistemicDebt {
     pub id: u64,
     pub pattern: String,
@@ -47,6 +55,10 @@ pub struct EpistemicDebt {
     pub resolution: Option<String>,
     pub realm: String,
     pub source_session: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<DebtEvidence>,
+    #[serde(default)]
+    pub auto_resolved: bool,
 }
 
 pub struct DebtStats {
@@ -100,6 +112,8 @@ impl EpistemicDebtStore {
             resolution: None,
             realm,
             source_session,
+            evidence: Vec::new(),
+            auto_resolved: false,
         };
         self.insert(debt);
         id
@@ -253,5 +267,76 @@ impl EpistemicDebtStore {
 
     pub fn count(&self) -> usize {
         self.debts.len()
+    }
+
+    /// Attach evidence to an open debt. Returns true if debt found.
+    pub fn attach_evidence(
+        &mut self,
+        id: u64,
+        memory_ids: Vec<u64>,
+        confidence: f32,
+        note: Option<String>,
+        now_ms: i64,
+    ) -> bool {
+        if let Some(debt) = self.get_mut(id) {
+            debt.evidence.push(DebtEvidence {
+                memory_ids,
+                confidence: confidence.clamp(0.0, 1.0),
+                note,
+                attached_ms: now_ms,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// WAL replay for attach evidence.
+    pub fn replay_attach_evidence(
+        &mut self,
+        id: u64,
+        memory_ids: Vec<u64>,
+        confidence: f32,
+        note: Option<String>,
+        attached_ms: i64,
+    ) {
+        if let Some(debt) = self.get_mut(id) {
+            debt.evidence.push(DebtEvidence {
+                memory_ids,
+                confidence: confidence.clamp(0.0, 1.0),
+                note,
+                attached_ms,
+            });
+        }
+    }
+
+    /// Auto-resolve a debt if cumulative evidence confidence exceeds threshold.
+    /// Returns true if the debt was resolved.
+    pub fn auto_resolve_if_ready(&mut self, id: u64, threshold: f32, now_ms: i64) -> bool {
+        if let Some(debt) = self.get_mut(id) {
+            if debt.status != DebtStatus::Open {
+                return false;
+            }
+            let total_confidence: f32 = debt.evidence.iter().map(|e| e.confidence).sum();
+            if total_confidence >= threshold {
+                debt.status = DebtStatus::Resolved;
+                debt.resolved_ms = now_ms;
+                debt.auto_resolved = true;
+                debt.resolution = Some(format!(
+                    "auto-resolved: cumulative evidence confidence {:.2} >= {:.2}",
+                    total_confidence, threshold
+                ));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get all open debts with their evidence for the learning cycle.
+    pub fn open_debts_with_evidence(&self) -> Vec<&EpistemicDebt> {
+        self.debts
+            .iter()
+            .filter(|d| d.status == DebtStatus::Open)
+            .collect()
     }
 }

@@ -30,6 +30,10 @@ pub use ops::{
     OP_ADD_TRIGGER, OP_UPDATE_TRIGGER, OP_FIRE_TRIGGER,
     RecordSurpriseOp, RegisterDebtOp, UpdateDebtOp, UpdateSourceWeightOp, RecordFeedbackOp,
     OP_RECORD_SURPRISE, OP_REGISTER_DEBT, OP_UPDATE_DEBT, OP_UPDATE_SOURCE_WEIGHT, OP_RECORD_FEEDBACK,
+    UpdateSurpriseCreditOp, UpsertWisdomCandidateOp, UpdateWisdomLifecycleOp,
+    UpdateScorerModelOp, AttachDebtEvidenceOp,
+    OP_UPDATE_SURPRISE_CREDIT, OP_UPSERT_WISDOM_CANDIDATE, OP_UPDATE_WISDOM_LIFECYCLE,
+    OP_UPDATE_SCORER_MODEL, OP_ATTACH_DEBT_EVIDENCE,
 };
 pub use organ::cortex::{CorticalIndex, SparseCode, SparseEncoder};
 pub use organ::pq::{ProductQuantizer, PQ_BYTES};
@@ -40,6 +44,9 @@ pub use organ::trigger::{TriggerStore, TriggerAutomaton, TriggerCondition, Trigg
 pub use organ::surprise::{SurpriseStore, SurpriseEvent, BlindSpot};
 pub use organ::epistemic_debt::{EpistemicDebtStore, EpistemicDebt, DebtStatus};
 pub use organ::integration::{IntegrationKernel, SourceWeight, IntegrationTrace};
+pub use organ::surprise_learning::{SurpriseLearningStore, SurpriseLearningState, SurpriseCreditResult};
+pub use organ::wisdom_promotion::{WisdomPromotionStore, WisdomCandidate, WisdomLifecycle};
+pub use scoring::learned::{LearnedScoringModel, LearnedScoringStats};
 pub use organ::triplet::{TripletEntry, TripletStore};
 pub use payload::{ArtifactRef, ArtifactRelation, MemoryPayload};
 pub use recall::RecallHit;

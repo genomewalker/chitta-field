@@ -1,5 +1,6 @@
 pub mod config;
 pub mod factors;
+pub mod learned;
 
 use crate::state::{EpistemicStatus, MemoryState, MemoryStatus};
 use config::ScoringConfig;

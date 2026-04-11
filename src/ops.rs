@@ -49,6 +49,11 @@ pub enum Op {
     UpdateDebt(UpdateDebtOp),
     UpdateSourceWeight(UpdateSourceWeightOp),
     RecordFeedback(RecordFeedbackOp),
+    UpdateSurpriseCredit(UpdateSurpriseCreditOp),
+    UpsertWisdomCandidate(UpsertWisdomCandidateOp),
+    UpdateWisdomLifecycle(UpdateWisdomLifecycleOp),
+    UpdateScorerModel(UpdateScorerModelOp),
+    AttachDebtEvidence(AttachDebtEvidenceOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -79,6 +84,11 @@ pub const OP_REGISTER_DEBT: u8 = 40;
 pub const OP_UPDATE_DEBT: u8 = 41;
 pub const OP_UPDATE_SOURCE_WEIGHT: u8 = 42;
 pub const OP_RECORD_FEEDBACK: u8 = 43;
+pub const OP_UPDATE_SURPRISE_CREDIT: u8 = 44;
+pub const OP_UPSERT_WISDOM_CANDIDATE: u8 = 45;
+pub const OP_UPDATE_WISDOM_LIFECYCLE: u8 = 46;
+pub const OP_UPDATE_SCORER_MODEL: u8 = 47;
+pub const OP_ATTACH_DEBT_EVIDENCE: u8 = 48;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -542,4 +552,61 @@ pub struct RecordFeedbackOp {
     pub new_weight: f32,
     pub success_count: u64,
     pub total_count: u64,
+}
+
+// ── Autonomous Learning (Moves 1-6) ──────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSurpriseCreditOp {
+    pub memory_id: u64,
+    pub credit: f32,
+    pub last_dir: i8,
+    pub same_dir_streak: u8,
+    pub last_surprise_id: u64,
+    pub updated_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertWisdomCandidateOp {
+    pub candidate_id: u64,
+    pub cluster_key: String,
+    pub domain: String,
+    pub action: String,
+    pub summary: String,
+    pub episode_ids: Vec<u64>,
+    pub debt_ids: Vec<u64>,
+    pub support_count: u32,
+    pub cross_session_count: u32,
+    pub mean_surprise: f32,
+    pub promotion_score: f32,
+    pub created_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateWisdomLifecycleOp {
+    pub candidate_id: u64,
+    pub memory_id: Option<u64>,
+    pub old_state: u8,
+    pub new_state: u8,
+    pub contradiction_count: u32,
+    pub updated_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateScorerModelOp {
+    pub model_version: u64,
+    pub baseline_version: String,
+    pub weights_json: String,
+    pub applied_at_ms: i64,
+    pub outcome_count: u64,
+    pub mean_loss: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachDebtEvidenceOp {
+    pub debt_id: u64,
+    pub evidence_memory_ids: Vec<u64>,
+    pub confidence: f32,
+    pub note: Option<String>,
+    pub attached_ms: i64,
 }
