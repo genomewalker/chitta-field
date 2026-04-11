@@ -19,3 +19,6 @@ pub mod triplet;
 pub mod user_model;
 pub mod skill;
 pub mod agent;
+pub mod constraint;
+pub mod trigger;
+pub mod predictor;

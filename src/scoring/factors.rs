@@ -293,3 +293,24 @@ impl ScoringFactor for RealmReliabilityFactor {
         Some(ctx.realm_reliability)
     }
 }
+
+// ── Prediction boost (Markov chain access predictor) ───────────────────────
+
+pub struct PredictionFactor;
+
+impl ScoringFactor for PredictionFactor {
+    fn name(&self) -> &'static str { "prediction" }
+
+    fn compute(
+        &self,
+        ctx: &ScoringContext,
+        config: &ScoringConfig,
+        _decomp: &mut ScoreDecomposition,
+    ) -> Option<f32> {
+        let boost = match ctx.prediction_prob {
+            Some(prob) if prob > 0.0 => 1.0 + config.prediction_weight * prob,
+            _ => 1.0,
+        };
+        Some(boost)
+    }
+}

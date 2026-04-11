@@ -24,6 +24,8 @@ pub struct ScoringContext<'a> {
     /// Caller's affect state (None = not provided).
     pub query_valence: Option<f32>,
     pub query_arousal: Option<f32>,
+    /// Prediction probability from Markov chain predictor (None = not predicted).
+    pub prediction_prob: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +91,7 @@ impl ScoringPipeline {
             Box::new(RealmReliabilityFactor),
             Box::new(InterferenceDensityFactor),
             Box::new(SpacingBoostFactor),
+            Box::new(PredictionFactor),
         ];
         Self { factors, config }
     }

@@ -24,10 +24,17 @@ pub use ops::{
     MsgEventOp, Op, PutPayloadOp, SessionEventOp, StateDeltaOp, TaskEventOp, ThemeEventOp,
     TranscriptEventOp, UpsertArtifactOp, UserModelEventOp, OP_ANALYTICS_EVENT, OP_MSG_EVENT,
     OP_SESSION_EVENT, OP_TASK_EVENT, OP_THEME_EVENT, OP_TRANSCRIPT_EVENT, OP_USER_MODEL_EVENT,
+    AssertConstraintOp, RetractConstraintOp, CreateBranchOp, ResolveBranchOp,
+    AddTriggerOp, UpdateTriggerOp, FireTriggerOp,
+    OP_ASSERT_CONSTRAINT, OP_RETRACT_CONSTRAINT, OP_CREATE_BRANCH, OP_RESOLVE_BRANCH,
+    OP_ADD_TRIGGER, OP_UPDATE_TRIGGER, OP_FIRE_TRIGGER,
 };
 pub use organ::cortex::{CorticalIndex, SparseCode, SparseEncoder};
 pub use organ::pq::{ProductQuantizer, PQ_BYTES};
 pub use organ::prototype::{ProtoId, PrototypeEntry, PrototypeIndex};
+pub use organ::constraint::{ConstraintStore, Constraint, Provenance, Branch, BranchStatus};
+pub use organ::predictor::AccessPredictor;
+pub use organ::trigger::{TriggerStore, TriggerAutomaton, TriggerCondition, TriggerAction, TriggerStatus};
 pub use organ::triplet::{TripletEntry, TripletStore};
 pub use payload::{ArtifactRef, ArtifactRelation, MemoryPayload};
 pub use recall::RecallHit;
