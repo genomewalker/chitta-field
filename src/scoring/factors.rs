@@ -214,6 +214,26 @@ impl ScoringFactor for KindFactor {
     }
 }
 
+// ── Strength (time-decayed memory strength) ────────────────────────────────
+
+pub struct StrengthFactor;
+
+impl ScoringFactor for StrengthFactor {
+    fn name(&self) -> &'static str { "strength" }
+
+    fn compute(
+        &self,
+        ctx: &ScoringContext,
+        config: &ScoringConfig,
+        decomp: &mut ScoreDecomposition,
+    ) -> Option<f32> {
+        let eff = ctx.state.effective_strength(ctx.now_ms);
+        let factor = config.strength_floor + config.strength_range * eff;
+        decomp.strength_factor = factor;
+        Some(factor)
+    }
+}
+
 // ── Realm reliability (Product of Experts) ──────────────────────────────────
 
 pub struct RealmReliabilityFactor;
