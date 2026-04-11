@@ -29,4 +29,8 @@ pub struct RecallHit {
     pub mood_congruence: f32,
     /// Frustration-escalation: extra boost for corrections when caller is frustrated
     pub frustration_boost: f32,
+    /// Interference density: penalty from local competitor crowding (Price of Meaning)
+    pub interference_factor: f32,
+    /// Spacing boost: reward for well-spaced retrieval intervals (Geometry of Forgetting)
+    pub spacing_boost: f32,
 }

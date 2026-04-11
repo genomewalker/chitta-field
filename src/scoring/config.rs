@@ -86,6 +86,23 @@ pub struct ScoringConfig {
     // ── Association spreading ───────────────────────────────────────────
     /// Per-hop decay factor for spreading activation.
     pub assoc_hop_decay: f32,
+
+    // ── Interference density (Price of Meaning) ────────────────────────
+    /// Penalty weight for local competitor crowding.
+    /// Factor = 1 / (1 + interference_penalty * competitive_weight).
+    pub interference_penalty: f32,
+
+    // ── Spacing boost (Geometry of Forgetting) ─────────────────────────
+    /// Floor of spacing factor (minimum contribution).
+    pub spacing_floor: f32,
+    /// Range above floor: factor = floor + range * spacing_quality.
+    pub spacing_range: f32,
+
+    // ── Lure detection (post-pipeline) ─────────────────────────────────
+    /// Lure risk threshold above which candidates may be suppressed.
+    pub lure_risk_threshold: f32,
+    /// Maximum number of lure-flagged candidates to suppress per query.
+    pub lure_max_suppressed: usize,
 }
 
 impl Default for ScoringConfig {
@@ -144,6 +161,17 @@ impl Default for ScoringConfig {
 
             // Association
             assoc_hop_decay: 0.55,
+
+            // Interference (Price of Meaning)
+            interference_penalty: 0.3,
+
+            // Spacing (Geometry of Forgetting)
+            spacing_floor: 0.85,
+            spacing_range: 0.15,
+
+            // Lure detection
+            lure_risk_threshold: 0.7,
+            lure_max_suppressed: 2,
         }
     }
 }

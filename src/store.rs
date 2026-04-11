@@ -285,6 +285,39 @@ impl ChittaField {
             self.semantic_idx
                 .write()
                 .upsert(memory_id, embedding.to_vec());
+
+            // Write-path: compute interference density (competitive_weight + lure_risk).
+            // Query k=8 nearest neighbors to measure local crowding.
+            // Exclude self and near-exact matches (above dedup threshold) since
+            // those represent the same information, not competitors.
+            let dedup_upper = self.scoring_pipeline.read().config.dedup_cosine_upper;
+            let neighbors = self.semantic_idx.read().search(embedding, 9, None);
+            if neighbors.len() > 1 {
+                let payloads_r = self.payloads.read();
+                let mut cos_sum = 0.0f32;
+                let mut same_kind_count = 0u32;
+                let mut neighbor_count = 0u32;
+                for n in &neighbors {
+                    if n.memory_id == memory_id { continue; }
+                    if n.cosine_similarity >= dedup_upper { continue; }
+                    cos_sum += n.cosine_similarity;
+                    neighbor_count += 1;
+                    if let Some(p) = payloads_r.get(&n.memory_id) {
+                        if p.kind == kind { same_kind_count += 1; }
+                    }
+                }
+                drop(payloads_r);
+                if neighbor_count > 0 {
+                    let cw = cos_sum / neighbor_count as f32;
+                    let same_kind_ratio = same_kind_count as f32 / neighbor_count as f32;
+                    let lure = cw * same_kind_ratio;
+                    let mut states_w = self.states.write();
+                    if let Some(st) = states_w.get_mut(&memory_id) {
+                        st.competitive_weight = cw;
+                        st.lure_risk = lure;
+                    }
+                }
+            }
         }
         let content_str = std::str::from_utf8(content).unwrap_or("").to_string();
         let index_text = extract_bm25_text(&content_str, self.filter_level());
@@ -605,8 +638,11 @@ impl ChittaField {
 
         for memory_id in pending.strengthen {
             let _ = self.update_state(memory_id, Some(0.01), None, None, true, None);
-            let new_strength = self.states.read().get(&memory_id).map(|s| s.strength);
-            if let Some(strength) = new_strength {
+            let mut states = self.states.write();
+            if let Some(st) = states.get_mut(&memory_id) {
+                st.recompute_spacing_quality();
+                let strength = st.strength;
+                drop(states);
                 self.cortical_idx
                     .write()
                     .update_strength(memory_id, strength);
@@ -726,6 +762,8 @@ impl ChittaField {
                     arousal_boost: decomp.arousal_boost,
                     mood_congruence: decomp.mood_congruence,
                     frustration_boost: decomp.frustration_boost,
+                    interference_factor: decomp.interference_factor,
+                    spacing_boost: decomp.spacing_boost,
                 })
             })
             .collect();
@@ -735,6 +773,27 @@ impl ChittaField {
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        // Lure detection (Price of Meaning no-escape theorem):
+        // Suppress high-lure-risk candidates that could be false recalls.
+        // Only suppress from the tail — never remove the top-scoring hit.
+        let lure_threshold = pipeline.config.lure_risk_threshold;
+        let max_suppressed = pipeline.config.lure_max_suppressed;
+        if max_suppressed > 0 && hits.len() > 1 {
+            let mut suppressed = 0usize;
+            let mut i = hits.len();
+            while i > 1 && suppressed < max_suppressed {
+                i -= 1;
+                if states.get(&hits[i].memory_id)
+                    .map(|s| s.lure_risk >= lure_threshold)
+                    .unwrap_or(false)
+                {
+                    hits.remove(i);
+                    suppressed += 1;
+                }
+            }
+        }
+
         hits.truncate(k);
 
         let hit_ids: Vec<MemoryId> = hits.iter().map(|h| h.memory_id).collect();
@@ -849,6 +908,8 @@ impl ChittaField {
                     arousal_boost: 1.0,
                     mood_congruence: 1.0,
                     frustration_boost: 1.0,
+                    interference_factor: 1.0,
+                    spacing_boost: 1.0,
                 })
             })
             .collect();
@@ -945,6 +1006,8 @@ impl ChittaField {
                     arousal_boost: 1.0,
                     mood_congruence: 1.0,
                     frustration_boost: 1.0,
+                    interference_factor: 1.0,
+                    spacing_boost: 1.0,
                 })
             })
             .collect();
@@ -1019,6 +1082,8 @@ impl ChittaField {
                     arousal_boost: decomp.arousal_boost,
                     mood_congruence: decomp.mood_congruence,
                     frustration_boost: decomp.frustration_boost,
+                    interference_factor: decomp.interference_factor,
+                    spacing_boost: decomp.spacing_boost,
                 })
             })
             .collect();
@@ -1109,6 +1174,8 @@ impl ChittaField {
                     arousal_boost: 1.0,
                     mood_congruence: 1.0,
                     frustration_boost: 1.0,
+                    interference_factor: 1.0,
+                    spacing_boost: 1.0,
                 })
             })
             .collect();
