@@ -6910,3 +6910,247 @@ pub extern "C" fn cf_auto_resolve_debts(h: *mut CfHandle, threshold: f32) -> *mu
     let json = serde_json::json!({ "resolved_count": resolved });
     CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
+
+// ── Agent Protocol Memory (Layer 8) ──────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn cf_register_task(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
+        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+    }};
+    let p: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+    };
+    let goal = p["goal"].as_str().unwrap_or("").to_string();
+    let constraints: Vec<String> = p["constraints"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let acceptance_criteria: Vec<String> = p["acceptance_criteria"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let realm = p["realm"].as_str().unwrap_or("coding").to_string();
+    let session_id = p["session_id"].as_str().unwrap_or("").to_string();
+    let priority = p["priority"].as_u64().unwrap_or(5) as u8;
+    let parent_task_id = p["parent_task_id"].as_u64();
+    let deadline_ms = p["deadline_ms"].as_i64();
+    let tags: Vec<String> = p["tags"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    match handle.field.register_task(
+        goal, constraints, acceptance_criteria,
+        realm, session_id, priority, parent_task_id, deadline_ms, tags,
+    ) {
+        Ok(id) => {
+            let json = serde_json::json!({ "task_id": id });
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_update_task(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> c_int {
+    if h.is_null() || params_json.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
+        Ok(s) => s, Err(_) => return -1
+    }};
+    let p: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v, Err(_) => return -1
+    };
+    let task_id = match p["task_id"].as_u64() { Some(id) => id, None => return -1 };
+    let status: Option<u8> = p["status"].as_u64().map(|v| v as u8);
+    let add_intervention_id = p["add_intervention_id"].as_u64();
+    let add_tag = p["add_tag"].as_str().map(|s| s.to_string());
+    match handle.field.update_task(task_id, status, add_intervention_id, add_tag) {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_add_delegation(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
+        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+    }};
+    let p: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+    };
+    let task_id = match p["task_id"].as_u64() { Some(id) => id, None => return std::ptr::null_mut() };
+    let from_agent = p["from_agent"].as_str().unwrap_or("").to_string();
+    let to_agent = p["to_agent"].as_str().unwrap_or("").to_string();
+    let handoff_note = p["handoff_note"].as_str().map(|s| s.to_string());
+    match handle.field.add_delegation(task_id, from_agent, to_agent, handoff_note) {
+        Ok(Some(id)) => {
+            let json = serde_json::json!({ "delegation_id": id });
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_link_evidence(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
+        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+    }};
+    let p: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+    };
+    let task_id = match p["task_id"].as_u64() { Some(id) => id, None => return std::ptr::null_mut() };
+    let memory_id = match p["memory_id"].as_u64() { Some(id) => id, None => return std::ptr::null_mut() };
+    let produced_by = p["produced_by"].as_str().unwrap_or("").to_string();
+    let evidence_kind = p["evidence_kind"].as_u64().unwrap_or(0) as u8;
+    let relevance = p["relevance"].as_f64().unwrap_or(1.0) as f32;
+    match handle.field.link_evidence(task_id, memory_id, produced_by, evidence_kind, relevance) {
+        Ok(Some(id)) => {
+            let json = serde_json::json!({ "evidence_id": id });
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_add_probe(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
+        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+    }};
+    let p: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+    };
+    let task_id = match p["task_id"].as_u64() { Some(id) => id, None => return std::ptr::null_mut() };
+    let question = p["question"].as_str().unwrap_or("").to_string();
+    let expected_answerer = p["expected_answerer"].as_str().map(|s| s.to_string());
+    let priority = p["priority"].as_u64().unwrap_or(5) as u8;
+    match handle.field.add_probe(task_id, question, expected_answerer, priority) {
+        Ok(Some(id)) => {
+            let json = serde_json::json!({ "probe_id": id });
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_resolve_probe(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> c_int {
+    if h.is_null() || params_json.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
+        Ok(s) => s, Err(_) => return -1
+    }};
+    let p: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v, Err(_) => return -1
+    };
+    let probe_id = match p["probe_id"].as_u64() { Some(id) => id, None => return -1 };
+    let status = p["status"].as_u64().unwrap_or(1) as u8;
+    let answer = p["answer"].as_str().map(|s| s.to_string());
+    match handle.field.resolve_probe(probe_id, status, answer) {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_set_criterion(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
+        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+    }};
+    let p: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+    };
+    let task_id = match p["task_id"].as_u64() { Some(id) => id, None => return std::ptr::null_mut() };
+    let criterion = p["criterion"].as_str().unwrap_or("").to_string();
+    let is_met = p["is_met"].as_bool().unwrap_or(false);
+    let evidence_note = p["evidence_note"].as_str().map(|s| s.to_string());
+    match handle.field.set_criterion(task_id, criterion, is_met, evidence_note) {
+        Ok(Some(id)) => {
+            let json = serde_json::json!({ "criterion_id": id });
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_get_task(
+    h: *const CfHandle, task_id: u64,
+) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    match handle.field.get_task_full(task_id) {
+        Some(view) => {
+            let json = serde_json::to_value(&view).unwrap_or(serde_json::Value::Null);
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_query_tasks(
+    h: *const CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let p: serde_json::Value = if params_json.is_null() {
+        serde_json::Value::Null
+    } else {
+        let s = unsafe { match CStr::from_ptr(params_json).to_str() {
+            Ok(s) => s, Err(_) => return std::ptr::null_mut()
+        }};
+        serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
+    };
+    let realm = p["realm"].as_str();
+    let session_id = p["session_id"].as_str();
+    let status: Option<u8> = p["status"].as_u64().map(|v| v as u8);
+    let priority: Option<u8> = p["priority"].as_u64().map(|v| v as u8);
+    let limit = p["limit"].as_u64().unwrap_or(50) as usize;
+    let results = handle.field.query_tasks(realm, session_id, status, priority, limit);
+    let json = serde_json::to_value(&results).unwrap_or(serde_json::Value::Array(vec![]));
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_agent_protocol_stats(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let stats = handle.field.agent_protocol_stats();
+    let json = serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null);
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_auto_complete_tasks(h: *mut CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let completed = handle.field.auto_complete_tasks().unwrap_or(0);
+    let json = serde_json::json!({ "completed_count": completed });
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}

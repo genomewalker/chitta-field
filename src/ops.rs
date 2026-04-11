@@ -58,6 +58,14 @@ pub enum Op {
     AddObservation(AddObservationOp),
     CloseIntervention(CloseInterventionOp),
     RecordAttribution(RecordAttributionOp),
+    // Layer 8: Agent Protocol Memory
+    RegisterTask(RegisterTaskOp),
+    UpdateTask(UpdateTaskOp),
+    AddDelegation(AddDelegationOp),
+    LinkEvidence(LinkEvidenceOp),
+    AddProbe(AddProbeOp),
+    ResolveProbe(ResolveProbeOp),
+    SetCriterion(SetCriterionOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -97,6 +105,13 @@ pub const OP_START_INTERVENTION: u8 = 49;
 pub const OP_ADD_OBSERVATION: u8 = 50;
 pub const OP_CLOSE_INTERVENTION: u8 = 51;
 pub const OP_RECORD_ATTRIBUTION: u8 = 52;
+pub const OP_REGISTER_TASK: u8 = 53;
+pub const OP_UPDATE_TASK: u8 = 54;
+pub const OP_ADD_DELEGATION: u8 = 55;
+pub const OP_LINK_EVIDENCE: u8 = 56;
+pub const OP_ADD_PROBE: u8 = 57;
+pub const OP_RESOLVE_PROBE: u8 = 58;
+pub const OP_SET_CRITERION: u8 = 59;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -668,4 +683,79 @@ pub struct RecordAttributionOp {
     pub skill_memory_ids: Vec<u64>,
     pub note: Option<String>,
     pub timestamp_ms: i64,
+}
+
+// ── Layer 8: Agent Protocol Memory ───────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterTaskOp {
+    pub id: u64,
+    pub session_id: String,
+    pub realm: String,
+    pub goal: String,
+    pub constraints: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub priority: u8,
+    pub parent_task_id: Option<u64>,
+    pub tags: Vec<String>,
+    pub deadline_ms: Option<i64>,
+    pub created_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateTaskOp {
+    pub task_id: u64,
+    pub status: u8,
+    pub add_intervention_id: Option<u64>,
+    pub add_tag: Option<String>,
+    pub updated_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddDelegationOp {
+    pub id: u64,
+    pub task_id: u64,
+    pub from_agent: String,
+    pub to_agent: String,
+    pub handoff_note: Option<String>,
+    pub delegated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkEvidenceOp {
+    pub id: u64,
+    pub task_id: u64,
+    pub memory_id: u64,
+    pub produced_by: String,
+    pub evidence_kind: u8,
+    pub relevance: f32,
+    pub created_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddProbeOp {
+    pub id: u64,
+    pub task_id: u64,
+    pub question: String,
+    pub expected_answerer: Option<String>,
+    pub priority: u8,
+    pub created_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveProbeOp {
+    pub probe_id: u64,
+    pub status: u8,
+    pub answer: Option<String>,
+    pub resolved_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetCriterionOp {
+    pub id: u64,
+    pub task_id: u64,
+    pub criterion: String,
+    pub is_met: bool,
+    pub evidence_note: Option<String>,
+    pub checked_ms: i64,
 }
