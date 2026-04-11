@@ -7,7 +7,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read as IoRead, Write};
 use std::path::Path;
 
-const SNAPSHOT_MAGIC: u64 = 0xC417745F3A7_0001;
+/// V1 cortex snapshot: PostingEntry without affect_q field.
+const CORTEX_SNAPSHOT_MAGIC_V1: u64 = 0xC417745F3A7_0001;
+/// Current cortex snapshot (V2): PostingEntry with affect_q.
+const CORTEX_SNAPSHOT_MAGIC: u64 = 0xC417745F3A7_0002;
 
 // ── Sparse Code ──────────────────────────────────────────────────────────────
 
@@ -257,7 +260,25 @@ impl SparseEncoder {
     }
 }
 
+// ── Compile-time guard: PostingEntry size must match cortex snapshot magic ────
+// If you add/remove fields to PostingEntry, this assert will fail.
+// You MUST: (1) bump CORTEX_SNAPSHOT_MAGIC, (2) add a LegacyPostingEntryVN,
+// (3) add migration in CorticalIndex::load_snapshot(), (4) update this constant.
+const _POSTING_ENTRY_SIZE_V2: usize = 16;
+const _: () = assert!(
+    std::mem::size_of::<PostingEntry>() == _POSTING_ENTRY_SIZE_V2,
+);
+
 // ── Cortical Posting Index ────────────────────────────────────────────────────
+
+/// V1 PostingEntry: no affect_q field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyPostingEntryV1 {
+    pub mem_id: MemoryId,
+    pub activation_q: u8,
+    pub strength_q: u8,
+    pub proto_id: ProtoId,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostingEntry {
@@ -267,8 +288,21 @@ pub struct PostingEntry {
     pub proto_id: ProtoId, // prototype cluster assignment
     /// Affect arousal quantized: 0=calm, 255=intense. High arousal boosts retrieval
     /// (flashbulb memory effect, inspired by Anthropic emotion vectors 2026).
-    #[serde(default)]
     pub affect_q: u8,
+}
+
+/// V1 CorticalIndex: uses LegacyPostingEntryV1 (no affect_q).
+#[derive(Serialize, Deserialize)]
+struct LegacyCorticalIndexV1 {
+    postings: HashMap<u32, Vec<LegacyPostingEntryV1>>,
+    df: HashMap<u32, u64>,
+    pub n_memories: u64,
+    pub(crate) mem_codes: HashMap<MemoryId, SparseCode>,
+    mem_ts: HashMap<MemoryId, i64>,
+    mem_kind: HashMap<MemoryId, String>,
+    prototype_idx: PrototypeIndex,
+    pub pq: Option<ProductQuantizer>,
+    pub mem_pq: HashMap<MemoryId, [u8; PQ_BYTES]>,
 }
 
 /// Inverted posting index over sparse codes. O(K) posting lookups per query.
@@ -648,7 +682,7 @@ impl CorticalIndex {
                 .open(&tmp_path)?;
             let mut writer = BufWriter::new(file);
 
-            writer.write_all(&SNAPSHOT_MAGIC.to_be_bytes())?;
+            writer.write_all(&CORTEX_SNAPSHOT_MAGIC.to_be_bytes())?;
             writer.write_all(&snapshot_seqno.to_be_bytes())?;
 
             let encoded =
@@ -668,10 +702,10 @@ impl CorticalIndex {
         let mut buf = [0u8; 16];
         reader.read_exact(&mut buf).map_err(FieldError::Io)?;
         let magic = u64::from_be_bytes(buf[0..8].try_into().unwrap());
-        if magic != SNAPSHOT_MAGIC {
+        if magic != CORTEX_SNAPSHOT_MAGIC && magic != CORTEX_SNAPSHOT_MAGIC_V1 {
             return Err(FieldError::Manifest(format!(
-                "cortex snapshot magic mismatch: expected {:#x}, got {:#x}",
-                SNAPSHOT_MAGIC, magic
+                "cortex snapshot magic mismatch: expected {:#x} or {:#x}, got {:#x}",
+                CORTEX_SNAPSHOT_MAGIC, CORTEX_SNAPSHOT_MAGIC_V1, magic
             )));
         }
         Ok(u64::from_be_bytes(buf[8..16].try_into().unwrap()))
@@ -688,10 +722,10 @@ impl CorticalIndex {
             .read_exact(&mut magic_buf)
             .map_err(|e| FieldError::Io(e))?;
         let magic = u64::from_be_bytes(magic_buf);
-        if magic != SNAPSHOT_MAGIC {
+        if magic != CORTEX_SNAPSHOT_MAGIC && magic != CORTEX_SNAPSHOT_MAGIC_V1 {
             return Err(FieldError::Manifest(format!(
-                "cortex snapshot magic mismatch: expected {:#x}, got {:#x}",
-                SNAPSHOT_MAGIC, magic
+                "cortex snapshot magic mismatch: expected {:#x} or {:#x}, got {:#x}",
+                CORTEX_SNAPSHOT_MAGIC, CORTEX_SNAPSHOT_MAGIC_V1, magic
             )));
         }
 
@@ -706,9 +740,37 @@ impl CorticalIndex {
             .read_to_end(&mut data)
             .map_err(|e| FieldError::Io(e))?;
 
-        let index: CorticalIndex =
-            bincode::deserialize(&data).map_err(|e| FieldError::Serialization(e.to_string()))?;
+        if magic == CORTEX_SNAPSHOT_MAGIC {
+            let index: CorticalIndex = bincode::deserialize(&data)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            return Ok((index, snapshot_seqno));
+        }
 
+        // V1 migration: PostingEntry without affect_q
+        eprintln!("[chitta-field] migrating cortex v1 snapshot → v2 (adding affect_q)");
+        let v1: LegacyCorticalIndexV1 = bincode::deserialize(&data)
+            .map_err(|e| FieldError::Serialization(e.to_string()))?;
+        let postings = v1.postings.into_iter().map(|(fid, entries)| {
+            let upgraded: Vec<PostingEntry> = entries.into_iter().map(|e| PostingEntry {
+                mem_id: e.mem_id,
+                activation_q: e.activation_q,
+                strength_q: e.strength_q,
+                proto_id: e.proto_id,
+                affect_q: 0,
+            }).collect();
+            (fid, upgraded)
+        }).collect();
+        let index = CorticalIndex {
+            postings,
+            df: v1.df,
+            n_memories: v1.n_memories,
+            mem_codes: v1.mem_codes,
+            mem_ts: v1.mem_ts,
+            mem_kind: v1.mem_kind,
+            prototype_idx: v1.prototype_idx,
+            pq: v1.pq,
+            mem_pq: v1.mem_pq,
+        };
         Ok((index, snapshot_seqno))
     }
 }

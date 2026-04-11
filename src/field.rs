@@ -239,7 +239,14 @@ impl ChittaField {
                 ),
             }
         }
-        for path in &stale_cortex_paths {
+        // Keep the 1 most recent stale cortex snapshot as a safety net.
+        // Cortex is a cache (rebuilt from segments), so 1 backup is enough.
+        let mut stale_cortex_by_seqno: Vec<(u64, &std::path::PathBuf)> = stale_cortex_paths
+            .iter()
+            .filter_map(|p| CorticalIndex::peek_snapshot_seqno(p).ok().map(|s| (s, p)))
+            .collect();
+        stale_cortex_by_seqno.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, path) in stale_cortex_by_seqno.iter().skip(1) {
             let _ = std::fs::remove_file(path);
         }
 
@@ -327,11 +334,17 @@ impl ChittaField {
             ));
         }
         // Only clean up stale snapshots if we successfully loaded one.
+        // Keep the 1 most recent stale snapshot as a safety net against format bugs.
         if full_snapshot_loaded {
-            for path in &stale_full_paths {
-                if best_full_path.as_ref() != Some(path) {
-                    let _ = std::fs::remove_file(path);
-                }
+            let mut stale_by_seqno: Vec<(u64, &std::path::PathBuf)> = stale_full_paths
+                .iter()
+                .filter(|p| best_full_path.as_ref() != Some(p))
+                .filter_map(|p| FullSnapshot::peek_seqno(p).ok().map(|s| (s, p)))
+                .collect();
+            stale_by_seqno.sort_by(|a, b| b.0.cmp(&a.0));
+            // Skip the most recent stale (keep as backup), delete the rest.
+            for (_, path) in stale_by_seqno.iter().skip(1) {
+                let _ = std::fs::remove_file(path);
             }
         }
 
