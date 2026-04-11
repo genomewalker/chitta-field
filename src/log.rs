@@ -51,6 +51,8 @@ use crate::ops::{
     OP_SESSION_EVENT, OP_SKILL_DEPRECATE, OP_SKILL_UPLOAD, OP_TASK_EVENT, OP_THEME_EVENT,
     OP_RECORD_RECALL_BATCH, OP_STRENGTHEN_ASSOC_EDGE, OP_TRANSCRIPT_EVENT,
     OP_UPDATE_MEMORY_CONTENT, OP_UPDATE_SYMBOL_DESCRIPTION, OP_USER_MODEL_EVENT,
+    OP_ASSERT_CONSTRAINT, OP_RETRACT_CONSTRAINT, OP_CREATE_BRANCH, OP_RESOLVE_BRANCH,
+    OP_ADD_TRIGGER, OP_UPDATE_TRIGGER, OP_FIRE_TRIGGER,
 };
 
 fn op_type_byte(op: &Op) -> u8 {
@@ -87,6 +89,13 @@ fn op_type_byte(op: &Op) -> u8 {
         Op::SkillDeprecate(_) => OP_SKILL_DEPRECATE,
         Op::AgentUpsert(_) => OP_AGENT_UPSERT,
         Op::AgentDisable(_) => OP_AGENT_DISABLE,
+        Op::AssertConstraint(_) => OP_ASSERT_CONSTRAINT,
+        Op::RetractConstraint(_) => OP_RETRACT_CONSTRAINT,
+        Op::CreateBranch(_) => OP_CREATE_BRANCH,
+        Op::ResolveBranch(_) => OP_RESOLVE_BRANCH,
+        Op::AddTrigger(_) => OP_ADD_TRIGGER,
+        Op::UpdateTrigger(_) => OP_UPDATE_TRIGGER,
+        Op::FireTrigger(_) => OP_FIRE_TRIGGER,
     }
 }
 

@@ -622,6 +622,13 @@ impl ChittaField {
         if !window_ids.is_empty() && pending.proto_windows.len() < MAX_PENDING_WINDOWS {
             pending.proto_windows.push(window_ids);
         }
+        drop(pending);
+
+        // Hot-path: record access sequence for predictive memory (Layer 3)
+        let mut predictor = self.predictor.write();
+        for &id in hit_ids.iter().take(8) {
+            predictor.record_access(id);
+        }
     }
 
     pub(crate) fn drain_pending_recall_effects(&self) -> Result<()> {
@@ -740,6 +747,7 @@ impl ChittaField {
                     now_ms: now,
                     query_valence,
                     query_arousal,
+                    prediction_prob: None,
                 };
                 let (score, decomp) = pipeline.score(&ctx)?;
                 let eff_strength = state.effective_strength(now);
@@ -1066,6 +1074,7 @@ impl ChittaField {
                     now_ms: now,
                     query_valence,
                     query_arousal,
+                    prediction_prob: None,
                 };
                 let (score, decomp) = pipeline.score(&ctx)?;
                 let eff_strength = state.effective_strength(now);
@@ -2019,6 +2028,186 @@ impl ChittaField {
             .data_dir
             .join(format!("cortex.{:08x}.snapshot", self.instance_id));
         self.cortical_idx.read().save_snapshot(&path, seqno)
+    }
+
+    // ── Layer 1: Executable Constraints ────────────────────────────────────
+
+    pub fn assert_constraint(
+        &self,
+        subject: String,
+        predicate: String,
+        object: String,
+        confidence: f32,
+        scope: String,
+        branch_id: u64,
+        provenance: crate::organ::constraint::Provenance,
+        source_memory_id: Option<u64>,
+    ) -> Result<crate::organ::constraint::AssertResult> {
+        let now = now_ms();
+        let result = self.constraint_store.write().assert_fact(
+            subject.clone(), predicate.clone(), object.clone(),
+            confidence, scope.clone(), branch_id, provenance.clone(),
+            now, source_memory_id,
+        );
+        let op = Op::AssertConstraint(crate::ops::AssertConstraintOp {
+            fact_id: result.fact_id,
+            subject, predicate, object, confidence, scope, branch_id,
+            provenance_source: provenance.source,
+            provenance_session: provenance.session_id,
+            provenance_basis: provenance.confidence_basis,
+            valid_from_ms: now,
+            source_memory_id,
+        });
+        self.log.write().append(&op)?;
+        Ok(result)
+    }
+
+    pub fn retract_constraint(&self, fact_id: u64) -> Result<bool> {
+        let now = now_ms();
+        let ok = self.constraint_store.write().retract(fact_id, now);
+        if ok {
+            let op = Op::RetractConstraint(crate::ops::RetractConstraintOp {
+                fact_id, retracted_at_ms: now,
+            });
+            self.log.write().append(&op)?;
+        }
+        Ok(ok)
+    }
+
+    pub fn query_constraints(
+        &self,
+        subject: Option<&str>,
+        predicate: Option<&str>,
+        object: Option<&str>,
+        scope: Option<&str>,
+    ) -> Vec<crate::organ::constraint::Constraint> {
+        self.constraint_store.read().query_unify(subject, predicate, object, scope)
+            .into_iter().cloned().collect()
+    }
+
+    pub fn query_constraint_chain(
+        &self, subject: &str, predicates: &[&str], max_depth: usize,
+    ) -> Vec<Vec<crate::organ::constraint::Constraint>> {
+        self.constraint_store.read().query_chain(subject, predicates, max_depth)
+            .into_iter().map(|v| v.into_iter().cloned().collect()).collect()
+    }
+
+    pub fn explain_constraint(&self, fact_id: u64) -> Option<crate::organ::constraint::Explanation> {
+        self.constraint_store.read().explain(fact_id)
+    }
+
+    pub fn create_constraint_branch(&self, parent_id: u64, scope: String) -> Result<u64> {
+        let now = now_ms();
+        let branch_id = self.constraint_store.write().create_branch(parent_id, scope.clone(), now);
+        let op = Op::CreateBranch(crate::ops::CreateBranchOp {
+            branch_id, parent_id, scope, created_ms: now,
+        });
+        self.log.write().append(&op)?;
+        Ok(branch_id)
+    }
+
+    pub fn resolve_constraint_branch(&self, winner_id: u64, loser_id: u64) -> Result<bool> {
+        let now = now_ms();
+        let ok = self.constraint_store.write().resolve_branch(winner_id, loser_id, now);
+        if ok {
+            let op = Op::ResolveBranch(crate::ops::ResolveBranchOp {
+                winner_id, loser_id, resolved_at_ms: now,
+            });
+            self.log.write().append(&op)?;
+        }
+        Ok(ok)
+    }
+
+    pub fn constraint_stats(&self) -> (usize, usize) {
+        let store = self.constraint_store.read();
+        (store.count(), store.branch_count())
+    }
+
+    // ── Layer 2: Trigger Tissue ─────────────────────────────────────────
+
+    pub fn add_trigger(
+        &self,
+        name: String,
+        condition: crate::organ::trigger::TriggerCondition,
+        action: crate::organ::trigger::TriggerAction,
+        deadline_ms: i64,
+        tension_threshold: f32,
+        gain: f32,
+        realm: String,
+        source_session: Option<String>,
+    ) -> Result<u64> {
+        let now = now_ms();
+        let id = self.trigger_store.write().add_trigger(
+            name, condition.clone(), action.clone(),
+            deadline_ms, tension_threshold, gain, realm.clone(), source_session.clone(), now,
+        );
+        let trigger = self.trigger_store.read().get(id).cloned();
+        if let Some(t) = trigger {
+            let json = serde_json::to_vec(&t).unwrap_or_default();
+            let op = Op::AddTrigger(crate::ops::AddTriggerOp { trigger_json: json });
+            self.log.write().append(&op)?;
+        }
+        Ok(id)
+    }
+
+    pub fn fire_trigger(&self, trigger_id: u64) -> Result<Option<crate::organ::trigger::FireResult>> {
+        let now = now_ms();
+        let result = self.trigger_store.write().fire(trigger_id, now);
+        if result.is_some() {
+            let op = Op::FireTrigger(crate::ops::FireTriggerOp {
+                trigger_id, fired_ms: now,
+            });
+            self.log.write().append(&op)?;
+        }
+        Ok(result)
+    }
+
+    pub fn dismiss_trigger(&self, trigger_id: u64) -> Result<bool> {
+        let now = now_ms();
+        let ok = self.trigger_store.write().dismiss(trigger_id, now);
+        if ok {
+            let op = Op::UpdateTrigger(crate::ops::UpdateTriggerOp {
+                trigger_id, status: 2, fired_ms: now,
+            });
+            self.log.write().append(&op)?;
+        }
+        Ok(ok)
+    }
+
+    pub fn list_triggers(&self) -> Vec<crate::organ::trigger::TriggerAutomaton> {
+        self.trigger_store.read().list_all().to_vec()
+    }
+
+    pub fn evaluate_triggers(&self) -> Result<Vec<crate::organ::trigger::FireResult>> {
+        let now = now_ms();
+        let ready_ids = self.trigger_store.read().evaluate_time_triggers(now);
+        let mut results = Vec::new();
+        for id in ready_ids {
+            if let Some(result) = self.fire_trigger(id)? {
+                results.push(result);
+            }
+        }
+        Ok(results)
+    }
+
+    pub fn trigger_stats(&self) -> usize {
+        self.trigger_store.read().count_armed()
+    }
+
+    // ── Layer 3: Predictive Memory ──────────────────────────────────────
+
+    pub fn predict_needed(&self, k: usize) -> Vec<(MemoryId, f32)> {
+        self.predictor.read().predict(k)
+    }
+
+    pub fn retrain_predictor(&self) {
+        let now = now_ms();
+        self.predictor.write().retrain(now);
+    }
+
+    pub fn predictor_stats(&self) -> (u64, usize, usize) {
+        let p = self.predictor.read();
+        (p.total_transitions(), p.transition_count(), p.recent_access_len())
     }
 
     /// Save full in-memory state to a binary snapshot (chitta.snapshot).

@@ -98,6 +98,10 @@ pub struct ScoringConfig {
     /// Range above floor: factor = floor + range * spacing_quality.
     pub spacing_range: f32,
 
+    // ── Prediction boost (Markov chain access predictor) ──────────────
+    /// Prediction boost weight: factor = 1 + weight * prediction_probability.
+    pub prediction_weight: f32,
+
     // ── Lure detection (post-pipeline) ─────────────────────────────────
     /// Lure risk threshold above which candidates may be suppressed.
     pub lure_risk_threshold: f32,
@@ -168,6 +172,9 @@ impl Default for ScoringConfig {
             // Spacing (Geometry of Forgetting)
             spacing_floor: 0.85,
             spacing_range: 0.15,
+
+            // Prediction
+            prediction_weight: 0.3,
 
             // Lure detection
             lure_risk_threshold: 0.7,

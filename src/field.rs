@@ -16,8 +16,11 @@ use crate::organ::hopfield::HopfieldNetwork;
 use crate::organ::keyword::KeywordIndex;
 use crate::organ::lite_encoder::LiteEncoder;
 use crate::organ::agent::AgentRegistry;
+use crate::organ::constraint::ConstraintStore;
 use crate::organ::msg::MsgRegistry;
+use crate::organ::predictor::AccessPredictor;
 use crate::organ::skill::SkillRegistry;
+use crate::organ::trigger::TriggerStore;
 use crate::organ::pq::ProductQuantizer;
 use crate::organ::session::SessionRegistry;
 use crate::organ::symbol::{SymbolEntry, SymbolIndex};
@@ -123,6 +126,9 @@ pub struct ChittaField {
     pub(crate) msg_registry: RwLock<MsgRegistry>,
     pub(crate) skill_registry: RwLock<SkillRegistry>,
     pub(crate) agent_registry: RwLock<AgentRegistry>,
+    pub(crate) constraint_store: RwLock<ConstraintStore>,
+    pub(crate) trigger_store: RwLock<TriggerStore>,
+    pub(crate) predictor: RwLock<AccessPredictor>,
     pub(crate) lite_encoder: RwLock<Option<LiteEncoder>>,
     /// Byte offsets for each foreign segment file, used by sync_foreign().
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
@@ -191,6 +197,9 @@ impl ChittaField {
         let mut msg_registry = MsgRegistry::new();
         let mut skill_registry = SkillRegistry::new();
         let mut agent_registry = AgentRegistry::new();
+        let mut constraint_store = ConstraintStore::new();
+        let mut trigger_store = TriggerStore::new();
+        let predictor = AccessPredictor::new();
         let mut chunk_hash_idx: HashMap<crate::ids::ChunkHash, MemoryId> = HashMap::new();
         let mut snapshot_coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats> = HashMap::new();
 
@@ -402,6 +411,8 @@ impl ChittaField {
                 &mut msg_registry,
                 &mut skill_registry,
                 &mut agent_registry,
+                &mut constraint_store,
+                &mut trigger_store,
                 &mut chunk_hash_idx,
                 &mut replay_realm_members,
                 &mut replay_coactivation_stats,
@@ -491,6 +502,9 @@ impl ChittaField {
             msg_registry: RwLock::new(msg_registry),
             skill_registry: RwLock::new(skill_registry),
             agent_registry: RwLock::new(agent_registry),
+            constraint_store: RwLock::new(constraint_store),
+            trigger_store: RwLock::new(trigger_store),
+            predictor: RwLock::new(predictor),
             lite_encoder: RwLock::new(loaded_lite_encoder),
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
@@ -577,6 +591,8 @@ impl ChittaField {
         let mut msg_reg = self.msg_registry.write();
         let mut skill_reg = self.skill_registry.write();
         let mut agent_reg = self.agent_registry.write();
+        let mut constraint_reg = self.constraint_store.write();
+        let mut trigger_reg = self.trigger_store.write();
         let mut chunk_hash_idx = self.chunk_hash_idx.write();
         let mut realm_members = self.realm_members.write();
         let mut coactivation_stats = self.coactivation_stats.write();
@@ -607,6 +623,8 @@ impl ChittaField {
                 &mut *msg_reg,
                 &mut *skill_reg,
                 &mut *agent_reg,
+                &mut *constraint_reg,
+                &mut *trigger_reg,
                 &mut *chunk_hash_idx,
                 &mut *realm_members,
                 &mut *coactivation_stats,
@@ -754,6 +772,8 @@ pub(crate) fn apply_op(
     msg_registry: &mut MsgRegistry,
     skill_registry: &mut SkillRegistry,
     agent_registry: &mut AgentRegistry,
+    constraint_store: &mut ConstraintStore,
+    trigger_store: &mut TriggerStore,
     chunk_hash_idx: &mut HashMap<crate::ids::ChunkHash, MemoryId>,
     realm_members: &mut HashMap<String, HashSet<MemoryId>>,
     coactivation_stats: &mut HashMap<(MemoryId, MemoryId), CoActivationStats>,
@@ -1204,6 +1224,49 @@ pub(crate) fn apply_op(
         }
         Op::AgentDisable(a) => {
             agent_registry.disable(&a.agent_id);
+        }
+        Op::AssertConstraint(c) => {
+            use crate::organ::constraint::Provenance;
+            constraint_store.replay_assert(
+                c.fact_id, c.subject, c.predicate, c.object, c.confidence,
+                c.scope, c.branch_id,
+                Provenance {
+                    source: c.provenance_source,
+                    session_id: c.provenance_session,
+                    confidence_basis: c.provenance_basis,
+                },
+                c.valid_from_ms, c.source_memory_id,
+            );
+        }
+        Op::RetractConstraint(r) => {
+            constraint_store.replay_retract(r.fact_id, r.retracted_at_ms);
+        }
+        Op::CreateBranch(b) => {
+            constraint_store.replay_create_branch(b.branch_id, b.parent_id, b.scope, b.created_ms);
+        }
+        Op::ResolveBranch(r) => {
+            constraint_store.replay_resolve_branch(r.winner_id, r.loser_id, r.resolved_at_ms);
+        }
+        Op::AddTrigger(t) => {
+            if let Ok(trigger) = serde_json::from_slice(&t.trigger_json) {
+                trigger_store.replay_add(trigger);
+            }
+        }
+        Op::UpdateTrigger(u) => {
+            let status = match u.status {
+                0 => crate::organ::trigger::TriggerStatus::Armed,
+                1 => crate::organ::trigger::TriggerStatus::Fired,
+                2 => crate::organ::trigger::TriggerStatus::Expired,
+                _ => crate::organ::trigger::TriggerStatus::Inhibited,
+            };
+            trigger_store.replay_update_status(u.trigger_id, status, u.fired_ms);
+        }
+        Op::FireTrigger(f) => {
+            trigger_store.replay_update_status(
+                f.trigger_id,
+                crate::organ::trigger::TriggerStatus::Fired,
+                f.fired_ms,
+            );
         }
     }
 }

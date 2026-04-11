@@ -6005,3 +6005,252 @@ pub extern "C" fn cf_agent_disable(
     }
     if handle.field.agent_registry.write().disable(agent_id_str) { 0 } else { -1 }
 }
+
+// ── Layer 1: Executable Constraints ─────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn cf_assert_constraint(
+    h: *mut CfHandle,
+    params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+
+    let subject = params["subject"].as_str().unwrap_or("").to_string();
+    let predicate = params["predicate"].as_str().unwrap_or("").to_string();
+    let object = params["object"].as_str().unwrap_or("").to_string();
+    let confidence = params["confidence"].as_f64().unwrap_or(0.8) as f32;
+    let scope = params["scope"].as_str().unwrap_or("global").to_string();
+    let branch_id = params["branch_id"].as_u64().unwrap_or(0);
+    let provenance = crate::organ::constraint::Provenance {
+        source: params["provenance_source"].as_str().unwrap_or("tool").to_string(),
+        session_id: params["session_id"].as_str().map(|s| s.to_string()),
+        confidence_basis: params["confidence_basis"].as_str().unwrap_or("observed").to_string(),
+    };
+    let source_memory_id = params["source_memory_id"].as_u64();
+
+    match handle.field.assert_constraint(subject, predicate, object, confidence, scope, branch_id, provenance, source_memory_id) {
+        Ok(result) => {
+            let json = serde_json::json!({
+                "fact_id": result.fact_id,
+                "conflict": result.conflict.map(|c| serde_json::json!({
+                    "rival_fact_id": c.rival_fact_id,
+                    "rival_object": c.rival_object,
+                    "new_branch_id": c.new_branch_id,
+                })),
+            });
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_retract_constraint(h: *mut CfHandle, fact_id: u64) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    match handle.field.retract_constraint(fact_id) {
+        Ok(true) => handle.ok(),
+        Ok(false) => handle.err("fact not found"),
+        Err(e) => handle.err(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_query_constraints(
+    h: *const CfHandle,
+    params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+
+    let subject = params["subject"].as_str();
+    let predicate = params["predicate"].as_str();
+    let object = params["object"].as_str();
+    let scope = params["scope"].as_str();
+
+    let results = handle.field.query_constraints(subject, predicate, object, scope);
+    let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_explain_constraint(h: *const CfHandle, fact_id: u64) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    match handle.field.explain_constraint(fact_id) {
+        Some(explanation) => {
+            let json = serde_json::json!({
+                "fact": {
+                    "id": explanation.fact.id,
+                    "subject": explanation.fact.subject,
+                    "predicate": explanation.fact.predicate,
+                    "object": explanation.fact.object,
+                    "confidence": explanation.fact.confidence,
+                    "scope": explanation.fact.scope,
+                    "branch_id": explanation.fact.branch_id,
+                    "provenance": {
+                        "source": explanation.fact.provenance.source,
+                        "session_id": explanation.fact.provenance.session_id,
+                        "confidence_basis": explanation.fact.provenance.confidence_basis,
+                    },
+                },
+                "supporting": explanation.supporting,
+                "conflicting": explanation.conflicting,
+                "branch": explanation.branch.map(|b| serde_json::json!({
+                    "id": b.id, "parent_id": b.parent_id, "scope": b.scope,
+                    "status": format!("{:?}", b.status),
+                })),
+            });
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_create_constraint_branch(
+    h: *mut CfHandle, parent_id: u64, scope: *const c_char,
+) -> i64 {
+    if h.is_null() || scope.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let scope_str = unsafe { match CStr::from_ptr(scope).to_str() { Ok(s) => s.to_string(), Err(_) => return -1 } };
+    match handle.field.create_constraint_branch(parent_id, scope_str) {
+        Ok(id) => id as i64,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_resolve_constraint_branch(
+    h: *mut CfHandle, winner_id: u64, loser_id: u64,
+) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    match handle.field.resolve_constraint_branch(winner_id, loser_id) {
+        Ok(true) => handle.ok(),
+        Ok(false) => handle.err("branch not found"),
+        Err(e) => handle.err(e),
+    }
+}
+
+// ── Layer 2: Trigger Tissue ─────────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn cf_add_trigger(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> i64 {
+    if h.is_null() || params_json.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return -1 } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return -1 };
+
+    let name = params["name"].as_str().unwrap_or("").to_string();
+    let condition: crate::organ::trigger::TriggerCondition = match serde_json::from_value(params["condition"].clone()) {
+        Ok(c) => c, Err(_) => return -1,
+    };
+    let action: crate::organ::trigger::TriggerAction = match serde_json::from_value(params["action"].clone()) {
+        Ok(a) => a, Err(_) => return -1,
+    };
+    let deadline_ms = params["deadline_ms"].as_i64().unwrap_or(0);
+    let tension_threshold = params["tension_threshold"].as_f64().unwrap_or(0.8) as f32;
+    let gain = params["gain"].as_f64().unwrap_or(0.5) as f32;
+    let realm = params["realm"].as_str().unwrap_or("global").to_string();
+    let source_session = params["session_id"].as_str().map(|s| s.to_string());
+
+    match handle.field.add_trigger(name, condition, action, deadline_ms, tension_threshold, gain, realm, source_session) {
+        Ok(id) => id as i64,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_fire_trigger(h: *mut CfHandle, trigger_id: u64) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    match handle.field.fire_trigger(trigger_id) {
+        Ok(Some(result)) => {
+            let json = serde_json::json!({
+                "trigger_id": result.trigger_id,
+                "action": result.action,
+            });
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_dismiss_trigger(h: *mut CfHandle, trigger_id: u64) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    match handle.field.dismiss_trigger(trigger_id) {
+        Ok(true) => handle.ok(),
+        Ok(false) => handle.err("trigger not found or not armed"),
+        Err(e) => handle.err(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_list_triggers(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let triggers = handle.field.list_triggers();
+    let json = serde_json::to_string(&triggers).unwrap_or_else(|_| "[]".to_string());
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_evaluate_triggers(h: *mut CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    match handle.field.evaluate_triggers() {
+        Ok(results) => {
+            let json = serde_json::json!(results.iter().map(|r| serde_json::json!({
+                "trigger_id": r.trigger_id,
+            })).collect::<Vec<_>>());
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+// ── Layer 3: Predictive Memory ──────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn cf_predict_needed(h: *const CfHandle, k: usize) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let predictions = handle.field.predict_needed(k);
+    let json = serde_json::json!(predictions.iter().map(|(id, prob)| {
+        serde_json::json!({"memory_id": id, "probability": prob})
+    }).collect::<Vec<_>>());
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_retrain_predictor(h: *mut CfHandle) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    handle.field.retrain_predictor();
+    handle.ok()
+}
+
+#[no_mangle]
+pub extern "C" fn cf_constraint_stats(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let (facts, branches) = handle.field.constraint_stats();
+    let armed = handle.field.trigger_stats();
+    let (transitions, transition_sources, recent_accesses) = handle.field.predictor_stats();
+    let json = serde_json::json!({
+        "constraints": {"facts": facts, "branches": branches},
+        "triggers": {"armed": armed},
+        "predictor": {"transitions": transitions, "sources": transition_sources, "recent_accesses": recent_accesses},
+    });
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}

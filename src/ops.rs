@@ -37,6 +37,13 @@ pub enum Op {
     SkillDeprecate(SkillDeprecateOp),
     AgentUpsert(AgentUpsertOp),
     AgentDisable(AgentDisableOp),
+    AssertConstraint(AssertConstraintOp),
+    RetractConstraint(RetractConstraintOp),
+    CreateBranch(CreateBranchOp),
+    ResolveBranch(ResolveBranchOp),
+    AddTrigger(AddTriggerOp),
+    UpdateTrigger(UpdateTriggerOp),
+    FireTrigger(FireTriggerOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -55,6 +62,13 @@ pub const OP_SKILL_UPLOAD: u8 = 28;
 pub const OP_SKILL_DEPRECATE: u8 = 29;
 pub const OP_AGENT_UPSERT: u8 = 30;
 pub const OP_AGENT_DISABLE: u8 = 31;
+pub const OP_ASSERT_CONSTRAINT: u8 = 32;
+pub const OP_RETRACT_CONSTRAINT: u8 = 33;
+pub const OP_CREATE_BRANCH: u8 = 34;
+pub const OP_RESOLVE_BRANCH: u8 = 35;
+pub const OP_ADD_TRIGGER: u8 = 36;
+pub const OP_UPDATE_TRIGGER: u8 = 37;
+pub const OP_FIRE_TRIGGER: u8 = 38;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -393,4 +407,70 @@ pub struct AgentUpsertOp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentDisableOp {
     pub agent_id: String,
+}
+
+// ── Layer 1: Executable Constraints ─────────────────────────────────────────
+
+/// Assert a constraint fact into the constraint store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssertConstraintOp {
+    pub fact_id: u64,
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub confidence: f32,
+    pub scope: String,
+    pub branch_id: u64,
+    pub provenance_source: String,
+    pub provenance_session: Option<String>,
+    pub provenance_basis: String,
+    pub valid_from_ms: i64,
+    pub source_memory_id: Option<u64>,
+}
+
+/// Soft-retract a constraint fact (set valid_to_ms).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetractConstraintOp {
+    pub fact_id: u64,
+    pub retracted_at_ms: i64,
+}
+
+/// Create a rival branch for conflicting interpretations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateBranchOp {
+    pub branch_id: u64,
+    pub parent_id: u64,
+    pub scope: String,
+    pub created_ms: i64,
+}
+
+/// Resolve a branch conflict (winner stays, loser abandoned).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveBranchOp {
+    pub winner_id: u64,
+    pub loser_id: u64,
+    pub resolved_at_ms: i64,
+}
+
+// ── Layer 2: Trigger Tissue ─────────────────────────────────────────────────
+
+/// Add a trigger automaton.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddTriggerOp {
+    pub trigger_json: Vec<u8>,
+}
+
+/// Update trigger status (tension, status changes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateTriggerOp {
+    pub trigger_id: u64,
+    pub status: u8, // 0=Armed, 1=Fired, 2=Expired, 3=Inhibited
+    pub fired_ms: i64,
+}
+
+/// Fire a trigger (record the firing event).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FireTriggerOp {
+    pub trigger_id: u64,
+    pub fired_ms: i64,
 }
