@@ -66,6 +66,12 @@ pub enum Op {
     AddProbe(AddProbeOp),
     ResolveProbe(ResolveProbeOp),
     SetCriterion(SetCriterionOp),
+    // Layer 9: Wisdom Homeostasis
+    UpsertWisdomLineage(UpsertWisdomLineageOp),
+    AdjudicateLineage(AdjudicateLineageOp),
+    TransitionLineage(TransitionLineageOp),
+    RecordChallenger(RecordChallengerOp),
+    CloseRederive(CloseRederiveOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -112,6 +118,11 @@ pub const OP_LINK_EVIDENCE: u8 = 56;
 pub const OP_ADD_PROBE: u8 = 57;
 pub const OP_RESOLVE_PROBE: u8 = 58;
 pub const OP_SET_CRITERION: u8 = 59;
+pub const OP_UPSERT_WISDOM_LINEAGE: u8 = 60;
+pub const OP_ADJUDICATE_LINEAGE: u8 = 61;
+pub const OP_TRANSITION_LINEAGE: u8 = 62;
+pub const OP_RECORD_CHALLENGER: u8 = 63;
+pub const OP_CLOSE_REDERIVE: u8 = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -758,4 +769,65 @@ pub struct SetCriterionOp {
     pub is_met: bool,
     pub evidence_note: Option<String>,
     pub checked_ms: i64,
+}
+
+// ── Layer 9: Wisdom Homeostasis ───────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertWisdomLineageOp {
+    pub lineage_id: u64,
+    pub wisdom_candidate_id: u64,
+    pub claim: String,
+    pub envelope_json: String,
+    pub seed_episode_ids: Vec<u64>,
+    pub seed_surprise_ids: Vec<u64>,
+    pub seed_intervention_ids: Vec<u64>,
+    pub seed_debt_ids: Vec<u64>,
+    pub ancestor_lineage_id: Option<u64>,
+    pub derivation_version: u32,
+    pub derivation_relation: Option<String>,
+    pub rederive_ttl_ms: i64,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdjudicateLineageOp {
+    pub lineage_id: u64,
+    pub support_mass: f32,
+    pub contradiction_mass: f32,
+    pub staleness_mass: f32,
+    pub last_supported_ms: i64,
+    pub last_challenged_ms: i64,
+    pub adjudicated_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransitionLineageOp {
+    pub lineage_id: u64,
+    pub old_state: u8,
+    pub new_state: u8,
+    pub reason: String,
+    pub rederive_task_id: Option<u64>,
+    pub transitioned_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordChallengerOp {
+    pub lineage_id: u64,
+    pub intervention_id: Option<u64>,
+    pub surprise_id: Option<u64>,
+    pub outcome_summary: String,
+    pub attached_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloseRederiveOp {
+    pub lineage_id: u64,
+    /// 0=reaffirm, 1=narrow, 2=split, 3=demote
+    pub action: u8,
+    pub new_envelope_json: Option<String>,
+    pub fork_claim: Option<String>,
+    pub fork_lineage_id: Option<u64>,
+    pub closed_ms: i64,
 }

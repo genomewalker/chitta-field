@@ -7154,3 +7154,147 @@ pub extern "C" fn cf_auto_complete_tasks(h: *mut CfHandle) -> *mut c_char {
     let json = serde_json::json!({ "completed_count": completed });
     CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
+
+// ── Layer 9: Wisdom Homeostasis ───────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn cf_enroll_wisdom_lineage(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let s = unsafe { match CStr::from_ptr(params_json).to_str() {
+        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+    }};
+    let p: serde_json::Value = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
+    let candidate_id = match p["wisdom_candidate_id"].as_u64() {
+        Some(v) => v, None => return std::ptr::null_mut()
+    };
+    let claim = p["claim"].as_str().unwrap_or("").to_string();
+    let envelope_json = p["envelope"].to_string();
+    let to_u64_vec = |v: &serde_json::Value| -> Vec<u64> {
+        v.as_array().map(|a| a.iter().filter_map(|x| x.as_u64()).collect()).unwrap_or_default()
+    };
+    match handle.field.enroll_wisdom_lineage(
+        candidate_id, claim, envelope_json,
+        to_u64_vec(&p["seed_episode_ids"]),
+        to_u64_vec(&p["seed_surprise_ids"]),
+        to_u64_vec(&p["seed_intervention_ids"]),
+        to_u64_vec(&p["seed_debt_ids"]),
+        p["ancestor_lineage_id"].as_u64(),
+        p["derivation_relation"].as_str().map(|s| s.to_string()),
+    ) {
+        Ok(id) => {
+            let json = serde_json::json!({ "lineage_id": id });
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_transition_wisdom_lineage(
+    h: *mut CfHandle, lineage_id: u64, new_state: u8,
+    reason: *const c_char, task_id: u64,
+) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let reason_str = if reason.is_null() { "manual".to_string() } else {
+        unsafe { CStr::from_ptr(reason).to_str().unwrap_or("manual").to_string() }
+    };
+    let tid = if task_id == 0 { None } else { Some(task_id) };
+    match handle.field.transition_wisdom_lineage(lineage_id, new_state, reason_str, tid) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_close_rederive(
+    h: *mut CfHandle, params_json: *const c_char,
+) -> c_int {
+    if h.is_null() || params_json.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let s = unsafe { match CStr::from_ptr(params_json).to_str() {
+        Ok(s) => s, Err(_) => return -1
+    }};
+    let p: serde_json::Value = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
+    let lineage_id = match p["lineage_id"].as_u64() { Some(v) => v, None => return -1 };
+    let action = p["action"].as_u64().unwrap_or(3) as u8;
+    let new_envelope_json = if p["new_envelope"].is_null() { None } else {
+        Some(p["new_envelope"].to_string())
+    };
+    let fork_claim = p["fork_claim"].as_str().map(|s| s.to_string());
+    let fork_lineage_id = p["fork_lineage_id"].as_u64();
+    match handle.field.close_rederive(lineage_id, action, new_envelope_json, fork_claim, fork_lineage_id) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_query_wisdom_lineages(
+    h: *const CfHandle, params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let p: serde_json::Value = if params_json.is_null() {
+        serde_json::Value::Null
+    } else {
+        let s = unsafe { match CStr::from_ptr(params_json).to_str() {
+            Ok(s) => s, Err(_) => return std::ptr::null_mut()
+        }};
+        serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
+    };
+    let state_str = p["state"].as_str();
+    let domain = p["domain"].as_str();
+    let limit = p["limit"].as_u64().unwrap_or(50) as usize;
+    let results = handle.field.query_wisdom_lineages(state_str, domain, limit);
+    let json = serde_json::to_value(&results).unwrap_or(serde_json::Value::Array(vec![]));
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_get_wisdom_lineage(
+    h: *const CfHandle, lineage_id: u64,
+) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    match handle.field.get_wisdom_lineage(lineage_id) {
+        Some(l) => {
+            let json = serde_json::to_value(&l).unwrap_or(serde_json::Value::Null);
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_wisdom_lineage_stats(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let stats = handle.field.wisdom_lineage_stats();
+    let json = serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null);
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_tick_lineage_staleness(h: *mut CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &mut *h };
+    let ids = handle.field.tick_lineage_staleness().unwrap_or_default();
+    let count = ids.len();
+    let json = serde_json::json!({ "transitioned_ids": ids, "count": count });
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_lineage_expiry_check(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let ids = handle.field.lineage_expiry_check();
+    let count = ids.len();
+    let json = serde_json::json!({ "expired_ids": ids, "count": count });
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}

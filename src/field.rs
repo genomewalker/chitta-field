@@ -23,6 +23,7 @@ use crate::organ::skill::SkillRegistry;
 use crate::organ::trigger::TriggerStore;
 use crate::organ::surprise::SurpriseStore;
 use crate::organ::agent_protocol::AgentProtocolStore;
+use crate::organ::wisdom_lineage::WisdomLineageStore;
 use crate::organ::epistemic_debt::EpistemicDebtStore;
 use crate::organ::integration::IntegrationKernel;
 use crate::organ::surprise_learning::SurpriseLearningStore;
@@ -145,6 +146,7 @@ pub struct ChittaField {
     pub(crate) learned_scorer: RwLock<LearnedScoringModel>,
     pub(crate) intervention_store: RwLock<InterventionStore>,
     pub(crate) agent_protocol_store: RwLock<AgentProtocolStore>,
+    pub(crate) wisdom_lineage_store: RwLock<WisdomLineageStore>,
     pub(crate) lite_encoder: RwLock<Option<LiteEncoder>>,
     /// Byte offsets for each foreign segment file, used by sync_foreign().
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
@@ -224,6 +226,7 @@ impl ChittaField {
         let mut learned_scorer = LearnedScoringModel::new("v5.14".to_string());
         let mut intervention_store = InterventionStore::new();
         let mut agent_protocol_store = AgentProtocolStore::new();
+        let mut wisdom_lineage_store = WisdomLineageStore::new();
         let mut chunk_hash_idx: HashMap<crate::ids::ChunkHash, MemoryId> = HashMap::new();
         let mut snapshot_coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats> = HashMap::new();
 
@@ -445,6 +448,7 @@ impl ChittaField {
                 &mut learned_scorer,
                 &mut intervention_store,
                 &mut agent_protocol_store,
+                &mut wisdom_lineage_store,
                 &mut chunk_hash_idx,
                 &mut replay_realm_members,
                 &mut replay_coactivation_stats,
@@ -545,6 +549,7 @@ impl ChittaField {
             learned_scorer: RwLock::new(learned_scorer),
             intervention_store: RwLock::new(intervention_store),
             agent_protocol_store: RwLock::new(agent_protocol_store),
+            wisdom_lineage_store: RwLock::new(wisdom_lineage_store),
             lite_encoder: RwLock::new(loaded_lite_encoder),
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
@@ -641,6 +646,7 @@ impl ChittaField {
         let mut learned_scorer_reg = self.learned_scorer.write();
         let mut intervention_store_reg = self.intervention_store.write();
         let mut agent_protocol_store_reg = self.agent_protocol_store.write();
+        let mut wisdom_lineage_store_reg = self.wisdom_lineage_store.write();
         let mut chunk_hash_idx = self.chunk_hash_idx.write();
         let mut realm_members = self.realm_members.write();
         let mut coactivation_stats = self.coactivation_stats.write();
@@ -681,6 +687,7 @@ impl ChittaField {
                 &mut *learned_scorer_reg,
                 &mut *intervention_store_reg,
                 &mut *agent_protocol_store_reg,
+                &mut *wisdom_lineage_store_reg,
                 &mut *chunk_hash_idx,
                 &mut *realm_members,
                 &mut *coactivation_stats,
@@ -838,6 +845,7 @@ pub(crate) fn apply_op(
     learned_scorer: &mut LearnedScoringModel,
     intervention_store: &mut InterventionStore,
     agent_protocol_store: &mut AgentProtocolStore,
+    wisdom_lineage_store: &mut WisdomLineageStore,
     chunk_hash_idx: &mut HashMap<crate::ids::ChunkHash, MemoryId>,
     realm_members: &mut HashMap<String, HashSet<MemoryId>>,
     coactivation_stats: &mut HashMap<(MemoryId, MemoryId), CoActivationStats>,
@@ -1583,6 +1591,84 @@ pub(crate) fn apply_op(
                 checked_ms: Some(c.checked_ms),
                 evidence_note: c.evidence_note,
             });
+        }
+        // Layer 9: Wisdom Homeostasis
+        Op::UpsertWisdomLineage(l) => {
+            use crate::organ::wisdom_lineage::{ApplicabilityEnvelope, WisdomLineage, LineageState};
+            let envelope: ApplicabilityEnvelope =
+                serde_json::from_str(&l.envelope_json).unwrap_or_default();
+            wisdom_lineage_store.replay_upsert(WisdomLineage {
+                id: l.lineage_id,
+                wisdom_candidate_id: l.wisdom_candidate_id,
+                claim: l.claim,
+                envelope,
+                seed_episode_ids: l.seed_episode_ids,
+                seed_surprise_ids: l.seed_surprise_ids,
+                seed_intervention_ids: l.seed_intervention_ids,
+                seed_debt_ids: l.seed_debt_ids,
+                ancestor_lineage_id: l.ancestor_lineage_id,
+                derivation_version: l.derivation_version,
+                derivation_relation: l.derivation_relation,
+                support_mass: 0.0,
+                contradiction_mass: 0.0,
+                staleness_mass: 0.0,
+                last_supported_ms: l.created_ms,
+                last_challenged_ms: 0,
+                state: LineageState::Trusted,
+                challengers: Vec::new(),
+                rederive_task_id: None,
+                rederive_opened_ms: None,
+                rederive_ttl_ms: l.rederive_ttl_ms,
+                created_ms: l.created_ms,
+                updated_ms: l.updated_ms,
+            });
+        }
+        Op::AdjudicateLineage(a) => {
+            wisdom_lineage_store.replay_adjudicate(
+                a.lineage_id,
+                a.support_mass,
+                a.contradiction_mass,
+                a.staleness_mass,
+                a.last_supported_ms,
+                a.last_challenged_ms,
+                a.adjudicated_ms,
+            );
+        }
+        Op::TransitionLineage(t) => {
+            use crate::organ::wisdom_lineage::LineageState;
+            wisdom_lineage_store.transition_state(
+                t.lineage_id,
+                LineageState::from_u8(t.new_state),
+                "",
+                t.rederive_task_id,
+                t.transitioned_ms,
+            );
+        }
+        Op::RecordChallenger(c) => {
+            use crate::organ::wisdom_lineage::ChallengerEvidence;
+            wisdom_lineage_store.record_challenger(
+                c.lineage_id,
+                ChallengerEvidence {
+                    intervention_id: c.intervention_id,
+                    surprise_id: c.surprise_id,
+                    outcome_summary: c.outcome_summary,
+                    attached_ms: c.attached_ms,
+                },
+                c.attached_ms,
+            );
+        }
+        Op::CloseRederive(r) => {
+            use crate::organ::wisdom_lineage::{RederiveAction, ApplicabilityEnvelope};
+            let new_envelope = r.new_envelope_json.as_deref()
+                .and_then(|j| serde_json::from_str::<ApplicabilityEnvelope>(j).ok());
+            wisdom_lineage_store.close_rederive(
+                r.lineage_id,
+                RederiveAction::from_u8(r.action),
+                new_envelope,
+                r.fork_claim,
+                r.fork_lineage_id,
+                r.closed_ms,
+            );
         }
     }
 }
