@@ -2240,6 +2240,7 @@ impl ChittaField {
             )
         };
         let domain_ref = domain.clone();
+        let action_ref = action.clone();
         let op = Op::RecordSurprise(crate::ops::RecordSurpriseOp {
             event_id,
             context_sketch,
@@ -2307,6 +2308,56 @@ impl ChittaField {
                 .should_send_positive_feedback(surprise_magnitude);
             if should_pos {
                 let _ = self.record_feedback(&domain_ref, "keyword", true);
+            }
+        }
+
+        // ── Layer 9: adjudicate wisdom lineages by envelope overlap ───
+        {
+            use crate::organ::wisdom_lineage::CONTRADICTION_DELTA_HIT;
+            let matching = self.wisdom_lineage_store.read()
+                .find_by_envelope(&domain_ref, &action_ref);
+            for lineage_id in matching {
+                let new_state = self.wisdom_lineage_store.write().adjudicate(
+                    lineage_id, 0.0,
+                    surprise_magnitude * CONTRADICTION_DELTA_HIT,
+                    0.0, now,
+                );
+                if let Some(l) = self.wisdom_lineage_store.read().get(lineage_id) {
+                    self.log.write().append(&Op::AdjudicateLineage(
+                        crate::ops::AdjudicateLineageOp {
+                            lineage_id,
+                            support_mass: l.support_mass,
+                            contradiction_mass: l.contradiction_mass,
+                            staleness_mass: l.staleness_mass,
+                            last_supported_ms: l.last_supported_ms,
+                            last_challenged_ms: l.last_challenged_ms,
+                            adjudicated_ms: now,
+                        },
+                    ))?;
+                    if let Some(ns) = new_state {
+                        self.log.write().append(&Op::TransitionLineage(
+                            crate::ops::TransitionLineageOp {
+                                lineage_id,
+                                old_state: l.state.as_u8(),
+                                new_state: ns.as_u8(),
+                                reason: "surprise_adjudication".to_string(),
+                                rederive_task_id: None,
+                                transitioned_ms: now,
+                            },
+                        ))?;
+                    }
+                }
+                // Record surprise as challenger evidence
+                let _ = self.wisdom_lineage_store.write().record_challenger(
+                    lineage_id,
+                    crate::organ::wisdom_lineage::ChallengerEvidence {
+                        intervention_id: None,
+                        surprise_id: Some(event_id),
+                        outcome_summary: format!("surprise magnitude {:.2}", surprise_magnitude),
+                        attached_ms: now,
+                    },
+                    now,
+                );
             }
         }
 
@@ -2736,7 +2787,15 @@ impl ChittaField {
         intervention_id: u64,
         status: crate::organ::intervention::InterventionStatus,
     ) -> Result<bool> {
+        use crate::organ::intervention::InterventionStatus;
+        use crate::organ::wisdom_lineage::{SUPPORT_DELTA_HIT, CONTRADICTION_DELTA_HIT};
         let now = now_ms();
+        let (domain, action_type) = {
+            let store = self.intervention_store.read();
+            store.get(intervention_id)
+                .map(|r| (r.domain.clone(), format!("{:?}", r.action_type).to_lowercase()))
+                .unwrap_or_default()
+        };
         let ok = self.intervention_store.write().close_intervention(intervention_id, status, now);
         if ok {
             self.log.write().append(&crate::ops::Op::CloseIntervention(
@@ -2744,6 +2803,60 @@ impl ChittaField {
                     intervention_id, status: status.to_u8(), closed_ms: now,
                 }
             ))?;
+
+            // ── Layer 9: adjudicate wisdom lineages by outcome ────────
+            if !domain.is_empty() {
+                let matching = self.wisdom_lineage_store.read()
+                    .find_by_envelope(&domain, &action_type);
+                let (support_delta, contradiction_delta) = match status {
+                    InterventionStatus::Succeeded => (SUPPORT_DELTA_HIT, 0.0f32),
+                    InterventionStatus::Failed | InterventionStatus::Aborted => (0.0f32, CONTRADICTION_DELTA_HIT),
+                    InterventionStatus::Partial => (SUPPORT_DELTA_HIT * 0.3, CONTRADICTION_DELTA_HIT * 0.3),
+                    InterventionStatus::Open => (0.0f32, 0.0f32),
+                };
+                for lineage_id in matching {
+                    let new_state = self.wisdom_lineage_store.write().adjudicate(
+                        lineage_id, support_delta, contradiction_delta, 0.0, now,
+                    );
+                    if let Some(l) = self.wisdom_lineage_store.read().get(lineage_id) {
+                        self.log.write().append(&Op::AdjudicateLineage(
+                            crate::ops::AdjudicateLineageOp {
+                                lineage_id,
+                                support_mass: l.support_mass,
+                                contradiction_mass: l.contradiction_mass,
+                                staleness_mass: l.staleness_mass,
+                                last_supported_ms: l.last_supported_ms,
+                                last_challenged_ms: l.last_challenged_ms,
+                                adjudicated_ms: now,
+                            },
+                        ))?;
+                        if let Some(ns) = new_state {
+                            self.log.write().append(&Op::TransitionLineage(
+                                crate::ops::TransitionLineageOp {
+                                    lineage_id,
+                                    old_state: l.state.as_u8(),
+                                    new_state: ns.as_u8(),
+                                    reason: "intervention_outcome".to_string(),
+                                    rederive_task_id: None,
+                                    transitioned_ms: now,
+                                },
+                            ))?;
+                        }
+                    }
+                    if matches!(status, InterventionStatus::Failed | InterventionStatus::Aborted) {
+                        let _ = self.wisdom_lineage_store.write().record_challenger(
+                            lineage_id,
+                            crate::organ::wisdom_lineage::ChallengerEvidence {
+                                intervention_id: Some(intervention_id),
+                                surprise_id: None,
+                                outcome_summary: format!("intervention {} {:?}", intervention_id, status),
+                                attached_ms: now,
+                            },
+                            now,
+                        );
+                    }
+                }
+            }
         }
         Ok(ok)
     }
@@ -3378,6 +3491,167 @@ impl ChittaField {
     /// Return how many memories have PQ residual codes.
     pub fn pq_count(&self) -> usize {
         self.cortical_idx.read().pq_count()
+    }
+
+    // ── Layer 9: Wisdom Homeostasis ───────────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enroll_wisdom_lineage(
+        &self,
+        wisdom_candidate_id: u64,
+        claim: String,
+        envelope_json: String,
+        seed_episode_ids: Vec<u64>,
+        seed_surprise_ids: Vec<u64>,
+        seed_intervention_ids: Vec<u64>,
+        seed_debt_ids: Vec<u64>,
+        ancestor_lineage_id: Option<u64>,
+        derivation_relation: Option<String>,
+    ) -> Result<u64> {
+        use crate::organ::wisdom_lineage::ApplicabilityEnvelope;
+        let now = now_ms();
+        let envelope: ApplicabilityEnvelope =
+            serde_json::from_str(&envelope_json).unwrap_or_default();
+        let lineage_id = self.wisdom_lineage_store.write().enroll(
+            wisdom_candidate_id, claim.clone(), envelope, seed_episode_ids.clone(),
+            seed_surprise_ids.clone(), seed_intervention_ids.clone(), seed_debt_ids.clone(),
+            ancestor_lineage_id, derivation_relation.clone(), now,
+        );
+        self.log.write().append(&Op::UpsertWisdomLineage(
+            crate::ops::UpsertWisdomLineageOp {
+                lineage_id,
+                wisdom_candidate_id,
+                claim,
+                envelope_json,
+                seed_episode_ids,
+                seed_surprise_ids,
+                seed_intervention_ids,
+                seed_debt_ids,
+                ancestor_lineage_id,
+                derivation_version: 0,
+                derivation_relation,
+                rederive_ttl_ms: crate::organ::wisdom_lineage::DEFAULT_REDERIVE_TTL_MS,
+                created_ms: now,
+                updated_ms: now,
+            },
+        ))?;
+        Ok(lineage_id)
+    }
+
+    pub fn transition_wisdom_lineage(
+        &self,
+        lineage_id: u64,
+        new_state: u8,
+        reason: String,
+        rederive_task_id: Option<u64>,
+    ) -> Result<bool> {
+        use crate::organ::wisdom_lineage::LineageState;
+        let now = now_ms();
+        let old_state = self.wisdom_lineage_store.read()
+            .get(lineage_id).map(|l| l.state.as_u8()).unwrap_or(0);
+        let ok = self.wisdom_lineage_store.write().transition_state(
+            lineage_id, LineageState::from_u8(new_state), &reason, rederive_task_id, now,
+        );
+        if ok {
+            self.log.write().append(&Op::TransitionLineage(
+                crate::ops::TransitionLineageOp {
+                    lineage_id, old_state, new_state,
+                    reason, rederive_task_id, transitioned_ms: now,
+                },
+            ))?;
+        }
+        Ok(ok)
+    }
+
+    pub fn close_rederive(
+        &self,
+        lineage_id: u64,
+        action: u8,
+        new_envelope_json: Option<String>,
+        fork_claim: Option<String>,
+        fork_lineage_id: Option<u64>,
+    ) -> Result<()> {
+        use crate::organ::wisdom_lineage::{ApplicabilityEnvelope, RederiveAction};
+        let now = now_ms();
+        let new_envelope = new_envelope_json.as_deref()
+            .and_then(|j| serde_json::from_str::<ApplicabilityEnvelope>(j).ok());
+        self.wisdom_lineage_store.write().close_rederive(
+            lineage_id, RederiveAction::from_u8(action),
+            new_envelope, fork_claim.clone(), fork_lineage_id, now,
+        );
+        self.log.write().append(&Op::CloseRederive(
+            crate::ops::CloseRederiveOp {
+                lineage_id, action,
+                new_envelope_json, fork_claim, fork_lineage_id, closed_ms: now,
+            },
+        ))?;
+        Ok(())
+    }
+
+    pub fn query_wisdom_lineages(
+        &self,
+        state_str: Option<&str>,
+        domain: Option<&str>,
+        limit: usize,
+    ) -> Vec<crate::organ::wisdom_lineage::WisdomLineage> {
+        use crate::organ::wisdom_lineage::LineageState;
+        let state_filter = state_str.and_then(|s| match s {
+            "trusted" => Some(LineageState::Trusted),
+            "watch" => Some(LineageState::Watch),
+            "inflamed" => Some(LineageState::Inflamed),
+            "demoted" => Some(LineageState::Demoted),
+            _ => None,
+        });
+        self.wisdom_lineage_store.read()
+            .query(state_filter, domain, limit)
+            .into_iter().cloned().collect()
+    }
+
+    pub fn get_wisdom_lineage(
+        &self, id: u64,
+    ) -> Option<crate::organ::wisdom_lineage::WisdomLineage> {
+        self.wisdom_lineage_store.read().get(id).cloned()
+    }
+
+    pub fn wisdom_lineage_stats(&self) -> crate::organ::wisdom_lineage::WisdomLineageStats {
+        self.wisdom_lineage_store.read().stats()
+    }
+
+    /// Grow staleness on stale lineages and return IDs that transitioned.
+    pub fn tick_lineage_staleness(&self) -> Result<Vec<u64>> {
+        let now = now_ms();
+        let transitioned = self.wisdom_lineage_store.write().tick_staleness(now);
+        for &lineage_id in &transitioned {
+            if let Some(l) = self.wisdom_lineage_store.read().get(lineage_id) {
+                self.log.write().append(&Op::AdjudicateLineage(
+                    crate::ops::AdjudicateLineageOp {
+                        lineage_id,
+                        support_mass: l.support_mass,
+                        contradiction_mass: l.contradiction_mass,
+                        staleness_mass: l.staleness_mass,
+                        last_supported_ms: l.last_supported_ms,
+                        last_challenged_ms: l.last_challenged_ms,
+                        adjudicated_ms: now,
+                    },
+                ))?;
+                self.log.write().append(&Op::TransitionLineage(
+                    crate::ops::TransitionLineageOp {
+                        lineage_id,
+                        old_state: 0,
+                        new_state: l.state.as_u8(),
+                        reason: "staleness_tick".to_string(),
+                        rederive_task_id: None,
+                        transitioned_ms: now,
+                    },
+                ))?;
+            }
+        }
+        Ok(transitioned)
+    }
+
+    /// Return IDs of Inflamed lineages whose re-derive TTL has expired.
+    pub fn lineage_expiry_check(&self) -> Vec<u64> {
+        self.wisdom_lineage_store.read().expiry_check(now_ms())
     }
 }
 

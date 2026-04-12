@@ -44,7 +44,9 @@ chitta-field/
     ├── IntegrationKernel  (recall source weights — Layer 6)
     ├── SurpriseLearningStore (hysteresis-gated strength credit — Move 1/2)
     ├── WisdomPromotionStore  (candidate lifecycle FSM — Move 5)
-    └── LearnedScoringModel   (outcome-calibrated weight deltas — Move 6)
+    ├── LearnedScoringModel   (outcome-calibrated weight deltas — Move 6)
+    ├── InterventionStore     (action/outcome/attribution ledger — Layer 7)
+    └── AgentProtocolStore    (task contracts, delegation, evidence, probes — Layer 8)
 ```
 
 ### Multi-writer design (Upanishads model)
@@ -91,7 +93,7 @@ After the final pass, `cf_record_recall_batch` atomically commits all learning:
 - **Resonance learning** — feedback signal updates retrieval weights via `LearnerSet`
 - **Session / transcript / task registries** — first-class domain objects for AI session management
 - **Snapshot acceleration** — `cf_save_full_snapshot` / `cf_save_snapshot` skip log replay on next open
-- **Meta-memory layers** — six organ stores beyond core recall: executable constraints (Prolog-style logic), trigger tissue (event-condition-action), predictive memory (Markov chain), surprise memory (prediction error tracking with blind spot detection), epistemic debt (uncertainty boundaries with fragility scoring), and integration kernel (learned recall source weights via Bayesian feedback)
+- **Meta-memory layers** — eight organ stores beyond core recall: executable constraints (Prolog-style logic), trigger tissue (event-condition-action), predictive memory (Markov chain), surprise memory (prediction error tracking with blind spot detection), epistemic debt (uncertainty boundaries with fragility scoring), integration kernel (learned recall source weights via Bayesian feedback), intervention ledger (action/outcome/attribution tracking with causal routing), and agent protocol memory (task contracts, delegation edges, evidence links, and probes across multi-step agent loops)
 
 ## Why not flat files?
 
@@ -346,6 +348,56 @@ Tracks `model_version` (monotonically increasing), `baseline_version` (validated
 The subconscious learning cycle calls `cf_auto_resolve_debts(threshold=0.70)` every 30 minutes, scanning all open debts with attached evidence.
 
 **WAL ops:** `AttachDebtEvidence` (byte 48).
+
+### InterventionStore (Layer 7)
+
+Append-only ledger of **interventions** — discrete agent actions with observed outcomes and causal attribution. Each `Intervention` record captures the action taken, domain, realm, outcome kind (`Success`, `PartialSuccess`, `Failure`, `Unknown`), confidence, and an optional `memory_id` link to the memory that triggered the action.
+
+Attribution routing chooses among three strategies at log time:
+- **Causal** — attributed to a specific prior memory (when `source_memory_id` is set)
+- **Contextual** — attributed to the active session context
+- **Ambient** — no attributable cause identified
+
+The subconscious runs `cf_close_stale_interventions(max_age_ms)` every 30 minutes to mark open interventions whose deadline has passed as `Unknown` outcome, preventing unbounded open state.
+
+| Tool | Description |
+|------|-------------|
+| `log_intervention` | Record an action with optional source memory, deadline, and tags |
+| `update_intervention` | Set outcome, confidence, and resolution note |
+| `query_interventions` | Filter by domain, outcome, realm, or time range |
+| `intervention_stats` | Counts by outcome kind and open/closed status |
+| `close_stale_interventions` | Force-close open interventions older than `max_age_ms` |
+
+**WAL ops:** `LogIntervention` (byte 49), `UpdateIntervention` (byte 50), `CloseStaleInterventions` (byte 51), `RecordFeedback` (byte 52 — integration kernel feedback sourced from intervention outcomes).
+
+### AgentProtocolStore (Layer 8)
+
+WAL-backed organ for **multi-step agent task tracking**. Maintains five interrelated record types that together describe task contracts across agent loops, delegation hierarchies, and completion evidence:
+
+| Record | Key fields |
+|--------|-----------|
+| `TaskContract` | `goal`, `realm`, `session_id`, `status` (Open/InProgress/Completed/Failed/Abandoned), `priority`, `parent_task_id`, `deadline_ms`, `tags`, `acceptance_criteria` |
+| `DelegationEdge` | `parent_task_id`, `child_task_id`, `delegated_to`, `role`, `scope` |
+| `EvidenceLink` | `task_id`, `memory_id`, `kind` (Supports/Contradicts/Resolves/Illustrates), `confidence`, `note` |
+| `PendingProbe` | `task_id`, `question`, `expected_answer_kind`, `status` (Open/Answered/Expired), `answer_memory_id` |
+| `CompletionCriterion` | `task_id`, `criterion_text`, `met`, `met_at_ms`, `evidence_memory_id` |
+
+Tasks are keyed by ID; evidence links are idempotent by `(task_id, memory_id)`; criteria are idempotent by `(task_id, criterion_text)`. `cf_auto_complete_tasks` is called in the subconscious learning cycle every 30 minutes: it resolves tasks whose acceptance criteria are all met and whose probes are all answered.
+
+| Tool | Description |
+|------|-------------|
+| `register_task` | Create a new task contract (returns `task_id`) |
+| `update_task` | Change status, priority, deadline, or acceptance criteria |
+| `add_delegation` | Link a parent task to a child task with a delegatee and role |
+| `link_evidence` | Attach a memory as evidence for a task |
+| `add_probe` | Register a pending question against a task |
+| `resolve_probe` | Mark a probe answered or expired (with answer memory) |
+| `set_criterion` | Add or mark a completion criterion as met |
+| `query_tasks` | Filter by status, realm, session, or priority |
+| `auto_complete_tasks` | Sweep all tasks and complete those with all criteria met |
+| `agent_protocol_stats` | Counts by status, probe state, and evidence kind |
+
+**WAL ops:** `RegisterTask` (byte 53), `UpdateTask` (byte 54), `AddDelegation` (byte 55), `LinkEvidence` (byte 56), `AddProbe` (byte 57), `ResolveProbe` (byte 58), `SetCriterion` (byte 59).
 
 ### SkillRegistry
 

@@ -60,6 +60,8 @@ use crate::ops::{
     OP_START_INTERVENTION, OP_ADD_OBSERVATION, OP_CLOSE_INTERVENTION, OP_RECORD_ATTRIBUTION,
     OP_REGISTER_TASK, OP_UPDATE_TASK, OP_ADD_DELEGATION, OP_LINK_EVIDENCE,
     OP_ADD_PROBE, OP_RESOLVE_PROBE, OP_SET_CRITERION,
+    OP_UPSERT_WISDOM_LINEAGE, OP_ADJUDICATE_LINEAGE, OP_TRANSITION_LINEAGE,
+    OP_RECORD_CHALLENGER, OP_CLOSE_REDERIVE,
 };
 
 fn op_type_byte(op: &Op) -> u8 {
@@ -124,6 +126,11 @@ fn op_type_byte(op: &Op) -> u8 {
         Op::AddProbe(_) => OP_ADD_PROBE,
         Op::ResolveProbe(_) => OP_RESOLVE_PROBE,
         Op::SetCriterion(_) => OP_SET_CRITERION,
+        Op::UpsertWisdomLineage(_) => OP_UPSERT_WISDOM_LINEAGE,
+        Op::AdjudicateLineage(_) => OP_ADJUDICATE_LINEAGE,
+        Op::TransitionLineage(_) => OP_TRANSITION_LINEAGE,
+        Op::RecordChallenger(_) => OP_RECORD_CHALLENGER,
+        Op::CloseRederive(_) => OP_CLOSE_REDERIVE,
     }
 }
 
