@@ -9,6 +9,14 @@ pub struct CodeFile {
     pub path: String,
     pub project: String,
     pub mtime: i64,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub git_commit: Option<String>,
+    #[serde(default)]
+    pub git_author: Option<String>,
+    #[serde(default)]
+    pub git_timestamp_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,19 +34,33 @@ impl CodeFileIndex {
     }
 
     /// Upsert a file. Returns (id, was_updated).
+    /// `was_updated` is true when content_hash changed (or was absent before).
     pub fn upsert(
         &mut self,
         path: &str,
         project: &str,
         mtime: i64,
+        content_hash: Option<String>,
+        git_commit: Option<String>,
+        git_author: Option<String>,
+        git_timestamp_ms: Option<i64>,
         next_id: impl FnOnce() -> CodeFileId,
     ) -> (CodeFileId, bool) {
         if let Some(&existing_id) = self.by_path.get(path) {
             let entry = self.by_id.get_mut(&existing_id).unwrap();
-            let changed = entry.mtime != mtime || entry.project != project;
+            let hash_changed = match (&entry.content_hash, &content_hash) {
+                (Some(old), Some(new)) => old != new,
+                (None, Some(_)) => true,
+                (Some(_), None) => entry.mtime != mtime || entry.project != project,
+                (None, None) => entry.mtime != mtime || entry.project != project,
+            };
             entry.mtime = mtime;
             entry.project = project.to_string();
-            return (existing_id, changed);
+            entry.content_hash = content_hash;
+            entry.git_commit = git_commit;
+            entry.git_author = git_author;
+            entry.git_timestamp_ms = git_timestamp_ms;
+            return (existing_id, hash_changed);
         }
 
         let id = next_id();
@@ -47,10 +69,20 @@ impl CodeFileIndex {
             path: path.to_string(),
             project: project.to_string(),
             mtime,
+            content_hash,
+            git_commit,
+            git_author,
+            git_timestamp_ms,
         };
         self.by_path.insert(path.to_string(), id);
         self.by_id.insert(id, file);
         (id, true)
+    }
+
+    /// Get the stored content hash for a path.
+    pub fn get_hash(&self, path: &str) -> Option<&str> {
+        let &id = self.by_path.get(path)?;
+        self.by_id.get(&id)?.content_hash.as_deref()
     }
 
     pub fn get_by_path(&self, path: &str) -> Option<&CodeFile> {

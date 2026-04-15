@@ -657,57 +657,10 @@ pub extern "C" fn cf_add_triplet(
     source_memory_id: u64,
     out_triplet_id: *mut u64,
 ) -> c_int {
-    if h.is_null()
-        || subject.is_null()
-        || predicate.is_null()
-        || object.is_null()
-        || out_triplet_id.is_null()
-    {
-        return -1;
-    }
-    let handle = unsafe { &mut *h };
-
-    let subject_str = unsafe {
-        match CStr::from_ptr(subject).to_str() {
-            Ok(s) => s,
-            Err(e) => return handle.err(e),
-        }
-    };
-    let predicate_str = unsafe {
-        match CStr::from_ptr(predicate).to_str() {
-            Ok(s) => s,
-            Err(e) => return handle.err(e),
-        }
-    };
-    let object_str = unsafe {
-        match CStr::from_ptr(object).to_str() {
-            Ok(s) => s,
-            Err(e) => return handle.err(e),
-        }
-    };
-
-    let src_mem = if source_memory_id == 0 {
-        None
-    } else {
-        Some(source_memory_id)
-    };
-
-    match handle.field.add_triplet(
-        subject_str.to_string(),
-        predicate_str.to_string(),
-        object_str.to_string(),
-        weight,
-        src_mem,
-        None,
-    ) {
-        Ok(triplet_id) => {
-            unsafe {
-                *out_triplet_id = triplet_id;
-            }
-            handle.ok()
-        }
-        Err(e) => handle.err(e),
-    }
+    cf_add_triplet_with_source(
+        h, subject, predicate, object, weight,
+        source_memory_id, std::ptr::null(), out_triplet_id,
+    )
 }
 
 /// Invalidate a triplet.
@@ -1367,13 +1320,36 @@ pub extern "C" fn cf_get_confirmations(
     }
 }
 
-/// Upsert a code file. Returns its file_id via *out_id.
+/// Upsert a code file (legacy). Returns its file_id via *out_id.
 #[no_mangle]
 pub extern "C" fn cf_upsert_code_file(
     h: *mut CfHandle,
     path: *const c_char,
     project: *const c_char,
     mtime: i64,
+    out_id: *mut u64,
+) -> c_int {
+    cf_upsert_code_file_v2(
+        h, path, project, mtime,
+        std::ptr::null(), std::ptr::null(), std::ptr::null(), 0,
+        std::ptr::null_mut(),
+        out_id,
+    )
+}
+
+/// Upsert a code file with content hash and git provenance.
+/// Nullable params: pass null for absent. out_changed: set to 1 if content changed, 0 if hash matched.
+#[no_mangle]
+pub extern "C" fn cf_upsert_code_file_v2(
+    h: *mut CfHandle,
+    path: *const c_char,
+    project: *const c_char,
+    mtime: i64,
+    content_hash: *const c_char,
+    git_commit: *const c_char,
+    git_author: *const c_char,
+    git_timestamp_ms: i64,
+    out_changed: *mut c_int,
     out_id: *mut u64,
 ) -> c_int {
     if h.is_null() || path.is_null() || project.is_null() || out_id.is_null() {
@@ -1389,11 +1365,113 @@ pub extern "C" fn cf_upsert_code_file(
         Err(e) => return handle.err(e),
     };
 
-    match handle.field.upsert_code_file(path_str, project_str, mtime) {
-        Ok(id) => {
-            unsafe {
-                *out_id = id;
+    let hash_opt = if content_hash.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(content_hash).to_str().ok().map(|s| s.to_string()) }
+    };
+    let commit_opt = if git_commit.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(git_commit).to_str().ok().map(|s| s.to_string()) }
+    };
+    let author_opt = if git_author.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(git_author).to_str().ok().map(|s| s.to_string()) }
+    };
+    let ts_opt = if git_timestamp_ms == 0 { None } else { Some(git_timestamp_ms) };
+
+    match handle.field.upsert_code_file(
+        path_str, project_str, mtime,
+        hash_opt, commit_opt, author_opt, ts_opt,
+    ) {
+        Ok((id, was_updated)) => {
+            unsafe { *out_id = id; }
+            if !out_changed.is_null() {
+                unsafe { *out_changed = if was_updated { 1 } else { 0 }; }
             }
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Invalidate all active triplets associated with a source file.
+#[no_mangle]
+pub extern "C" fn cf_invalidate_triplets_by_source_file(
+    h: *mut CfHandle,
+    source_file: *const c_char,
+) -> c_int {
+    if h.is_null() || source_file.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let sf_str = match unsafe { CStr::from_ptr(source_file).to_str() } {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    match handle.field.invalidate_triplets_by_source_file(sf_str) {
+        Ok(_) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Add a triplet with optional source_file. Returns triplet_id via out_triplet_id.
+#[no_mangle]
+pub extern "C" fn cf_add_triplet_with_source(
+    h: *mut CfHandle,
+    subject: *const c_char,
+    predicate: *const c_char,
+    object: *const c_char,
+    weight: f32,
+    source_memory_id: u64,
+    source_file: *const c_char,
+    out_triplet_id: *mut u64,
+) -> c_int {
+    if h.is_null() || subject.is_null() || predicate.is_null()
+        || object.is_null() || out_triplet_id.is_null()
+    {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+
+    let subject_str = unsafe {
+        match CStr::from_ptr(subject).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let predicate_str = unsafe {
+        match CStr::from_ptr(predicate).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let object_str = unsafe {
+        match CStr::from_ptr(object).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let src_mem = if source_memory_id == 0 { None } else { Some(source_memory_id) };
+    let src_file = if source_file.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(source_file).to_str().ok().map(|s| s.to_string()) }
+    };
+
+    match handle.field.add_triplet(
+        subject_str.to_string(),
+        predicate_str.to_string(),
+        object_str.to_string(),
+        weight,
+        src_mem,
+        src_file,
+    ) {
+        Ok(triplet_id) => {
+            unsafe { *out_triplet_id = triplet_id; }
             handle.ok()
         }
         Err(e) => handle.err(e),

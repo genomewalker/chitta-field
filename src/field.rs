@@ -996,7 +996,15 @@ pub(crate) fn apply_op(
             }
         }
         Op::UpsertCodeFile(f) => {
-            code_files.upsert(&f.path, &f.project, f.mtime, || f.file_id);
+            code_files.upsert(
+                &f.path, &f.project, f.mtime,
+                f.content_hash.clone(), f.git_commit.clone(),
+                f.git_author.clone(), f.git_timestamp_ms,
+                || f.file_id,
+            );
+        }
+        Op::InvalidateTripletsBySourceFile(op) => {
+            triplet_store.invalidate_by_source_file(&op.source_file, op.invalidated_at_ms);
         }
         Op::UpdateSparseCode(op) => {
             let code = SparseCode {

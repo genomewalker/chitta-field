@@ -1678,21 +1678,52 @@ impl ChittaField {
         self.call_graph.read().get_callers(symbol_id)
     }
 
-    /// Upsert a code file record. Returns its CodeFileId.
-    pub fn upsert_code_file(&self, path: &str, project: &str, mtime: i64) -> Result<u64> {
+    /// Upsert a code file record. Returns (CodeFileId, was_updated).
+    /// `was_updated` is true when content_hash changed or was absent.
+    pub fn upsert_code_file(
+        &self,
+        path: &str,
+        project: &str,
+        mtime: i64,
+        content_hash: Option<String>,
+        git_commit: Option<String>,
+        git_author: Option<String>,
+        git_timestamp_ms: Option<i64>,
+    ) -> Result<(u64, bool)> {
         let next_id_fn = || self.code_file_id_alloc.next_id();
-        let (file_id, _was_updated) = self
-            .code_files
-            .write()
-            .upsert(path, project, mtime, next_id_fn);
+        let (file_id, was_updated) = self.code_files.write().upsert(
+            path, project, mtime,
+            content_hash.clone(), git_commit.clone(),
+            git_author.clone(), git_timestamp_ms,
+            next_id_fn,
+        );
         let op = Op::UpsertCodeFile(UpsertCodeFileOp {
             file_id,
             path: path.to_string(),
             project: project.to_string(),
             mtime,
+            content_hash,
+            git_commit,
+            git_author,
+            git_timestamp_ms,
         });
         let _seqno = self.log.write().append(&op)?;
-        Ok(file_id)
+        Ok((file_id, was_updated))
+    }
+
+    /// Invalidate all active triplets associated with a source file.
+    /// Returns the IDs of invalidated triplets.
+    pub fn invalidate_triplets_by_source_file(&self, source_file: &str) -> Result<Vec<u64>> {
+        let now = now_ms();
+        let ids = self.triplet_store.write().invalidate_by_source_file(source_file, now);
+        let op = Op::InvalidateTripletsBySourceFile(
+            crate::ops::InvalidateTripletsBySourceFileOp {
+                source_file: source_file.to_string(),
+                invalidated_at_ms: now,
+            },
+        );
+        let _seqno = self.log.write().append(&op)?;
+        Ok(ids)
     }
 
     pub fn symbol_count(&self) -> usize {
