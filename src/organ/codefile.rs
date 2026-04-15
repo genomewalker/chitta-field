@@ -9,13 +9,13 @@ pub struct CodeFile {
     pub path: String,
     pub project: String,
     pub mtime: i64,
-    #[serde(default)]
+    #[serde(skip)]
     pub content_hash: Option<String>,
-    #[serde(default)]
+    #[serde(skip)]
     pub git_commit: Option<String>,
-    #[serde(default)]
+    #[serde(skip)]
     pub git_author: Option<String>,
-    #[serde(default)]
+    #[serde(skip)]
     pub git_timestamp_ms: Option<i64>,
 }
 
