@@ -72,6 +72,7 @@ pub enum Op {
     TransitionLineage(TransitionLineageOp),
     RecordChallenger(RecordChallengerOp),
     CloseRederive(CloseRederiveOp),
+    InvalidateTripletsBySourceFile(InvalidateTripletsBySourceFileOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -123,6 +124,7 @@ pub const OP_ADJUDICATE_LINEAGE: u8 = 61;
 pub const OP_TRANSITION_LINEAGE: u8 = 62;
 pub const OP_RECORD_CHALLENGER: u8 = 63;
 pub const OP_CLOSE_REDERIVE: u8 = 64;
+pub const OP_INVALIDATE_TRIPLETS_BY_SOURCE_FILE: u8 = 65;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -246,6 +248,20 @@ pub struct UpsertCodeFileOp {
     pub path: String,
     pub project: String,
     pub mtime: i64,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub git_commit: Option<String>,
+    #[serde(default)]
+    pub git_author: Option<String>,
+    #[serde(default)]
+    pub git_timestamp_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvalidateTripletsBySourceFileOp {
+    pub source_file: String,
+    pub invalidated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

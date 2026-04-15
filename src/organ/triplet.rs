@@ -253,6 +253,23 @@ impl TripletStore {
             .collect()
     }
 
+    /// Invalidate all active triplets whose source_file matches.
+    /// Returns the IDs of invalidated triplets.
+    pub fn invalidate_by_source_file(&mut self, source_file: &str, now_ms: i64) -> Vec<u64> {
+        let mut invalidated = Vec::new();
+        for entry in self.entries.iter_mut() {
+            if entry.valid_to_ms == 0 {
+                if let Some(ref sf) = entry.source_file {
+                    if sf == source_file {
+                        entry.valid_to_ms = now_ms;
+                        invalidated.push(entry.id);
+                    }
+                }
+            }
+        }
+        invalidated
+    }
+
     pub fn triplet_count(&self) -> usize {
         self.entries.len()
     }
