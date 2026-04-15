@@ -1680,6 +1680,7 @@ impl ChittaField {
 
     /// Upsert a code file record. Returns (CodeFileId, was_updated).
     /// `was_updated` is true when content_hash changed or was absent.
+    /// WAL is written before the in-memory update to ensure crash consistency.
     pub fn upsert_code_file(
         &self,
         path: &str,
@@ -1690,25 +1691,28 @@ impl ChittaField {
         git_author: Option<String>,
         git_timestamp_ms: Option<i64>,
     ) -> Result<(u64, bool)> {
-        let next_id_fn = || self.code_file_id_alloc.next_id();
-        let (file_id, was_updated) = self.code_files.write().upsert(
-            path, project, mtime,
-            content_hash.clone(), git_commit.clone(),
-            git_author.clone(), git_timestamp_ms,
-            next_id_fn,
-        );
+        let existing_id = self.code_files.read().get_by_path(path).map(|f| f.id);
+        let file_id = existing_id.unwrap_or_else(|| self.code_file_id_alloc.next_id());
+
         let op = Op::UpsertCodeFile(UpsertCodeFileOp {
             file_id,
             path: path.to_string(),
             project: project.to_string(),
             mtime,
-            content_hash,
-            git_commit,
-            git_author,
+            content_hash: content_hash.clone(),
+            git_commit: git_commit.clone(),
+            git_author: git_author.clone(),
             git_timestamp_ms,
         });
         let _seqno = self.log.write().append(&op)?;
-        Ok((file_id, was_updated))
+
+        let (id, was_updated) = self.code_files.write().upsert(
+            path, project, mtime,
+            content_hash, git_commit,
+            git_author, git_timestamp_ms,
+            || file_id,
+        );
+        Ok((id, was_updated))
     }
 
     /// Invalidate all active triplets associated with a source file.

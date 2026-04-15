@@ -51,8 +51,8 @@ impl CodeFileIndex {
             let hash_changed = match (&entry.content_hash, &content_hash) {
                 (Some(old), Some(new)) => old != new,
                 (None, Some(_)) => true,
-                (Some(_), None) => entry.mtime != mtime || entry.project != project,
-                (None, None) => entry.mtime != mtime || entry.project != project,
+                (Some(_), None) => true,
+                (None, None) => true,
             };
             entry.mtime = mtime;
             entry.project = project.to_string();

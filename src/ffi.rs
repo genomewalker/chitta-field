@@ -1380,7 +1380,7 @@ pub extern "C" fn cf_upsert_code_file_v2(
     } else {
         unsafe { CStr::from_ptr(git_author).to_str().ok().map(|s| s.to_string()) }
     };
-    let ts_opt = if git_timestamp_ms == 0 { None } else { Some(git_timestamp_ms) };
+    let ts_opt = if git_timestamp_ms < 0 { None } else { Some(git_timestamp_ms) };
 
     match handle.field.upsert_code_file(
         path_str, project_str, mtime,
