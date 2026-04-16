@@ -32,7 +32,6 @@ path = "benches/recall_bench.rs"
 
 [dev-dependencies]
 tempfile = "3"
-env_logger = "0.10"
 
 [profile.release]
 lto = true
