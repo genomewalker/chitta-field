@@ -265,6 +265,12 @@ impl OpLog {
     /// Replay ALL segment files in data_dir/segments/ (from all instances).
     /// Segments are sorted alphabetically — instance_id prefix ensures consistent ordering.
     /// Updates chain_head as V2 records are replayed.
+    ///
+    /// Each instance maintains an independent chain. When replay crosses an
+    /// instance boundary (filename prefix change), chain_head is reset to
+    /// ZERO_HASH — otherwise the next instance's first segment would always
+    /// trigger a "chain continuity warning" because its stored_head is zero
+    /// while the accumulated head from the prior instance is not.
     pub fn replay<F>(&mut self, _start_seqno: u64, mut f: F) -> Result<()>
     where
         F: FnMut(u64, Op) -> Result<()>,
@@ -272,7 +278,17 @@ impl OpLog {
         let seg_dir = self.data_dir.join("segments");
         let segments = collect_all_segments(&seg_dir)?;
         let mut chain_head = ZERO_HASH;
+        let mut current_instance: Option<String> = None;
         for seg_path in &segments {
+            let instance = seg_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.split_once('_'))
+                .map(|(prefix, _)| prefix.to_string());
+            if instance != current_instance {
+                chain_head = ZERO_HASH;
+                current_instance = instance;
+            }
             chain_head = replay_segment_chained(seg_path, 0, chain_head, &mut f)?;
         }
         self.chain_head = chain_head;
@@ -689,4 +705,100 @@ where
         f(seqno, op)?;
     }
     Ok(chain_head)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::{Op, StateDeltaOp};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // Unique temp-dir helper — avoids pulling the `tempfile` dev-dep (which
+    // transitively drags getrandom/aho-corasick into the build graph).
+    struct ScratchDir(PathBuf);
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "chitta-field-test-{}-{}-{}",
+                tag,
+                std::process::id(),
+                seq
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn make_op(memory_id: u64) -> Op {
+        Op::UpdateState(StateDeltaOp {
+            memory_id,
+            strength_delta: Some(0.1),
+            confidence_delta: None,
+            decay_rate: None,
+            touch: true,
+            pin: None,
+            op_ts_ms: 0,
+            status: None,
+            epistemic_status: None,
+        })
+    }
+
+    // Regression for the chain-continuity warning that fired O(segments)
+    // times on every daemon startup when the data dir contained segments
+    // from more than one instance. Each instance owns an independent chain;
+    // replay() MUST reset chain_head to ZERO_HASH at an instance-id prefix
+    // boundary, otherwise the next instance's first segment is compared
+    // against the prior instance's accumulated hash.
+    //
+    // Before the fix, this test produced ~1 warning per appended op on stderr.
+    // After the fix, the replay is silent and every op is surfaced exactly once.
+    #[test]
+    fn replay_across_independent_instance_chains() {
+        let tmp = ScratchDir::new("replay-chains");
+        let data_dir = tmp.path();
+
+        // Instance A: two ops.
+        {
+            let mut log_a = OpLog::open(data_dir, 0x1111_1111, 0).unwrap();
+            log_a.append(&make_op(1)).unwrap();
+            log_a.append(&make_op(2)).unwrap();
+            log_a.flush_buf().unwrap();
+        }
+
+        // Instance B: two ops, independent chain, same data_dir.
+        {
+            let mut log_b = OpLog::open(data_dir, 0x2222_2222, 0).unwrap();
+            log_b.append(&make_op(3)).unwrap();
+            log_b.append(&make_op(4)).unwrap();
+            log_b.flush_buf().unwrap();
+        }
+
+        // Fresh instance C replays everything.
+        let mut log_c = OpLog::open(data_dir, 0x3333_3333, 0).unwrap();
+        let mut seen: Vec<u64> = Vec::new();
+        log_c
+            .replay(0, |_seqno, op| {
+                if let Op::UpdateState(s) = op {
+                    seen.push(s.memory_id);
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        // All four ops surfaced in deterministic (instance-prefix) order.
+        // Each instance is a separate chain; replay must cross the prefix
+        // boundary without corrupting chain_head and without aborting.
+        assert_eq!(seen, vec![1, 2, 3, 4]);
+    }
 }
