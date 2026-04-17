@@ -279,6 +279,8 @@ impl OpLog {
         let segments = collect_all_segments(&seg_dir)?;
         let mut chain_head = ZERO_HASH;
         let mut current_instance: Option<String> = None;
+        let own_prefix = format!("{:08x}", self.instance_id);
+        let mut own_chain_head = ZERO_HASH;
         for seg_path in &segments {
             let instance = seg_path
                 .file_name()
@@ -287,11 +289,18 @@ impl OpLog {
                 .map(|(prefix, _)| prefix.to_string());
             if instance != current_instance {
                 chain_head = ZERO_HASH;
-                current_instance = instance;
+                current_instance = instance.clone();
             }
             chain_head = replay_segment_chained(seg_path, 0, chain_head, &mut f)?;
+            if current_instance.as_deref() == Some(own_prefix.as_str()) {
+                own_chain_head = chain_head;
+            }
         }
-        self.chain_head = chain_head;
+        // Only track this instance's chain tip — not the global replay result.
+        // Using the cross-instance accumulated hash would cause the first append
+        // to write prev_hash = <foreign tip>, triggering a warning on every
+        // subsequent restart when the boundary reset sets chain_head back to zero.
+        self.chain_head = own_chain_head;
         Ok(())
     }
 
@@ -596,8 +605,9 @@ where
         if file.read_exact(&mut stored_head).is_err() {
             return Ok(chain_head);
         }
-        // Verify segment continuity: stored head must match incoming chain_head
-        if stored_head != chain_head {
+        // Verify segment continuity: stored head must match incoming chain_head.
+        // Skip when chain_head is ZERO (instance boundary reset) — mismatch there is expected.
+        if stored_head != chain_head && chain_head != ZERO_HASH {
             eprintln!(
                 "[chitta-field] chain continuity warning in {}: expected {}, segment has {}",
                 path.display(),
@@ -669,9 +679,12 @@ where
             });
         }
 
-        // V2: verify chain integrity (warn on mismatch, don't fail — cross-instance segments have independent chains)
+        // V2: verify chain integrity (warn on mismatch, don't fail — cross-instance segments have independent chains).
+        // Skip warning when chain_head is ZERO: we're at an instance boundary reset, so any prev_hash
+        // mismatch is either correct (genesis) or legacy bad data from a prior bug where replay()
+        // propagated a foreign instance's chain tip into the first append of a new instance.
         if version == 2 {
-            if prev_hash != chain_head {
+            if prev_hash != chain_head && chain_head != ZERO_HASH {
                 eprintln!(
                     "[chitta-field] chain record warning at seqno {}: expected {}, record has {} — resetting chain",
                     seqno,
