@@ -4549,10 +4549,24 @@ pub extern "C" fn cf_purge_corrupt(h: *mut CfHandle, out_purged: *mut usize) -> 
             .collect()
     };
     let count = to_purge.len();
-    for id in to_purge {
-        let _ = handle.field.forget(id);
+    for id in &to_purge {
+        let _ = handle.field.forget(*id);
     }
-    unsafe { *out_purged = count; }
+
+    // Also remove orphaned semantic index entries (embedding exists but no payload)
+    let orphaned: Vec<u64> = {
+        let idx = handle.field.semantic_idx.read();
+        let payloads = handle.field.payloads.read();
+        idx.all_ids()
+            .filter(|id| !payloads.contains_key(id))
+            .collect()
+    };
+    let orphan_count = orphaned.len();
+    for id in orphaned {
+        handle.field.semantic_idx.write().remove(id);
+    }
+
+    unsafe { *out_purged = count + orphan_count; }
     handle.ok()
 }
 
