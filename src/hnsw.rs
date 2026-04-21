@@ -347,6 +347,11 @@ impl SemanticIndex {
         self.embeddings.get(&id).map(|v| v.as_slice())
     }
 
+    /// Iterator over all memory IDs that have an embedding (including soft-deleted).
+    pub fn all_ids(&self) -> impl Iterator<Item = MemoryId> + '_ {
+        self.embeddings.keys().copied()
+    }
+
     /// Add or update an embedding. Un-deletes the entry if it was soft-deleted.
     pub fn upsert(&mut self, memory_id: MemoryId, mut embedding: Vec<f32>) {
         self.remove(memory_id);
