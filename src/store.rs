@@ -864,7 +864,8 @@ impl ChittaField {
                     return None;
                 }
                 let payload = payloads.get(&memory_id)?;
-                if payload.content.is_empty() {
+                let content_str = String::from_utf8(payload.content.clone()).unwrap_or_default();
+                if content_str.trim().is_empty() {
                     return None;
                 }
                 // soul:* realms are internal — exclude from unscoped queries.
@@ -898,7 +899,7 @@ impl ChittaField {
                     strength: eff_strength,
                     confidence: state.confidence,
                     access_count: state.access_count,
-                    content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
+                    content: content_str,
                     semantic_weight: decomp.semantic_weight,
                     status_mul: decomp.status_mul,
                     epistemic_mul: decomp.epistemic_mul,
@@ -1195,7 +1196,8 @@ impl ChittaField {
                     return None;
                 }
                 let payload = payloads.get(&hit.memory_id)?;
-                if payload.content.is_empty() {
+                let content_str = String::from_utf8(payload.content.clone()).unwrap_or_default();
+                if content_str.trim().is_empty() {
                     return None;
                 }
                 if payload.realm.starts_with("soul:") {
@@ -1228,7 +1230,7 @@ impl ChittaField {
                     strength: eff_strength,
                     confidence: state.confidence,
                     access_count: state.access_count,
-                    content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
+                    content: content_str,
                     semantic_weight: decomp.semantic_weight,
                     status_mul: decomp.status_mul,
                     epistemic_mul: decomp.epistemic_mul,
