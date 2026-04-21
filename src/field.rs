@@ -158,6 +158,8 @@ pub struct ChittaField {
     pub(crate) hopfield: RwLock<HopfieldNetwork>,
     pub(crate) filter_level: std::sync::Arc<std::sync::atomic::AtomicU8>,
     pub(crate) scoring_pipeline: RwLock<crate::scoring::ScoringPipeline>,
+    pub(crate) realm_stats: RwLock<HashMap<String, crate::store::GroupStats>>,
+    pub(crate) kind_stats:  RwLock<HashMap<String, crate::store::GroupStats>>,
 }
 
 impl Drop for ChittaField {
@@ -554,6 +556,8 @@ impl ChittaField {
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
             realm_members: RwLock::new(realm_members),
+            realm_stats: RwLock::new(HashMap::new()),
+            kind_stats:  RwLock::new(HashMap::new()),
             pending_recall: Mutex::new(PendingRecallEffects::default()),
             coactivation_stats: RwLock::new(replay_coactivation_stats),
             hopfield: RwLock::new(HopfieldNetwork::new()),
