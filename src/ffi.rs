@@ -4518,6 +4518,44 @@ pub extern "C" fn cf_recall_by_kind(
     write_json_buf(&json_str, buf, buf_cap, written)
 }
 
+/// Purge corrupt memories: empty/whitespace content or non-finite affect values.
+/// Writes the count of purged memories to *out_purged.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_purge_corrupt(h: *mut CfHandle, out_purged: *mut usize) -> c_int {
+    if h.is_null() || out_purged.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *h };
+    let to_purge: Vec<u64> = {
+        let payloads = handle.field.payloads.read();
+        let states = handle.field.states.read();
+        payloads
+            .iter()
+            .filter(|(mid, payload)| {
+                let deleted = states.get(mid).map(|s| s.deleted).unwrap_or(false);
+                if deleted {
+                    return false;
+                }
+                let content_str = String::from_utf8(payload.content.clone()).unwrap_or_default();
+                let empty = content_str.trim().is_empty();
+                let av = states.get(mid).map(|s| s.affect_valence).unwrap_or(0.0);
+                let aa = states.get(mid).map(|s| s.affect_arousal).unwrap_or(0.0);
+                let corrupt_affect = !av.is_finite() || !aa.is_finite()
+                    || av.abs() > 1000.0 || aa.abs() > 1000.0;
+                empty || corrupt_affect
+            })
+            .map(|(mid, _)| *mid)
+            .collect()
+    };
+    let count = to_purge.len();
+    for id in to_purge {
+        let _ = handle.field.forget(id);
+    }
+    unsafe { *out_purged = count; }
+    handle.ok()
+}
+
 /// Return the 768-dim embeddings for a batch of memory IDs as JSON.
 /// Output: {"embeddings": {"<id>": [f32, ...], ...}}
 /// Missing IDs are silently omitted.
