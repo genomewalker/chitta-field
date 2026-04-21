@@ -18,6 +18,123 @@ use crate::state::MemoryState;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const RESERVOIR_SIZE: usize = 500;
+
+pub(crate) struct GroupStats {
+    sum:            Vec<f64>,
+    sum_sq:         Vec<f64>,
+    count:          u64,
+    reservoir:      Vec<Vec<f32>>,
+    reservoir_seen: u64,
+}
+
+impl GroupStats {
+    fn new() -> Self {
+        Self {
+            sum:            vec![0.0f64; EMBED_DIM],
+            sum_sq:         vec![0.0f64; EMBED_DIM],
+            count:          0,
+            reservoir:      Vec::new(),
+            reservoir_seen: 0,
+        }
+    }
+
+    fn add(&mut self, emb: &[f32]) {
+        if emb.len() != EMBED_DIM { return; }
+        self.count += 1;
+        for (i, &v) in emb.iter().enumerate() {
+            let v64 = v as f64;
+            self.sum[i]    += v64;
+            self.sum_sq[i] += v64 * v64;
+        }
+        self.reservoir_seen += 1;
+        if self.reservoir.len() < RESERVOIR_SIZE {
+            self.reservoir.push(emb.to_vec());
+        } else {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            self.reservoir_seen.hash(&mut h);
+            let r = (h.finish() as usize) % self.reservoir_seen as usize;
+            if r < RESERVOIR_SIZE {
+                self.reservoir[r] = emb.to_vec();
+            }
+        }
+    }
+
+    fn remove(&mut self, emb: &[f32]) {
+        if emb.len() != EMBED_DIM || self.count == 0 { return; }
+        self.count -= 1;
+        for (i, &v) in emb.iter().enumerate() {
+            let v64 = v as f64;
+            self.sum[i]    -= v64;
+            self.sum_sq[i] -= v64 * v64;
+        }
+    }
+
+    fn geometry(&self, group_name: &str) -> Option<serde_json::Value> {
+        let n = self.count as usize;
+        if n < 2 { return None; }
+        let n_f = self.count as f64;
+
+        let mut variance = vec![0.0f64; EMBED_DIM];
+        for d in 0..EMBED_DIM {
+            let mean_d    = self.sum[d] / n_f;
+            let mean_sq_d = self.sum_sq[d] / n_f;
+            variance[d]   = (mean_sq_d - mean_d * mean_d).max(0.0);
+        }
+
+        let sum_var: f64    = variance.iter().sum();
+        let sum_var_sq: f64 = variance.iter().map(|v| v * v).sum();
+        let effective_dim = if sum_var_sq > 1e-30 {
+            (sum_var * sum_var) / sum_var_sq
+        } else { 0.0 };
+        let isotropy = effective_dim / EMBED_DIM as f64;
+
+        let res = &self.reservoir;
+        let max_pairs = 500usize;
+        let mut cos_sum = 0.0f64;
+        let mut pair_count = 0u64;
+        if res.len() <= 32 {
+            for i in 0..res.len() {
+                for j in (i + 1)..res.len() {
+                    let dot: f64 = res[i].iter().zip(res[j].iter())
+                        .map(|(&a, &b)| a as f64 * b as f64).sum();
+                    cos_sum += dot;
+                    pair_count += 1;
+                }
+            }
+        } else {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            group_name.hash(&mut h);
+            let mut seed = h.finish();
+            let rn = res.len();
+            for _ in 0..max_pairs {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let i = (seed >> 32) as usize % rn;
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let j = (seed >> 32) as usize % rn;
+                if i == j { continue; }
+                let dot: f64 = res[i].iter().zip(res[j].iter())
+                    .map(|(&a, &b)| a as f64 * b as f64).sum();
+                cos_sum += dot;
+                pair_count += 1;
+            }
+        }
+        let mean_cosine = if pair_count > 0 { cos_sum / pair_count as f64 } else { 0.0 };
+
+        Some(serde_json::json!({
+            "group":           group_name,
+            "count":           n,
+            "effective_dim":   (effective_dim * 10.0).round() / 10.0,
+            "isotropy":        (isotropy * 1000.0).round() / 1000.0,
+            "mean_cosine_sim": (mean_cosine * 1000.0).round() / 1000.0,
+        }))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterLevel {
     #[default]
@@ -82,6 +199,7 @@ fn now_ms() -> i64 {
 
 /// Compute embedding geometry stats for a group of embeddings.
 /// Returns JSON value with group name, count, effective_dim, isotropy, mean_cosine_sim.
+#[allow(dead_code)]
 fn compute_geometry(embeddings: &[&[f32]], group_name: &str) -> Option<serde_json::Value> {
     let n = embeddings.len();
     if n < 2 {
@@ -349,6 +467,11 @@ impl ChittaField {
         // Auto-encode into cortical sparse index (non-fatal if fails)
         let _ = self.encode_memory(memory_id);
 
+        if !embedding.is_empty() {
+            self.realm_stats.write().entry(realm.to_string()).or_insert_with(GroupStats::new).add(embedding);
+            self.kind_stats.write().entry(kind.to_string()).or_insert_with(GroupStats::new).add(embedding);
+        }
+
         // PoE: corrections penalise the realm they target.
         // A correction stored in realm X signals that X produced an error.
         if kind == "correction" {
@@ -499,14 +622,21 @@ impl ChittaField {
                 state.deleted = true;
             }
         }
-        self.semantic_idx.write().remove(memory_id);
-        self.keyword_idx.write().remove(memory_id);
-        self.cortical_idx.write().remove(memory_id);
-
         // Remove from temporal index (need authored_at_ms from payload).
+        // Also subtract from spectral accumulators before removing from semantic_idx.
         {
             let payloads = self.payloads.read();
             if let Some(payload) = payloads.get(&memory_id) {
+                if let Some(emb) = self.semantic_idx.read().get_embedding(memory_id) {
+                    let emb_owned: Vec<f32> = emb.to_vec();
+                    if let Some(s) = self.realm_stats.write().get_mut(&payload.realm) {
+                        s.remove(&emb_owned);
+                    }
+                    if let Some(s) = self.kind_stats.write().get_mut(&payload.kind) {
+                        s.remove(&emb_owned);
+                    }
+                }
+
                 self.time_idx
                     .write()
                     .remove(memory_id, payload.authored_at_ms);
@@ -522,6 +652,10 @@ impl ChittaField {
                 }
             }
         }
+
+        self.semantic_idx.write().remove(memory_id);
+        self.keyword_idx.write().remove(memory_id);
+        self.cortical_idx.write().remove(memory_id);
         self.artifact_idx.write().remove_memory(memory_id);
 
         Ok(())
@@ -1749,61 +1883,30 @@ impl ChittaField {
     /// Per-realm embedding geometry stats (inspired by "Geometry of Forgetting").
     /// Returns JSON: `{"by_realm": [...], "by_kind": [...], "anomalies": [...]}`
     pub fn spectral_stats_by_realm(&self) -> String {
-        let realm_members = self.realm_members.read();
-        let semantic_idx = self.semantic_idx.read();
-        let payloads = self.payloads.read();
-        let states = self.states.read();
+        let realm_stats = self.realm_stats.read();
+        let kind_stats  = self.kind_stats.read();
 
-        // By realm
-        let mut realm_results: Vec<serde_json::Value> = Vec::new();
-        let mut realms: Vec<&String> = realm_members.keys().collect();
-        realms.sort();
-        for realm in realms {
-            let ids = match realm_members.get(realm.as_str()) {
-                Some(ids) if ids.len() >= 2 => ids,
-                _ => continue,
-            };
-            let embeddings: Vec<&[f32]> = ids
-                .iter()
-                .filter_map(|id| semantic_idx.get_embedding(*id))
-                .collect();
-            if let Some(stats) = compute_geometry(&embeddings, realm) {
-                realm_results.push(stats);
-            }
-        }
+        let mut realm_results: Vec<serde_json::Value> = realm_stats
+            .iter()
+            .filter_map(|(name, stats)| stats.geometry(name))
+            .collect();
+        realm_results.sort_by(|a, b| {
+            b["count"].as_u64().unwrap_or(0).cmp(&a["count"].as_u64().unwrap_or(0))
+        });
 
-        // By kind
-        let mut kind_ids: std::collections::HashMap<&str, Vec<MemoryId>> =
-            std::collections::HashMap::new();
-        for (mid, payload) in payloads.iter() {
-            if states.get(mid).map(|s| s.deleted).unwrap_or(true) {
-                continue;
-            }
-            kind_ids.entry(&payload.kind).or_default().push(*mid);
-        }
-        let mut kind_results: Vec<serde_json::Value> = Vec::new();
-        let mut kinds: Vec<&&str> = kind_ids.keys().collect();
-        kinds.sort();
-        for kind in kinds {
-            let ids = &kind_ids[*kind];
-            if ids.len() < 2 {
-                continue;
-            }
-            let embeddings: Vec<&[f32]> = ids
-                .iter()
-                .filter_map(|id| semantic_idx.get_embedding(*id))
-                .collect();
-            if let Some(stats) = compute_geometry(&embeddings, *kind) {
-                kind_results.push(stats);
-            }
-        }
+        let mut kind_results: Vec<serde_json::Value> = kind_stats
+            .iter()
+            .filter_map(|(name, stats)| stats.geometry(name))
+            .collect();
+        kind_results.sort_by(|a, b| {
+            a["group"].as_str().unwrap_or("").cmp(b["group"].as_str().unwrap_or(""))
+        });
 
-        // Anomalies
         let mut anomalies: Vec<serde_json::Value> = Vec::new();
         for entry in realm_results.iter().chain(kind_results.iter()) {
             let label = entry["group"].as_str().unwrap_or("?");
-            let cos = entry["mean_cosine_sim"].as_f64().unwrap_or(0.0);
-            let iso = entry["isotropy"].as_f64().unwrap_or(1.0);
+            let cos   = entry["mean_cosine_sim"].as_f64().unwrap_or(0.0);
+            let iso   = entry["isotropy"].as_f64().unwrap_or(1.0);
             let count = entry["count"].as_u64().unwrap_or(0);
             let has_newline = label.contains('\n') || label.contains('\r');
             if cos > 0.95 && count >= 5 {
@@ -1828,7 +1931,7 @@ impl ChittaField {
 
         serde_json::to_string(&serde_json::json!({
             "by_realm": realm_results,
-            "by_kind": kind_results,
+            "by_kind":  kind_results,
             "anomalies": anomalies,
         }))
         .unwrap_or_else(|_| "{}".to_string())
