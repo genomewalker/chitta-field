@@ -7428,3 +7428,58 @@ pub extern "C" fn cf_lineage_expiry_check(h: *const CfHandle) -> *mut c_char {
     let json = serde_json::json!({ "expired_ids": ids, "count": count });
     CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
+
+// ── Soul REPL Session Store FFI ─────────────────────────────────────────────
+
+/// Get a REPL session namespace as JSON string. Returns null if not found.
+/// Caller must free with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_repl_session_get(
+    h: *const CfHandle,
+    session_id: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || session_id.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let id_str = unsafe { match CStr::from_ptr(session_id).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    match handle.field.repl_session_get(id_str) {
+        Some(ns) => CString::new(ns).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Set/update a REPL session namespace. Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_repl_session_set(
+    h: *mut CfHandle,
+    session_id: *const c_char,
+    namespace_json: *const c_char,
+    updated_ms: i64,
+) -> c_int {
+    if h.is_null() || session_id.is_null() || namespace_json.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let id_str = unsafe { match CStr::from_ptr(session_id).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+    let ns_str = unsafe { match CStr::from_ptr(namespace_json).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+    handle.field.repl_session_set(id_str, ns_str, updated_ms);
+    0
+}
+
+/// Delete a REPL session. Returns 1 if deleted, 0 if not found.
+#[no_mangle]
+pub extern "C" fn cf_repl_session_delete(
+    h: *mut CfHandle,
+    session_id: *const c_char,
+) -> c_int {
+    if h.is_null() || session_id.is_null() { return -1; }
+    let handle = unsafe { &mut *h };
+    let id_str = unsafe { match CStr::from_ptr(session_id).to_str() { Ok(e) => e, Err(e) => return handle.err(e) } };
+    if handle.field.repl_session_delete(id_str) { 1 } else { 0 }
+}
+
+/// List all REPL sessions as JSON array. Caller must free with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_repl_session_list(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let json = handle.field.repl_session_list();
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}

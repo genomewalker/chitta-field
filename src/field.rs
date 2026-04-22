@@ -162,6 +162,8 @@ pub struct ChittaField {
     pub(crate) kind_stats:  RwLock<HashMap<String, crate::store::GroupStats>>,
     /// Ack/nack usage scores — persisted in FullSnapshot.ack_scores (v9+).
     pub(crate) ack_scores: RwLock<HashMap<MemoryId, i32>>,
+    /// Soul REPL session namespaces — persisted to repl_sessions.json (not in snapshot).
+    pub(crate) repl_sessions: RwLock<crate::repl_sessions::ReplSessionStore>,
 }
 
 impl Drop for ChittaField {
@@ -511,6 +513,7 @@ impl ChittaField {
         let loaded_lite_encoder = Self::load_lite_encoder(&data_dir);
         let loaded_seen_offsets = Self::load_seen_offsets(&data_dir, instance_id);
         let scoring_config = crate::scoring::config::ScoringConfig::load(&data_dir);
+        let loaded_repl_sessions = crate::repl_sessions::ReplSessionStore::load(&data_dir);
 
         Ok(Self {
             data_dir,
@@ -566,6 +569,7 @@ impl ChittaField {
             realm_stats: RwLock::new(HashMap::new()),
             kind_stats:  RwLock::new(HashMap::new()),
             ack_scores:  RwLock::new(snap_ack_scores),
+            repl_sessions: RwLock::new(loaded_repl_sessions),
             pending_recall: Mutex::new(PendingRecallEffects::default()),
             coactivation_stats: RwLock::new(replay_coactivation_stats),
             hopfield: RwLock::new(HopfieldNetwork::new()),
