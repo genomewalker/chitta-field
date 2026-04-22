@@ -33,6 +33,8 @@ pub struct ScoringContext<'a> {
     pub has_open_debt: bool,
     /// Learned source weight from integration kernel (Layer 6)
     pub integration_weight: Option<f32>,
+    /// Cumulative ack/nack score for this memory (positive = proven useful, negative = stale/wrong).
+    pub ack_score: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +113,7 @@ impl ScoringPipeline {
             Box::new(SurpriseDomainFactor),
             Box::new(EpistemicDebtFactor),
             Box::new(IntegrationWeightFactor),
+            Box::new(AckScoreFactor),
         ];
         Self { factors, config }
     }

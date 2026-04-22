@@ -2,6 +2,15 @@ use crate::ids::MemoryId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CorrectionState {
+    #[default]
+    Emitted,
+    Acknowledged,
+    Applied,
+    Verified,
+}
+
 /// A single subject-predicate-object fact.
 /// `weight` is the forward (subject→object) strength.
 /// `reverse_weight` is the backward (object→subject) strength.
@@ -45,6 +54,11 @@ pub struct TripletStore {
     by_subject: HashMap<String, Vec<u64>>,
     by_object: HashMap<String, Vec<u64>>,
     by_predicate: HashMap<String, Vec<u64>>,
+
+    // Sidecar — not serialized (bincode ignores serde(default); skip = ephemeral).
+    // Absent entries are implicitly Emitted.
+    #[serde(skip)]
+    pub correction_states: HashMap<u64, CorrectionState>,
 }
 
 impl TripletStore {
@@ -56,7 +70,12 @@ impl TripletStore {
             by_subject: HashMap::new(),
             by_object: HashMap::new(),
             by_predicate: HashMap::new(),
+            correction_states: HashMap::new(),
         }
+    }
+
+    pub fn correction_state(&self, id: u64) -> CorrectionState {
+        self.correction_states.get(&id).copied().unwrap_or_default()
     }
 
     /// Add a triplet fact, allocating a new ID. Returns the new triplet ID.
@@ -268,6 +287,15 @@ impl TripletStore {
             }
         }
         invalidated
+    }
+
+    pub fn set_correction_state(&mut self, id: u64, state: CorrectionState) -> bool {
+        if self.id_to_index.contains_key(&id) {
+            self.correction_states.insert(id, state);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn triplet_count(&self) -> usize {

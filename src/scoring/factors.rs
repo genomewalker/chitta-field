@@ -365,6 +365,30 @@ impl ScoringFactor for EpistemicDebtFactor {
     }
 }
 
+// ── Ack/nack usage score bonus ────────────────────────────────────────────
+
+pub struct AckScoreFactor;
+
+impl ScoringFactor for AckScoreFactor {
+    fn name(&self) -> &'static str { "ack_score" }
+
+    fn compute(
+        &self,
+        ctx: &ScoringContext,
+        _config: &ScoringConfig,
+        _decomp: &mut ScoreDecomposition,
+    ) -> Option<f32> {
+        let factor = match ctx.ack_score {
+            s if s >= 3  => 1.2,
+            s if s >= 1  => 1.1,
+            s if s <= -3 => 0.8,
+            s if s <= -1 => 0.9,
+            _            => 1.0,
+        };
+        Some(factor)
+    }
+}
+
 // ── Integration weight factor (Layer 6) ───────────────────────────────────
 
 pub struct IntegrationWeightFactor;

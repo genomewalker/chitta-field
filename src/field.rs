@@ -160,6 +160,8 @@ pub struct ChittaField {
     pub(crate) scoring_pipeline: RwLock<crate::scoring::ScoringPipeline>,
     pub(crate) realm_stats: RwLock<HashMap<String, crate::store::GroupStats>>,
     pub(crate) kind_stats:  RwLock<HashMap<String, crate::store::GroupStats>>,
+    /// Ack/nack usage scores — persisted in FullSnapshot.ack_scores (v9+).
+    pub(crate) ack_scores: RwLock<HashMap<MemoryId, i32>>,
 }
 
 impl Drop for ChittaField {
@@ -231,6 +233,8 @@ impl ChittaField {
         let mut wisdom_lineage_store = WisdomLineageStore::new();
         let mut chunk_hash_idx: HashMap<crate::ids::ChunkHash, MemoryId> = HashMap::new();
         let mut snapshot_coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats> = HashMap::new();
+        let mut snap_ack_scores: HashMap<MemoryId, i32> = HashMap::new();
+        let mut snap_correction_states: HashMap<u64, crate::organ::triplet::CorrectionState> = HashMap::new();
 
         // Find best cortical snapshot by peeking seqno (16-byte read per file), then load only that one.
         let mut snapshot_seqno: u64 = 0;
@@ -351,6 +355,8 @@ impl ChittaField {
                     code_files = snap.code_files;
                     semantic_idx = snap.semantic_idx;
                     snapshot_coactivation_stats = snap.coactivation_stats;
+                    snap_ack_scores = snap.ack_scores;
+                    snap_correction_states = snap.correction_states;
                     eprintln!(
                         "[chitta-field] loaded full snapshot seqno={} ({} memories) from {:?}",
                         full_snapshot_seqno, payloads.len(), candidate
@@ -390,6 +396,7 @@ impl ChittaField {
         // Skip ops already covered by the full snapshot or cortical snapshot.
         let mut replay_realm_members: HashMap<String, HashSet<MemoryId>> = HashMap::new();
         let mut replay_coactivation_stats = snapshot_coactivation_stats;
+        triplet_store.correction_states = snap_correction_states;
         log.replay(0, |seqno, op| {
             if seqno <= full_snapshot_seqno {
                 // This op is covered by the full snapshot.
@@ -558,6 +565,7 @@ impl ChittaField {
             realm_members: RwLock::new(realm_members),
             realm_stats: RwLock::new(HashMap::new()),
             kind_stats:  RwLock::new(HashMap::new()),
+            ack_scores:  RwLock::new(snap_ack_scores),
             pending_recall: Mutex::new(PendingRecallEffects::default()),
             coactivation_stats: RwLock::new(replay_coactivation_stats),
             hopfield: RwLock::new(HopfieldNetwork::new()),
