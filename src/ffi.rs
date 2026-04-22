@@ -7475,6 +7475,31 @@ pub extern "C" fn cf_repl_session_delete(
     if handle.field.repl_session_delete(id_str) { 1 } else { 0 }
 }
 
+/// Execute Python code in the REPL sandbox. Atomically gets session namespace,
+/// executes code, persists updated namespace.
+/// Returns JSON: {success, output, error, session_id, trajectory}.
+/// Caller must free result with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_repl_execute(
+    h: *mut CfHandle,
+    session_id: *const c_char,
+    code: *const c_char,
+    reset: c_int,
+    socket_path: *const c_char,
+    max_output: c_int,
+) -> *mut c_char {
+    if h.is_null() || session_id.is_null() || code.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let sid  = unsafe { match CStr::from_ptr(session_id).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let code = unsafe { match CStr::from_ptr(code).to_str()       { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let sp   = if socket_path.is_null() { "" } else {
+        unsafe { CStr::from_ptr(socket_path).to_str().unwrap_or("") }
+    };
+    let max = if max_output > 0 { max_output as usize } else { 10_000 };
+    let json = handle.field.repl_execute(sid, code, reset != 0, sp, max);
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
 /// List all REPL sessions as JSON array. Caller must free with cf_free_string.
 #[no_mangle]
 pub extern "C" fn cf_repl_session_list(h: *const CfHandle) -> *mut c_char {

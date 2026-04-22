@@ -635,6 +635,49 @@ impl ChittaField {
         self.repl_sessions.write().delete(id)
     }
 
+    /// Execute Python code in the REPL sandbox. Atomically: get namespace →
+    /// execute → persist namespace. Returns JSON result.
+    pub fn repl_execute(
+        &self,
+        session_id: &str,
+        code: &str,
+        reset: bool,
+        socket_path: &str,
+        max_output: usize,
+    ) -> String {
+        let initial_ns = if reset {
+            None
+        } else {
+            self.repl_sessions.read().get(session_id).map(|s| s.namespace_json.clone())
+        };
+
+        let result = crate::repl_executor::repl_execute(
+            code,
+            initial_ns.as_deref(),
+            socket_path,
+            max_output,
+        );
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        self.repl_sessions.write().set(
+            session_id.to_string(),
+            result.namespace_json.clone(),
+            now_ms,
+        );
+
+        serde_json::json!({
+            "success":   result.success,
+            "output":    result.output,
+            "error":     result.error,
+            "session_id": session_id,
+            "trajectory": serde_json::from_str::<serde_json::Value>(&result.trajectory_json)
+                .unwrap_or(serde_json::json!([])),
+        }).to_string()
+    }
+
     pub fn repl_session_list(&self) -> String {
         let store = self.repl_sessions.read();
         let entries: Vec<serde_json::Value> = store.list().iter().map(|s| serde_json::json!({
