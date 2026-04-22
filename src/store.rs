@@ -621,6 +621,30 @@ impl ChittaField {
         Ok(())
     }
 
+    // ── Soul REPL session persistence ──────────────────────────────────────────
+
+    pub fn repl_session_get(&self, id: &str) -> Option<String> {
+        self.repl_sessions.read().get(id).map(|s| s.namespace_json.clone())
+    }
+
+    pub fn repl_session_set(&self, id: &str, namespace_json: &str, updated_ms: i64) {
+        self.repl_sessions.write().set(id.to_string(), namespace_json.to_string(), updated_ms);
+    }
+
+    pub fn repl_session_delete(&self, id: &str) -> bool {
+        self.repl_sessions.write().delete(id)
+    }
+
+    pub fn repl_session_list(&self) -> String {
+        let store = self.repl_sessions.read();
+        let entries: Vec<serde_json::Value> = store.list().iter().map(|s| serde_json::json!({
+            "id": s.id,
+            "updated_ms": s.updated_ms,
+            "namespace_size": s.namespace_json.len(),
+        })).collect();
+        serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+    }
+
     /// Soft-delete a memory.
     pub fn forget(&self, memory_id: MemoryId) -> Result<()> {
         {
