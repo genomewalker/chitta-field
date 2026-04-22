@@ -10,6 +10,7 @@ pub mod ops;
 pub mod organ;
 pub mod payload;
 pub mod recall;
+pub mod repl_executor;
 pub mod repl_sessions;
 pub mod scoring;
 pub mod snapshot;
