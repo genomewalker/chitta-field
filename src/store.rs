@@ -599,6 +599,28 @@ impl ChittaField {
         Ok(())
     }
 
+    /// Increment ack_score by 1 for the given memory (signals proven useful).
+    pub fn ack_memory(&self, memory_id: MemoryId) -> Result<()> {
+        if !self.states.read().contains_key(&memory_id) {
+            return Err(FieldError::NotFound(memory_id));
+        }
+        let mut scores = self.ack_scores.write();
+        let score = scores.entry(memory_id).or_insert(0);
+        *score = score.saturating_add(1);
+        Ok(())
+    }
+
+    /// Decrement ack_score by 1 for the given memory (signals stale or wrong).
+    pub fn nack_memory(&self, memory_id: MemoryId) -> Result<()> {
+        if !self.states.read().contains_key(&memory_id) {
+            return Err(FieldError::NotFound(memory_id));
+        }
+        let mut scores = self.ack_scores.write();
+        let score = scores.entry(memory_id).or_insert(0);
+        *score = score.saturating_sub(1);
+        Ok(())
+    }
+
     /// Soft-delete a memory.
     pub fn forget(&self, memory_id: MemoryId) -> Result<()> {
         {
@@ -854,6 +876,7 @@ impl ChittaField {
         let payloads = self.payloads.read();
         let pipeline = self.scoring_pipeline.read();
         let learners = self.learners.read();
+        let ack_scores = self.ack_scores.read();
 
         let mut hits: Vec<RecallHit> = semantic_hits
             .into_iter()
@@ -886,6 +909,7 @@ impl ChittaField {
                     surprise_role: None,
                     has_open_debt: false,
                     integration_weight: None,
+                    ack_score: ack_scores.get(&memory_id).copied().unwrap_or(0),
                 };
                 let (score, decomp) = pipeline.score(&ctx)?;
                 let eff_strength = state.effective_strength(now);
@@ -950,6 +974,7 @@ impl ChittaField {
         drop(payloads);
         drop(pipeline);
         drop(learners);
+        drop(ack_scores);
         self.enqueue_recall_effects(&hit_ids);
 
         Ok(hits)
@@ -1187,6 +1212,7 @@ impl ChittaField {
         let payloads = self.payloads.read();
         let pipeline = self.scoring_pipeline.read();
         let learners = self.learners.read();
+        let ack_scores = self.ack_scores.read();
 
         let mut hits: Vec<RecallHit> = keyword_hits
             .into_iter()
@@ -1217,6 +1243,7 @@ impl ChittaField {
                     surprise_role: None,
                     has_open_debt: false,
                     integration_weight: None,
+                    ack_score: ack_scores.get(&hit.memory_id).copied().unwrap_or(0),
                 };
                 let (score, decomp) = pipeline.score(&ctx)?;
                 let eff_strength = state.effective_strength(now);
@@ -1260,6 +1287,7 @@ impl ChittaField {
         drop(payloads);
         drop(pipeline);
         drop(learners);
+        drop(ack_scores);
         self.enqueue_recall_effects(&hit_ids);
 
         Ok(hits)
@@ -3345,6 +3373,8 @@ impl ChittaField {
             code_files: self.code_files.read().clone(),
             semantic_idx: self.semantic_idx.read().clone(),
             coactivation_stats: self.coactivation_stats.read().clone(),
+            ack_scores: self.ack_scores.read().clone(),
+            correction_states: self.triplet_store.read().correction_states.clone(),
         };
         let path = self
             .data_dir

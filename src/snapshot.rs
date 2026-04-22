@@ -8,7 +8,7 @@ use crate::organ::codefile::CodeFileIndex;
 use crate::organ::keyword::KeywordIndex;
 use crate::organ::symbol::SymbolIndex;
 use crate::organ::temporal::TemporalIndex;
-use crate::organ::triplet::TripletStore;
+use crate::organ::triplet::{CorrectionState, TripletStore};
 use crate::payload::MemoryPayload;
 use crate::state::{EpistemicStatus, MemoryState, MemoryStatus, RetrievalHistory};
 use serde::{Deserialize, Serialize};
@@ -29,17 +29,20 @@ const FULL_SNAPSHOT_MAGIC_V5: u64 = 0xF011_5741_7E00_0005;
 const FULL_SNAPSHOT_MAGIC_V6: u64 = 0xF011_5741_7E00_0006;
 /// Magic for v1.0.7 snapshots: adds access_timestamps but NO interference fields.
 const FULL_SNAPSHOT_MAGIC_V7: u64 = 0xF011_5741_7E00_0007;
-/// Current magic (v1.0.8+): adds competitive_weight, lure_risk, spacing_quality.
-const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_0008;
+/// Magic for v1.0.8 snapshots: adds competitive_weight, lure_risk, spacing_quality.
+/// FullSnapshot had no top-level sidecars (ack_scores / correction_states).
+const FULL_SNAPSHOT_MAGIC_V8: u64 = 0xF011_5741_7E00_0008;
+/// Current magic (v1.0.9+): FullSnapshot gains ack_scores + correction_states sidecars.
+const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_0009;
 
 // ── Compile-time guard: MemoryState size must match snapshot magic ────────────
 // If you add/remove fields to MemoryState, this assert will fail.
 // You MUST: (1) bump FULL_SNAPSHOT_MAGIC, (2) add a LegacyMemoryStateVN,
 // (3) add migration in FullSnapshot::load(), (4) update this constant.
 // bincode is positional — #[serde(default)] does NOT work with it.
-const _MEMORY_STATE_SIZE_V8: usize = 200;
+const _MEMORY_STATE_SIZE_V9: usize = 200;
 const _: () = assert!(
-    std::mem::size_of::<MemoryState>() == _MEMORY_STATE_SIZE_V8,
+    std::mem::size_of::<MemoryState>() == _MEMORY_STATE_SIZE_V9,
     // If this fails, a field was added/removed from MemoryState without
     // bumping the snapshot magic. See comment above.
 );
@@ -379,7 +382,28 @@ struct LegacyFullSnapshotV7 {
     pub coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats>,
 }
 
-// ── Current snapshot struct ───────────────────────────────────────────────────
+// ── V8 snapshot struct (no top-level sidecars) ───────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV8 {
+    pub snapshot_seqno: u64,
+    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub states: HashMap<MemoryId, MemoryState>,
+    pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts: HashMap<String, ArtifactId>,
+    pub artifact_paths: HashMap<ArtifactId, String>,
+    pub time_idx: TemporalIndex,
+    pub keyword_idx: KeywordIndex,
+    pub artifact_idx: ArtifactIndex,
+    pub triplet_store: TripletStore,
+    pub symbol_idx: SymbolIndex,
+    pub call_graph: CallGraph,
+    pub code_files: CodeFileIndex,
+    pub semantic_idx: SemanticIndex,
+    pub coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats>,
+}
+
+// ── Current snapshot struct (v9+) ────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
 pub struct FullSnapshot {
@@ -398,6 +422,10 @@ pub struct FullSnapshot {
     pub code_files: CodeFileIndex,
     pub semantic_idx: SemanticIndex,
     pub coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats>,
+    /// Persistent ack/nack usage scores keyed by MemoryId.
+    pub ack_scores: HashMap<MemoryId, i32>,
+    /// Persistent correction lifecycle states keyed by triplet id.
+    pub correction_states: HashMap<u64, CorrectionState>,
 }
 
 impl FullSnapshot {
@@ -423,6 +451,7 @@ impl FullSnapshot {
         r.read_exact(&mut buf)?;
         let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         if magic != FULL_SNAPSHOT_MAGIC
+            && magic != FULL_SNAPSHOT_MAGIC_V8
             && magic != FULL_SNAPSHOT_MAGIC_V7
             && magic != FULL_SNAPSHOT_MAGIC_V6
             && magic != FULL_SNAPSHOT_MAGIC_V5
@@ -443,7 +472,7 @@ impl FullSnapshot {
         let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
 
         if magic == FULL_SNAPSHOT_MAGIC {
-            // Current format (v8): full MemoryState with interference fields.
+            // Current format (v9): adds ack_scores + correction_states sidecars.
             let r = BufReader::new(&bytes[8..]);
             let mut snap: Self = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
@@ -453,9 +482,38 @@ impl FullSnapshot {
             return Ok(snap);
         }
 
+        if magic == FULL_SNAPSHOT_MAGIC_V8 {
+            // V8: no top-level sidecars — migrate to v9 with empty sidecars.
+            eprintln!("[chitta-field] migrating v8 snapshot → v9 (adding ack_scores + correction_states)");
+            let r = BufReader::new(&bytes[8..]);
+            let v8: LegacyFullSnapshotV8 = bincode::deserialize_from(r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            let mut states = v8.states;
+            for s in states.values_mut() { s.sanitize(); }
+            return Ok(FullSnapshot {
+                snapshot_seqno: v8.snapshot_seqno,
+                payloads: v8.payloads,
+                states,
+                assoc_edges: v8.assoc_edges,
+                artifacts: v8.artifacts,
+                artifact_paths: v8.artifact_paths,
+                time_idx: v8.time_idx,
+                keyword_idx: v8.keyword_idx,
+                artifact_idx: v8.artifact_idx,
+                triplet_store: v8.triplet_store,
+                symbol_idx: v8.symbol_idx,
+                call_graph: v8.call_graph,
+                code_files: v8.code_files,
+                semantic_idx: v8.semantic_idx,
+                coactivation_stats: v8.coactivation_stats,
+                ack_scores: HashMap::new(),
+                correction_states: HashMap::new(),
+            });
+        }
+
         if magic == FULL_SNAPSHOT_MAGIC_V7 {
             // V7: access_timestamps but no interference fields.
-            eprintln!("[chitta-field] migrating v7 snapshot → v8 (adding interference density fields)");
+            eprintln!("[chitta-field] migrating v7 snapshot → v9");
             let r = BufReader::new(&bytes[8..]);
             let v7: LegacyFullSnapshotV7 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
@@ -476,12 +534,14 @@ impl FullSnapshot {
                 code_files: v7.code_files,
                 semantic_idx: v7.semantic_idx,
                 coactivation_stats: v7.coactivation_stats,
+                ack_scores: HashMap::new(),
+                correction_states: HashMap::new(),
             });
         }
 
         if magic == FULL_SNAPSHOT_MAGIC_V6 {
             // V6: MemoryState with affect/surprise but no access_timestamps.
-            eprintln!("[chitta-field] migrating v6 snapshot → v7 (adding access_timestamps for ACT-R)");
+            eprintln!("[chitta-field] migrating v6 snapshot → v9");
             let r = BufReader::new(&bytes[8..]);
             let v6: LegacyFullSnapshotV6 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
@@ -502,12 +562,14 @@ impl FullSnapshot {
                 code_files: v6.code_files,
                 semantic_idx: v6.semantic_idx,
                 coactivation_stats: v6.coactivation_stats,
+                ack_scores: HashMap::new(),
+                correction_states: HashMap::new(),
             });
         }
 
         if magic == FULL_SNAPSHOT_MAGIC_V5 {
             // V5: 14-field MemoryState + coactivation_stats.
-            eprintln!("[chitta-field] migrating v5 snapshot → v7 (adding MemoryStatus + EpistemicStatus + affect + access_timestamps)");
+            eprintln!("[chitta-field] migrating v5 snapshot → v9");
             let r = BufReader::new(&bytes[8..]);
             let v5: LegacyFullSnapshotV5 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
@@ -528,12 +590,14 @@ impl FullSnapshot {
                 code_files: v5.code_files,
                 semantic_idx: v5.semantic_idx,
                 coactivation_stats: v5.coactivation_stats,
+                ack_scores: HashMap::new(),
+                correction_states: HashMap::new(),
             });
         }
 
         if magic == FULL_SNAPSHOT_MAGIC_V4 {
             // V4: 14-field MemoryState, no coactivation_stats.
-            eprintln!("[chitta-field] migrating v4 snapshot → v6 (adding coactivation_stats + MemoryStatus + EpistemicStatus)");
+            eprintln!("[chitta-field] migrating v4 snapshot → v9");
             let r = BufReader::new(&bytes[8..]);
             let v4: LegacyFullSnapshotV4 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
@@ -554,6 +618,8 @@ impl FullSnapshot {
                 code_files: v4.code_files,
                 semantic_idx: v4.semantic_idx,
                 coactivation_stats: HashMap::new(),
+                ack_scores: HashMap::new(),
+                correction_states: HashMap::new(),
             });
         }
 
@@ -584,6 +650,8 @@ impl FullSnapshot {
                 code_files: v1.code_files,
                 semantic_idx,
                 coactivation_stats: HashMap::new(),
+                ack_scores: HashMap::new(),
+                correction_states: HashMap::new(),
             });
         }
 
