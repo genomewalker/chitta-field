@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build tools
-        run: dnf install -y perl-IPC-Cmd
+        run: dnf install -y perl-IPC-Cmd python3.11 python3.11-devel
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -25,12 +25,16 @@ jobs:
           toolchain: "1.92.0"
 
       - name: Run tests
+        env:
+          PYO3_PYTHON: /usr/bin/python3.11
         run: |
           unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
           export PATH="/usr/bin:$HOME/.rustup/toolchains/1.92.0-x86_64-unknown-linux-gnu/bin:$PATH"
           cargo test --release
 
       - name: Build release artifacts
+        env:
+          PYO3_PYTHON: /usr/bin/python3.11
         run: |
           unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
           export PATH="/usr/bin:$HOME/.rustup/toolchains/1.92.0-x86_64-unknown-linux-gnu/bin:$PATH"
