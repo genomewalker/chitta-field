@@ -399,6 +399,11 @@ impl ChittaField {
             .entry(realm.to_string())
             .or_default()
             .insert(memory_id);
+        self.kind_members
+            .write()
+            .entry(kind.to_string())
+            .or_default()
+            .insert(memory_id);
         if !embed_pending {
             self.semantic_idx
                 .write()
@@ -738,6 +743,16 @@ impl ChittaField {
                 };
                 if remove_realm {
                     realm_members.remove(&payload.realm);
+                }
+                let mut kind_members = self.kind_members.write();
+                let remove_kind = if let Some(ids) = kind_members.get_mut(&payload.kind) {
+                    ids.remove(&memory_id);
+                    ids.is_empty()
+                } else {
+                    false
+                };
+                if remove_kind {
+                    kind_members.remove(&payload.kind);
                 }
             }
         }
