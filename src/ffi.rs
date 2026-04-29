@@ -4485,32 +4485,51 @@ pub extern "C" fn cf_recall_by_kind(
             Err(e) => return handle.err(e),
         }
     };
-    let payloads = handle.field.payloads.read();
+    // O(K log limit) via kind_members index — only iterate members of this kind,
+    // and keep a min-heap of size `limit` on confidence.
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let kind_members = handle.field.kind_members.read();
     let states = handle.field.states.read();
-    let mut entries: Vec<(u64, f32, &[u8])> = payloads
-        .iter()
-        .filter(|(mid, payload)| {
-            payload.kind == kind_str && states.get(mid).map(|s| !s.deleted).unwrap_or(false)
-        })
-        .map(|(mid, payload)| {
-            let conf = states.get(mid).map(|s| s.confidence).unwrap_or(0.0);
-            (*mid, conf, payload.content.as_slice())
-        })
-        .collect();
-    entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let page: Vec<serde_json::Value> = entries
-        .iter()
-        .take(limit)
-        .map(|(mid, conf, content)| {
-            serde_json::json!({
+    let payloads = handle.field.payloads.read();
+
+    let empty_set;
+    let members: &std::collections::HashSet<u64> = match kind_members.get(&kind_str) {
+        Some(s) => s,
+        None => { empty_set = std::collections::HashSet::new(); &empty_set }
+    };
+
+    let mut heap: BinaryHeap<Reverse<(u32, u64)>> = BinaryHeap::with_capacity(limit + 1);
+    for &mid in members.iter() {
+        let st = match states.get(&mid) { Some(s) if !s.deleted => s, _ => continue };
+        let conf_bits = if st.confidence.is_nan() { 0 } else { st.confidence.to_bits() };
+        if heap.len() < limit {
+            heap.push(Reverse((conf_bits, mid)));
+        } else if let Some(&Reverse((min_bits, _))) = heap.peek() {
+            if conf_bits > min_bits {
+                heap.pop();
+                heap.push(Reverse((conf_bits, mid)));
+            }
+        }
+    }
+    let mut top: Vec<(u32, u64)> = heap.into_iter().map(|Reverse(t)| t).collect();
+    top.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let page: Vec<serde_json::Value> = top
+        .into_iter()
+        .filter_map(|(conf_bits, mid)| {
+            let payload = payloads.get(&mid)?;
+            Some(serde_json::json!({
                 "id": mid,
-                "confidence": conf,
-                "content": String::from_utf8_lossy(content),
-            })
+                "confidence": f32::from_bits(conf_bits),
+                "content": String::from_utf8_lossy(&payload.content),
+            }))
         })
         .collect();
     drop(payloads);
     drop(states);
+    drop(kind_members);
     let json_str = match serde_json::to_string(&page) {
         Ok(s) => s,
         Err(e) => return handle.err(e),

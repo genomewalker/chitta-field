@@ -152,6 +152,7 @@ pub struct ChittaField {
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
     pub(crate) chunk_hash_idx: RwLock<HashMap<crate::ids::ChunkHash, MemoryId>>,
     pub(crate) realm_members: RwLock<HashMap<String, HashSet<MemoryId>>>,
+    pub(crate) kind_members:  RwLock<HashMap<String, HashSet<MemoryId>>>,
     pub(crate) pending_recall: Mutex<PendingRecallEffects>,
     pub(crate) coactivation_stats: RwLock<HashMap<(MemoryId, MemoryId), CoActivationStats>>,
     /// Asymmetric Hopfield network for energy-based attractor recall. FEP §3.2.
@@ -397,6 +398,7 @@ impl ChittaField {
         // Replay ALL segment files to rebuild in-memory state.
         // Skip ops already covered by the full snapshot or cortical snapshot.
         let mut replay_realm_members: HashMap<String, HashSet<MemoryId>> = HashMap::new();
+        let mut replay_kind_members:  HashMap<String, HashSet<MemoryId>> = HashMap::new();
         let mut replay_coactivation_stats = snapshot_coactivation_stats;
         triplet_store.correction_states = snap_correction_states;
         log.replay(0, |seqno, op| {
@@ -462,6 +464,7 @@ impl ChittaField {
                 &mut wisdom_lineage_store,
                 &mut chunk_hash_idx,
                 &mut replay_realm_members,
+                &mut replay_kind_members,
                 &mut replay_coactivation_stats,
             );
             Ok(())
@@ -470,6 +473,7 @@ impl ChittaField {
         semantic_idx.normalize_all();
         keyword_idx.rebuild_reverse_index();
         let realm_members = build_realm_members(&payloads, &states);
+        let kind_members  = build_kind_members(&payloads, &states);
 
         // Fix temporal entries that have ts_ms=0 (stored before authored_at_ms default fix)
         {
@@ -566,6 +570,7 @@ impl ChittaField {
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
             realm_members: RwLock::new(realm_members),
+            kind_members:  RwLock::new(kind_members),
             realm_stats: RwLock::new(HashMap::new()),
             kind_stats:  RwLock::new(HashMap::new()),
             ack_scores:  RwLock::new(snap_ack_scores),
@@ -665,6 +670,7 @@ impl ChittaField {
         let mut wisdom_lineage_store_reg = self.wisdom_lineage_store.write();
         let mut chunk_hash_idx = self.chunk_hash_idx.write();
         let mut realm_members = self.realm_members.write();
+        let mut kind_members  = self.kind_members.write();
         let mut coactivation_stats = self.coactivation_stats.write();
 
         for op in ops {
@@ -706,6 +712,7 @@ impl ChittaField {
                 &mut *wisdom_lineage_store_reg,
                 &mut *chunk_hash_idx,
                 &mut *realm_members,
+                &mut *kind_members,
                 &mut *coactivation_stats,
             );
         }
@@ -864,6 +871,7 @@ pub(crate) fn apply_op(
     wisdom_lineage_store: &mut WisdomLineageStore,
     chunk_hash_idx: &mut HashMap<crate::ids::ChunkHash, MemoryId>,
     realm_members: &mut HashMap<String, HashSet<MemoryId>>,
+    kind_members:  &mut HashMap<String, HashSet<MemoryId>>,
     coactivation_stats: &mut HashMap<(MemoryId, MemoryId), CoActivationStats>,
 ) {
     match op {
@@ -896,6 +904,10 @@ pub(crate) fn apply_op(
             keyword_idx.index(memory_id, &content_str);
             realm_members
                 .entry(realm.clone())
+                .or_default()
+                .insert(memory_id);
+            kind_members
+                .entry(kind.clone())
                 .or_default()
                 .insert(memory_id);
 
@@ -940,6 +952,15 @@ pub(crate) fn apply_op(
                 };
                 if remove_realm {
                     realm_members.remove(&payload.realm);
+                }
+                let remove_kind = if let Some(ids) = kind_members.get_mut(&payload.kind) {
+                    ids.remove(&memory_id);
+                    ids.is_empty()
+                } else {
+                    false
+                };
+                if remove_kind {
+                    kind_members.remove(&payload.kind);
                 }
             }
             artifact_idx.remove_memory(memory_id);
@@ -1761,4 +1782,22 @@ fn build_realm_members(
             .insert(memory_id);
     }
     realm_members
+}
+
+fn build_kind_members(
+    payloads: &HashMap<MemoryId, MemoryPayload>,
+    states: &HashMap<MemoryId, MemoryState>,
+) -> HashMap<String, HashSet<MemoryId>> {
+    let mut kind_members: HashMap<String, HashSet<MemoryId>> = HashMap::new();
+    for (&memory_id, payload) in payloads {
+        let not_deleted = states.get(&memory_id).map(|s| !s.deleted).unwrap_or(false);
+        if !not_deleted {
+            continue;
+        }
+        kind_members
+            .entry(payload.kind.clone())
+            .or_default()
+            .insert(memory_id);
+    }
+    kind_members
 }
