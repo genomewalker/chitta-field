@@ -73,6 +73,7 @@ pub enum Op {
     RecordChallenger(RecordChallengerOp),
     CloseRederive(CloseRederiveOp),
     InvalidateTripletsBySourceFile(InvalidateTripletsBySourceFileOp),
+    UpdateMemoryKind(UpdateMemoryKindOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -125,6 +126,7 @@ pub const OP_TRANSITION_LINEAGE: u8 = 62;
 pub const OP_RECORD_CHALLENGER: u8 = 63;
 pub const OP_CLOSE_REDERIVE: u8 = 64;
 pub const OP_INVALIDATE_TRIPLETS_BY_SOURCE_FILE: u8 = 65;
+pub const OP_UPDATE_MEMORY_KIND: u8 = 66;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -391,6 +393,13 @@ pub struct UpdateMemoryContentOp {
     pub memory_id: MemoryId,
     pub content: Vec<u8>,
     pub embedding: Vec<f32>, // empty = no embedding change
+}
+
+/// Update the semantic kind (e.g. wisdom -> belief) for an existing memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateMemoryKindOp {
+    pub memory_id: MemoryId,
+    pub new_kind: String,
 }
 
 /// Domain event envelope for analytics events.

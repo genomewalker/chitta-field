@@ -1286,6 +1286,11 @@ pub(crate) fn apply_op(
             }
             keyword_idx.index(umc.memory_id, &content_str);
         }
+        Op::UpdateMemoryKind(umk) => {
+            if let Some(payload) = payloads.get_mut(&umk.memory_id) {
+                payload.kind = umk.new_kind;
+            }
+        }
         Op::RecordRecallBatch(op) => {
             let ctx = crate::state::RetrievalContext {
                 centroid_q: op.centroid_q.clone(),

@@ -12,24 +12,35 @@ use crate::ops::{
 };
 use crate::recall::RecallHit;
 use serde_json;
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-/// Opaque handle. C code holds *mut CfHandle.
+// Thread-local last error, errno-style. Concurrent FFI calls on the same
+// CfHandle no longer race on a shared error slot; each thread reads its own.
+// Pointer returned by cf_last_error remains valid until the next FFI call
+// on the same thread overwrites it (same contract as errno / strerror).
+thread_local! {
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+}
+
+/// Opaque handle. C code holds *mut CfHandle, but the Rust side accesses it
+/// through shared references (`&*h`) so concurrent FFI calls are sound;
+/// interior mutability inside ChittaField (parking_lot RwLocks) protects the
+/// actual data.
 pub struct CfHandle {
     field: ChittaField,
-    last_error: Option<CString>,
 }
 
 impl CfHandle {
-    fn ok(&mut self) -> c_int {
-        self.last_error = None;
+    fn ok(&self) -> c_int {
+        LAST_ERROR.with(|le| *le.borrow_mut() = None);
         0
     }
-    fn err(&mut self, e: impl std::fmt::Display) -> c_int {
-        self.last_error = CString::new(e.to_string()).ok();
+    fn err(&self, e: impl std::fmt::Display) -> c_int {
+        LAST_ERROR.with(|le| *le.borrow_mut() = CString::new(e.to_string()).ok());
         -1
     }
 }
@@ -92,10 +103,7 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
         }
     };
     match ChittaField::open(data_dir) {
-        Ok(field) => Box::into_raw(Box::new(CfHandle {
-            field,
-            last_error: None,
-        })),
+        Ok(field) => Box::into_raw(Box::new(CfHandle { field })),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -108,16 +116,13 @@ pub extern "C" fn cf_close(h: *mut CfHandle) {
 }
 
 #[no_mangle]
-pub extern "C" fn cf_last_error(h: *const CfHandle) -> *const c_char {
-    if h.is_null() {
-        return std::ptr::null();
-    }
-    unsafe {
-        (*h).last_error
+pub extern "C" fn cf_last_error(_h: *const CfHandle) -> *const c_char {
+    LAST_ERROR.with(|le| {
+        le.borrow()
             .as_ref()
             .map(|s| s.as_ptr())
             .unwrap_or(std::ptr::null())
-    }
+    })
 }
 
 // ── Chain integrity ──────────────────────────────────────────────────────────
@@ -167,7 +172,7 @@ pub extern "C" fn cf_put_memory(
     if h.is_null() || out_memory_id.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let kind_str = unsafe {
         match CStr::from_ptr(kind).to_str() {
@@ -225,7 +230,7 @@ pub extern "C" fn cf_update_state(
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let strength_delta = if strength_delta.is_nan() {
         None
@@ -267,7 +272,7 @@ pub extern "C" fn cf_forget(h: *mut CfHandle, memory_id: u64) -> c_int {
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.forget(memory_id) {
         Ok(()) => handle.ok(),
         Err(e) => handle.err(e),
@@ -287,7 +292,7 @@ pub extern "C" fn cf_add_assoc_edge(
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let et = edge_type_from_u8(edge_type);
     match handle.field.add_assoc_edge(src, dst, et, weight) {
         Ok(()) => handle.ok(),
@@ -305,7 +310,7 @@ pub extern "C" fn cf_upsert_artifact(
     if h.is_null() || out_artifact_id.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let path_str = unsafe {
         match CStr::from_ptr(normalized_path).to_str() {
             Ok(s) => s,
@@ -368,7 +373,7 @@ pub extern "C" fn cf_recall_semantic(
     if h.is_null() || hits_buf.is_null() || hits_written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let embedding = unsafe { std::slice::from_raw_parts(query_embedding, embedding_len) };
     let realm_str = if realm.is_null() {
         None
@@ -408,7 +413,7 @@ pub extern "C" fn cf_recall_semantic_ctx(
     if h.is_null() || hits_buf.is_null() || hits_written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let embedding = unsafe { std::slice::from_raw_parts(query_embedding, embedding_len) };
     let realm_str = if realm.is_null() {
         None
@@ -446,7 +451,7 @@ pub extern "C" fn cf_recall_temporal(
     if h.is_null() || hits_buf.is_null() || hits_written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let realm_str = if realm.is_null() {
         None
     } else {
@@ -482,7 +487,7 @@ pub extern "C" fn cf_recall_artifact(
     if h.is_null() || normalized_path.is_null() || hits_buf.is_null() || hits_written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let path_str = unsafe {
         match CStr::from_ptr(normalized_path).to_str() {
             Ok(s) => s,
@@ -513,7 +518,7 @@ pub extern "C" fn cf_expand_associations(
     if h.is_null() || seed_ids.is_null() || hits_buf.is_null() || hits_written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let seeds = unsafe { std::slice::from_raw_parts(seed_ids, seed_count) };
 
     match handle.field.expand_associations(seeds, max_hops, limit) {
@@ -538,7 +543,7 @@ pub extern "C" fn cf_get_content(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     match handle.field.get_memory(memory_id) {
         Ok(payload) => {
@@ -567,7 +572,7 @@ pub extern "C" fn cf_get_kind(
     if h.is_null() || buf.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     match handle.field.get_memory(memory_id) {
         Ok(payload) => {
@@ -596,7 +601,7 @@ pub extern "C" fn cf_get_realm(
     if h.is_null() || buf.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     match handle.field.get_memory(memory_id) {
         Ok(payload) => {
@@ -626,7 +631,7 @@ pub extern "C" fn cf_recall_keyword(
     if h.is_null() || query.is_null() || hits_buf.is_null() || hits_written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let query_str = unsafe {
         match CStr::from_ptr(query).to_str() {
             Ok(s) => s,
@@ -669,7 +674,7 @@ pub extern "C" fn cf_invalidate_triplet(h: *mut CfHandle, triplet_id: u64) -> c_
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.invalidate_triplet(triplet_id) {
         Ok(()) => handle.ok(),
         Err(e) => handle.err(e),
@@ -684,7 +689,7 @@ pub extern "C" fn cf_select_route(
     out_episode_id: *mut u64, out_route: *mut u8,
 ) -> c_int {
     if h.is_null() || query.is_null() || out_episode_id.is_null() || out_route.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let q = unsafe { std::ffi::CStr::from_ptr(query) }.to_string_lossy();
     let (episode_id, route) = handle.field.select_route(&q);
     use crate::learner::route::Route;
@@ -707,7 +712,7 @@ pub extern "C" fn cf_route_feedback(
     h: *mut CfHandle, episode_id: u64, reward: f32,
 ) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.feedback(episode_id, reward) {
         Ok(()) => handle.ok(),
         Err(e) => handle.err(e),
@@ -720,7 +725,7 @@ pub extern "C" fn cf_forget_triplet(
     predicate: *const c_char, object: *const c_char,
 ) -> c_int {
     if h.is_null() || subject.is_null() || predicate.is_null() || object.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let s = unsafe { std::ffi::CStr::from_ptr(subject) }.to_string_lossy();
     let p = unsafe { std::ffi::CStr::from_ptr(predicate) }.to_string_lossy();
     let o = unsafe { std::ffi::CStr::from_ptr(object) }.to_string_lossy();
@@ -736,7 +741,7 @@ pub extern "C" fn cf_backfill_embedding(
     embedding_ptr: *const f32, embedding_len: usize,
 ) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let embedding = if embedding_ptr.is_null() || embedding_len == 0 {
         &[][..]
     } else {
@@ -753,7 +758,7 @@ pub extern "C" fn cf_pending_embeddings(
     h: *mut CfHandle, out_ids: *mut u64, max_ids: usize, out_count: *mut usize,
 ) -> c_int {
     if h.is_null() || out_ids.is_null() || out_count.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let ids = handle.field.pending_embeddings(max_ids);
     let n = ids.len().min(max_ids);
     unsafe {
@@ -818,7 +823,7 @@ pub extern "C" fn cf_query_subject(
     if h.is_null() || subject.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let subject_str = unsafe {
         match CStr::from_ptr(subject).to_str() {
             Ok(s) => s,
@@ -844,7 +849,7 @@ pub extern "C" fn cf_query_object(
     if h.is_null() || object.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let object_str = unsafe {
         match CStr::from_ptr(object).to_str() {
             Ok(s) => s,
@@ -870,7 +875,7 @@ pub extern "C" fn cf_query_entity(
     if h.is_null() || entity.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let entity_str = unsafe {
         match CStr::from_ptr(entity).to_str() {
             Ok(s) => s,
@@ -894,7 +899,7 @@ pub extern "C" fn cf_feedback(h: *mut CfHandle, episode_id: u64, reward: f32) ->
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.feedback(episode_id, reward) {
         Ok(()) => handle.ok(),
         Err(e) => handle.err(e),
@@ -929,7 +934,7 @@ pub extern "C" fn cf_sync_foreign(h: *mut CfHandle) -> c_int {
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.sync_foreign() {
         Ok(count) => count as c_int,
         Err(e) => handle.err(e),
@@ -942,7 +947,7 @@ pub extern "C" fn cf_flush(h: *mut CfHandle) -> c_int {
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.flush() {
         Ok(()) => handle.ok(),
         Err(e) => handle.err(e),
@@ -1040,7 +1045,7 @@ pub extern "C" fn cf_upsert_symbol(
     if h.is_null() || out_id.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     macro_rules! parse_str {
         ($ptr:expr) => {
@@ -1089,7 +1094,7 @@ pub extern "C" fn cf_remove_symbol(h: *mut CfHandle, symbol_id: u64) -> c_int {
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.remove_symbol(symbol_id) {
         Ok(()) => handle.ok(),
         Err(e) => handle.err(e),
@@ -1109,7 +1114,7 @@ pub extern "C" fn cf_search_symbols_by_name(
     if h.is_null() || query.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let query_str = match unsafe { CStr::from_ptr(query).to_str() } {
         Ok(s) => s,
         Err(e) => return handle.err(e),
@@ -1134,7 +1139,7 @@ pub extern "C" fn cf_search_symbols_semantic(
     if h.is_null() || query.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let emb = unsafe { std::slice::from_raw_parts(query, embed_len) };
 
     let scored = handle.field.search_symbols_semantic(emb, k);
@@ -1164,7 +1169,7 @@ pub extern "C" fn cf_symbols_in_file(
     if h.is_null() || file_path.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let path_str = match unsafe { CStr::from_ptr(file_path).to_str() } {
         Ok(s) => s,
         Err(e) => return handle.err(e),
@@ -1181,7 +1186,7 @@ pub extern "C" fn cf_add_sym_call_edge(h: *mut CfHandle, caller_id: u64, callee_
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.add_call_edge(caller_id, callee_id) {
         Ok(()) => handle.ok(),
         Err(e) => handle.err(e),
@@ -1200,7 +1205,7 @@ pub extern "C" fn cf_get_callees(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let ids = handle.field.get_callees(symbol_id);
     let n = ids.len().min(buf_len);
     for (i, &id) in ids.iter().take(n).enumerate() {
@@ -1226,7 +1231,7 @@ pub extern "C" fn cf_get_callers(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let ids = handle.field.get_callers(symbol_id);
     let n = ids.len().min(buf_len);
     for (i, &id) in ids.iter().take(n).enumerate() {
@@ -1254,7 +1259,7 @@ pub extern "C" fn cf_get_conflicts(
     if h.is_null() || out_ids.is_null() || out_count.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.get_conflicts(memory_id) {
         Ok(ids) => {
             let n = ids.len().min(max_ids);
@@ -1280,7 +1285,7 @@ pub extern "C" fn cf_get_supersession_chain(
     if h.is_null() || out_ids.is_null() || out_count.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.get_supersession_chain(memory_id) {
         Ok(ids) => {
             let n = ids.len().min(max_ids);
@@ -1306,7 +1311,7 @@ pub extern "C" fn cf_get_confirmations(
     if h.is_null() || out_ids.is_null() || out_count.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.get_confirmations(memory_id) {
         Ok(ids) => {
             let n = ids.len().min(max_ids);
@@ -1355,7 +1360,7 @@ pub extern "C" fn cf_upsert_code_file_v2(
     if h.is_null() || path.is_null() || project.is_null() || out_id.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let path_str = match unsafe { CStr::from_ptr(path).to_str() } {
         Ok(s) => s,
         Err(e) => return handle.err(e),
@@ -1406,7 +1411,7 @@ pub extern "C" fn cf_invalidate_triplets_by_source_file(
     if h.is_null() || source_file.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let sf_str = match unsafe { CStr::from_ptr(source_file).to_str() } {
         Ok(s) => s,
         Err(e) => return handle.err(e),
@@ -1434,7 +1439,7 @@ pub extern "C" fn cf_add_triplet_with_source(
     {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let subject_str = unsafe {
         match CStr::from_ptr(subject).to_str() {
@@ -1500,7 +1505,7 @@ pub extern "C" fn cf_encode_all(h: *mut CfHandle) -> usize {
     if h.is_null() {
         return 0;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.encode_all_unindexed() {
         Ok(n) => n,
         Err(e) => {
@@ -1535,7 +1540,7 @@ pub extern "C" fn cf_train_pq(h: *mut CfHandle) -> bool {
     if h.is_null() {
         return false;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     handle.field.train_pq().is_ok()
 }
 
@@ -1546,7 +1551,7 @@ pub extern "C" fn cf_encode_all_pq(h: *mut CfHandle) -> usize {
     if h.is_null() {
         return 0;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.encode_all_pq() {
         Ok(n) => n,
         Err(e) => {
@@ -1571,7 +1576,7 @@ pub extern "C" fn cf_save_snapshot(h: *mut CfHandle) -> bool {
     if h.is_null() {
         return false;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     handle.field.save_snapshot().is_ok()
 }
 
@@ -1582,7 +1587,7 @@ pub extern "C" fn cf_save_full_snapshot(h: *mut CfHandle) -> bool {
     if h.is_null() {
         return false;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     handle.field.save_full_snapshot().is_ok()
 }
 
@@ -1595,7 +1600,7 @@ pub extern "C" fn cf_train_lite_encoder(h: *mut CfHandle) -> i32 {
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.train_lite_encoder() {
         Ok(n) => n as i32,
         Err(e) => handle.err(e),
@@ -1609,7 +1614,7 @@ pub extern "C" fn cf_save_lite_encoder(h: *mut CfHandle) -> i32 {
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.save_lite_encoder() {
         Ok(()) => handle.ok(),
         Err(e) => handle.err(e),
@@ -1674,7 +1679,7 @@ pub extern "C" fn cf_run_demotion(h: *mut CfHandle, now_ms: i64) -> u64 {
     if h.is_null() {
         return 0;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.run_demotion_pass(now_ms) {
         Ok((demoted, deleted)) => (demoted as u64) | ((deleted as u64) << 32),
         Err(e) => {
@@ -1699,7 +1704,7 @@ pub extern "C" fn cf_iterate_log(
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let result = handle.field.log.write().replay(from_seqno, |seqno, op| {
         let json = serde_json::to_vec(&op).unwrap_or_default();
         callback(json.as_ptr(), json.len(), seqno, ctx);
@@ -1730,7 +1735,7 @@ pub extern "C" fn cf_emit_event(
     if h.is_null() || domain.is_null() || kind.is_null() || out_event_id.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let domain_str = unsafe {
         match CStr::from_ptr(domain).to_str() {
@@ -1920,7 +1925,7 @@ pub extern "C" fn cf_get_latest_event(
     {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let domain_str = unsafe {
         match CStr::from_ptr(domain).to_str() {
@@ -1988,7 +1993,7 @@ pub extern "C" fn cf_get_events_by_target(
     {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let domain_str = unsafe {
         match CStr::from_ptr(domain).to_str() {
@@ -2048,7 +2053,7 @@ pub extern "C" fn cf_get_events_by_domain_kind(
     if h.is_null() || domain.is_null() || kind.is_null() || out_buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let domain_str = unsafe {
         match CStr::from_ptr(domain).to_str() {
@@ -2097,7 +2102,7 @@ pub extern "C" fn cf_has_event(
     if h.is_null() || domain.is_null() || kind.is_null() || target.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let domain_str = unsafe { CStr::from_ptr(domain).to_str().unwrap_or("") };
     let kind_str   = unsafe { CStr::from_ptr(kind).to_str().unwrap_or("") };
     let target_str = unsafe { CStr::from_ptr(target).to_str().unwrap_or("") };
@@ -2118,7 +2123,7 @@ pub extern "C" fn cf_get_event_by_id(
     if h.is_null() || out_buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let registry = handle.field.msg_registry.read();
     let json_str = match registry.get_event_by_id(event_id) {
@@ -2155,7 +2160,7 @@ pub extern "C" fn cf_session_register(
     if h.is_null() || session_id.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let session_id_str = unsafe {
         match CStr::from_ptr(session_id).to_str() {
@@ -2218,7 +2223,7 @@ pub extern "C" fn cf_session_heartbeat(
     if h.is_null() || session_id.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let session_id_str = unsafe {
         match CStr::from_ptr(session_id).to_str() {
@@ -2259,7 +2264,7 @@ pub extern "C" fn cf_session_deregister(
     if h.is_null() || session_id.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let session_id_str = unsafe {
         match CStr::from_ptr(session_id).to_str() {
@@ -2302,7 +2307,7 @@ pub extern "C" fn cf_transcript_register(
     if h.is_null() || transcript_id.is_null() || session_id.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let transcript_id_str = unsafe {
         match CStr::from_ptr(transcript_id).to_str() {
@@ -2357,7 +2362,7 @@ pub extern "C" fn cf_transcript_update_progress(
     if h.is_null() || transcript_id.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let transcript_id_str = unsafe {
         match CStr::from_ptr(transcript_id).to_str() {
@@ -2425,7 +2430,7 @@ pub extern "C" fn cf_transcript_add_turn(
     if h.is_null() || transcript_id.is_null() || out_turn_id.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let transcript_id_str = unsafe {
         match CStr::from_ptr(transcript_id).to_str() {
@@ -2515,7 +2520,7 @@ pub extern "C" fn cf_task_create(
     if h.is_null() || task_id.is_null() || kind.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let task_id_str = unsafe {
         match CStr::from_ptr(task_id).to_str() {
@@ -2578,7 +2583,7 @@ pub extern "C" fn cf_task_transition(
     if h.is_null() || task_id.is_null() || new_status.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let task_id_str = unsafe {
         match CStr::from_ptr(task_id).to_str() {
@@ -2646,7 +2651,7 @@ pub extern "C" fn cf_task_list(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let filter_str = if kind_filter.is_null() {
         None
@@ -2724,7 +2729,7 @@ pub extern "C" fn cf_user_model_upsert(
     if h.is_null() || entity_id.is_null() || entity_type.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let entity_id_str = unsafe {
         match CStr::from_ptr(entity_id).to_str() {
@@ -2781,7 +2786,7 @@ pub extern "C" fn cf_user_model_observe(
     if h.is_null() || entity_id.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let entity_id_str = unsafe {
         match CStr::from_ptr(entity_id).to_str() {
@@ -2826,7 +2831,7 @@ pub extern "C" fn cf_user_model_list(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let filter_str = if entity_type_filter.is_null() {
         None
@@ -2884,7 +2889,7 @@ pub extern "C" fn cf_theme_create(h: *mut CfHandle, theme_id: u64, name: *const 
     if h.is_null() || name.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let name_str = unsafe {
         match CStr::from_ptr(name).to_str() {
@@ -2927,7 +2932,7 @@ pub extern "C" fn cf_theme_update_centroid(
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let centroid_str = if centroid_json.is_null() || centroid_len == 0 {
         String::new()
@@ -2967,7 +2972,7 @@ pub extern "C" fn cf_theme_assign_member(h: *mut CfHandle, theme_id: u64, memory
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let payload = serde_json::json!({ "memory_id": memory_id }).to_string();
     let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
@@ -2997,7 +3002,7 @@ pub extern "C" fn cf_theme_remove_member(h: *mut CfHandle, theme_id: u64, memory
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let payload = serde_json::json!({ "memory_id": memory_id }).to_string();
     let event_id = handle.field.event_id_alloc.fetch_add(1, Ordering::Relaxed);
@@ -3034,7 +3039,7 @@ pub extern "C" fn cf_theme_list(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let json_val: Vec<serde_json::Value> = {
         let organ = handle.field.theme_organ.read();
@@ -3079,7 +3084,7 @@ pub extern "C" fn cf_theme_get(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let theme_val = {
         let organ = handle.field.theme_organ.read();
@@ -3125,7 +3130,7 @@ pub extern "C" fn cf_theme_stats(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let realm_str = if realm.is_null() {
         ""
@@ -3182,7 +3187,7 @@ pub extern "C" fn cf_theme_recall(
     if h.is_null() || embedding_ptr.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let embedding = unsafe { std::slice::from_raw_parts(embedding_ptr, embedding_len) };
 
@@ -3240,7 +3245,7 @@ pub extern "C" fn cf_theme_maintain(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let embeddings: std::collections::HashMap<u64, Vec<f32>> = {
         let payloads = handle.field.payloads.read();
@@ -3285,7 +3290,7 @@ pub extern "C" fn cf_theme_assign_orphans(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let realm_str: String = if realm.is_null() {
         String::new()
@@ -3356,7 +3361,7 @@ pub extern "C" fn cf_analytics_append(
     if h.is_null() || kind.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let kind_str = unsafe {
         match CStr::from_ptr(kind).to_str() {
@@ -3419,7 +3424,7 @@ pub extern "C" fn cf_analytics_recent(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let json_val: Vec<serde_json::Value> = {
         let registry = handle.field.analytics_registry.read();
@@ -3487,7 +3492,7 @@ pub extern "C" fn cf_recall_filtered(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let kind_filter = if kind.is_null() {
         None
@@ -3588,7 +3593,7 @@ pub extern "C" fn cf_list_memories(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let kind_filter = if kind.is_null() {
         None
@@ -3714,7 +3719,7 @@ pub extern "C" fn cf_memory_stats(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let realm_str = if realm_filter.is_null() {
         None
@@ -3801,7 +3806,7 @@ pub extern "C" fn cf_spectral_stats_by_realm(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = handle.field.spectral_stats_by_realm();
     write_json_buf(&json_str, buf, buf_cap, written)
 }
@@ -3818,7 +3823,7 @@ pub extern "C" fn cf_save_spectral_snapshot(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.save_spectral_snapshot() {
         Ok(filename) => write_json_buf(&format!("\"{}\"", filename), buf, buf_cap, written),
         Err(e) => handle.err(e),
@@ -3836,7 +3841,7 @@ pub extern "C" fn cf_spectral_drift(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = handle.field.spectral_drift();
     write_json_buf(&json_str, buf, buf_cap, written)
 }
@@ -3847,7 +3852,7 @@ pub extern "C" fn cf_trim_realm_names(h: *mut CfHandle) -> i64 {
     if h.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     handle.field.trim_realm_names() as i64
 }
 
@@ -3864,7 +3869,7 @@ pub extern "C" fn cf_task_get(
     if h.is_null() || task_id.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let task_id_str = unsafe {
         match CStr::from_ptr(task_id).to_str() {
@@ -3906,7 +3911,7 @@ pub extern "C" fn cf_task_update_payload(
     if h.is_null() || task_id.is_null() || payload_json.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let task_id_str = unsafe {
         match CStr::from_ptr(task_id).to_str() {
@@ -3983,7 +3988,7 @@ pub extern "C" fn cf_session_list(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let json_val: Vec<serde_json::Value> = {
         let registry = handle.field.session_registry.read();
@@ -4027,7 +4032,7 @@ pub extern "C" fn cf_transcript_list(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let json_val: Vec<serde_json::Value> = {
         let registry = handle.field.transcript_registry.read();
@@ -4071,7 +4076,7 @@ pub extern "C" fn cf_get_memory_metadata(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -4140,7 +4145,7 @@ pub extern "C" fn cf_set_realm(
     if h.is_null() || new_realm.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let realm_str = unsafe {
         match CStr::from_ptr(new_realm).to_str() {
             Ok(s) => s.to_string(),
@@ -4182,7 +4187,7 @@ pub extern "C" fn cf_update_memory_kind(
     if h.is_null() || new_kind.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let kind_str = unsafe {
         match CStr::from_ptr(new_kind).to_str() {
@@ -4193,6 +4198,17 @@ pub extern "C" fn cf_update_memory_kind(
             }
         }
     };
+
+    // Log first for durability — without this, kind changes are lost on
+    // crash between mutation and snapshot.
+    let op = crate::ops::Op::UpdateMemoryKind(crate::ops::UpdateMemoryKindOp {
+        memory_id,
+        new_kind: kind_str.to_string(),
+    });
+    let log_result = handle.field.log.write().append(&op);
+    if let Err(e) = log_result {
+        return handle.err(e);
+    }
 
     let mut payloads = handle.field.payloads.write();
     match payloads.get_mut(&memory_id) {
@@ -4224,7 +4240,7 @@ pub extern "C" fn cf_list_triplets_for_entity(
     if h.is_null() || entity.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     let entity_str = unsafe {
         match CStr::from_ptr(entity).to_str() {
@@ -4255,7 +4271,7 @@ pub extern "C" fn cf_list_code_files(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let project = if project_filter.is_null() {
         None
     } else {
@@ -4299,7 +4315,7 @@ pub extern "C" fn cf_clear_project(h: *mut CfHandle, project: *const c_char) -> 
     if h.is_null() || project.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let project_str = unsafe {
         match CStr::from_ptr(project).to_str() {
             Ok(s) => s.to_string(),
@@ -4341,7 +4357,7 @@ pub extern "C" fn cf_set_symbol_description(
     if h.is_null() || description.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let desc = match unsafe {
         std::str::from_utf8(std::slice::from_raw_parts(
             description as *const u8,
@@ -4385,7 +4401,7 @@ pub extern "C" fn cf_update_memory_content(
     if h.is_null() || content.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let new_content = unsafe { std::slice::from_raw_parts(content, content_len) }.to_vec();
     let new_embedding: Vec<f32> = if embedding.is_null() || embedding_len == 0 {
         Vec::new()
@@ -4442,7 +4458,7 @@ pub extern "C" fn cf_realm_list(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let payloads = handle.field.payloads.read();
     let states = handle.field.states.read();
     let mut realms: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4478,7 +4494,7 @@ pub extern "C" fn cf_recall_by_kind(
     if h.is_null() || kind.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let kind_str = unsafe {
         match CStr::from_ptr(kind).to_str() {
             Ok(s) => s.to_string(),
@@ -4545,7 +4561,7 @@ pub extern "C" fn cf_purge_corrupt(h: *mut CfHandle, out_purged: *mut usize) -> 
     if h.is_null() || out_purged.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let to_purge: Vec<u64> = {
         let payloads = handle.field.payloads.read();
         let states = handle.field.states.read();
@@ -4640,7 +4656,7 @@ pub unsafe extern "C" fn cf_record_recall_batch(
     if handle.is_null() || ids.is_null() {
         return -1;
     }
-    let h = &mut *handle;
+    let h = &*handle;
     let id_slice = std::slice::from_raw_parts(ids, ids_len);
     // centroid_q is optional: null/zero-len → empty slice
     let cq_slice: &[i8] = if centroid_q.is_null() || centroid_q_len == 0 {
@@ -4724,7 +4740,7 @@ pub extern "C" fn cf_get_assoc_edges(
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
 
     fn et_u8(et: &crate::ops::EdgeType) -> u8 {
         match et {
@@ -5722,7 +5738,7 @@ mod tests {
 #[no_mangle]
 pub extern "C" fn cf_set_memory_status(h: *mut CfHandle, memory_id: u64, status: u8) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     use crate::state::MemoryStatus;
     let s = match status {
         1 => MemoryStatus::Superseded,
@@ -5743,7 +5759,7 @@ pub extern "C" fn cf_set_memory_status(h: *mut CfHandle, memory_id: u64, status:
 #[no_mangle]
 pub extern "C" fn cf_set_epistemic_status(h: *mut CfHandle, memory_id: u64, es: u8) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     use crate::state::EpistemicStatus;
     let status = match es {
         0 => EpistemicStatus::UserStated,
@@ -5761,7 +5777,7 @@ pub extern "C" fn cf_set_epistemic_status(h: *mut CfHandle, memory_id: u64, es: 
 #[no_mangle]
 pub extern "C" fn cf_set_affect(h: *mut CfHandle, memory_id: u64, valence: f32, arousal: f32) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.set_affect(memory_id, valence, arousal) {
         Ok(()) => handle.ok(),
         Err(e) => handle.err(e),
@@ -5773,7 +5789,7 @@ pub extern "C" fn cf_set_affect(h: *mut CfHandle, memory_id: u64, valence: f32, 
 #[no_mangle]
 pub extern "C" fn cf_compact_wal(h: *mut CfHandle) -> i64 {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.compact_wal() {
         Ok(n) => n as i64,
         Err(e) => { handle.err(e); -1 }
@@ -5787,7 +5803,7 @@ pub extern "C" fn cf_compact_wal(h: *mut CfHandle) -> i64 {
 #[no_mangle]
 pub extern "C" fn cf_reload_scoring_config(h: *mut CfHandle) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let config = crate::scoring::config::ScoringConfig::load(&handle.field.data_dir);
     handle.field.scoring_pipeline.write().reload_config(config);
     0
@@ -5907,7 +5923,7 @@ pub extern "C" fn cf_hopfield_co_retrieval(
     ts_ms: i64,
 ) -> c_int {
     if h.is_null() || ids.is_null() || count == 0 { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let id_slice = unsafe { std::slice::from_raw_parts(ids, count) };
     handle.field.hopfield.write().record_co_retrieval(id_slice, ts_ms);
     0
@@ -5931,7 +5947,7 @@ pub extern "C" fn cf_hopfield_stats(h: *const CfHandle) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn cf_adapt_vigilance(h: *mut CfHandle, avg_error: f32) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     handle.field.cortical_idx.write().adapt_vigilance(avg_error);
     0
 }
@@ -5951,7 +5967,7 @@ pub extern "C" fn cf_skill_upload(
     if h.is_null() || skill_id.is_null() || content.is_null() {
         return -1;
     }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let skill_id_str = unsafe { match CStr::from_ptr(skill_id).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
     let content_str = unsafe { match CStr::from_ptr(content).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
     let uploaded_by_str = if uploaded_by.is_null() { "" } else {
@@ -6035,7 +6051,7 @@ pub extern "C" fn cf_skill_deprecate(
     skill_id: *const c_char,
 ) -> c_int {
     if h.is_null() || skill_id.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let skill_id_str = unsafe { match CStr::from_ptr(skill_id).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
     let op = Op::SkillDeprecate(SkillDeprecateOp { skill_id: skill_id_str.to_string() });
     let result = handle.field.log.write().append(&op);
@@ -6057,7 +6073,7 @@ pub extern "C" fn cf_agent_upsert(
     ts_ms: i64,
 ) -> c_int {
     if h.is_null() || agent_id.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let agent_id_str = unsafe { match CStr::from_ptr(agent_id).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
     let name_str = if display_name.is_null() { "" } else {
         unsafe { match CStr::from_ptr(display_name).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } }
@@ -6088,7 +6104,7 @@ pub extern "C" fn cf_agent_record_activity(
     ts_ms: i64,
 ) -> c_int {
     if h.is_null() || agent_id.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let agent_id_str = unsafe { match CStr::from_ptr(agent_id).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
     handle.field.agent_registry.write().record_activity(agent_id_str, ts_ms);
     handle.ok()
@@ -6102,7 +6118,7 @@ pub extern "C" fn cf_agent_record_session(
     ts_ms: i64,
 ) -> c_int {
     if h.is_null() || agent_id.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let agent_id_str = unsafe { match CStr::from_ptr(agent_id).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
     handle.field.agent_registry.write().record_session(agent_id_str, ts_ms);
     handle.ok()
@@ -6145,7 +6161,7 @@ pub extern "C" fn cf_agent_disable(
     agent_id: *const c_char,
 ) -> c_int {
     if h.is_null() || agent_id.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let agent_id_str = unsafe { match CStr::from_ptr(agent_id).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
     let op = Op::AgentDisable(AgentDisableOp { agent_id: agent_id_str.to_string() });
     let result = handle.field.log.write().append(&op);
@@ -6163,7 +6179,7 @@ pub extern "C" fn cf_assert_constraint(
     params_json: *const c_char,
 ) -> *mut c_char {
     if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
     let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
 
@@ -6199,7 +6215,7 @@ pub extern "C" fn cf_assert_constraint(
 #[no_mangle]
 pub extern "C" fn cf_retract_constraint(h: *mut CfHandle, fact_id: u64) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.retract_constraint(fact_id) {
         Ok(true) => handle.ok(),
         Ok(false) => handle.err("fact not found"),
@@ -6266,7 +6282,7 @@ pub extern "C" fn cf_create_constraint_branch(
     h: *mut CfHandle, parent_id: u64, scope: *const c_char,
 ) -> i64 {
     if h.is_null() || scope.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let scope_str = unsafe { match CStr::from_ptr(scope).to_str() { Ok(s) => s.to_string(), Err(_) => return -1 } };
     match handle.field.create_constraint_branch(parent_id, scope_str) {
         Ok(id) => id as i64,
@@ -6279,7 +6295,7 @@ pub extern "C" fn cf_resolve_constraint_branch(
     h: *mut CfHandle, winner_id: u64, loser_id: u64,
 ) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.resolve_constraint_branch(winner_id, loser_id) {
         Ok(true) => handle.ok(),
         Ok(false) => handle.err("branch not found"),
@@ -6294,7 +6310,7 @@ pub extern "C" fn cf_add_trigger(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> i64 {
     if h.is_null() || params_json.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return -1 } };
     let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return -1 };
 
@@ -6320,7 +6336,7 @@ pub extern "C" fn cf_add_trigger(
 #[no_mangle]
 pub extern "C" fn cf_fire_trigger(h: *mut CfHandle, trigger_id: u64) -> *mut c_char {
     if h.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.fire_trigger(trigger_id) {
         Ok(Some(result)) => {
             let json = serde_json::json!({
@@ -6336,7 +6352,7 @@ pub extern "C" fn cf_fire_trigger(h: *mut CfHandle, trigger_id: u64) -> *mut c_c
 #[no_mangle]
 pub extern "C" fn cf_dismiss_trigger(h: *mut CfHandle, trigger_id: u64) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.dismiss_trigger(trigger_id) {
         Ok(true) => handle.ok(),
         Ok(false) => handle.err("trigger not found or not armed"),
@@ -6356,7 +6372,7 @@ pub extern "C" fn cf_list_triggers(h: *const CfHandle) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn cf_evaluate_triggers(h: *mut CfHandle) -> *mut c_char {
     if h.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.evaluate_triggers() {
         Ok(results) => {
             let json = serde_json::json!(results.iter().map(|r| serde_json::json!({
@@ -6384,7 +6400,7 @@ pub extern "C" fn cf_predict_needed(h: *const CfHandle, k: usize) -> *mut c_char
 #[no_mangle]
 pub extern "C" fn cf_retrain_predictor(h: *mut CfHandle) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     handle.field.retrain_predictor();
     handle.ok()
 }
@@ -6417,7 +6433,7 @@ pub extern "C" fn cf_record_surprise(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
     if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
     let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
 
@@ -6500,7 +6516,7 @@ pub extern "C" fn cf_register_debt(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
     if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
     let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
 
@@ -6532,7 +6548,7 @@ pub extern "C" fn cf_resolve_debt(
     h: *mut CfHandle, debt_id: u64, resolution_json: *const c_char,
 ) -> c_int {
     if h.is_null() || resolution_json.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let resolution = unsafe { match CStr::from_ptr(resolution_json).to_str() { Ok(s) => s.to_string(), Err(_) => return -1 } };
     match handle.field.resolve_debt(debt_id, resolution) {
         Ok(true) => handle.ok(),
@@ -6544,7 +6560,7 @@ pub extern "C" fn cf_resolve_debt(
 #[no_mangle]
 pub extern "C" fn cf_defer_debt(h: *mut CfHandle, debt_id: u64) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.defer_debt(debt_id) {
         Ok(true) => handle.ok(),
         Ok(false) => handle.err("debt not found"),
@@ -6615,7 +6631,7 @@ pub extern "C" fn cf_record_feedback(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
     if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
     let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
 
@@ -6658,7 +6674,7 @@ pub extern "C" fn cf_update_source_weight(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> c_int {
     if h.is_null() || params_json.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return -1 } };
     let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return -1 };
 
@@ -6707,7 +6723,7 @@ pub extern "C" fn cf_upsert_wisdom_candidate(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
     if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
         Ok(s) => s, Err(_) => return std::ptr::null_mut()
     }};
@@ -6746,7 +6762,7 @@ pub extern "C" fn cf_update_wisdom_lifecycle(
     h: *mut CfHandle, candidate_id: u64, new_state: u8,
 ) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let lifecycle = crate::organ::wisdom_promotion::WisdomLifecycle::from_u8(new_state);
     match handle.field.update_wisdom_lifecycle(candidate_id, lifecycle, None, 0) {
         Ok(true) => 0,
@@ -6791,7 +6807,7 @@ pub extern "C" fn cf_attach_debt_evidence(
     h: *mut CfHandle, debt_id: u64, evidence_json: *const c_char,
 ) -> c_int {
     if h.is_null() || evidence_json.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(evidence_json).to_str() {
         Ok(s) => s, Err(_) => return -1
     }};
@@ -6814,7 +6830,7 @@ pub extern "C" fn cf_update_scorer_model(
     h: *mut CfHandle, model_json: *const c_char,
 ) -> c_int {
     if h.is_null() || model_json.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(model_json).to_str() {
         Ok(s) => s, Err(_) => return -1
     }};
@@ -6868,7 +6884,7 @@ pub extern "C" fn cf_start_intervention(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
     if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
         Ok(s) => s, Err(_) => return std::ptr::null_mut()
     }};
@@ -6908,7 +6924,7 @@ pub extern "C" fn cf_add_observation(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
     if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
         Ok(s) => s, Err(_) => return std::ptr::null_mut()
     }};
@@ -6938,7 +6954,7 @@ pub extern "C" fn cf_close_intervention(
     h: *mut CfHandle, intervention_id: u64, status: u8,
 ) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     use crate::organ::intervention::InterventionStatus;
     match handle.field.close_intervention(intervention_id, InterventionStatus::from_u8(status)) {
         Ok(true) => 0,
@@ -6952,7 +6968,7 @@ pub extern "C" fn cf_record_attribution(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> c_int {
     if h.is_null() || params_json.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
         Ok(s) => s, Err(_) => return -1
     }};
@@ -7044,7 +7060,7 @@ pub extern "C" fn cf_close_stale_interventions(
     h: *mut CfHandle, threshold_ms: i64,
 ) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     match handle.field.close_stale_interventions(threshold_ms) {
         Ok(count) => count as c_int,
         Err(_) => -1,
@@ -7054,7 +7070,7 @@ pub extern "C" fn cf_close_stale_interventions(
 #[no_mangle]
 pub extern "C" fn cf_auto_resolve_debts(h: *mut CfHandle, threshold: f32) -> *mut c_char {
     if h.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let resolved = handle.field.auto_resolve_debts(threshold).unwrap_or(0);
     let json = serde_json::json!({ "resolved_count": resolved });
     CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
@@ -7067,7 +7083,7 @@ pub extern "C" fn cf_register_task(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
     if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
         Ok(s) => s, Err(_) => return std::ptr::null_mut()
     }};
@@ -7106,7 +7122,7 @@ pub extern "C" fn cf_update_task(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> c_int {
     if h.is_null() || params_json.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
         Ok(s) => s, Err(_) => return -1
     }};
@@ -7129,7 +7145,7 @@ pub extern "C" fn cf_add_delegation(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
     if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
         Ok(s) => s, Err(_) => return std::ptr::null_mut()
     }};
@@ -7154,7 +7170,7 @@ pub extern "C" fn cf_link_evidence(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
     if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
         Ok(s) => s, Err(_) => return std::ptr::null_mut()
     }};
@@ -7180,7 +7196,7 @@ pub extern "C" fn cf_add_probe(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
     if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
         Ok(s) => s, Err(_) => return std::ptr::null_mut()
     }};
@@ -7205,7 +7221,7 @@ pub extern "C" fn cf_resolve_probe(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> c_int {
     if h.is_null() || params_json.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
         Ok(s) => s, Err(_) => return -1
     }};
@@ -7227,7 +7243,7 @@ pub extern "C" fn cf_set_criterion(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
     if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
         Ok(s) => s, Err(_) => return std::ptr::null_mut()
     }};
@@ -7298,7 +7314,7 @@ pub extern "C" fn cf_agent_protocol_stats(h: *const CfHandle) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn cf_auto_complete_tasks(h: *mut CfHandle) -> *mut c_char {
     if h.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let completed = handle.field.auto_complete_tasks().unwrap_or(0);
     let json = serde_json::json!({ "completed_count": completed });
     CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
@@ -7311,7 +7327,7 @@ pub extern "C" fn cf_enroll_wisdom_lineage(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
     if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let s = unsafe { match CStr::from_ptr(params_json).to_str() {
         Ok(s) => s, Err(_) => return std::ptr::null_mut()
     }};
@@ -7347,7 +7363,7 @@ pub extern "C" fn cf_transition_wisdom_lineage(
     reason: *const c_char, task_id: u64,
 ) -> c_int {
     if h.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let reason_str = if reason.is_null() { "manual".to_string() } else {
         unsafe { CStr::from_ptr(reason).to_str().unwrap_or("manual").to_string() }
     };
@@ -7364,7 +7380,7 @@ pub extern "C" fn cf_close_rederive(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> c_int {
     if h.is_null() || params_json.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let s = unsafe { match CStr::from_ptr(params_json).to_str() {
         Ok(s) => s, Err(_) => return -1
     }};
@@ -7431,7 +7447,7 @@ pub extern "C" fn cf_wisdom_lineage_stats(h: *const CfHandle) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn cf_tick_lineage_staleness(h: *mut CfHandle) -> *mut c_char {
     if h.is_null() { return std::ptr::null_mut(); }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let ids = handle.field.tick_lineage_staleness().unwrap_or_default();
     let count = ids.len();
     let json = serde_json::json!({ "transitioned_ids": ids, "count": count });
@@ -7475,7 +7491,7 @@ pub extern "C" fn cf_repl_session_set(
     updated_ms: i64,
 ) -> c_int {
     if h.is_null() || session_id.is_null() || namespace_json.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let id_str = unsafe { match CStr::from_ptr(session_id).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
     let ns_str = unsafe { match CStr::from_ptr(namespace_json).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
     handle.field.repl_session_set(id_str, ns_str, updated_ms);
@@ -7489,7 +7505,7 @@ pub extern "C" fn cf_repl_session_delete(
     session_id: *const c_char,
 ) -> c_int {
     if h.is_null() || session_id.is_null() { return -1; }
-    let handle = unsafe { &mut *h };
+    let handle = unsafe { &*h };
     let id_str = unsafe { match CStr::from_ptr(session_id).to_str() { Ok(e) => e, Err(e) => return handle.err(e) } };
     if handle.field.repl_session_delete(id_str) { 1 } else { 0 }
 }

@@ -63,6 +63,7 @@ use crate::ops::{
     OP_UPSERT_WISDOM_LINEAGE, OP_ADJUDICATE_LINEAGE, OP_TRANSITION_LINEAGE,
     OP_RECORD_CHALLENGER, OP_CLOSE_REDERIVE,
     OP_INVALIDATE_TRIPLETS_BY_SOURCE_FILE,
+    OP_UPDATE_MEMORY_KIND,
 };
 
 fn op_type_byte(op: &Op) -> u8 {
@@ -133,6 +134,7 @@ fn op_type_byte(op: &Op) -> u8 {
         Op::RecordChallenger(_) => OP_RECORD_CHALLENGER,
         Op::CloseRederive(_) => OP_CLOSE_REDERIVE,
         Op::InvalidateTripletsBySourceFile(_) => OP_INVALIDATE_TRIPLETS_BY_SOURCE_FILE,
+        Op::UpdateMemoryKind(_) => OP_UPDATE_MEMORY_KIND,
     }
 }
 
