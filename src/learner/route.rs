@@ -68,24 +68,19 @@ impl RouteLearner {
             Route::Attractor,
         ];
         let seed = now_ms ^ (self.next_episode_id * 2654435761);
-
-        let best = routes
-            .iter()
-            .max_by(|a, b| {
-                let sa = self
-                    .arms
-                    .entry((intent.clone(), (*a).clone()))
-                    .or_insert(BetaPrior::new())
-                    .sample(seed);
-                let sb = self
-                    .arms
-                    .entry((intent.clone(), (*b).clone()))
-                    .or_insert(BetaPrior::new())
-                    .sample(seed.wrapping_add(1));
-                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .unwrap()
-            .clone();
+        let mut best = Route::Hybrid;
+        let mut best_score = f64::NEG_INFINITY;
+        for (i, route) in routes.iter().enumerate() {
+            let score = self
+                .arms
+                .entry((intent.clone(), route.clone()))
+                .or_insert(BetaPrior::new())
+                .sample(seed.wrapping_add((i as u64) * 7919));
+            if score > best_score {
+                best_score = score;
+                best = route.clone();
+            }
+        }
 
         let episode_id = self.next_episode_id;
         self.next_episode_id += 1;
