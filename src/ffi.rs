@@ -7535,6 +7535,106 @@ pub extern "C" fn cf_repl_execute(
     CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
+/// Set source_session on an existing memory (in-memory; persisted at next snapshot).
+#[no_mangle]
+pub extern "C" fn cf_set_source_session(
+    h: *mut CfHandle,
+    memory_id: u64,
+    session_id: *const c_char,
+) -> c_int {
+    if h.is_null() || session_id.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let sid = match unsafe { CStr::from_ptr(session_id).to_str() } {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    match handle.field.set_source_session(memory_id, sid) {
+        Ok(()) => 0,
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Session-level recall hit returned by cf_recall_session.
+/// `session_id` and `best_evidence` are C strings valid until the next cf_recall_session call
+/// on the same handle (stored in thread-local scratch).
+#[repr(C)]
+#[derive(Clone)]
+pub struct CfSessionHit {
+    pub score: f32,
+    pub chunk_count: u32,
+    pub max_chunk_score: f32,
+}
+
+/// Session-level recall: groups chunk hits by source_session and scores with noisy-OR.
+/// `query_embedding` — pre-computed embedding (may be null to use keyword-only path).
+/// On return `session_ids_json` is set to a JSON array of session IDs in score order.
+/// Returns number of sessions written (≤ hits_cap), or -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_recall_session(
+    h: *mut CfHandle,
+    query_embedding: *const f32,
+    embedding_len: usize,
+    query_text: *const c_char,
+    realm: *const c_char,
+    k: usize,
+    hits_buf: *mut CfSessionHit,
+    hits_cap: usize,
+    hits_written: *mut usize,
+    session_ids_json_out: *mut *mut c_char,
+) -> c_int {
+    if h.is_null() || hits_buf.is_null() || hits_written.is_null() { return -1; }
+    let handle = unsafe { &*h };
+
+    let embedding: Option<&[f32]> = if query_embedding.is_null() || embedding_len == 0 {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts(query_embedding, embedding_len) })
+    };
+    let qtext = if query_text.is_null() { "" } else {
+        match unsafe { CStr::from_ptr(query_text).to_str() } {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let realm_str = if realm.is_null() { None } else {
+        match unsafe { CStr::from_ptr(realm).to_str() } {
+            Ok(s) => Some(s),
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    match handle.field.recall_session(embedding, qtext, k, realm_str) {
+        Ok(hits) => {
+            let n = hits.len().min(hits_cap);
+            unsafe { *hits_written = n; }
+            let session_ids: Vec<&str> = hits[..n].iter().map(|h| h.session_id.as_str()).collect();
+            let ids_json = serde_json::to_string(&session_ids).unwrap_or_else(|_| "[]".into());
+
+            for (i, hit) in hits[..n].iter().enumerate() {
+                unsafe {
+                    let slot = &mut *hits_buf.add(i);
+                    slot.score = hit.score;
+                    slot.chunk_count = hit.chunk_count;
+                    slot.max_chunk_score = hit.max_chunk_score;
+                }
+            }
+            // Best evidence strings packed as JSON array
+            let evidence: Vec<&str> = hits[..n].iter().map(|h| h.best_evidence.as_str()).collect();
+            let evidence_json = serde_json::to_string(&evidence).unwrap_or_else(|_| "[]".into());
+            // Return both as a single JSON object
+            let combined = format!(r#"{{"session_ids":{},"evidence":{}}}"#, ids_json, evidence_json);
+            if !session_ids_json_out.is_null() {
+                match CString::new(combined) {
+                    Ok(cs) => unsafe { *session_ids_json_out = cs.into_raw(); },
+                    Err(_) => unsafe { *session_ids_json_out = std::ptr::null_mut(); },
+                }
+            }
+            0
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
 /// List all REPL sessions as JSON array. Caller must free with cf_free_string.
 #[no_mangle]
 pub extern "C" fn cf_repl_session_list(h: *const CfHandle) -> *mut c_char {

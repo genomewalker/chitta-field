@@ -407,3 +407,26 @@ impl ScoringFactor for IntegrationWeightFactor {
         Some(factor)
     }
 }
+
+pub struct RareEntityFactor;
+
+impl ScoringFactor for RareEntityFactor {
+    fn name(&self) -> &'static str { "rare_entity" }
+
+    fn compute(
+        &self,
+        ctx: &ScoringContext,
+        config: &ScoringConfig,
+        decomp: &mut ScoreDecomposition,
+    ) -> Option<f32> {
+        if ctx.max_query_idf <= 0.0 {
+            decomp.rare_entity_boost = 1.0;
+            return Some(1.0);
+        }
+        // Normalize: IDF for a hapax in a 20k+ corpus ≈ ln(20000) ≈ 9.9; cap at 10
+        let normalized = (ctx.max_query_idf / 10.0).min(1.0);
+        let boost = 1.0 + config.rare_entity_weight * normalized;
+        decomp.rare_entity_boost = boost;
+        Some(boost)
+    }
+}

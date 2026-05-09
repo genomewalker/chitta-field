@@ -35,6 +35,8 @@ pub struct ScoringContext<'a> {
     pub integration_weight: Option<f32>,
     /// Cumulative ack/nack score for this memory (positive = proven useful, negative = stale/wrong).
     pub ack_score: i32,
+    /// Max IDF of query tokens that appear in the keyword index — rare-entity signal.
+    pub max_query_idf: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +68,7 @@ pub struct ScoreDecomposition {
     pub surprise_domain_factor: f32,
     pub epistemic_debt_factor: f32,
     pub integration_weight_factor: f32,
+    pub rare_entity_boost: f32,
 }
 
 /// A single scoring factor in the pipeline.
@@ -114,6 +117,7 @@ impl ScoringPipeline {
             Box::new(EpistemicDebtFactor),
             Box::new(IntegrationWeightFactor),
             Box::new(AckScoreFactor),
+            Box::new(RareEntityFactor),
         ];
         Self { factors, config }
     }

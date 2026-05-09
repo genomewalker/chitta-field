@@ -186,6 +186,21 @@ impl KeywordIndex {
         terms.truncate(MAX_QUERY_TERMS);
         terms
     }
+
+    /// IDF for a single term (BM25 variant). Returns 0.0 if term not in index.
+    pub fn token_idf(&self, term: &str) -> f32 {
+        if self.total_docs == 0 { return 0.0; }
+        let df = self.postings.get(term).map(|p| p.len()).unwrap_or(0);
+        if df == 0 { return 0.0; }
+        let n = self.total_docs as f32;
+        ((n - df as f32 + 0.5) / (df as f32 + 0.5) + 1.0).ln()
+    }
+
+    /// Max IDF across all query tokens. Useful as a rare-entity signal for scoring.
+    pub fn query_max_idf(&self, query: &str) -> f32 {
+        let terms = dedup_terms(tokenize(query));
+        terms.iter().map(|t| self.token_idf(t)).fold(0.0f32, f32::max)
+    }
 }
 
 fn tokenize(text: &str) -> Vec<String> {

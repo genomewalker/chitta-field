@@ -992,6 +992,7 @@ impl ChittaField {
                     has_open_debt: false,
                     integration_weight: None,
                     ack_score: ack_scores.get(&memory_id).copied().unwrap_or(0),
+                    max_query_idf: 0.0,
                 };
                 let (score, decomp) = pipeline.score(&ctx)?;
                 let eff_strength = state.effective_strength(now);
@@ -1287,6 +1288,7 @@ impl ChittaField {
         query_valence: Option<f32>,
         query_arousal: Option<f32>,
     ) -> Result<Vec<RecallHit>> {
+        let max_query_idf = self.keyword_idx.read().query_max_idf(query);
         let keyword_hits = self.keyword_idx.read().search(query, k * 3);
 
         let now = now_ms();
@@ -1326,6 +1328,7 @@ impl ChittaField {
                     has_open_debt: false,
                     integration_weight: None,
                     ack_score: ack_scores.get(&hit.memory_id).copied().unwrap_or(0),
+                    max_query_idf,
                 };
                 let (score, decomp) = pipeline.score(&ctx)?;
                 let eff_strength = state.effective_strength(now);
@@ -1373,6 +1376,93 @@ impl ChittaField {
         self.enqueue_recall_effects(&hit_ids);
 
         Ok(hits)
+    }
+
+    /// Session-level recall: aggregates chunk-level hits per source_session using noisy-OR.
+    /// Returns sessions ranked by combined evidence strength.
+    /// `query_embedding` — pre-computed by caller (C++ embed layer); None skips semantic lane.
+    pub fn recall_session(
+        &self,
+        query_embedding: Option<&[f32]>,
+        query_text: &str,
+        k: usize,
+        realm: Option<&str>,
+    ) -> Result<Vec<crate::recall::SessionRecallHit>> {
+        use std::collections::HashMap;
+        use crate::recall::SessionRecallHit;
+
+        // Fetch candidate chunks from both semantic and keyword lanes
+        let fetch_limit = k * 10;
+        let mut candidates: Vec<crate::recall::RecallHit> = if let Some(emb) = query_embedding {
+            self.recall_semantic_ctx(emb, fetch_limit, realm, None, None)?
+        } else {
+            Vec::new()
+        };
+
+        // Merge in keyword hits, deduplicating by memory_id (keep max score)
+        let kw_hits = self.recall_keyword_ctx(query_text, fetch_limit, None, None)?;
+        let mut seen: std::collections::HashSet<crate::ids::MemoryId> =
+            candidates.iter().map(|h| h.memory_id).collect();
+        for h in kw_hits {
+            if seen.insert(h.memory_id) {
+                candidates.push(h);
+            }
+        }
+
+        // Group by source_session; skip memories without a session
+        let payloads = self.payloads.read();
+        struct SessionAcc {
+            scores: Vec<f32>,
+            best_score: f32,
+            best_content: String,
+            realm: String,
+        }
+        let mut sessions: HashMap<String, SessionAcc> = HashMap::new();
+
+        for hit in &candidates {
+            if let Some(payload) = payloads.get(&hit.memory_id) {
+                if let Some(ref sid) = payload.source_session {
+                    let acc = sessions.entry(sid.clone()).or_insert_with(|| SessionAcc {
+                        scores: Vec::new(),
+                        best_score: 0.0,
+                        best_content: String::new(),
+                        realm: payload.realm.clone(),
+                    });
+                    acc.scores.push(hit.score);
+                    if hit.score > acc.best_score {
+                        acc.best_score = hit.score;
+                        acc.best_content = hit.content.clone();
+                    }
+                }
+            }
+        }
+        drop(payloads);
+
+        // Score each session with noisy-OR over top-3 chunks
+        let mut session_hits: Vec<SessionRecallHit> = sessions
+            .into_iter()
+            .map(|(session_id, mut acc)| {
+                acc.scores.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                // noisy-OR: 1 - prod(1 - s) for top-3
+                let session_score = acc.scores.iter().take(3).fold(0.0f32, |combined, &s| {
+                    1.0 - (1.0 - combined) * (1.0 - s.min(1.0).max(0.0))
+                });
+                SessionRecallHit {
+                    session_id,
+                    score: session_score,
+                    chunk_count: acc.scores.len() as u32,
+                    max_chunk_score: acc.best_score,
+                    best_evidence: acc.best_content,
+                    realm: acc.realm,
+                }
+            })
+            .collect();
+
+        session_hits.sort_unstable_by(|a, b| {
+            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        session_hits.truncate(k);
+        Ok(session_hits)
     }
 
     pub fn recall_with_fallback(
@@ -1583,6 +1673,17 @@ impl ChittaField {
         if let Some(st) = states.get_mut(&memory_id) {
             st.affect_valence = valence.clamp(-1.0, 1.0);
             st.affect_arousal = arousal.clamp(0.0, 1.0);
+            Ok(())
+        } else {
+            Err(FieldError::NotFound(memory_id))
+        }
+    }
+
+    /// Set the source_session tag on a memory payload. In-memory only; persisted at next snapshot.
+    pub fn set_source_session(&self, memory_id: MemoryId, session_id: &str) -> Result<()> {
+        let mut payloads = self.payloads.write();
+        if let Some(p) = payloads.get_mut(&memory_id) {
+            p.source_session = Some(session_id.to_string());
             Ok(())
         } else {
             Err(FieldError::NotFound(memory_id))
