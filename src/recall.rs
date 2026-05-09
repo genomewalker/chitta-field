@@ -49,3 +49,12 @@ pub struct SessionRecallHit {
     pub best_evidence: String,
     pub realm: String,
 }
+
+/// Result from recall_spreading — a memory reached via entity graph traversal.
+pub struct SpreadingRecallHit {
+    pub memory_id:    u64,
+    pub score:        f32,
+    pub text:         String,
+    pub kind:         String,
+    pub realm:        String,
+}

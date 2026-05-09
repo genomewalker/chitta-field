@@ -12,7 +12,7 @@ use crate::organ::pq::ProductQuantizer;
 use crate::organ::symbol::SymbolEntry;
 use crate::organ::triplet::TripletEntry;
 use crate::payload::MemoryPayload;
-use crate::recall::RecallHit;
+use crate::recall::{RecallHit, SessionRecallHit, SpreadingRecallHit};
 use crate::scoring::{RecallMode, ScoringContext};
 use crate::state::MemoryState;
 use std::collections::HashSet;
@@ -1688,6 +1688,93 @@ impl ChittaField {
         } else {
             Err(FieldError::NotFound(memory_id))
         }
+    }
+
+    /// Extract entity seeds from a query string: capitalized words (≥3 chars),
+    /// @tag references, and double-quoted strings.
+    fn extract_seeds(query: &str) -> Vec<String> {
+        let mut seeds: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        // @tag references
+        for cap in query.split_whitespace() {
+            let w = cap.trim_matches(|c: char| !c.is_alphanumeric() && c != '@' && c != '_');
+            if w.starts_with('@') && w.len() > 1 {
+                let tag = w[1..].to_string();
+                if seen.insert(tag.clone()) { seeds.push(tag); }
+            }
+        }
+        // Quoted strings
+        let mut in_quote = false;
+        let mut buf = String::new();
+        for c in query.chars() {
+            if c == '"' {
+                if in_quote && !buf.trim().is_empty() {
+                    let s = buf.trim().to_string();
+                    if seen.insert(s.clone()) { seeds.push(s); }
+                    buf.clear();
+                }
+                in_quote = !in_quote;
+            } else if in_quote {
+                buf.push(c);
+            }
+        }
+        // Capitalized words ≥3 chars (skip first word of query which may be sentence-start)
+        let words: Vec<&str> = query.split_whitespace().collect();
+        for (i, word) in words.iter().enumerate() {
+            let w = word.trim_matches(|c: char| !c.is_alphabetic());
+            if w.len() < 3 { continue; }
+            let mut chars = w.chars();
+            if let Some(first) = chars.next() {
+                if first.is_uppercase() && i > 0 {
+                    if seen.insert(w.to_string()) { seeds.push(w.to_string()); }
+                }
+            }
+        }
+        seeds
+    }
+
+    /// Spreading-activation recall: traverse triplet graph from query entities,
+    /// return top-k memories ranked by accumulated activation.
+    pub fn recall_spreading(
+        &self,
+        query: &str,
+        k: usize,
+        realm: Option<&str>,
+    ) -> Vec<SpreadingRecallHit> {
+        let seeds = Self::extract_seeds(query);
+        if seeds.is_empty() { return Vec::new(); }
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let memory_scores = self.triplet_store.read().spreading_activation(&seeds, 2, 0.6, now_ms);
+        if memory_scores.is_empty() { return Vec::new(); }
+
+        // Sort by score descending, take top k
+        let mut ranked: Vec<(MemoryId, f32)> = memory_scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(k * 4); // fetch extra for realm filtering
+
+        let payloads = self.payloads.read();
+        let mut results: Vec<SpreadingRecallHit> = Vec::new();
+        for (mid, score) in ranked {
+            if let Some(p) = payloads.get(&mid) {
+                if let Some(r) = realm {
+                    if p.realm.as_str() != r { continue; }
+                }
+                results.push(SpreadingRecallHit {
+                    memory_id: mid,
+                    score,
+                    text: String::from_utf8_lossy(&p.content).chars().take(300).collect::<String>(),
+                    kind: p.kind.clone(),
+                    realm: p.realm.clone(),
+                });
+                if results.len() >= k { break; }
+            }
+        }
+        results
     }
 
     /// Invalidate a triplet (marks it as expired at the current time).

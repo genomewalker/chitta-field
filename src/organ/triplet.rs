@@ -303,7 +303,49 @@ impl TripletStore {
     }
 
     /// Current next_id — used to seed the TripletIdAllocator after replay.
-    pub fn next_id(&self) -> u64 {
+    /// BFS spreading activation from seed entities. Returns memory_id → max activation score.
+    /// depth=2, decay=0.6 gives two hops with diminishing strength.
+    pub fn spreading_activation(
+        &self,
+        seeds: &[String],
+        depth: u8,
+        decay: f32,
+        at_ms: i64,
+    ) -> HashMap<MemoryId, f32> {
+        let mut entity_activation: HashMap<String, f32> = HashMap::new();
+        let mut memory_scores: HashMap<MemoryId, f32> = HashMap::new();
+        let mut stack: Vec<(String, f32, u8)> = seeds
+            .iter()
+            .map(|s| (s.clone(), 1.0f32, 0u8))
+            .collect();
+        for seed in seeds {
+            entity_activation.insert(seed.clone(), 1.0);
+        }
+        while let Some((entity, activation, d)) = stack.pop() {
+            for entry in self.query_entity(&entity, at_ms) {
+                if let Some(mid) = entry.source_memory_id {
+                    let s = memory_scores.entry(mid).or_insert(0.0);
+                    if activation > *s { *s = activation; }
+                }
+                if d >= depth { continue; }
+                let (neighbor, w) = if entry.subject == entity {
+                    (entry.object.clone(), entry.forward_weight())
+                } else {
+                    (entry.subject.clone(), entry.reverse_weight())
+                };
+                let next_act = activation * w.max(0.0) * decay;
+                if next_act < 0.01 { continue; }
+                let prev = entity_activation.entry(neighbor.clone()).or_insert(0.0);
+                if next_act > *prev {
+                    *prev = next_act;
+                    stack.push((neighbor, next_act, d + 1));
+                }
+            }
+        }
+        memory_scores
+    }
+
+        pub fn next_id(&self) -> u64 {
         self.next_id
     }
 }
