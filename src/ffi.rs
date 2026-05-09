@@ -7554,6 +7554,52 @@ pub extern "C" fn cf_set_source_session(
     }
 }
 
+#[repr(C)]
+pub struct CfSpreadingHit {
+    pub memory_id: u64,
+    pub score:     f32,
+}
+
+#[no_mangle]
+pub extern "C" fn cf_recall_spreading(
+    handle: *mut CfHandle,
+    query: *const libc::c_char,
+    k:     libc::size_t,
+    realm: *const libc::c_char,
+    out_json: *mut libc::c_char,
+    out_json_len: libc::size_t,
+) -> libc::c_int {
+    let h = unsafe { &*handle };
+    let query_str = unsafe { std::ffi::CStr::from_ptr(query).to_string_lossy() };
+    let realm_opt: Option<String> = if realm.is_null() {
+        None
+    } else {
+        let s = unsafe { std::ffi::CStr::from_ptr(realm).to_string_lossy() };
+        if s.is_empty() { None } else { Some(s.into_owned()) }
+    };
+    let results = h.field.recall_spreading(
+        &query_str,
+        k,
+        realm_opt.as_deref(),
+    );
+    let arr: Vec<serde_json::Value> = results.iter().map(|r| serde_json::json!({
+        "memory_id": r.memory_id,
+        "score":     r.score,
+        "text":      r.text,
+        "kind":      r.kind,
+        "realm":     r.realm,
+    })).collect();
+    let json = serde_json::json!({ "results": arr });
+    let s = json.to_string();
+    let bytes = s.as_bytes();
+    let copy_len = bytes.len().min(out_json_len.saturating_sub(1));
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_json as *mut u8, copy_len);
+        *out_json.add(copy_len) = 0;
+    }
+    results.len() as libc::c_int
+}
+
 /// Session-level recall hit returned by cf_recall_session.
 /// `session_id` and `best_evidence` are C strings valid until the next cf_recall_session call
 /// on the same handle (stored in thread-local scratch).
