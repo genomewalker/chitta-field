@@ -34,3 +34,18 @@ pub struct RecallHit {
     /// Spacing boost: reward for well-spaced retrieval intervals (Geometry of Forgetting)
     pub spacing_boost: f32,
 }
+
+/// Session-level recall hit: evidence from multiple chunks aggregated per source_session.
+#[derive(Debug, Clone)]
+pub struct SessionRecallHit {
+    pub session_id: String,
+    /// Noisy-OR combined evidence score
+    pub score: f32,
+    /// Number of chunks contributing evidence
+    pub chunk_count: u32,
+    /// Best single-chunk score (max semantic)
+    pub max_chunk_score: f32,
+    /// Content of the highest-scoring chunk
+    pub best_evidence: String,
+    pub realm: String,
+}

@@ -117,8 +117,13 @@ pub struct ScoringConfig {
     pub lure_risk_threshold: f32,
     /// Maximum number of lure-flagged candidates to suppress per query.
     pub lure_max_suppressed: usize,
+
+    // ── Rare-entity surprisal ─────────────────────────────────────────
+    #[serde(default = "default_rare_entity_weight")]
+    pub rare_entity_weight: f32,
 }
 
+fn default_rare_entity_weight() -> f32 { 0.15 }
 fn default_surprise_domain_actual_weight() -> f32 { 0.15 }
 fn default_surprise_domain_expected_weight() -> f32 { 0.10 }
 fn default_epistemic_debt_boost() -> f32 { 1.1 }
@@ -200,6 +205,9 @@ impl Default for ScoringConfig {
             // Lure detection
             lure_risk_threshold: 0.7,
             lure_max_suppressed: 2,
+
+            // Rare-entity surprisal
+            rare_entity_weight: 0.15,
         }
     }
 }
