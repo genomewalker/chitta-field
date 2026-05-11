@@ -302,7 +302,6 @@ impl TripletStore {
         self.entries.len()
     }
 
-    /// Current next_id — used to seed the TripletIdAllocator after replay.
     /// BFS spreading activation from seed entities. Returns memory_id → max activation score.
     /// depth=2, decay=0.6 gives two hops with diminishing strength.
     pub fn spreading_activation(
@@ -312,40 +311,50 @@ impl TripletStore {
         decay: f32,
         at_ms: i64,
     ) -> HashMap<MemoryId, f32> {
-        let mut entity_activation: HashMap<String, f32> = HashMap::new();
+        use std::collections::HashSet;
+        const MAX_LAYER: usize = 100;
+        const MAX_ENTRIES_PER_ENTITY: usize = 50;
         let mut memory_scores: HashMap<MemoryId, f32> = HashMap::new();
-        let mut stack: Vec<(String, f32, u8)> = seeds
-            .iter()
-            .map(|s| (s.clone(), 1.0f32, 0u8))
-            .collect();
-        for seed in seeds {
-            entity_activation.insert(seed.clone(), 1.0);
-        }
-        while let Some((entity, activation, d)) = stack.pop() {
-            for entry in self.query_entity(&entity, at_ms) {
-                if let Some(mid) = entry.source_memory_id {
-                    let s = memory_scores.entry(mid).or_insert(0.0);
-                    if activation > *s { *s = activation; }
-                }
-                if d >= depth { continue; }
-                let (neighbor, w) = if entry.subject == entity {
-                    (entry.object.clone(), entry.forward_weight())
+        let mut visited: HashSet<String> = seeds.iter().cloned().collect();
+        let mut current_layer: Vec<(String, f32)> =
+            seeds.iter().map(|s| (s.clone(), 1.0f32)).collect();
+        for d in 0u8..=depth {
+            let mut next_layer: Vec<(String, f32)> = Vec::new();
+            for (entity, activation) in &current_layer {
+                let raw_entries = self.query_entity(entity, at_ms);
+                let entries_slice = if raw_entries.len() > MAX_ENTRIES_PER_ENTITY {
+                    &raw_entries[..MAX_ENTRIES_PER_ENTITY]
                 } else {
-                    (entry.subject.clone(), entry.reverse_weight())
+                    &raw_entries[..]
                 };
-                let next_act = activation * w.max(0.0) * decay;
-                if next_act < 0.01 { continue; }
-                let prev = entity_activation.entry(neighbor.clone()).or_insert(0.0);
-                if next_act > *prev {
-                    *prev = next_act;
-                    stack.push((neighbor, next_act, d + 1));
+                for &entry in entries_slice {
+                    if let Some(mid) = entry.source_memory_id {
+                        let s = memory_scores.entry(mid).or_insert(0.0);
+                        if *activation > *s { *s = *activation; }
+                    }
+                    if d >= depth { continue; }
+                    let (neighbor, w) = if entry.subject == *entity {
+                        (entry.object.clone(), entry.forward_weight())
+                    } else {
+                        (entry.subject.clone(), entry.reverse_weight())
+                    };
+                    let next_act = (*activation) * w.max(0.0_f32) * decay;
+                    if next_act < 0.01_f32 { continue; }
+                    if visited.insert(neighbor.clone()) {
+                        next_layer.push((neighbor, next_act));
+                    }
                 }
             }
+            if next_layer.len() > MAX_LAYER {
+                next_layer.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                next_layer.truncate(MAX_LAYER);
+            }
+            current_layer = next_layer;
         }
         memory_scores
     }
 
-        pub fn next_id(&self) -> u64 {
+    pub fn next_id(&self) -> u64 {
         self.next_id
     }
 }

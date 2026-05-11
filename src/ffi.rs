@@ -7563,12 +7563,12 @@ pub struct CfSpreadingHit {
 #[no_mangle]
 pub extern "C" fn cf_recall_spreading(
     handle: *mut CfHandle,
-    query: *const libc::c_char,
-    k:     libc::size_t,
-    realm: *const libc::c_char,
-    out_json: *mut libc::c_char,
-    out_json_len: libc::size_t,
-) -> libc::c_int {
+    query: *const c_char,
+    k:     usize,
+    realm: *const c_char,
+    out_json: *mut c_char,
+    out_json_len: usize,
+) -> c_int {
     let h = unsafe { &*handle };
     let query_str = unsafe { std::ffi::CStr::from_ptr(query).to_string_lossy() };
     let realm_opt: Option<String> = if realm.is_null() {
@@ -7597,7 +7597,7 @@ pub extern "C" fn cf_recall_spreading(
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_json as *mut u8, copy_len);
         *out_json.add(copy_len) = 0;
     }
-    results.len() as libc::c_int
+    results.len() as c_int
 }
 
 /// Session-level recall hit returned by cf_recall_session.
@@ -7688,4 +7688,168 @@ pub extern "C" fn cf_repl_session_list(h: *const CfHandle) -> *mut c_char {
     let handle = unsafe { &*h };
     let json = handle.field.repl_session_list();
     CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+// ── Contradiction detection FFI ───────────────────────────────────────────────
+
+/// Detect contradictions for a memory already stored in the field.
+/// Builds a transient ContradictionIndex from realm peers, then runs
+/// detect_for_new_memory. Returns JSON array of ContradictionCandidate.
+/// Caller must free with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_detect_contradictions(
+    h: *const CfHandle,
+    memory_id: u64,
+    realm_ptr: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || realm_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let handle = unsafe { &*h };
+    let realm = match unsafe { CStr::from_ptr(realm_ptr) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    // Gather peers and target content in a single lock window
+    let (peer_pairs, target_content): (Vec<(u64, Vec<u8>)>, Vec<u8>) = {
+        let payloads = handle.field.payloads.read();
+        let members = handle.field.realm_members.read();
+        let ids: Vec<u64> = match members.get(realm) {
+            Some(s) => s.iter().copied().collect(),
+            None => vec![],
+        };
+        let peers = ids.iter()
+            .filter(|&&id| id != memory_id)
+            .filter_map(|&id| payloads.get(&id).map(|p| (id, p.content.clone())))
+            .collect();
+        let target = match payloads.get(&memory_id) {
+            Some(p) => p.content.clone(),
+            None => return CString::new("[]").map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
+        };
+        (peers, target)
+    };
+
+    use crate::contradiction::{ContradictionIndex, parse_claim_atoms};
+    let mut index = ContradictionIndex::new();
+
+    // Register peers first
+    for (pid, content) in &peer_pairs {
+        let atoms = parse_claim_atoms(*pid, realm, content);
+        if !atoms.is_empty() {
+            index.register_atoms(*pid, atoms);
+        }
+    }
+
+    let candidates = index.detect_for_new_memory(memory_id, &target_content, realm);
+    let json = serde_json::to_string(&candidates).unwrap_or_else(|_| "[]".into());
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Background scan: detect contradictions across all memories in a realm.
+/// Returns JSON array of ContradictionCandidate (up to `limit`).
+/// Caller must free with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_scan_contradictions(
+    h: *const CfHandle,
+    realm_ptr: *const c_char,
+    limit: u32,
+) -> *mut c_char {
+    if h.is_null() || realm_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let handle = unsafe { &*h };
+    let realm = match unsafe { CStr::from_ptr(realm_ptr) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let pairs: Vec<(u64, Vec<u8>)> = {
+        let payloads = handle.field.payloads.read();
+        let members = handle.field.realm_members.read();
+        let ids = match members.get(realm) {
+            Some(s) => s.iter().copied().collect::<Vec<_>>(),
+            None => vec![],
+        };
+        ids.into_iter()
+            .filter_map(|id| payloads.get(&id).map(|p| (id, p.content.clone())))
+            .collect()
+    };
+
+    use crate::contradiction::ContradictionIndex;
+    let mut index = ContradictionIndex::new();
+    let candidates = index.scan_realm(realm, &pairs, limit as usize);
+    let json = serde_json::to_string(&candidates).unwrap_or_else(|_| "[]".into());
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Resolve a contradiction pair by declaring a winner and loser.
+/// Returns JSON ResolutionOps for the C++ handler to apply.
+/// Caller must free with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_resolve_contradiction(
+    h: *const CfHandle,
+    winner_id: u64,
+    loser_id: u64,
+    reason_ptr: *const c_char,
+) -> *mut c_char {
+    if h.is_null() {
+        return std::ptr::null_mut();
+    }
+    let reason = if reason_ptr.is_null() {
+        "manual"
+    } else {
+        match unsafe { CStr::from_ptr(reason_ptr) }.to_str() {
+            Ok(s) => s,
+            Err(_) => "manual",
+        }
+    };
+
+    // Build a minimal ContradictionIndex with just the two memories' content
+    let (winner_content, loser_content) = {
+        let payloads = handle_from(h).field.payloads.read();
+        let wc = payloads.get(&winner_id).map(|p| p.content.clone()).unwrap_or_default();
+        let lc = payloads.get(&loser_id).map(|p| p.content.clone()).unwrap_or_default();
+        (wc, lc)
+    };
+
+    // Infer realm from winner
+    let realm = {
+        let payloads = handle_from(h).field.payloads.read();
+        payloads.get(&winner_id).map(|p| p.realm.clone()).unwrap_or_default()
+    };
+
+    use crate::contradiction::{ContradictionIndex, ContradictionCandidate, CandidateStatus, parse_claim_atoms};
+    let mut index = ContradictionIndex::new();
+
+    let winner_atoms = parse_claim_atoms(winner_id, &realm, &winner_content);
+    let loser_atoms  = parse_claim_atoms(loser_id,  &realm, &loser_content);
+    if !winner_atoms.is_empty() { index.register_atoms(winner_id, winner_atoms); }
+    if !loser_atoms.is_empty()  { index.register_atoms(loser_id,  loser_atoms); }
+
+    // Synthesise a candidate with id=0 to resolve against
+    let candidate_id = index.add_candidate(ContradictionCandidate {
+        id: 0,
+        memory_a: winner_id,
+        memory_b: loser_id,
+        score: 1.0,
+        same_score: 1.0,
+        opposition_score: 1.0,
+        reason: reason.to_string(),
+        status: CandidateStatus::Open,
+        created_at_ms: 0,
+    });
+
+    match index.resolve(candidate_id, winner_id, loser_id, reason) {
+        Some(ops) => {
+            let json = serde_json::to_string(&ops).unwrap_or_else(|_| "{}".into());
+            CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        None => CString::new("{}").map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
+    }
+}
+
+#[inline]
+fn handle_from(h: *const CfHandle) -> &'static CfHandle {
+    unsafe { &*h }
 }
