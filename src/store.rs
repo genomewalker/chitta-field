@@ -1392,7 +1392,7 @@ impl ChittaField {
         use crate::recall::SessionRecallHit;
 
         // Fetch candidate chunks from both semantic and keyword lanes
-        let fetch_limit = k * 10;
+        let fetch_limit = k * 20;
         let mut candidates: Vec<crate::recall::RecallHit> = if let Some(emb) = query_embedding {
             self.recall_semantic_ctx(emb, fetch_limit, realm, None, None)?
         } else {
@@ -1438,15 +1438,18 @@ impl ChittaField {
         }
         drop(payloads);
 
-        // Score each session with noisy-OR over top-3 chunks
+        // Score: max_chunk_score dominates; small noisy-OR bonus from remaining evidence.
+        // Avoids multi-mediocre-chunk sessions beating a single high-score gold chunk.
         let mut session_hits: Vec<SessionRecallHit> = sessions
             .into_iter()
             .map(|(session_id, mut acc)| {
                 acc.scores.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                // noisy-OR: 1 - prod(1 - s) for top-3
-                let session_score = acc.scores.iter().take(3).fold(0.0f32, |combined, &s| {
+                let max_s = acc.scores[0].min(1.0).max(0.0);
+                // noisy-OR of chunks beyond the best (corroborating evidence only)
+                let corroboration = acc.scores.iter().skip(1).take(4).fold(0.0f32, |combined, &s| {
                     1.0 - (1.0 - combined) * (1.0 - s.min(1.0).max(0.0))
                 });
+                let session_score = max_s + 0.15 * corroboration * (1.0 - max_s);
                 SessionRecallHit {
                     session_id,
                     score: session_score,
@@ -1749,7 +1752,10 @@ impl ChittaField {
             .unwrap_or_default()
             .as_millis() as i64;
 
-        let memory_scores = self.triplet_store.read().spreading_activation(&seeds, 2, 0.6, now_ms);
+        let memory_scores = match self.triplet_store.try_read_for(std::time::Duration::from_secs(5)) {
+            Some(ts) => ts.spreading_activation(&seeds, 2, 0.6, now_ms),
+            None => return Vec::new(),
+        };
         if memory_scores.is_empty() { return Vec::new(); }
 
         // Sort by score descending, take top k
@@ -1757,7 +1763,10 @@ impl ChittaField {
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(k * 4); // fetch extra for realm filtering
 
-        let payloads = self.payloads.read();
+        let payloads = match self.payloads.try_read_for(std::time::Duration::from_secs(5)) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
         let mut results: Vec<SpreadingRecallHit> = Vec::new();
         for (mid, score) in ranked {
             if let Some(p) = payloads.get(&mid) {
