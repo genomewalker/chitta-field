@@ -324,10 +324,17 @@ impl ChittaField {
             let idx = self.chunk_hash_idx.read();
             if let Some(&existing_id) = idx.get(&chunk_hash) {
                 drop(idx);
-                // Recurrence: same observation seen again → boost confidence (+0.05)
-                // After 6+ recurrences, provisional (0.50) reaches durable tier (0.80)
-                let _ = self.update_state(existing_id, Some(0.0), Some(0.05), None, true, None);
-                return Ok((existing_id, chunk_hash));
+                // Skip if the matched memory was deleted (ghost in chunk_hash_idx)
+                let is_alive = self.states.read()
+                    .get(&existing_id)
+                    .map(|s| !s.deleted)
+                    .unwrap_or(false);
+                if is_alive {
+                    // Recurrence: same observation seen again → boost confidence (+0.05)
+                    // After 6+ recurrences, provisional (0.50) reaches durable tier (0.80)
+                    let _ = self.update_state(existing_id, Some(0.0), Some(0.05), None, true, None);
+                    return Ok((existing_id, chunk_hash));
+                }
             }
         }
 
@@ -3662,7 +3669,11 @@ impl ChittaField {
         let path = self
             .data_dir
             .join(format!("chitta.{:08x}.snapshot", self.instance_id));
-        snap.save(&path)
+        snap.save(&path)?;
+        // Save HNSW sidecar alongside snapshot (same stem, .hnsw ext).
+        let hnsw_path = path.with_extension("hnsw");
+        let _ = self.semantic_idx.read().save_hnsw(&hnsw_path);
+        Ok(())
     }
 
 
