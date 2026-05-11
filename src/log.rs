@@ -327,6 +327,13 @@ impl OpLog {
         self.next_seqno.saturating_sub(1)
     }
 
+    /// Advance next_seqno after WAL replay so snapshots get the correct seqno.
+    pub fn set_next_seqno(&mut self, seqno: u64) {
+        if seqno > self.next_seqno {
+            self.next_seqno = seqno;
+        }
+    }
+
     fn rotate_if_needed(&mut self) -> Result<()> {
         if self.current_segment_size < MAX_SEGMENT_SIZE {
             return Ok(());

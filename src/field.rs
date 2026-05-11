@@ -406,7 +406,9 @@ impl ChittaField {
             let hnsw_path = snap_path.with_extension("hnsw");
             let _hnsw_loaded = semantic_idx.load_hnsw(&hnsw_path);
         }
+        let mut max_replayed_seqno = full_snapshot_seqno;
         log.replay(0, |seqno, op| {
+            if seqno > max_replayed_seqno { max_replayed_seqno = seqno; }
             if seqno <= full_snapshot_seqno {
                 // This op is covered by the full snapshot.
                 // Still apply cortical ops not covered by the cortical snapshot.
@@ -474,6 +476,7 @@ impl ChittaField {
             );
             Ok(())
         })?;
+        log.set_next_seqno(max_replayed_seqno + 1);
         semantic_idx.normalize_all();
         keyword_idx.rebuild_reverse_index();
         let realm_members = build_realm_members(&payloads, &states);
