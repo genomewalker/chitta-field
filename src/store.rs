@@ -344,7 +344,11 @@ impl ChittaField {
                         .get(&top.memory_id)
                         .map(|p| p.realm.clone())
                         .unwrap_or_default();
-                    if candidate_realm == realm {
+                    let candidate_deleted = self.states.read()
+                        .get(&top.memory_id)
+                        .map(|s| s.deleted)
+                        .unwrap_or(true);
+                    if candidate_realm == realm && !candidate_deleted {
                         let _ = self.update_state(top.memory_id, Some(0.0), Some(0.02), None, true, None);
                         return Ok((top.memory_id, chunk_hash));
                     }
