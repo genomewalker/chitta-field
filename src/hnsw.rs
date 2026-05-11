@@ -28,7 +28,7 @@ const HNSW_ML: f64 = 0.36067; // 1/ln(16)
 ///
 /// All vectors stored in the parent `SemanticIndex` are unit-normalised, so
 /// inner product == cosine similarity throughout.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HnswGraph {
     /// Per-node adjacency lists, indexed by layer.
     /// `neighbors[id][layer]` = Vec of neighbour MemoryIds.
@@ -44,6 +44,10 @@ impl HnswGraph {
 
     fn is_empty(&self) -> bool {
         self.neighbors.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.neighbors.len()
     }
 
     /// Insert `id` with pre-normalised `embedding`.
@@ -315,7 +319,7 @@ pub struct SemanticIndex {
     lsh_buckets: Vec<HashMap<u16, Vec<MemoryId>>>,
     #[serde(skip)]
     mem_lsh: HashMap<MemoryId, Vec<u16>>,
-    /// HNSW graph — rebuilt from `embeddings` after snapshot load.
+    /// HNSW graph — saved to sidecar .hnsw file; rebuilt when stale.
     /// Active when `embeddings.len() >= HNSW_THRESHOLD`.
     #[serde(skip)]
     hnsw: HnswGraph,
@@ -594,7 +598,49 @@ impl SemanticIndex {
         self.rebuild_ann();
     }
 
+
+    /// Serialize the HNSW graph to a sidecar file.
+    pub fn save_hnsw(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let bytes = bincode::serialize(&self.hnsw)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let tmp = path.with_extension("hnsw.tmp");
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load HNSW from sidecar file. Returns false if file is missing/stale.
+    /// "Stale" means the graph node count doesn't match the embeddings count.
+    pub fn load_hnsw(&mut self, path: &std::path::Path) -> bool {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[hnsw] load_hnsw: read {:?} failed: {}", path, e);
+                return false;
+            }
+        };
+        let graph: HnswGraph = match bincode::deserialize(&bytes) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[hnsw] load_hnsw: deserialize failed: {}", e);
+                return false;
+            }
+        };
+        if graph.len() != self.embeddings.len() {
+            eprintln!("[hnsw] load_hnsw: stale graph ({} nodes) vs embeddings ({} entries) — rebuilding",
+                graph.len(), self.embeddings.len());
+            return false;
+        }
+        eprintln!("[hnsw] load_hnsw: loaded {} nodes from {:?}", graph.len(), path);
+        self.hnsw = graph;
+        true
+    }
+
     fn rebuild_ann(&mut self) {
+        let hnsw_valid = !self.hnsw.is_empty() && self.hnsw.len() == self.embeddings.len();
         self.coarse_members.clear();
         self.mem_coarse.clear();
         self.lsh_buckets = vec![HashMap::new(); LSH_TABLES];
@@ -629,7 +675,7 @@ impl SemanticIndex {
         }
 
         // Rebuild HNSW if collection is large enough
-        if self.use_hnsw() {
+        if !hnsw_valid && self.use_hnsw() {
             self.rebuild_hnsw();
         }
     }

@@ -401,6 +401,11 @@ impl ChittaField {
         let mut replay_kind_members:  HashMap<String, HashSet<MemoryId>> = HashMap::new();
         let mut replay_coactivation_stats = snapshot_coactivation_stats;
         triplet_store.correction_states = snap_correction_states;
+        // Load HNSW sidecar before WAL replay so incremental upsert/remove keeps it in sync.
+        if let Some(ref snap_path) = best_full_path {
+            let hnsw_path = snap_path.with_extension("hnsw");
+            let _hnsw_loaded = semantic_idx.load_hnsw(&hnsw_path);
+        }
         log.replay(0, |seqno, op| {
             if seqno <= full_snapshot_seqno {
                 // This op is covered by the full snapshot.
@@ -469,7 +474,6 @@ impl ChittaField {
             );
             Ok(())
         })?;
-
         semantic_idx.normalize_all();
         keyword_idx.rebuild_reverse_index();
         let realm_members = build_realm_members(&payloads, &states);
