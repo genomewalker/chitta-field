@@ -595,17 +595,34 @@ impl SemanticIndex {
         if self.lsh_planes.is_empty() {
             self.lsh_planes = default_lsh_planes();
         }
-        // Coarse (coarse_members, mem_coarse) is snapshot-serialized and kept in sync by
-        // incremental upsert/remove during WAL replay — skip the O(N) full rebuild when consistent.
-        // LSH (lsh_buckets, mem_lsh) is #[serde(skip)] so always needs rebuilding.
-        if self.mem_coarse.len() != self.embeddings.len() {
+        // Coarse, LSH, and HNSW are all snapshot-serialized (or sidecar) and kept in sync
+        // by incremental upsert/remove during WAL replay — skip O(N) rebuilds when consistent.
+        let coarse_ok = self.mem_coarse.len() == self.embeddings.len();
+        let lsh_ok    = self.mem_lsh.len()    == self.embeddings.len();
+        let hnsw_ok   = !self.hnsw.is_empty() && self.hnsw.len() == self.embeddings.len();
+        if !coarse_ok {
             self.rebuild_ann();
         } else {
-            self.rebuild_lsh();
-            let hnsw_valid = !self.hnsw.is_empty() && self.hnsw.len() == self.embeddings.len();
-            if !hnsw_valid && self.use_hnsw() {
+            if !lsh_ok {
+                // mem_lsh not populated — recompute from embeddings (O(N) with math)
+                self.rebuild_lsh();
+            } else {
+                // mem_lsh is snapshot-restored — rebuild inverted index from it (O(N), no math)
+                self.rebuild_lsh_buckets_from_mem();
+            }
+            if !hnsw_ok && self.use_hnsw() {
                 eprintln!("[hnsw] rebuild_hnsw: hnsw={} embeddings={} — rebuilding", self.hnsw.len(), self.embeddings.len());
                 self.rebuild_hnsw();
+            }
+        }
+    }
+
+    /// Rebuild lsh_buckets from existing mem_lsh (no embedding math — O(N) HashMap inserts only).
+    fn rebuild_lsh_buckets_from_mem(&mut self) {
+        self.lsh_buckets = vec![HashMap::new(); LSH_TABLES];
+        for (&id, sigs) in &self.mem_lsh {
+            for (t, &sig) in sigs.iter().enumerate() {
+                self.lsh_buckets[t].entry(sig).or_default().push(id);
             }
         }
     }
@@ -864,6 +881,10 @@ fn default_coarse_centroids() -> Vec<Vec<f32>> {
     (0..COARSE_CENTROIDS)
         .map(|idx| random_unit_vec(EMBED_DIM, 10_000 + idx as u64))
         .collect()
+}
+
+fn default_lsh_buckets() -> Vec<HashMap<u16, Vec<MemoryId>>> {
+    vec![HashMap::new(); LSH_TABLES]
 }
 
 fn default_lsh_planes() -> Vec<Vec<Vec<f32>>> {

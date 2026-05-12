@@ -125,6 +125,8 @@ size_t cf_recommended_window(CfHandle* h, const char* session_type);
 /* Maintenance */
 int    cf_flush(CfHandle* h);
 size_t cf_memory_count(const CfHandle* h);
+size_t cf_raw_memory_count(const CfHandle* h);
+size_t cf_pending_count(const CfHandle* h);
 /** Ingest new ops from foreign-instance segment files on shared storage.
  *  Safe to call from any thread. Returns ops applied, -1 on error. */
 int    cf_sync_foreign(CfHandle* h);

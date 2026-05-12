@@ -963,6 +963,24 @@ pub extern "C" fn cf_memory_count(h: *const CfHandle) -> usize {
     unsafe { (*h).field.memory_count() }
 }
 
+/// O(1) upper-bound count (includes soft-deleted). Safe for latency-sensitive paths.
+#[no_mangle]
+pub extern "C" fn cf_raw_memory_count(h: *const CfHandle) -> usize {
+    if h.is_null() {
+        return 0;
+    }
+    unsafe { (*h).field.raw_memory_count() }
+}
+
+/// O(1) count of memories awaiting embedding. Maintained atomically.
+#[no_mangle]
+pub extern "C" fn cf_pending_count(h: *const CfHandle) -> usize {
+    if h.is_null() {
+        return 0;
+    }
+    unsafe { (*h).field.raw_pending_count() }
+}
+
 // ── Code Intelligence ─────────────────────────────────────────────────────────
 
 /// A single symbol search result. Fixed-size POD struct for C interop.
