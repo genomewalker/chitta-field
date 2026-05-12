@@ -595,7 +595,35 @@ impl SemanticIndex {
         if self.lsh_planes.is_empty() {
             self.lsh_planes = default_lsh_planes();
         }
-        self.rebuild_ann();
+        // Coarse (coarse_members, mem_coarse) is snapshot-serialized and kept in sync by
+        // incremental upsert/remove during WAL replay — skip the O(N) full rebuild when consistent.
+        // LSH (lsh_buckets, mem_lsh) is #[serde(skip)] so always needs rebuilding.
+        if self.mem_coarse.len() != self.embeddings.len() {
+            self.rebuild_ann();
+        } else {
+            self.rebuild_lsh();
+            let hnsw_valid = !self.hnsw.is_empty() && self.hnsw.len() == self.embeddings.len();
+            if !hnsw_valid && self.use_hnsw() {
+                eprintln!("[hnsw] rebuild_hnsw: hnsw={} embeddings={} — rebuilding", self.hnsw.len(), self.embeddings.len());
+                self.rebuild_hnsw();
+            }
+        }
+    }
+
+    fn rebuild_lsh(&mut self) {
+        self.lsh_buckets = vec![HashMap::new(); LSH_TABLES];
+        self.mem_lsh.clear();
+        let assignments: Vec<(MemoryId, Vec<u16>)> = self
+            .embeddings
+            .iter()
+            .map(|(&id, emb)| (id, self.assign_lsh(emb)))
+            .collect();
+        for (id, sigs) in assignments {
+            for (t, sig) in sigs.iter().enumerate() {
+                self.lsh_buckets[t].entry(*sig).or_default().push(id);
+            }
+            self.mem_lsh.insert(id, sigs);
+        }
     }
 
 
