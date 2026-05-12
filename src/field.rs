@@ -45,7 +45,7 @@ use crate::state::MemoryState;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 
 /// A single directed association edge stored in memory.
@@ -153,6 +153,7 @@ pub struct ChittaField {
     pub(crate) chunk_hash_idx: RwLock<HashMap<crate::ids::ChunkHash, MemoryId>>,
     pub(crate) realm_members: RwLock<HashMap<String, HashSet<MemoryId>>>,
     pub(crate) kind_members:  RwLock<HashMap<String, HashSet<MemoryId>>>,
+    pub(crate) pending_embed_count: Arc<AtomicUsize>,
     pub(crate) pending_recall: Mutex<PendingRecallEffects>,
     pub(crate) coactivation_stats: RwLock<HashMap<(MemoryId, MemoryId), CoActivationStats>>,
     /// Asymmetric Hopfield network for energy-based attractor recall. FEP §3.2.
@@ -481,6 +482,7 @@ impl ChittaField {
         keyword_idx.rebuild_reverse_index();
         let realm_members = build_realm_members(&payloads, &states);
         let kind_members  = build_kind_members(&payloads, &states);
+        let init_pending = states.values().filter(|s| s.embed_pending && !s.deleted).count();
 
         // Fix temporal entries that have ts_ms=0 (stored before authored_at_ms default fix)
         {
@@ -578,6 +580,7 @@ impl ChittaField {
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
             realm_members: RwLock::new(realm_members),
             kind_members:  RwLock::new(kind_members),
+            pending_embed_count: Arc::new(AtomicUsize::new(init_pending)),
             realm_stats: RwLock::new(HashMap::new()),
             kind_stats:  RwLock::new(HashMap::new()),
             ack_scores:  RwLock::new(snap_ack_scores),

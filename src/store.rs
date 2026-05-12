@@ -399,6 +399,9 @@ impl ChittaField {
         state.decay_rate = decay_rate;
 
         state.embed_pending = embed_pending;
+        if embed_pending {
+            self.pending_embed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.payloads.write().insert(memory_id, payload);
         self.states.write().insert(memory_id, state);
         self.chunk_hash_idx
@@ -830,6 +833,17 @@ impl ChittaField {
     /// Total count of non-deleted memories.
     pub fn memory_count(&self) -> usize {
         self.states.read().values().filter(|s| !s.deleted).count()
+    }
+
+    /// O(1) upper-bound count — includes soft-deleted entries.
+    /// Use for latency-sensitive paths (health_check fast path).
+    pub fn raw_memory_count(&self) -> usize {
+        self.payloads.read().len()
+    }
+
+    /// O(1) pending-embedding count. Maintained by put_memory/backfill_embedding.
+    pub fn raw_pending_count(&self) -> usize {
+        self.pending_embed_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn enqueue_recall_effects(&self, hit_ids: &[MemoryId]) {
@@ -1844,7 +1858,10 @@ impl ChittaField {
         {
             let mut states = self.states.write();
             if let Some(st) = states.get_mut(&memory_id) {
-                st.embed_pending = false;
+                if st.embed_pending {
+                    st.embed_pending = false;
+                    self.pending_embed_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         Ok(())
