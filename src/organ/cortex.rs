@@ -9,8 +9,8 @@ use std::path::Path;
 
 /// V1 cortex snapshot: PostingEntry without affect_q field.
 const CORTEX_SNAPSHOT_MAGIC_V1: u64 = 0xC417745F3A7_0001;
-/// Current cortex snapshot (V2): PostingEntry with affect_q.
-const CORTEX_SNAPSHOT_MAGIC: u64 = 0xC417745F3A7_0002;
+/// Current cortex snapshot (V3): EMBED_DIM=256, HALF_DIM=128 (nomic MRL-256).
+const CORTEX_SNAPSHOT_MAGIC: u64 = 0xC417745F3A7_0003;
 
 // ── Sparse Code ──────────────────────────────────────────────────────────────
 
@@ -29,8 +29,8 @@ impl SparseCode {
 
 // ── Sparse Encoder (product-key) ─────────────────────────────────────────────
 
-pub const EMBED_DIM: usize = 768;
-pub const HALF_DIM: usize = 384; // EMBED_DIM / 2
+pub use crate::ops::EMBED_DIM;
+pub const HALF_DIM: usize = EMBED_DIM / 2;
 pub const N_LEFT: usize = 128; // centroids for left half
 pub const N_RIGHT: usize = 128; // centroids for right half
 pub const N_ATOMS: usize = N_LEFT * N_RIGHT; // 16,384 total
@@ -133,8 +133,8 @@ impl SparseEncoder {
 
     /// Reconstruct a dense 768-dim embedding from a sparse code.
     /// atom_id = left_idx * N_RIGHT + right_idx
-    /// reconstructed[0..384] += activation * left_atoms[left_idx]
-    /// reconstructed[384..768] += activation * right_atoms[right_idx]
+    /// reconstructed[0..HALF_DIM] += activation * left_atoms[left_idx]
+    /// reconstructed[HALF_DIM..EMBED_DIM] += activation * right_atoms[right_idx]
     pub fn decode(&self, code: &SparseCode) -> Vec<f32> {
         let mut out = vec![0.0f32; EMBED_DIM];
         for (&feat_id, &act) in code.feature_ids.iter().zip(code.activations.iter()) {
