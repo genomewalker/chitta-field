@@ -51,6 +51,10 @@ impl HnswGraph {
         self.neighbors.len()
     }
 
+    pub(crate) fn contains(&self, id: MemoryId) -> bool {
+        self.neighbors.contains_key(&id)
+    }
+
     /// Insert `id` with pre-normalised `embedding`.
     /// `embeddings` is the full store (used to look up neighbour vectors).
     fn insert(&mut self, id: MemoryId, embedding: &[f32], embeddings: &HashMap<MemoryId, Vec<f32>>) {
@@ -354,6 +358,24 @@ impl SemanticIndex {
     #[inline]
     fn use_hnsw(&self) -> bool {
         self.embeddings.len() >= HNSW_THRESHOLD
+    }
+
+    /// Insert embeddings that are in the store but not yet in HNSW (WAL replay delta).
+    /// O(K log N) where K = delta count. Called after WAL replay when binary_covers=true
+    /// prevents a full O(N log N) rebuild but HNSW is partially stale.
+    pub fn backfill_hnsw_delta(&mut self) {
+        if !self.use_hnsw() || self.hnsw.is_empty() { return; }
+        let delta: Vec<MemoryId> = self.embeddings.keys()
+            .filter(|&&id| !self.deleted.contains(&id) && !self.hnsw.contains(id))
+            .copied()
+            .collect();
+        if delta.is_empty() { return; }
+        eprintln!("[hnsw] backfill_hnsw_delta: inserting {} delta nodes", delta.len());
+        for id in delta {
+            if let Some(emb) = self.embeddings.get(&id).cloned() {
+                self.hnsw.insert(id, &emb, &self.embeddings);
+            }
+        }
     }
 
     /// Inhibit HNSW inserts during WAL replay when binary Hamming will be the active path.
@@ -682,14 +704,18 @@ impl SemanticIndex {
                 // mem_lsh is snapshot-restored — rebuild inverted index from it (O(N), no math)
                 self.rebuild_lsh_buckets_from_mem();
             }
-            // Skip HNSW rebuild when binary codes are populated — binary Hamming is the
-            // primary search path; HNSW is kept only as a cold fallback for the rare case
-            // where binary_codes is absent/stale (e.g. fresh snapshot before normalize_all).
             let binary_covers = self.binary_codes.len() == self.embeddings.len()
                 && !self.binary_codes.is_empty();
-            if !hnsw_ok && self.use_hnsw() && !binary_covers {
-                eprintln!("[hnsw] rebuild_hnsw: hnsw={} embeddings={} — rebuilding", self.hnsw.len(), self.embeddings.len());
-                self.rebuild_hnsw();
+            if !hnsw_ok && self.use_hnsw() {
+                if binary_covers && !self.hnsw.is_empty() {
+                    // HNSW is partially stale (WAL replay added delta without inserting into HNSW).
+                    // Incremental O(K log N) insert instead of O(N log N) full rebuild.
+                    self.backfill_hnsw_delta();
+                } else if !binary_covers {
+                    eprintln!("[hnsw] rebuild_hnsw: hnsw={} embeddings={} — rebuilding", self.hnsw.len(), self.embeddings.len());
+                    self.rebuild_hnsw();
+                }
+                // binary_covers && hnsw.is_empty(): binary Hamming is the active path, skip rebuild.
             }
         }
     }
@@ -772,12 +798,19 @@ impl SemanticIndex {
                 return false;
             }
         };
-        if graph.len() != self.embeddings.len() {
-            eprintln!("[hnsw] load_hnsw: stale graph ({} nodes) vs embeddings ({} entries) — rebuilding",
+        if graph.len() > self.embeddings.len() {
+            // Sidecar is LARGER than the snapshot — can't happen with normal flow, reject.
+            eprintln!("[hnsw] load_hnsw: sidecar ({} nodes) exceeds snapshot ({} entries) — discarding",
                 graph.len(), self.embeddings.len());
             return false;
         }
-        eprintln!("[hnsw] load_hnsw: loaded {} nodes from {:?}", graph.len(), path);
+        let delta = self.embeddings.len().saturating_sub(graph.len());
+        if delta > 0 {
+            eprintln!("[hnsw] load_hnsw: partial sidecar ({} nodes, {} delta will be backfilled after WAL replay)",
+                graph.len(), delta);
+        } else {
+            eprintln!("[hnsw] load_hnsw: loaded {} nodes from {:?}", graph.len(), path);
+        }
         self.hnsw = graph;
         true
     }
