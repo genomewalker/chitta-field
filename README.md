@@ -271,8 +271,32 @@ Train the bag-of-words lite encoder from existing memories and save it to disk. 
 ~/.claude/mind/chitta-field/
 ├── {instance_id}_{seqno}.seg    (op log segment, one per writer process)
 ├── chitta.snapshot              (full state snapshot, optional, speeds startup)
+├── chitta.snapshot.emb          (v10+ sidecar: magic + count + flat {id, f32×256} embedding records)
+├── chitta.snapshot.bin          (v10+ sidecar: binary sparse codes)
+├── chitta.hnsw                  (HNSW base graph, written at checkpoint)
+├── chitta.delta.hnsw            (two-tier HNSW delta graph, active above 100K memories)
 └── cortex.snapshot              (cortical index snapshot, optional)
 ```
+
+### v10 snapshot sidecar format
+
+As of v5.21.45, `cf_save_full_snapshot` writes two sidecars alongside the main bincode snapshot:
+
+- **`.emb` sidecar** — embeddings, removed from the main snapshot to reduce bincode serialization cost. Format: 8-byte magic (`CTEMB\x00\x00\x00`) + 4-byte little-endian count + contiguous `{u64 id, f32×256}` records. Designed for future `mmap` access.
+- **`.bin` sidecar** — binary sparse codes (bit-packed SDR representations), also separated from the main snapshot for the same reason.
+
+Older snapshots without sidecars are still readable; the loader falls back to the embedding data embedded in the bincode blob when sidecars are absent.
+
+### Two-tier HNSW (delta graph)
+
+Above `HNSW_TIER2_THRESHOLD = 100_000` memories, the semantic index activates a two-tier insert strategy:
+
+- **Base graph** (`chitta.hnsw`) — the large, fully connected HNSW over all memories. Rebuilt infrequently; insert cost is O(log N_total).
+- **Delta graph** (`chitta.delta.hnsw`) — a small HNSW that absorbs all new inserts. Insert cost is O(log N_delta), where N_delta ≪ N_total.
+
+At checkpoint, if the delta graph contains more than 10% of the base graph's node count, the delta is merged into the base and the sidecar is reset. Queries search both graphs and merge results before reranking.
+
+Below the threshold the single-graph path is used unchanged.
 
 ## Cognitive organs
 
