@@ -1,7 +1,8 @@
 use crate::ids::MemoryId;
-use crate::binary::{binarize, hamming_dist, HAMMING_CANDIDATES};
+use crate::binary::{binarize, hamming_dist, BINARY_WORDS, HAMMING_CANDIDATES};
 use crate::ops::EMBED_DIM;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::io::Write;
 
 const COARSE_CENTROIDS: usize = 256;
 const COARSE_ASSIGNMENTS: usize = 2;
@@ -770,7 +771,6 @@ impl SemanticIndex {
 
     /// Serialize the HNSW graph to a sidecar file.
     pub fn save_hnsw(&self, path: &std::path::Path) -> std::io::Result<()> {
-        use std::io::Write;
         let bytes = bincode::serialize(&self.hnsw)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let tmp = path.with_extension("hnsw.tmp");
@@ -812,6 +812,136 @@ impl SemanticIndex {
             eprintln!("[hnsw] load_hnsw: loaded {} nodes from {:?}", graph.len(), path);
         }
         self.hnsw = graph;
+        true
+    }
+
+    // ── Embedding sidecar (.emb) ─────────────────────────────────────────────
+    // Format: [magic:u64][count:u64]([id:u64][f32×EMBED_DIM])×count
+    // All values little-endian. Atomic write via .tmp rename.
+
+    const EMB_MAGIC: u64 = 0x454D4244_00000001; // "EMBD\0\0\0\x01"
+
+    pub fn save_embeddings_sidecar(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let tmp = path.with_extension("emb.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&Self::EMB_MAGIC.to_le_bytes())?;
+            f.write_all(&(self.embeddings.len() as u64).to_le_bytes())?;
+            for (&id, emb) in &self.embeddings {
+                f.write_all(&id.to_le_bytes())?;
+                for &v in emb.iter().take(EMBED_DIM) {
+                    f.write_all(&v.to_le_bytes())?;
+                }
+            }
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load embeddings from sidecar. Returns false if missing/corrupt.
+    /// On success, `self.embeddings` is fully populated from the sidecar.
+    pub fn load_embeddings_sidecar(&mut self, path: &std::path::Path) -> bool {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        if bytes.len() < 16 {
+            eprintln!("[hnsw] load_emb: sidecar too short");
+            return false;
+        }
+        let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        if magic != Self::EMB_MAGIC {
+            eprintln!("[hnsw] load_emb: bad magic {:016x}", magic);
+            return false;
+        }
+        let count = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let record_size = 8 + EMBED_DIM * 4;
+        if bytes.len() < 16 + count * record_size {
+            eprintln!("[hnsw] load_emb: truncated ({} bytes for {} entries)", bytes.len(), count);
+            return false;
+        }
+        let mut map = HashMap::with_capacity(count);
+        let mut off = 16usize;
+        for _ in 0..count {
+            let id = u64::from_le_bytes(bytes[off..off+8].try_into().unwrap());
+            off += 8;
+            let mut emb = vec![0f32; EMBED_DIM];
+            for v in emb.iter_mut() {
+                *v = f32::from_le_bytes(bytes[off..off+4].try_into().unwrap());
+                off += 4;
+            }
+            map.insert(id, emb);
+        }
+        self.embeddings = map;
+        eprintln!("[hnsw] load_emb: loaded {} embeddings from sidecar", count);
+        true
+    }
+
+    pub fn embeddings_count(&self) -> usize {
+        self.embeddings.len()
+    }
+
+    /// Clear embeddings (called on snapshot clone before bincode serialization in v10+).
+    pub fn clear_embeddings(&mut self) {
+        self.embeddings = HashMap::new();
+    }
+
+    // ── Binary codes sidecar (.bin) ──────────────────────────────────────────
+    // Format: [magic:u64][count:u64]([id:u64][u64×BINARY_WORDS])×count
+
+    const BIN_MAGIC: u64 = 0x42494E41_00000001; // "BINA\0\0\0\x01"
+
+    pub fn save_binary_sidecar(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let tmp = path.with_extension("bin.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&Self::BIN_MAGIC.to_le_bytes())?;
+            f.write_all(&(self.binary_codes.len() as u64).to_le_bytes())?;
+            for (&id, codes) in &self.binary_codes {
+                f.write_all(&id.to_le_bytes())?;
+                for &w in codes.iter().take(BINARY_WORDS) {
+                    f.write_all(&w.to_le_bytes())?;
+                }
+            }
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load binary codes from sidecar. Returns false if missing/corrupt.
+    pub fn load_binary_sidecar(&mut self, path: &std::path::Path) -> bool {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        if bytes.len() < 16 {
+            return false;
+        }
+        let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        if magic != Self::BIN_MAGIC {
+            return false;
+        }
+        let count = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let record_size = 8 + BINARY_WORDS * 8;
+        if bytes.len() < 16 + count * record_size {
+            eprintln!("[hnsw] load_bin: truncated ({} bytes for {} entries)", bytes.len(), count);
+            return false;
+        }
+        let mut map = HashMap::with_capacity(count);
+        let mut off = 16usize;
+        for _ in 0..count {
+            let id = u64::from_le_bytes(bytes[off..off+8].try_into().unwrap());
+            off += 8;
+            let mut codes = vec![0u64; BINARY_WORDS];
+            for w in codes.iter_mut() {
+                *w = u64::from_le_bytes(bytes[off..off+8].try_into().unwrap());
+                off += 8;
+            }
+            map.insert(id, codes);
+        }
+        self.binary_codes = map;
         true
     }
 

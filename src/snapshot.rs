@@ -32,8 +32,10 @@ const FULL_SNAPSHOT_MAGIC_V7: u64 = 0xF011_5741_7E00_0007;
 /// Magic for v1.0.8 snapshots: adds competitive_weight, lure_risk, spacing_quality.
 /// FullSnapshot had no top-level sidecars (ack_scores / correction_states).
 const FULL_SNAPSHOT_MAGIC_V8: u64 = 0xF011_5741_7E00_0008;
-/// Current magic (v1.0.9+): FullSnapshot gains ack_scores + correction_states sidecars.
-const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_0009;
+/// v1.0.9: FullSnapshot with ack_scores + correction_states; embeddings in bincode.
+const FULL_SNAPSHOT_MAGIC_V9: u64 = 0xF011_5741_7E00_0009;
+/// Current magic (v1.0.10+): embeddings moved to .emb sidecar; bincode field is empty.
+const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_000A;
 
 // ── Compile-time guard: MemoryState size must match snapshot magic ────────────
 // If you add/remove fields to MemoryState, this assert will fail.
@@ -451,6 +453,7 @@ impl FullSnapshot {
         r.read_exact(&mut buf)?;
         let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         if magic != FULL_SNAPSHOT_MAGIC
+            && magic != FULL_SNAPSHOT_MAGIC_V9
             && magic != FULL_SNAPSHOT_MAGIC_V8
             && magic != FULL_SNAPSHOT_MAGIC_V7
             && magic != FULL_SNAPSHOT_MAGIC_V6
@@ -472,13 +475,21 @@ impl FullSnapshot {
         let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
 
         if magic == FULL_SNAPSHOT_MAGIC {
-            // Current format (v9): adds ack_scores + correction_states sidecars.
+            // v10: same struct as v9, but semantic_idx.embeddings is empty in bincode.
+            // Caller (field.rs) populates embeddings from the .emb sidecar after this returns.
             let r = BufReader::new(&bytes[8..]);
             let mut snap: Self = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
-            for state in snap.states.values_mut() {
-                state.sanitize();
-            }
+            for state in snap.states.values_mut() { state.sanitize(); }
+            return Ok(snap);
+        }
+
+        if magic == FULL_SNAPSHOT_MAGIC_V9 {
+            // v9: embeddings included in bincode (pre-sidecar format).
+            let r = BufReader::new(&bytes[8..]);
+            let mut snap: Self = bincode::deserialize_from(r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
         }
 
