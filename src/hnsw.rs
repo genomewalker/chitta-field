@@ -1,4 +1,5 @@
 use crate::ids::MemoryId;
+use crate::binary::{binarize, hamming_dist, HAMMING_CANDIDATES};
 use crate::ops::EMBED_DIM;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -323,6 +324,9 @@ pub struct SemanticIndex {
     /// Active when `embeddings.len() >= HNSW_THRESHOLD`.
     #[serde(skip)]
     hnsw: HnswGraph,
+    /// Sign-bit binary codes for Hamming pre-filter (derived from embeddings; not persisted).
+    #[serde(skip)]
+    binary_codes: HashMap<MemoryId, Vec<u64>>,
 }
 
 impl SemanticIndex {
@@ -337,6 +341,7 @@ impl SemanticIndex {
             lsh_buckets: vec![HashMap::new(); LSH_TABLES],
             mem_lsh: HashMap::new(),
             hnsw: HnswGraph::new(),
+            binary_codes: HashMap::new(),
         }
     }
 
@@ -377,6 +382,7 @@ impl SemanticIndex {
                 .push(memory_id);
         }
         self.mem_lsh.insert(memory_id, lsh_ids);
+        self.binary_codes.insert(memory_id, binarize(&embedding));
         self.embeddings.insert(memory_id, embedding);
 
         // Insert into HNSW if it is already active, or activate it now that
@@ -392,6 +398,7 @@ impl SemanticIndex {
         self.hnsw.remove(memory_id);
         self.deleted.insert(memory_id);
         self.embeddings.remove(&memory_id);
+        self.binary_codes.remove(&memory_id);
         if let Some(coarse_ids) = self.mem_coarse.remove(&memory_id) {
             for coarse_id in coarse_ids {
                 let remove_bucket = if let Some(members) = self.coarse_members.get_mut(&coarse_id) {
@@ -454,7 +461,12 @@ impl SemanticIndex {
                 .collect();
         }
 
-        let mut candidates = self.collect_lsh_candidates(&query_unit, allowed, k);
+        let mut candidates = if self.binary_codes.len() == self.embeddings.len() && !self.binary_codes.is_empty() {
+            let query_bits = binarize(&query_unit);
+            self.hamming_candidates(&query_bits, allowed)
+        } else {
+            self.collect_lsh_candidates(&query_unit, allowed, k)
+        };
         if candidates.is_empty() {
             let probes = self.choose_probe_ids(&query_unit, MIN_PROBES);
             candidates = self.collect_candidates(&probes, allowed, k);
@@ -589,6 +601,11 @@ impl SemanticIndex {
         for embedding in self.embeddings.values_mut() {
             normalize_in_place(embedding);
         }
+        if self.binary_codes.len() != self.embeddings.len() {
+            self.binary_codes = self.embeddings.iter()
+                .map(|(&id, emb)| (id, binarize(emb)))
+                .collect();
+        }
         if self.coarse_centroids.is_empty() {
             self.coarse_centroids = default_coarse_centroids();
         }
@@ -643,6 +660,27 @@ impl SemanticIndex {
         }
     }
 
+
+    /// Hamming pre-filter: returns the top-HAMMING_CANDIDATES IDs by minimum Hamming
+    /// distance from the binarized query, restricted to `allowed` when provided.
+    fn hamming_candidates(
+        &self,
+        query_bits: &[u64],
+        allowed: Option<&HashSet<MemoryId>>,
+    ) -> Vec<MemoryId> {
+        let mut scored: Vec<(MemoryId, u32)> = self
+            .binary_codes
+            .iter()
+            .filter_map(|(&id, bits)| {
+                if self.deleted.contains(&id) { return None; }
+                if let Some(a) = allowed { if !a.contains(&id) { return None; } }
+                Some((id, hamming_dist(query_bits, bits)))
+            })
+            .collect();
+        scored.sort_unstable_by_key(|&(_, d)| d);
+        scored.truncate(HAMMING_CANDIDATES);
+        scored.into_iter().map(|(id, _)| id).collect()
+    }
 
     /// Serialize the HNSW graph to a sidecar file.
     pub fn save_hnsw(&self, path: &std::path::Path) -> std::io::Result<()> {
