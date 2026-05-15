@@ -452,7 +452,23 @@ impl SemanticIndex {
             }
         }
 
-        // Use HNSW when the graph is active (>= HNSW_THRESHOLD memories)
+        // Binary Hamming pre-filter: primary path when codes are fully in sync.
+        // O(N × 12 u64) scan + float rescore of top-HAMMING_CANDIDATES — replaces HNSW.
+        if self.binary_codes.len() == self.embeddings.len() && !self.binary_codes.is_empty() {
+            let query_bits = binarize(&query_unit);
+            let candidates = self.hamming_candidates(&query_bits, allowed);
+            if !candidates.is_empty() {
+                let mut top_k = BinaryHeap::new();
+                for memory_id in candidates {
+                    let Some(embedding) = self.embeddings.get(&memory_id) else { continue; };
+                    let sim = dot(&query_unit, embedding);
+                    push_top_k(&mut top_k, k, memory_id, sim);
+                }
+                return heap_to_hits(top_k);
+            }
+        }
+
+        // Fallback: HNSW when active and binary codes are absent/stale.
         if self.use_hnsw() && !self.hnsw.is_empty() {
             let hits = self.hnsw.search(&query_unit, k, allowed, &self.deleted, &self.embeddings);
             return hits
@@ -461,12 +477,7 @@ impl SemanticIndex {
                 .collect();
         }
 
-        let mut candidates = if self.binary_codes.len() == self.embeddings.len() && !self.binary_codes.is_empty() {
-            let query_bits = binarize(&query_unit);
-            self.hamming_candidates(&query_bits, allowed)
-        } else {
-            self.collect_lsh_candidates(&query_unit, allowed, k)
-        };
+        let mut candidates = self.collect_lsh_candidates(&query_unit, allowed, k);
         if candidates.is_empty() {
             let probes = self.choose_probe_ids(&query_unit, MIN_PROBES);
             candidates = self.collect_candidates(&probes, allowed, k);
@@ -512,9 +523,13 @@ impl SemanticIndex {
             return vec![];
         };
 
+        let binary_ready = self.binary_codes.len() == self.embeddings.len() && !self.binary_codes.is_empty();
         let candidates = if let Some(allowed_ids) = allowed {
             if allowed_ids.len() <= MIN_CANDIDATES {
                 allowed_ids.iter().copied().collect::<Vec<_>>()
+            } else if binary_ready {
+                let query_bits = binarize(&query_unit);
+                self.hamming_candidates(&query_bits, allowed)
             } else {
                 let mut cands = self.collect_lsh_candidates(&query_unit, allowed, k);
                 if cands.is_empty() {
@@ -523,6 +538,9 @@ impl SemanticIndex {
                 }
                 cands
             }
+        } else if binary_ready {
+            let query_bits = binarize(&query_unit);
+            self.hamming_candidates(&query_bits, allowed)
         } else {
             let mut cands = self.collect_lsh_candidates(&query_unit, allowed, k);
             if cands.is_empty() {
