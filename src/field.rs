@@ -412,8 +412,9 @@ impl ChittaField {
             }
             // .bin: binary codes sidecar — skip O(N×256) reconstruction in normalize_all.
             let _ = semantic_idx.load_binary_sidecar(&snap_path.with_extension("bin"));
-            // .hnsw: incremental delta backfill handles any WAL-replay additions.
+            // .hnsw + .delta.hnsw: load both tiers; backfill handles WAL-replay additions.
             let _ = semantic_idx.load_hnsw(&snap_path.with_extension("hnsw"));
+            let _ = semantic_idx.load_delta_hnsw(&snap_path.with_extension("delta.hnsw"));
         }
         // Inhibit HNSW inserts during replay — binary Hamming takes over after normalize_all(),
         // so building the O(N log N) HNSW graph incrementally would waste time and RAM.
