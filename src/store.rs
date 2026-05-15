@@ -1879,6 +1879,56 @@ impl ChittaField {
         pending.into_iter().take(limit).map(|(_, id)| id).collect()
     }
 
+    /// Clear embed_pending for specific memory IDs, regardless of content.
+    /// Returns count actually cleared (skips IDs not in pending state).
+    pub fn purge_orphan_embed_pending(&self) -> usize {
+        // Collect all embed_pending IDs
+        let pending: Vec<MemoryId> = {
+            let states = self.states.read();
+            states.iter()
+                .filter(|(_, st)| st.embed_pending && !st.deleted)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        if pending.is_empty() { return 0; }
+
+        // Check which ones get_memory() would fail for (not in payloads or error)
+        let to_clear: Vec<MemoryId> = pending.iter()
+            .filter(|id| self.get_memory(**id).is_err())
+            .copied()
+            .collect();
+
+        let n = to_clear.len();
+        if n > 0 {
+            let mut states = self.states.write();
+            for id in &to_clear {
+                if let Some(st) = states.get_mut(id) {
+                    if st.embed_pending {
+                        st.embed_pending = false;
+                        self.pending_embed_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    /// Force-clear embed_pending for specific IDs (maintenance tool).
+    pub fn force_clear_embed_pending(&self, ids: &[MemoryId]) -> usize {
+        let mut states = self.states.write();
+        let mut n = 0usize;
+        for id in ids {
+            if let Some(st) = states.get_mut(id) {
+                if st.embed_pending {
+                    st.embed_pending = false;
+                    self.pending_embed_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     /// Remove triplet by subject+predicate+object (invalidates first matching entry).
     pub fn forget_triplet(&self, subject: &str, predicate: &str, object: &str) -> Result<bool> {
         let at_ms = now_ms();
