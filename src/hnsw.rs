@@ -3,6 +3,7 @@ use crate::binary::{binarize, hamming_dist, BINARY_WORDS, HAMMING_CANDIDATES};
 use crate::ops::EMBED_DIM;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::Write;
+use memmap2;
 
 const COARSE_CENTROIDS: usize = 256;
 const COARSE_ASSIGNMENTS: usize = 2;
@@ -15,6 +16,12 @@ const LSH_BITS: usize = 12;
 
 // HNSW kicks in above this many memories — below it IVF+LSH is fast enough.
 const HNSW_THRESHOLD: usize = 2000;
+// Two-tier HNSW: above this count new inserts go to a small delta graph instead
+// of the large base graph. Queries search both and merge. Reduces insert cost from
+// O(log N_total) to O(log N_delta) at 1M+ scale.
+const HNSW_TIER2_THRESHOLD: usize = 100_000;
+// Merge delta into base when delta exceeds this fraction of the base size.
+const HNSW_DELTA_MERGE_RATIO: f64 = 0.10;
 // HNSW build/search parameters
 const HNSW_M: usize = 16;        // neighbors per non-zero layer
 const HNSW_M0: usize = 32;       // neighbors at layer 0 (2×M)
@@ -54,6 +61,10 @@ impl HnswGraph {
 
     pub(crate) fn contains(&self, id: MemoryId) -> bool {
         self.neighbors.contains_key(&id)
+    }
+
+    pub(crate) fn ids(&self) -> Vec<MemoryId> {
+        self.neighbors.keys().copied().collect()
     }
 
     /// Insert `id` with pre-normalised `embedding`.
@@ -329,6 +340,11 @@ pub struct SemanticIndex {
     /// Active when `embeddings.len() >= HNSW_THRESHOLD`.
     #[serde(skip)]
     hnsw: HnswGraph,
+    /// Delta tier: receives new inserts when embeddings.len() >= HNSW_TIER2_THRESHOLD.
+    /// Queries merge results from both tiers. Saved to .delta.hnsw sidecar.
+    /// Merged into base when delta_needs_merge() returns true (at checkpoint).
+    #[serde(skip)]
+    delta_hnsw: HnswGraph,
     /// Sign-bit binary codes for Hamming pre-filter (derived from embeddings; not persisted).
     #[serde(skip)]
     binary_codes: HashMap<MemoryId, Vec<u64>>,
@@ -350,6 +366,7 @@ impl SemanticIndex {
             lsh_buckets: vec![HashMap::new(); LSH_TABLES],
             mem_lsh: HashMap::new(),
             hnsw: HnswGraph::new(),
+            delta_hnsw: HnswGraph::new(),
             binary_codes: HashMap::new(),
             inhibit_hnsw: false,
         }
@@ -361,22 +378,60 @@ impl SemanticIndex {
         self.embeddings.len() >= HNSW_THRESHOLD
     }
 
+    /// True when two-tier mode is active: new inserts go to delta_hnsw, not hnsw.
+    #[inline]
+    fn use_tier2(&self) -> bool {
+        self.embeddings.len() >= HNSW_TIER2_THRESHOLD
+    }
+
     /// Insert embeddings that are in the store but not yet in HNSW (WAL replay delta).
     /// O(K log N) where K = delta count. Called after WAL replay when binary_covers=true
     /// prevents a full O(N log N) rebuild but HNSW is partially stale.
     pub fn backfill_hnsw_delta(&mut self) {
-        if !self.use_hnsw() || self.hnsw.is_empty() { return; }
+        if !self.use_hnsw() { return; }
+        if self.hnsw.is_empty() && self.delta_hnsw.is_empty() { return; }
         let delta: Vec<MemoryId> = self.embeddings.keys()
-            .filter(|&&id| !self.deleted.contains(&id) && !self.hnsw.contains(id))
+            .filter(|&&id| {
+                !self.deleted.contains(&id)
+                    && !self.hnsw.contains(id)
+                    && !self.delta_hnsw.contains(id)
+            })
             .copied()
             .collect();
         if delta.is_empty() { return; }
         eprintln!("[hnsw] backfill_hnsw_delta: inserting {} delta nodes", delta.len());
         for id in delta {
             if let Some(emb) = self.embeddings.get(&id).cloned() {
+                if self.use_tier2() {
+                    self.delta_hnsw.insert(id, &emb, &self.embeddings);
+                } else {
+                    self.hnsw.insert(id, &emb, &self.embeddings);
+                }
+            }
+        }
+    }
+
+    /// Returns true when the delta tier should be merged into the base HNSW.
+    /// Called at checkpoint time to keep delta small and inserts fast.
+    pub fn delta_needs_merge(&self) -> bool {
+        self.use_tier2()
+            && !self.hnsw.is_empty()
+            && self.delta_hnsw.len() as f64 > self.hnsw.len() as f64 * HNSW_DELTA_MERGE_RATIO
+    }
+
+    /// Merge delta tier into base HNSW. O(delta × log N_base).
+    /// Clears delta after merge. Called when delta_needs_merge() is true.
+    pub fn merge_delta_into_base(&mut self) {
+        if self.delta_hnsw.is_empty() { return; }
+        let ids = self.delta_hnsw.ids();
+        eprintln!("[hnsw] merge_delta_into_base: merging {} nodes into base", ids.len());
+        for id in ids {
+            if self.deleted.contains(&id) { continue; }
+            if let Some(emb) = self.embeddings.get(&id).cloned() {
                 self.hnsw.insert(id, &emb, &self.embeddings);
             }
         }
+        self.delta_hnsw = HnswGraph::new();
     }
 
     /// Inhibit HNSW inserts during WAL replay when binary Hamming will be the active path.
@@ -416,20 +471,28 @@ impl SemanticIndex {
                 .push(memory_id);
         }
         self.mem_lsh.insert(memory_id, lsh_ids);
-        self.binary_codes.insert(memory_id, binarize(&embedding));
+        // Only binarize and index into HNSW when the embedding has the correct dimension.
+        // Pending-embed memories arrive with an empty slice and must not trigger binarize.
+        let embedding_ready = embedding.len() == EMBED_DIM;
+        if embedding_ready {
+            self.binary_codes.insert(memory_id, binarize(&embedding));
+        }
         self.embeddings.insert(memory_id, embedding);
 
-        // Insert into HNSW only when it is the active search path (not inhibited during
-        // WAL replay when binary Hamming will take over after normalize_all).
-        if !self.inhibit_hnsw && self.use_hnsw() {
+        if !self.inhibit_hnsw && self.use_hnsw() && embedding_ready {
             let emb = self.embeddings[&memory_id].clone();
-            self.hnsw.insert(memory_id, &emb, &self.embeddings);
+            if self.use_tier2() {
+                self.delta_hnsw.insert(memory_id, &emb, &self.embeddings);
+            } else {
+                self.hnsw.insert(memory_id, &emb, &self.embeddings);
+            }
         }
     }
 
     /// Mark a memory as deleted — excluded from future search results.
     pub fn remove(&mut self, memory_id: MemoryId) {
         self.hnsw.remove(memory_id);
+        self.delta_hnsw.remove(memory_id);
         self.deleted.insert(memory_id);
         self.embeddings.remove(&memory_id);
         self.binary_codes.remove(&memory_id);
@@ -503,9 +566,21 @@ impl SemanticIndex {
         }
 
         // Fallback: HNSW when active and binary codes are absent/stale.
-        if self.use_hnsw() && !self.hnsw.is_empty() {
-            let hits = self.hnsw.search(&query_unit, k, allowed, &self.deleted, &self.embeddings);
-            return hits
+        // In two-tier mode, search both base and delta graphs, merge by similarity.
+        if self.use_hnsw() && (!self.hnsw.is_empty() || !self.delta_hnsw.is_empty()) {
+            let mut pairs: Vec<(MemoryId, f32)> = if !self.hnsw.is_empty() {
+                self.hnsw.search(&query_unit, k, allowed, &self.deleted, &self.embeddings)
+            } else {
+                vec![]
+            };
+            if self.use_tier2() && !self.delta_hnsw.is_empty() {
+                let delta_pairs = self.delta_hnsw.search(&query_unit, k, allowed, &self.deleted, &self.embeddings);
+                pairs.extend(delta_pairs);
+                pairs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                pairs.dedup_by_key(|p| p.0);
+                pairs.truncate(k);
+            }
+            return pairs
                 .into_iter()
                 .map(|(memory_id, cosine_similarity)| SemanticHit { memory_id, cosine_similarity })
                 .collect();
@@ -815,6 +890,46 @@ impl SemanticIndex {
         true
     }
 
+    // ── Delta HNSW sidecar (.delta.hnsw) ────────────────────────────────────
+
+    /// Save delta HNSW to sidecar. Removes the file if delta is empty (after merge).
+    pub fn save_delta_hnsw(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if self.delta_hnsw.is_empty() {
+            let _ = std::fs::remove_file(path);
+            return Ok(());
+        }
+        let bytes = bincode::serialize(&self.delta_hnsw)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let tmp = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(".tmp");
+            std::path::PathBuf::from(s)
+        };
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load delta HNSW from sidecar. Returns false if missing or corrupt.
+    pub fn load_delta_hnsw(&mut self, path: &std::path::Path) -> bool {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let graph: HnswGraph = match bincode::deserialize(&bytes) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[hnsw] load_delta_hnsw: deserialize failed: {}", e);
+                return false;
+            }
+        };
+        eprintln!("[hnsw] load_delta_hnsw: loaded {} delta nodes from {:?}", graph.len(), path);
+        self.delta_hnsw = graph;
+        true
+    }
+
     // ── Embedding sidecar (.emb) ─────────────────────────────────────────────
     // Format: [magic:u64][count:u64]([id:u64][f32×EMBED_DIM])×count
     // All values little-endian. Atomic write via .tmp rename.
@@ -841,10 +956,21 @@ impl SemanticIndex {
 
     /// Load embeddings from sidecar. Returns false if missing/corrupt.
     /// On success, `self.embeddings` is fully populated from the sidecar.
+    /// Uses mmap for zero-copy parsing; falls back to read() on NFS/SIGBUS risk.
     pub fn load_embeddings_sidecar(&mut self, path: &std::path::Path) -> bool {
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
+        // Try mmap first (avoids double-buffering: OS page cache + heap Vec<u8>).
+        // Fall back to read() if mmap fails (e.g. NFS with mmap disabled).
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
             Err(_) => return false,
+        };
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.ok();
+        let fallback;
+        let bytes: &[u8] = if let Some(ref m) = mmap {
+            &m[..]
+        } else {
+            fallback = match std::fs::read(path) { Ok(b) => b, Err(_) => return false };
+            &fallback
         };
         if bytes.len() < 16 {
             eprintln!("[hnsw] load_emb: sidecar too short");
@@ -946,7 +1072,8 @@ impl SemanticIndex {
     }
 
     fn rebuild_ann(&mut self) {
-        let hnsw_valid = !self.hnsw.is_empty() && self.hnsw.len() == self.embeddings.len();
+        let hnsw_valid = (!self.hnsw.is_empty() || !self.delta_hnsw.is_empty())
+            && (self.hnsw.len() + self.delta_hnsw.len() == self.embeddings.len());
         self.coarse_members.clear();
         self.mem_coarse.clear();
         self.lsh_buckets = vec![HashMap::new(); LSH_TABLES];
@@ -988,6 +1115,7 @@ impl SemanticIndex {
 
     fn rebuild_hnsw(&mut self) {
         self.hnsw = HnswGraph::new();
+        self.delta_hnsw = HnswGraph::new();
         // Insert in insertion order (by id for determinism) to build graph
         let mut ids: Vec<MemoryId> = self.embeddings.keys().copied().collect();
         ids.sort_unstable();

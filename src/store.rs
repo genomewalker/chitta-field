@@ -3686,10 +3686,26 @@ impl ChittaField {
         let path = self
             .data_dir
             .join(format!("chitta.{:08x}.snapshot", self.instance_id));
+        // Write embedding and binary-code sidecars from the live index (before clearing clone).
+        let emb_path   = path.with_extension("emb");
+        let bin_path   = path.with_extension("bin");
+        let hnsw_path  = path.with_extension("hnsw");
+        let delta_path = path.with_extension("delta.hnsw");
+        {
+            // Merge delta into base if threshold exceeded, then persist both sidecars.
+            let mut idx = self.semantic_idx.write();
+            if idx.delta_needs_merge() {
+                idx.merge_delta_into_base();
+            }
+            let _ = idx.save_embeddings_sidecar(&emb_path);
+            let _ = idx.save_binary_sidecar(&bin_path);
+            let _ = idx.save_hnsw(&hnsw_path);
+            let _ = idx.save_delta_hnsw(&delta_path);
+        }
+        // Remove embeddings from the bincode snapshot (they live in the .emb sidecar now).
+        let mut snap = snap;
+        snap.semantic_idx.clear_embeddings();
         snap.save(&path)?;
-        // Save HNSW sidecar alongside snapshot (same stem, .hnsw ext).
-        let hnsw_path = path.with_extension("hnsw");
-        let _ = self.semantic_idx.read().save_hnsw(&hnsw_path);
         Ok(())
     }
 
