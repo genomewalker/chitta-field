@@ -4151,7 +4151,7 @@ mod tests {
     #[test]
     fn test_put_get_roundtrip() {
         let (field, _tmp) = open_test_field();
-        let embedding = vec![0.1f32; 768];
+        let embedding = vec![0.1f32; crate::ops::EMBED_DIM];
         let (id, hash) = field
             .put_memory(
                 "wisdom",
@@ -4176,7 +4176,7 @@ mod tests {
     #[test]
     fn test_forget() {
         let (field, _tmp) = open_test_field();
-        let embedding = vec![0.0f32; 768];
+        let embedding = vec![0.0f32; crate::ops::EMBED_DIM];
         let (id, _) = field
             .put_memory(
                 "wisdom",
@@ -4205,7 +4205,7 @@ mod tests {
 
         let id = {
             let field = ChittaField::open(data_dir.clone()).unwrap();
-            let embedding = vec![0.5f32; 768];
+            let embedding = vec![0.5f32; crate::ops::EMBED_DIM];
             let (id, _) = field
                 .put_memory(
                     "episode",
@@ -4232,7 +4232,7 @@ mod tests {
     #[test]
     fn test_assoc_edge() {
         let (field, _tmp) = open_test_field();
-        let emb = vec![0.1f32; 768];
+        let emb = vec![0.1f32; crate::ops::EMBED_DIM];
         let (id1, _) = field
             .put_memory(
                 "wisdom",
@@ -4376,7 +4376,7 @@ mod tests {
     #[test]
     fn test_integration_recall_keyword() {
         let (field, _tmp) = open_test_field();
-        let emb = vec![0.1f32; 768];
+        let emb = vec![0.1f32; crate::ops::EMBED_DIM];
 
         field
             .put_memory(
@@ -4418,9 +4418,9 @@ mod tests {
     fn test_recall_effects_are_deferred_until_flush() {
         let (field, _tmp) = open_test_field();
 
-        let mut emb1 = vec![0.0f32; 768];
+        let mut emb1 = vec![0.0f32; crate::ops::EMBED_DIM];
         emb1[0] = 1.0;
-        let mut emb2 = vec![0.0f32; 768];
+        let mut emb2 = vec![0.0f32; crate::ops::EMBED_DIM];
         emb2[1] = 1.0;
 
         field
@@ -4469,7 +4469,7 @@ mod tests {
     #[test]
     fn test_recall_excludes_invalidated_statuses() {
         let (field, _tmp) = open_test_field();
-        let emb = vec![0.5f32; 768];
+        let emb = vec![0.5f32; crate::ops::EMBED_DIM];
 
         let (id_active, _)     = field.put_memory("wisdom", "test", b"active memory",     &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
         let (id_superseded, _) = field.put_memory("wisdom", "test", b"superseded memory", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
@@ -4493,7 +4493,7 @@ mod tests {
     #[test]
     fn test_recall_status_score_ordering() {
         let (field, _tmp) = open_test_field();
-        let emb = vec![0.5f32; 768];
+        let emb = vec![0.5f32; crate::ops::EMBED_DIM];
 
         let (id_active,   _) = field.put_memory("wisdom", "test", b"active",   &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
         let (id_verified, _) = field.put_memory("wisdom", "test", b"verified", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
@@ -4514,7 +4514,7 @@ mod tests {
     #[test]
     fn test_recall_explain_fields_populated() {
         let (field, _tmp) = open_test_field();
-        let emb = vec![0.5f32; 768];
+        let emb = vec![0.5f32; crate::ops::EMBED_DIM];
 
         let (id, _) = field.put_memory("wisdom", "test", b"tool derived memory", &emb, 0.9, 0.001, 0, vec![], None, None).unwrap();
         field.set_epistemic_status(id, crate::state::EpistemicStatus::ToolDerived).unwrap();
@@ -4531,7 +4531,7 @@ mod tests {
     #[test]
     fn test_recall_explain_score_decomposition() {
         let (field, _tmp) = open_test_field();
-        let emb = vec![0.5f32; 768];
+        let emb = vec![0.5f32; crate::ops::EMBED_DIM];
 
         let (id, _) = field.put_memory("wisdom", "test", b"decomposition test", &emb, 0.8, 0.001, 0, vec![], None, None).unwrap();
 
@@ -4553,7 +4553,7 @@ mod tests {
     #[test]
     fn test_recall_keyword_explain_fields() {
         let (field, _tmp) = open_test_field();
-        let emb = vec![0.1f32; 768];
+        let emb = vec![0.1f32; crate::ops::EMBED_DIM];
 
         field.put_memory("wisdom", "test", b"rust ownership borrow checker lifetime", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
 
@@ -4572,7 +4572,7 @@ mod tests {
     #[test]
     fn test_get_conflicts_bidirectional() {
         let (field, _tmp) = open_test_field();
-        let emb = vec![0.1f32; 768];
+        let emb = vec![0.1f32; crate::ops::EMBED_DIM];
         let (id_a, _) = field.put_memory("wisdom", "test", b"memory A", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
         let (id_b, _) = field.put_memory("wisdom", "test", b"memory B", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
 
@@ -4587,7 +4587,7 @@ mod tests {
     #[test]
     fn test_get_supersession_chain_follows_edges() {
         let (field, _tmp) = open_test_field();
-        let emb = vec![0.1f32; 768];
+        let emb = vec![0.1f32; crate::ops::EMBED_DIM];
         let (id_a, _) = field.put_memory("wisdom", "test", b"original", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
         let (id_b, _) = field.put_memory("wisdom", "test", b"revision 1", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
         let (id_c, _) = field.put_memory("wisdom", "test", b"revision 2", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
@@ -4603,7 +4603,7 @@ mod tests {
     #[test]
     fn test_get_supersession_chain_cycle_safe() {
         let (field, _tmp) = open_test_field();
-        let emb = vec![0.1f32; 768];
+        let emb = vec![0.1f32; crate::ops::EMBED_DIM];
         let (id_a, _) = field.put_memory("wisdom", "test", b"cycle A", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
         let (id_b, _) = field.put_memory("wisdom", "test", b"cycle B", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
 
@@ -4619,7 +4619,7 @@ mod tests {
     #[test]
     fn test_get_confirmations() {
         let (field, _tmp) = open_test_field();
-        let emb = vec![0.1f32; 768];
+        let emb = vec![0.1f32; crate::ops::EMBED_DIM];
         let (id_x, _) = field.put_memory("wisdom", "test", b"confirmer", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
         let (id_y, _) = field.put_memory("wisdom", "test", b"confirmed", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
 
@@ -4633,7 +4633,7 @@ mod tests {
     #[test]
     fn test_get_conflicts_empty() {
         let (field, _tmp) = open_test_field();
-        let emb = vec![0.1f32; 768];
+        let emb = vec![0.1f32; crate::ops::EMBED_DIM];
         let (id, _) = field.put_memory("wisdom", "test", b"lonely memory", &emb, 1.0, 0.001, 0, vec![], None, None).unwrap();
 
         let conflicts = field.get_conflicts(id).unwrap();
@@ -4643,7 +4643,7 @@ mod tests {
     // ── Regression tests for replay/contract correctness ─────────────────────
 
     fn put_test_memory(field: &ChittaField, content: &[u8]) -> MemoryId {
-        let emb = vec![0.1f32; 768];
+        let emb = vec![0.1f32; crate::ops::EMBED_DIM];
         field.put_memory("wisdom", "test", content, &emb, 1.0, 0.001, 0, vec![], None, None)
             .unwrap().0
     }
@@ -4684,7 +4684,7 @@ mod tests {
             let field = ChittaField::open(data_dir.clone()).unwrap();
             // Empty embedding slice → embed_pending = true
             let (id, _) = field.put_memory("wisdom", "test", b"needs-embed", &[], 1.0, 0.001, 0, vec![], None, None).unwrap();
-            let emb = vec![0.2f32; 768];
+            let emb = vec![0.2f32; crate::ops::EMBED_DIM];
             field.backfill_embedding(id, &emb).unwrap();
             field.flush().unwrap();
             id
@@ -4701,7 +4701,7 @@ mod tests {
     #[test]
     fn test_backfill_nonexistent_returns_not_found() {
         let (field, _tmp) = open_test_field();
-        let emb = vec![0.0f32; 768];
+        let emb = vec![0.0f32; crate::ops::EMBED_DIM];
         let fake_id: MemoryId = 0xdeadbeef_cafebabe;
         let result = field.backfill_embedding(fake_id, &emb);
         assert!(
@@ -4732,7 +4732,7 @@ mod tests {
     #[test]
     fn test_compact_wal_guard_rejects_small_store() {
         let (field, _tmp) = open_test_field();
-        let embedding = vec![0.1f32; 768];
+        let embedding = vec![0.1f32; crate::ops::EMBED_DIM];
         for i in 0..50 {
             field
                 .put_memory(
@@ -4761,7 +4761,7 @@ mod tests {
     #[test]
     fn test_compact_wal_guard_allows_large_store() {
         let (field, _tmp) = open_test_field();
-        let embedding = vec![0.1f32; 768];
+        let embedding = vec![0.1f32; crate::ops::EMBED_DIM];
         for i in 0..100 {
             field
                 .put_memory(
@@ -4816,7 +4816,7 @@ mod tests {
                 .unwrap();
         }
         let hits = field
-            .recall_with_fallback(&vec![0.0f32; 768], "unique_term_0", 5, None)
+            .recall_with_fallback(&vec![0.0f32; crate::ops::EMBED_DIM], "unique_term_0", 5, None)
             .unwrap();
         assert!(!hits.is_empty(), "fallback should return results");
     }
