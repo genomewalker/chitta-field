@@ -492,6 +492,31 @@ impl ChittaField {
         }
         semantic_idx.normalize_all();
         keyword_idx.rebuild_reverse_index();
+
+        // One-time migration: mark SSL memories (content with →) for gloss-baked re-embed.
+        // Guard file prevents re-running after backfill completes.
+        {
+            let flag = data_dir.join("ssl_gloss_v1.migrated");
+            if !flag.exists() {
+                let arrow: &[u8] = b"\xe2\x86\x92"; // UTF-8 →
+                let mut ssl_count = 0usize;
+                for (id, payload) in &payloads {
+                    if payload.content.windows(3).any(|w| w == arrow) {
+                        if let Some(state) = states.get_mut(id) {
+                            if !state.embed_pending && !state.deleted {
+                                state.embed_pending = true;
+                                ssl_count += 1;
+                            }
+                        }
+                    }
+                }
+                if ssl_count > 0 {
+                    eprintln!("[chitta-field] SSL gloss migration: marked {ssl_count} memories for re-embed with gloss");
+                }
+                let _ = std::fs::write(&flag, "done");
+            }
+        }
+
         let realm_members = build_realm_members(&payloads, &states);
         let kind_members  = build_kind_members(&payloads, &states);
         let init_pending = states.values().filter(|s| s.embed_pending && !s.deleted).count();
