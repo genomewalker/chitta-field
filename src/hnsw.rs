@@ -1128,11 +1128,11 @@ mod tests {
     #[test]
     fn test_search_returns_nearest() {
         let mut idx = SemanticIndex::new();
-        let mut e1 = vec![0.0f32; 768];
+        let mut e1 = vec![0.0f32; EMBED_DIM];
         e1[0] = 1.0;
-        let mut e2 = vec![0.0f32; 768];
+        let mut e2 = vec![0.0f32; EMBED_DIM];
         e2[1] = 1.0;
-        let mut e3 = vec![0.0f32; 768];
+        let mut e3 = vec![0.0f32; EMBED_DIM];
         e3[0] = 0.9;
         e3[1] = 0.1;
         idx.upsert(1, e1.clone());
@@ -1149,7 +1149,7 @@ mod tests {
     #[test]
     fn test_deleted_not_returned() {
         let mut idx = SemanticIndex::new();
-        let e = vec![1.0f32; 768];
+        let e = vec![1.0f32; EMBED_DIM];
         idx.upsert(1, e.clone());
         idx.upsert(2, e.clone());
         idx.remove(1);
@@ -1160,7 +1160,7 @@ mod tests {
     #[test]
     fn test_allowed_filter() {
         let mut idx = SemanticIndex::new();
-        let e = vec![1.0f32; 768];
+        let e = vec![1.0f32; EMBED_DIM];
         idx.upsert(1, e.clone());
         idx.upsert(2, e.clone());
         idx.upsert(3, e.clone());
@@ -1181,9 +1181,9 @@ mod tests {
     #[test]
     fn test_upsert_overwrites() {
         let mut idx = SemanticIndex::new();
-        let mut e1 = vec![0.0f32; 768];
+        let mut e1 = vec![0.0f32; EMBED_DIM];
         e1[0] = 1.0;
-        let mut e2 = vec![0.0f32; 768];
+        let mut e2 = vec![0.0f32; EMBED_DIM];
         e2[1] = 1.0;
 
         idx.upsert(1, e1);
@@ -1197,9 +1197,9 @@ mod tests {
     #[test]
     fn test_candidate_search() {
         let mut idx = SemanticIndex::new();
-        let mut e1 = vec![0.0f32; 768];
+        let mut e1 = vec![0.0f32; EMBED_DIM];
         e1[0] = 1.0;
-        let mut e2 = vec![0.0f32; 768];
+        let mut e2 = vec![0.0f32; EMBED_DIM];
         e2[1] = 1.0;
         idx.upsert(1, e1.clone());
         idx.upsert(2, e2.clone());

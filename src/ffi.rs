@@ -4877,7 +4877,7 @@ mod tests {
             let kind = CString::new("wisdom").unwrap();
             let realm = CString::new("test").unwrap();
             let content = b"ffi test memory";
-            let embedding = vec![0.1f32; 768];
+            let embedding = vec![0.1f32; crate::ops::EMBED_DIM];
             let mut id: u64 = 0;
 
             let r = cf_put_memory(
@@ -4948,7 +4948,7 @@ mod tests {
             let kind = CString::new("episode").unwrap();
             let realm = CString::new("test").unwrap();
             let content = b"to forget";
-            let embedding = vec![0.5f32; 768];
+            let embedding = vec![0.5f32; crate::ops::EMBED_DIM];
             let mut id: u64 = 0;
             cf_put_memory(
                 h,
@@ -5017,7 +5017,7 @@ mod tests {
             let kind = CString::new("correction").unwrap();
             let realm = CString::new("r").unwrap();
             let content = b"hello from ffi";
-            let embedding = vec![0.3f32; 768];
+            let embedding = vec![0.3f32; crate::ops::EMBED_DIM];
             let mut id: u64 = 0;
             cf_put_memory(
                 h,
@@ -5050,7 +5050,7 @@ mod tests {
             let kind = CString::new("wisdom").unwrap();
             let realm = CString::new("test").unwrap();
             let content = b"state test";
-            let embedding = vec![0.2f32; 768];
+            let embedding = vec![0.2f32; crate::ops::EMBED_DIM];
             let mut id: u64 = 0;
             cf_put_memory(
                 h,
@@ -5080,7 +5080,7 @@ mod tests {
             let (h, _tmp) = open_tmp();
             let kind = CString::new("wisdom").unwrap();
             let realm = CString::new("test").unwrap();
-            let emb = vec![0.1f32; 768];
+            let emb = vec![0.1f32; crate::ops::EMBED_DIM];
             let mut id1: u64 = 0;
             let mut id2: u64 = 0;
             cf_put_memory(
@@ -5143,7 +5143,7 @@ mod tests {
             let (h, _tmp) = open_tmp();
             let kind = CString::new("episode").unwrap();
             let realm = CString::new("test").unwrap();
-            let emb = vec![0.4f32; 768];
+            let emb = vec![0.4f32; crate::ops::EMBED_DIM];
             let mut id: u64 = 0;
             cf_put_memory(
                 h,
@@ -5221,7 +5221,7 @@ mod tests {
 
             let kind = CString::new("wisdom").unwrap();
             let realm = CString::new("test").unwrap();
-            let emb = vec![0.1f32; 768];
+            let emb = vec![0.1f32; crate::ops::EMBED_DIM];
             let mut id: u64 = 0;
             cf_put_memory(
                 h,
@@ -5251,7 +5251,7 @@ mod tests {
             let (h, _tmp) = open_tmp();
             let kind = CString::new("correction").unwrap();
             let realm = CString::new("myproject").unwrap();
-            let emb = vec![0.7f32; 768];
+            let emb = vec![0.7f32; crate::ops::EMBED_DIM];
             let mut id: u64 = 0;
             cf_put_memory(
                 h,
@@ -5293,7 +5293,7 @@ mod tests {
             let (h, _tmp) = open_tmp();
             let kind = CString::new("wisdom").unwrap();
             let realm = CString::new("test").unwrap();
-            let emb = vec![0.1f32; 768];
+            let emb = vec![0.1f32; crate::ops::EMBED_DIM];
             let mut id1: u64 = 0;
             let mut id2: u64 = 0;
             cf_put_memory(
@@ -5443,7 +5443,7 @@ mod tests {
             let kind = CString::new("wisdom").unwrap();
             let realm = CString::new("test").unwrap();
             let content = b"original content";
-            let emb = vec![0.1f32; 768];
+            let emb = vec![0.1f32; crate::ops::EMBED_DIM];
             let mut id: u64 = 0;
             assert_eq!(
                 cf_put_memory(
@@ -5465,7 +5465,7 @@ mod tests {
 
             // Update content + embedding
             let new_content = b"updated content";
-            let new_emb = vec![0.9f32; 768];
+            let new_emb = vec![0.9f32; crate::ops::EMBED_DIM];
             assert_eq!(
                 cf_update_memory_content(
                     h,
@@ -5513,7 +5513,7 @@ mod tests {
     fn test_ffi_realm_list_sorted() {
         unsafe {
             let (h, _tmp) = open_tmp();
-            let emb = vec![0.1f32; 768];
+            let emb = vec![0.1f32; crate::ops::EMBED_DIM];
             let mut id: u64 = 0;
             for realm_name in &["zebra", "alpha", "middle"] {
                 let kind = CString::new("wisdom").unwrap();
