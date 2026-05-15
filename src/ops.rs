@@ -1,7 +1,7 @@
 use crate::ids::{ArtifactId, ChunkHash, MemoryId};
 use serde::{Deserialize, Serialize};
 
-pub const EMBED_DIM: usize = 768; // BGE-base-en-v1.5
+pub const EMBED_DIM: usize = 256; // nomic-embed-text-v1 MRL-256
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Op {

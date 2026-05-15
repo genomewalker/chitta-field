@@ -625,6 +625,32 @@ impl SemanticIndex {
         self.embeddings.is_empty()
     }
 
+    /// Drop all embeddings whose length doesn't match EMBED_DIM (model-swap migration).
+    /// Returns the IDs that were purged so the caller can mark them embed_pending.
+    pub fn purge_wrong_dim(&mut self) -> Vec<MemoryId> {
+        let bad: Vec<MemoryId> = self.embeddings.iter()
+            .filter(|(_, v)| v.len() != EMBED_DIM)
+            .map(|(&id, _)| id)
+            .collect();
+        for &id in &bad {
+            self.embeddings.remove(&id);
+            self.binary_codes.remove(&id);
+            self.mem_coarse.remove(&id);
+            self.mem_lsh.remove(&id);
+            self.deleted.remove(&id);
+        }
+        if !bad.is_empty() {
+            // Reset coarse/LSH structures — they are also wrong-dim.
+            self.coarse_members.clear();
+            self.lsh_buckets = vec![std::collections::HashMap::new(); LSH_TABLES];
+            eprintln!(
+                "[chitta-field] purged {} wrong-dim embeddings (model swap migration)",
+                bad.len()
+            );
+        }
+        bad
+    }
+
     /// Normalize embeddings loaded from older snapshots that stored raw vectors.
     pub fn normalize_all(&mut self) {
         for embedding in self.embeddings.values_mut() {
