@@ -482,6 +482,14 @@ impl ChittaField {
         })?;
         log.set_next_seqno(max_replayed_seqno + 1);
         semantic_idx.set_inhibit_hnsw(false);
+        let purged_ids = semantic_idx.purge_wrong_dim();
+        for id in &purged_ids {
+            if let Some(state) = states.get_mut(id) {
+                if !state.deleted {
+                    state.embed_pending = true;
+                }
+            }
+        }
         semantic_idx.normalize_all();
         keyword_idx.rebuild_reverse_index();
         let realm_members = build_realm_members(&payloads, &states);
