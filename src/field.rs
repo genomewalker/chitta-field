@@ -402,10 +402,18 @@ impl ChittaField {
         let mut replay_kind_members:  HashMap<String, HashSet<MemoryId>> = HashMap::new();
         let mut replay_coactivation_stats = snapshot_coactivation_stats;
         triplet_store.correction_states = snap_correction_states;
-        // Load HNSW sidecar before WAL replay so incremental upsert/remove keeps it in sync.
+        // Load embedding + binary-code sidecars, then HNSW — all before WAL replay.
         if let Some(ref snap_path) = best_full_path {
-            let hnsw_path = snap_path.with_extension("hnsw");
-            let _hnsw_loaded = semantic_idx.load_hnsw(&hnsw_path);
+            // .emb: flat binary embeddings (v10+). For v9 snapshots the sidecar won't exist
+            // yet, so this is a no-op and embeddings remain populated from bincode.
+            let emb_loaded = semantic_idx.load_embeddings_sidecar(&snap_path.with_extension("emb"));
+            if !emb_loaded && semantic_idx.embeddings_count() == 0 {
+                eprintln!("[chitta-field] WARNING: v10 snapshot but .emb sidecar missing — embeddings will be empty until backfill");
+            }
+            // .bin: binary codes sidecar — skip O(N×256) reconstruction in normalize_all.
+            let _ = semantic_idx.load_binary_sidecar(&snap_path.with_extension("bin"));
+            // .hnsw: incremental delta backfill handles any WAL-replay additions.
+            let _ = semantic_idx.load_hnsw(&snap_path.with_extension("hnsw"));
         }
         // Inhibit HNSW inserts during replay — binary Hamming takes over after normalize_all(),
         // so building the O(N log N) HNSW graph incrementally would waste time and RAM.
