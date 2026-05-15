@@ -974,6 +974,27 @@ pub extern "C" fn cf_raw_memory_count(h: *const CfHandle) -> usize {
 
 /// O(1) count of memories awaiting embedding. Maintained atomically.
 #[no_mangle]
+pub extern "C" fn cf_purge_orphan_embed_pending(h: *mut CfHandle, out_cleared: *mut usize) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let n = handle.field.purge_orphan_embed_pending();
+    if !out_cleared.is_null() { unsafe { *out_cleared = n; } }
+    handle.ok()
+}
+
+#[no_mangle]
+pub extern "C" fn cf_force_clear_embed_pending(
+    h: *mut CfHandle, ids: *const u64, count: usize, out_cleared: *mut usize,
+) -> c_int {
+    if h.is_null() || ids.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let id_slice = unsafe { std::slice::from_raw_parts(ids, count) };
+    let n = handle.field.force_clear_embed_pending(id_slice);
+    if !out_cleared.is_null() { unsafe { *out_cleared = n; } }
+    handle.ok()
+}
+
+#[no_mangle]
 pub extern "C" fn cf_pending_count(h: *const CfHandle) -> usize {
     if h.is_null() {
         return 0;
