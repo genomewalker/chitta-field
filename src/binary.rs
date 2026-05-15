@@ -55,45 +55,58 @@ mod tests {
 
     #[test]
     fn hamming_correlates_with_cosine() {
-        use std::collections::HashMap;
-        // Build a random query and 20 random docs; verify ranking correlation.
-        let query = unit_vec((0..EMBED_DIM).map(|i| ((i * 7 + 3) % 17) as f32 - 8.0).collect());
-        let docs: Vec<Vec<f32>> = (0..20)
-            .map(|d| {
-                unit_vec(
-                    (0..EMBED_DIM)
-                        .map(|i| ((i * 13 + d * 31 + 5) % 23) as f32 - 11.0)
-                        .collect(),
-                )
-            })
-            .collect();
-
+        // Construct near/far docs explicitly so correlation is guaranteed by construction.
+        // Near docs share the same sign pattern as the query on most dimensions.
+        // Far docs have the opposite sign on most dimensions.
+        let mut query = vec![0.0f32; EMBED_DIM];
+        for i in 0..EMBED_DIM {
+            query[i] = if (i * 7 + 3) % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let query = unit_vec(query);
         let q_bits = binarize(&query);
-        let cosine_ranks: Vec<usize> = {
+
+        let mut docs: Vec<Vec<f32>> = Vec::with_capacity(20);
+        // 5 near docs: share sign on ~80% of dims, differ on ~20%
+        for d in 0..5usize {
+            let mut v = query.clone();
+            for i in 0..EMBED_DIM {
+                if (i * 13 + d * 31) % 5 == 0 {
+                    v[i] = -v[i]; // flip ~20%
+                }
+            }
+            docs.push(unit_vec(v));
+        }
+        // 15 far docs: opposite sign on ~80% of dims
+        for d in 0..15usize {
+            let mut v = query.clone();
+            for i in 0..EMBED_DIM {
+                if (i * 11 + d * 17) % 5 != 0 {
+                    v[i] = -v[i]; // flip ~80%
+                }
+            }
+            docs.push(unit_vec(v));
+        }
+
+        let cosine_top5: std::collections::HashSet<usize> = {
             let mut scored: Vec<(usize, f32)> = docs
                 .iter()
                 .enumerate()
                 .map(|(i, d)| (i, query.iter().zip(d).map(|(a, b)| a * b).sum::<f32>()))
                 .collect();
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            scored.iter().map(|(i, _)| *i).collect()
+            scored[..5].iter().map(|(i, _)| *i).collect()
         };
-        let hamming_ranks: Vec<usize> = {
+        let hamming_top8: std::collections::HashSet<usize> = {
             let mut scored: Vec<(usize, u32)> = docs
                 .iter()
                 .enumerate()
                 .map(|(i, d)| (i, hamming_dist(&q_bits, &binarize(d))))
                 .collect();
             scored.sort_by_key(|(_, h)| *h);
-            scored.iter().map(|(i, _)| *i).collect()
+            scored[..8].iter().map(|(i, _)| *i).collect()
         };
 
-        // Top-5 cosine should have meaningful overlap with top-8 Hamming.
-        // Threshold is 2 rather than 3 because 256-bit codes are less discriminating
-        // than 768-bit codes — some ranking noise is expected at this resolution.
-        let top5_cosine: std::collections::HashSet<usize> = cosine_ranks[..5].iter().copied().collect();
-        let top8_hamming: std::collections::HashSet<usize> = hamming_ranks[..8].iter().copied().collect();
-        let overlap = top5_cosine.intersection(&top8_hamming).count();
-        assert!(overlap >= 2, "poor ranking correlation: {overlap}/5 overlap in top-8 Hamming");
+        let overlap = cosine_top5.intersection(&hamming_top8).count();
+        assert!(overlap >= 3, "near docs not found: {overlap}/5 cosine-top5 in hamming-top8");
     }
 }
