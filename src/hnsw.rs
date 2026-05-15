@@ -327,6 +327,10 @@ pub struct SemanticIndex {
     /// Sign-bit binary codes for Hamming pre-filter (derived from embeddings; not persisted).
     #[serde(skip)]
     binary_codes: HashMap<MemoryId, Vec<u64>>,
+    /// When true, upsert() skips HNSW inserts (set during WAL replay to avoid O(N log N) cost
+    /// when binary Hamming will be the active search path after normalize_all()).
+    #[serde(skip)]
+    inhibit_hnsw: bool,
 }
 
 impl SemanticIndex {
@@ -342,6 +346,7 @@ impl SemanticIndex {
             mem_lsh: HashMap::new(),
             hnsw: HnswGraph::new(),
             binary_codes: HashMap::new(),
+            inhibit_hnsw: false,
         }
     }
 
@@ -349,6 +354,12 @@ impl SemanticIndex {
     #[inline]
     fn use_hnsw(&self) -> bool {
         self.embeddings.len() >= HNSW_THRESHOLD
+    }
+
+    /// Inhibit HNSW inserts during WAL replay when binary Hamming will be the active path.
+    /// Call with `true` before replay and `false` after `normalize_all()` completes.
+    pub fn set_inhibit_hnsw(&mut self, v: bool) {
+        self.inhibit_hnsw = v;
     }
 
     /// Read-only access to an embedding by memory ID.
@@ -385,9 +396,9 @@ impl SemanticIndex {
         self.binary_codes.insert(memory_id, binarize(&embedding));
         self.embeddings.insert(memory_id, embedding);
 
-        // Insert into HNSW if it is already active, or activate it now that
-        // we've just crossed the threshold.
-        if self.use_hnsw() {
+        // Insert into HNSW only when it is the active search path (not inhibited during
+        // WAL replay when binary Hamming will take over after normalize_all).
+        if !self.inhibit_hnsw && self.use_hnsw() {
             let emb = self.embeddings[&memory_id].clone();
             self.hnsw.insert(memory_id, &emb, &self.embeddings);
         }
@@ -645,7 +656,12 @@ impl SemanticIndex {
                 // mem_lsh is snapshot-restored — rebuild inverted index from it (O(N), no math)
                 self.rebuild_lsh_buckets_from_mem();
             }
-            if !hnsw_ok && self.use_hnsw() {
+            // Skip HNSW rebuild when binary codes are populated — binary Hamming is the
+            // primary search path; HNSW is kept only as a cold fallback for the rare case
+            // where binary_codes is absent/stale (e.g. fresh snapshot before normalize_all).
+            let binary_covers = self.binary_codes.len() == self.embeddings.len()
+                && !self.binary_codes.is_empty();
+            if !hnsw_ok && self.use_hnsw() && !binary_covers {
                 eprintln!("[hnsw] rebuild_hnsw: hnsw={} embeddings={} — rebuilding", self.hnsw.len(), self.embeddings.len());
                 self.rebuild_hnsw();
             }
