@@ -4,7 +4,8 @@ use crate::ops::EMBED_DIM;
 pub const BINARY_WORDS: usize = EMBED_DIM / 64; // 12 for 768-dim
 
 /// Number of candidates to evaluate with float rescore after Hamming pre-filter.
-pub const HAMMING_CANDIDATES: usize = 200;
+/// 400 / 54k ≈ 0.74% scan — strong recall guarantee with minimal rescore cost.
+pub const HAMMING_CANDIDATES: usize = 400;
 
 /// Sign-bit binarization: bit set when component ≥ 0.
 /// Input should be L2-normalized (unit vector).
