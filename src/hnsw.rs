@@ -881,8 +881,13 @@ impl SemanticIndex {
             normalize_in_place(embedding);
         }
         if self.binary_codes.len() != self.total_embedding_count() {
-            self.binary_codes = self.embeddings.iter()
-                .map(|(&id, emb)| (id, binarize(emb)))
+            let all_ids: Vec<MemoryId> = self.embeddings.keys()
+                .chain(self.emb_offsets.keys())
+                .copied()
+                .collect();
+            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+            self.binary_codes = all_ids.iter()
+                .filter_map(|&id| embs.get(id).map(|e| (id, binarize(e))))
                 .collect();
         }
         if self.binary_vec.len() != self.binary_codes.len() {
@@ -1071,11 +1076,27 @@ impl SemanticIndex {
     const EMB_MAGIC: u64 = 0x454D4244_00000001; // "EMBD\0\0\0\x01"
 
     pub fn save_embeddings_sidecar(&self, path: &std::path::Path) -> std::io::Result<()> {
+        // When mmap is active the heap holds only the post-activation delta.
+        // Write a combined file: mmap entries (bulk) + heap delta, so the next
+        // load sees the full dataset and activate_mmap_embeddings() works correctly.
+        let total = self.embeddings.len() + self.emb_offsets.len();
         let tmp = path.with_extension("emb.tmp");
         {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(&Self::EMB_MAGIC.to_le_bytes())?;
-            f.write_all(&(self.embeddings.len() as u64).to_le_bytes())?;
+            f.write_all(&(total as u64).to_le_bytes())?;
+            // Bulk: copy raw f32 bytes straight from mmap (no deserialise/reserialise).
+            if let Some(ref mm) = self.emb_mmap {
+                for (&id, &off) in &self.emb_offsets {
+                    let start = off as usize;
+                    let end = start + EMBED_DIM * 4;
+                    if end <= mm.len() {
+                        f.write_all(&id.to_le_bytes())?;
+                        f.write_all(&mm[start..end])?;
+                    }
+                }
+            }
+            // Delta: heap embeddings written after activation.
             for (&id, emb) in &self.embeddings {
                 f.write_all(&id.to_le_bytes())?;
                 for &v in emb.iter().take(EMBED_DIM) {
