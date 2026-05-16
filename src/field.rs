@@ -154,6 +154,7 @@ pub struct ChittaField {
     pub(crate) realm_members: RwLock<HashMap<String, HashSet<MemoryId>>>,
     pub(crate) kind_members:  RwLock<HashMap<String, HashSet<MemoryId>>>,
     pub(crate) pending_embed_count: Arc<AtomicUsize>,
+    pub(crate) last_compact_ms: Arc<std::sync::atomic::AtomicI64>,
     pub(crate) pending_recall: Mutex<PendingRecallEffects>,
     pub(crate) coactivation_stats: RwLock<HashMap<(MemoryId, MemoryId), CoActivationStats>>,
     /// Asymmetric Hopfield network for energy-based attractor recall. FEP §3.2.
@@ -412,6 +413,10 @@ impl ChittaField {
             }
             // .bin: binary codes sidecar — skip O(N×256) reconstruction in normalize_all.
             let _ = semantic_idx.load_binary_sidecar(&snap_path.with_extension("bin"));
+            // .emb mmap: above 200K, serve embeddings from mmap to free 1GB+ of heap.
+            if semantic_idx.embeddings_count() > 200_000 {
+                let _ = semantic_idx.activate_mmap_embeddings(&snap_path.with_extension("emb"));
+            }
             // .hnsw + .delta.hnsw: load both tiers; backfill handles WAL-replay additions.
             let _ = semantic_idx.load_hnsw(&snap_path.with_extension("hnsw"));
             let _ = semantic_idx.load_delta_hnsw(&snap_path.with_extension("delta.hnsw"));
@@ -627,6 +632,7 @@ impl ChittaField {
             realm_members: RwLock::new(realm_members),
             kind_members:  RwLock::new(kind_members),
             pending_embed_count: Arc::new(AtomicUsize::new(init_pending)),
+            last_compact_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             realm_stats: RwLock::new(HashMap::new()),
             kind_stats:  RwLock::new(HashMap::new()),
             ack_scores:  RwLock::new(snap_ack_scores),
