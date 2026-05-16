@@ -348,10 +348,24 @@ pub struct SemanticIndex {
     /// Sign-bit binary codes for Hamming pre-filter (derived from embeddings; not persisted).
     #[serde(skip)]
     binary_codes: HashMap<MemoryId, Vec<u64>>,
+    /// Contiguous flat scan buffer — cache-friendly alternative to HashMap iteration in hamming_candidates.
+    /// Kept in sync with binary_codes by upsert/remove/load_binary_sidecar/normalize_all.
+    #[serde(skip)]
+    binary_vec: Vec<(MemoryId, [u64; 4])>,
+    /// Position index for O(1) swap-remove from binary_vec.
+    #[serde(skip)]
+    binary_vec_pos: HashMap<MemoryId, usize>,
     /// When true, upsert() skips HNSW inserts (set during WAL replay to avoid O(N log N) cost
     /// when binary Hamming will be the active search path after normalize_all()).
     #[serde(skip)]
     inhibit_hnsw: bool,
+    /// Mmap of the .emb sidecar file — populated by activate_mmap_embeddings() above 200K.
+    /// Wrapped in Arc so SemanticIndex remains Clone (Arc<T>: Clone even when T: !Clone).
+    #[serde(skip)]
+    emb_mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+    /// Byte offset of the f32×EMBED_DIM data for each memory in emb_mmap.
+    #[serde(skip)]
+    emb_offsets: HashMap<MemoryId, u64>,
 }
 
 impl SemanticIndex {
@@ -368,7 +382,11 @@ impl SemanticIndex {
             hnsw: HnswGraph::new(),
             delta_hnsw: HnswGraph::new(),
             binary_codes: HashMap::new(),
+            binary_vec: Vec::new(),
+            binary_vec_pos: HashMap::new(),
             inhibit_hnsw: false,
+            emb_mmap: None,
+            emb_offsets: HashMap::new(),
         }
     }
 
@@ -442,12 +460,52 @@ impl SemanticIndex {
 
     /// Read-only access to an embedding by memory ID.
     pub fn get_embedding(&self, id: MemoryId) -> Option<&[f32]> {
+        if let Some(&off) = self.emb_offsets.get(&id) {
+            if let Some(ref mm) = self.emb_mmap {
+                let start = off as usize;
+                let end = start + EMBED_DIM * 4;
+                if end <= mm.len() {
+                    let bytes = &mm[start..end];
+                    let ptr = bytes.as_ptr() as *const f32;
+                    // SAFETY: offset was computed from the sidecar header; f32×EMBED_DIM data
+                    // starts at a 4-byte-aligned offset (24 + n*1032, always divisible by 4).
+                    return Some(unsafe { std::slice::from_raw_parts(ptr, EMBED_DIM) });
+                }
+            }
+        }
         self.embeddings.get(&id).map(|v| v.as_slice())
     }
 
     /// Iterator over all memory IDs that have an embedding (including soft-deleted).
     pub fn all_ids(&self) -> impl Iterator<Item = MemoryId> + '_ {
         self.embeddings.keys().copied()
+    }
+
+    /// Activate mmap mode: build offset index from .emb sidecar, then clear the heap HashMap.
+    /// No-op below 200K (guard in field.rs). Safe after normalize_all() has run.
+    /// After activation, get_embedding() serves from mmap; new upsert() calls repopulate the heap.
+    pub fn activate_mmap_embeddings(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }?;
+        if mmap.len() < 16 { return Ok(()); }
+        let magic = u64::from_le_bytes(mmap[0..8].try_into().unwrap());
+        if magic != Self::EMB_MAGIC { return Ok(()); }
+        let count = u64::from_le_bytes(mmap[8..16].try_into().unwrap()) as usize;
+        let record_size = 8 + EMBED_DIM * 4;
+        if mmap.len() < 16 + count * record_size { return Ok(()); }
+        let mut offsets = HashMap::with_capacity(count);
+        let mut off = 16usize;
+        for _ in 0..count {
+            let id = u64::from_le_bytes(mmap[off..off+8].try_into().unwrap());
+            offsets.insert(id, (off + 8) as u64);
+            off += record_size;
+        }
+        self.emb_offsets = offsets;
+        self.emb_mmap = Some(std::sync::Arc::new(mmap));
+        self.embeddings.clear();
+        self.embeddings.shrink_to_fit();
+        eprintln!("[hnsw] activate_mmap_embeddings: {} entries mapped, heap cleared", count);
+        Ok(())
     }
 
     /// Add or update an embedding. Un-deletes the entry if it was soft-deleted.
@@ -475,7 +533,15 @@ impl SemanticIndex {
         // Pending-embed memories arrive with an empty slice and must not trigger binarize.
         let embedding_ready = embedding.len() == EMBED_DIM;
         if embedding_ready {
-            self.binary_codes.insert(memory_id, binarize(&embedding));
+            let codes = binarize(&embedding);
+            let arr: [u64; 4] = codes[..BINARY_WORDS].try_into().unwrap_or([0u64; 4]);
+            if let Some(&pos) = self.binary_vec_pos.get(&memory_id) {
+                self.binary_vec[pos].1 = arr;
+            } else {
+                self.binary_vec_pos.insert(memory_id, self.binary_vec.len());
+                self.binary_vec.push((memory_id, arr));
+            }
+            self.binary_codes.insert(memory_id, codes);
         }
         self.embeddings.insert(memory_id, embedding);
 
@@ -495,6 +561,18 @@ impl SemanticIndex {
         self.delta_hnsw.remove(memory_id);
         self.deleted.insert(memory_id);
         self.embeddings.remove(&memory_id);
+        if let Some(&pos) = self.binary_vec_pos.get(&memory_id) {
+            let last = self.binary_vec.len().saturating_sub(1);
+            if !self.binary_vec.is_empty() {
+                if pos != last {
+                    self.binary_vec.swap(pos, last);
+                    let swapped_id = self.binary_vec[pos].0;
+                    self.binary_vec_pos.insert(swapped_id, pos);
+                }
+                self.binary_vec.pop();
+            }
+            self.binary_vec_pos.remove(&memory_id);
+        }
         self.binary_codes.remove(&memory_id);
         if let Some(coarse_ids) = self.mem_coarse.remove(&memory_id) {
             for coarse_id in coarse_ids {
@@ -551,7 +629,9 @@ impl SemanticIndex {
 
         // Binary Hamming pre-filter: primary path when codes are fully in sync.
         // O(N × 12 u64) scan + float rescore of top-HAMMING_CANDIDATES — replaces HNSW.
-        if self.binary_codes.len() == self.embeddings.len() && !self.binary_codes.is_empty() {
+        if self.binary_codes.len() == self.embeddings.len()
+            && self.binary_vec.len() == self.binary_codes.len()
+            && !self.binary_codes.is_empty() {
             let query_bits = binarize(&query_unit);
             let candidates = self.hamming_candidates(&query_bits, allowed);
             if !candidates.is_empty() {
@@ -759,6 +839,15 @@ impl SemanticIndex {
                 .map(|(&id, emb)| (id, binarize(emb)))
                 .collect();
         }
+        if self.binary_vec.len() != self.binary_codes.len() {
+            self.binary_vec.clear();
+            self.binary_vec_pos.clear();
+            for (id, codes) in &self.binary_codes {
+                let arr: [u64; 4] = codes[..BINARY_WORDS].try_into().unwrap_or([0u64; 4]);
+                self.binary_vec_pos.insert(*id, self.binary_vec.len());
+                self.binary_vec.push((*id, arr));
+            }
+        }
         if self.coarse_centroids.is_empty() {
             self.coarse_centroids = default_coarse_centroids();
         }
@@ -825,23 +914,23 @@ impl SemanticIndex {
 
     /// Hamming pre-filter: returns the top-HAMMING_CANDIDATES IDs by minimum Hamming
     /// distance from the binarized query, restricted to `allowed` when provided.
-    fn hamming_candidates(
+        fn hamming_candidates(
         &self,
         query_bits: &[u64],
         allowed: Option<&HashSet<MemoryId>>,
     ) -> Vec<MemoryId> {
-        let mut scored: Vec<(MemoryId, u32)> = self
-            .binary_codes
+        let mut scored: Vec<(u32, MemoryId)> = self
+            .binary_vec
             .iter()
-            .filter_map(|(&id, bits)| {
-                if self.deleted.contains(&id) { return None; }
-                if let Some(a) = allowed { if !a.contains(&id) { return None; } }
-                Some((id, hamming_dist(query_bits, bits)))
+            .filter_map(|(id, codes)| {
+                if self.deleted.contains(id) { return None; }
+                if let Some(a) = allowed { if !a.contains(id) { return None; } }
+                Some((hamming_dist(query_bits, codes.as_slice()), *id))
             })
             .collect();
-        scored.sort_unstable_by_key(|&(_, d)| d);
+        scored.sort_unstable_by_key(|&(d, _)| d);
         scored.truncate(HAMMING_CANDIDATES);
-        scored.into_iter().map(|(id, _)| id).collect()
+        scored.into_iter().map(|(_, id)| id).collect()
     }
 
     /// Serialize the HNSW graph to a sidecar file.
@@ -1068,6 +1157,13 @@ impl SemanticIndex {
             map.insert(id, codes);
         }
         self.binary_codes = map;
+        self.binary_vec.clear();
+        self.binary_vec_pos.clear();
+        for (id, codes) in &self.binary_codes {
+            let arr: [u64; 4] = codes[..BINARY_WORDS].try_into().unwrap_or([0u64; 4]);
+            self.binary_vec_pos.insert(*id, self.binary_vec.len());
+            self.binary_vec.push((*id, arr));
+        }
         true
     }
 

@@ -3805,6 +3805,70 @@ impl ChittaField {
         Ok(deleted)
     }
 
+    /// Count WAL segment files in the segments/ directory.
+    pub fn wal_segment_count(&self) -> usize {
+        let seg_dir = self.data_dir.join("segments");
+        std::fs::read_dir(&seg_dir)
+            .map(|rd| rd
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map_or(false, |x| x == "seg"))
+                .count())
+            .unwrap_or(0)
+    }
+
+    /// Compact WAL if segment count exceeds `threshold`, with a 1-hour cooldown.
+    /// Returns Ok(true) if compaction ran, Ok(false) if skipped (under threshold or cooldown).
+    pub fn maybe_compact_wal(&self, threshold: usize) -> Result<bool> {
+        if self.wal_segment_count() <= threshold { return Ok(false); }
+        let now = now_ms();
+        let last = self.last_compact_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if now - last < 3_600_000 { return Ok(false); }
+        self.last_compact_ms.store(now, std::sync::atomic::Ordering::Relaxed);
+        self.compact_wal()?;
+        eprintln!("[store] maybe_compact_wal: compacted (segments > {})", threshold);
+        Ok(true)
+    }
+
+    /// Prune episode memories: delete those older than `max_age_days` with strength < 0.3,
+    /// then cap total episode count to `max_count` by removing the oldest.
+    pub fn prune_episodes(&self, max_age_days: u64, max_count: usize) -> Result<usize> {
+        let cutoff_ms = now_ms() - (max_age_days as i64) * 86_400_000;
+        let mut episodes: Vec<(i64, MemoryId)> = {
+            let payloads = self.payloads.read();
+            payloads.iter()
+                .filter(|(_, p)| p.kind == "episode")
+                .map(|(id, p)| (p.created_at_ms, *id))
+                .collect()
+        };
+
+        let mut deleted = 0usize;
+        for &(created_ms, id) in &episodes {
+            if created_ms < cutoff_ms {
+                if let Ok(state) = self.get_state(id) {
+                    if state.strength < 0.3 {
+                        let _ = self.forget(id);
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+
+        episodes.retain(|(_, id)| self.get_memory(*id).is_ok());
+        if episodes.len() > max_count {
+            episodes.sort_unstable_by_key(|(ts, _)| *ts);
+            let target = (max_count as f64 * 0.8) as usize;
+            let to_delete = episodes.len().saturating_sub(target);
+            for &(_, id) in &episodes[..to_delete] {
+                let _ = self.forget(id);
+                deleted += 1;
+            }
+        }
+        if deleted > 0 {
+            eprintln!("[store] prune_episodes: deleted {} episode memories", deleted);
+        }
+        Ok(deleted)
+    }
+
     /// Run a single tier demotion pass over all memories.
     /// Returns `(demoted_count, deleted_count)`.
     ///

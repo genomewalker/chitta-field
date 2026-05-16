@@ -5835,6 +5835,38 @@ pub extern "C" fn cf_compact_wal(h: *mut CfHandle) -> i64 {
     }
 }
 
+/// Count WAL segment files. Returns segment count.
+#[no_mangle]
+pub extern "C" fn cf_wal_segment_count(h: *const CfHandle) -> usize {
+    if h.is_null() { return 0; }
+    unsafe { (*h).field.wal_segment_count() }
+}
+
+/// Compact WAL if segment count > threshold and cooldown elapsed.
+/// Returns 1 if compacted, 0 if skipped, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_maybe_compact_wal(h: *mut CfHandle, threshold: usize) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    match handle.field.maybe_compact_wal(threshold) {
+        Ok(true)  => 1,
+        Ok(false) => 0,
+        Err(e)    => { handle.err(e); -1 }
+    }
+}
+
+/// Prune old/excess episode memories.
+/// Returns deleted count, or -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_prune_episodes(h: *mut CfHandle, max_age_days: u64, max_count: usize) -> i64 {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    match handle.field.prune_episodes(max_age_days, max_count) {
+        Ok(n)  => n as i64,
+        Err(e) => { handle.err(e); -1 }
+    }
+}
+
 // ── Scoring Pipeline Config FFI ───────────────────────────────────────────────
 
 /// Reload scoring config from scoring.json in the data directory.
