@@ -30,6 +30,35 @@ const HNSW_EF_SEARCH: usize = 64;        // candidates during search
 // 1/ln(M) — controls layer probability distribution
 const HNSW_ML: f64 = 0.36067; // 1/ln(16)
 
+// ── Embedding lookup helper ───────────────────────────────────────────────────
+
+/// Thin two-source embedding accessor used by HnswGraph methods.
+/// Holds shared references to the heap HashMap and the mmap sidecar so callers
+/// can split-borrow the struct fields (heap/offsets/mmap immutably, hnsw mutably).
+pub(crate) struct EmbLookup<'a> {
+    pub heap:    &'a HashMap<MemoryId, Vec<f32>>,
+    pub offsets: &'a HashMap<MemoryId, u64>,
+    pub mmap:    &'a Option<std::sync::Arc<memmap2::Mmap>>,
+}
+
+impl<'a> EmbLookup<'a> {
+    #[inline]
+    pub fn get(&self, id: MemoryId) -> Option<&'a [f32]> {
+        if let Some(&off) = self.offsets.get(&id) {
+            if let Some(ref mm) = self.mmap {
+                let start = off as usize;
+                let end = start + EMBED_DIM * 4;
+                if end <= mm.len() {
+                    let ptr = mm[start..end].as_ptr() as *const f32;
+                    // SAFETY: offset was written by save_embeddings_sidecar with 4-byte alignment.
+                    return Some(unsafe { std::slice::from_raw_parts(ptr, EMBED_DIM) });
+                }
+            }
+        }
+        self.heap.get(&id).map(|v| v.as_slice())
+    }
+}
+
 // ── HNSW graph ────────────────────────────────────────────────────────────────
 
 /// A layered navigable small-world graph for approximate nearest-neighbour
@@ -67,9 +96,7 @@ impl HnswGraph {
         self.neighbors.keys().copied().collect()
     }
 
-    /// Insert `id` with pre-normalised `embedding`.
-    /// `embeddings` is the full store (used to look up neighbour vectors).
-    fn insert(&mut self, id: MemoryId, embedding: &[f32], embeddings: &HashMap<MemoryId, Vec<f32>>) {
+    fn insert(&mut self, id: MemoryId, embedding: &[f32], embs: &EmbLookup<'_>) {
         let node_level = self.random_level();
 
         // Determine current max layer
@@ -90,14 +117,14 @@ impl HnswGraph {
         // Phase 1: descend from top of graph down to node_level+1
         let mut ep_set = vec![ep];
         for layer in (node_level + 1..=current_top).rev() {
-            ep_set = self.search_layer(embedding, &ep_set, 1, layer, embeddings);
+            ep_set = self.search_layer(embedding, &ep_set, 1, layer, embs);
         }
 
         // Phase 2: insert at each layer from min(node_level, current_top) down to 0
         for layer in (0..=node_level.min(current_top)).rev() {
-            let candidates = self.search_layer(embedding, &ep_set, HNSW_EF_CONSTRUCTION, layer, embeddings);
+            let candidates = self.search_layer(embedding, &ep_set, HNSW_EF_CONSTRUCTION, layer, embs);
             let m = if layer == 0 { HNSW_M0 } else { HNSW_M };
-            let selected = self.select_neighbors(embedding, &candidates, m, embeddings);
+            let selected = self.select_neighbors(embedding, &candidates, m, embs);
 
             // Connect new node to its selected neighbours
             if let Some(node_neighbors) = self.neighbors.get_mut(&id) {
@@ -120,11 +147,11 @@ impl HnswGraph {
                 };
                 if needs_shrink {
                     // Compute shrunk list without holding mutable borrow
-                    let shrunk = if let (Some(nbr_layers), Some(nbr_emb)) =
-                        (self.neighbors.get(&neighbor_id), embeddings.get(&neighbor_id))
-                    {
+                    let shrunk = if let Some(nbr_layers) = self.neighbors.get(&neighbor_id) {
                         if layer < nbr_layers.len() {
-                            Some(self.select_neighbors(nbr_emb, &nbr_layers[layer].clone(), m_max, embeddings))
+                            if let Some(nbr_emb) = embs.get(neighbor_id) {
+                                Some(self.select_neighbors(nbr_emb, &nbr_layers[layer].clone(), m_max, embs))
+                            } else { None }
                         } else { None }
                     } else { None };
                     if let (Some(shrunk), Some(nbr_layers)) = (shrunk, self.neighbors.get_mut(&neighbor_id)) {
@@ -170,13 +197,13 @@ impl HnswGraph {
     }
 
     /// Greedy k-NN search. Returns up to k MemoryIds, filtered by `allowed`.
-    fn search(
+        fn search(
         &self,
         query: &[f32],
         k: usize,
         allowed: Option<&HashSet<MemoryId>>,
         deleted: &HashSet<MemoryId>,
-        embeddings: &HashMap<MemoryId, Vec<f32>>,
+        embs: &EmbLookup<'_>,
     ) -> Vec<(MemoryId, f32)> {
         let Some((ep, top_layer)) = self.entry_point else { return vec![] };
 
@@ -184,18 +211,18 @@ impl HnswGraph {
 
         // Descend from top layer to layer 1 with ef=1
         for layer in (1..=top_layer).rev() {
-            ep_set = self.search_layer(query, &ep_set, 1, layer, embeddings);
+            ep_set = self.search_layer(query, &ep_set, 1, layer, embs);
         }
 
         // Final search at layer 0 with ef_search
-        let candidates = self.search_layer(query, &ep_set, HNSW_EF_SEARCH.max(k), 0, embeddings);
+        let candidates = self.search_layer(query, &ep_set, HNSW_EF_SEARCH.max(k), 0, embs);
 
         // Filter deleted / not-allowed, compute similarities, take top k
         let mut scored: Vec<(MemoryId, f32)> = candidates
             .into_iter()
             .filter(|id| !deleted.contains(id))
             .filter(|id| allowed.map(|a| a.contains(id)).unwrap_or(true))
-            .filter_map(|id| embeddings.get(&id).map(|e| (id, dot(query, e))))
+            .filter_map(|id| embs.get(id).map(|e| (id, dot(query, e))))
             .collect();
 
         scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
@@ -204,28 +231,24 @@ impl HnswGraph {
     }
 
     /// Greedy beam search within one layer. Returns ef best candidates.
-    fn search_layer(
+        fn search_layer(
         &self,
         query: &[f32],
         entry_points: &[MemoryId],
         ef: usize,
         layer: usize,
-        embeddings: &HashMap<MemoryId, Vec<f32>>,
+        embs: &EmbLookup<'_>,
     ) -> Vec<MemoryId> {
         let mut visited: HashSet<MemoryId> = entry_points.iter().copied().collect();
         // candidates: min-heap by score (worst-best at top, so we can prune)
         let mut candidates: BinaryHeap<(OrderedF32, MemoryId)> = entry_points
             .iter()
-            .filter_map(|&id| {
-                embeddings.get(&id).map(|e| (OrderedF32(-dot(query, e)), id))
-            })
+            .filter_map(|&id| embs.get(id).map(|e| (OrderedF32(-dot(query, e)), id)))
             .collect();
         // result: max-heap by score (best at top)
         let mut result: BinaryHeap<(OrderedF32, MemoryId)> = entry_points
             .iter()
-            .filter_map(|&id| {
-                embeddings.get(&id).map(|e| (OrderedF32(dot(query, e)), id))
-            })
+            .filter_map(|&id| embs.get(id).map(|e| (OrderedF32(dot(query, e)), id)))
             .collect();
 
         while let Some((neg_score, cid)) = candidates.pop() {
@@ -243,13 +266,13 @@ impl HnswGraph {
             let Some(layer_neighbors) = node_layers.get(layer) else { continue };
             for &neighbor_id in layer_neighbors {
                 if visited.insert(neighbor_id) {
-                    let Some(emb) = embeddings.get(&neighbor_id) else { continue };
-                    let sim = dot(query, emb);
+                    let Some(e) = embs.get(neighbor_id) else { continue };
+                    let sim = dot(query, e);
                     candidates.push((OrderedF32(-sim), neighbor_id));
                     result.push((OrderedF32(sim), neighbor_id));
                     // Trim result to ef
                     while result.len() > ef {
-                        result.pop(); // pops the *highest* score because max-heap
+                        result.pop();
                     }
                 }
             }
@@ -259,16 +282,16 @@ impl HnswGraph {
     }
 
     /// Simple greedy neighbour selection (no heuristic pruning for now).
-    fn select_neighbors(
+        fn select_neighbors(
         &self,
         query: &[f32],
         candidates: &[MemoryId],
         m: usize,
-        embeddings: &HashMap<MemoryId, Vec<f32>>,
+        embs: &EmbLookup<'_>,
     ) -> Vec<MemoryId> {
         let mut scored: Vec<(f32, MemoryId)> = candidates
             .iter()
-            .filter_map(|&id| embeddings.get(&id).map(|e| (dot(query, e), id)))
+            .filter_map(|&id| embs.get(id).map(|e| (dot(query, e), id)))
             .collect();
         scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
         scored.truncate(m);
@@ -390,16 +413,22 @@ impl SemanticIndex {
         }
     }
 
+    /// Total number of embeddings — heap + mmap-backed combined.
+    #[inline]
+    pub fn total_embedding_count(&self) -> usize {
+        self.embeddings.len() + self.emb_offsets.len()
+    }
+
     /// True when the HNSW graph is the active search path.
     #[inline]
     fn use_hnsw(&self) -> bool {
-        self.embeddings.len() >= HNSW_THRESHOLD
+        self.total_embedding_count() >= HNSW_THRESHOLD
     }
 
     /// True when two-tier mode is active: new inserts go to delta_hnsw, not hnsw.
     #[inline]
     fn use_tier2(&self) -> bool {
-        self.embeddings.len() >= HNSW_TIER2_THRESHOLD
+        self.total_embedding_count() >= HNSW_TIER2_THRESHOLD
     }
 
     /// Insert embeddings that are in the store but not yet in HNSW (WAL replay delta).
@@ -409,6 +438,7 @@ impl SemanticIndex {
         if !self.use_hnsw() { return; }
         if self.hnsw.is_empty() && self.delta_hnsw.is_empty() { return; }
         let delta: Vec<MemoryId> = self.embeddings.keys()
+            .chain(self.emb_offsets.keys())
             .filter(|&&id| {
                 !self.deleted.contains(&id)
                     && !self.hnsw.contains(id)
@@ -419,11 +449,17 @@ impl SemanticIndex {
         if delta.is_empty() { return; }
         eprintln!("[hnsw] backfill_hnsw_delta: inserting {} delta nodes", delta.len());
         for id in delta {
-            if let Some(emb) = self.embeddings.get(&id).cloned() {
-                if self.use_tier2() {
-                    self.delta_hnsw.insert(id, &emb, &self.embeddings);
+            let emb_owned = {
+                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                embs.get(id).map(|s| s.to_vec())
+            };
+            if let Some(emb) = emb_owned {
+                let tier2 = self.use_tier2();
+                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                if tier2 {
+                    self.delta_hnsw.insert(id, &emb, &embs);
                 } else {
-                    self.hnsw.insert(id, &emb, &self.embeddings);
+                    self.hnsw.insert(id, &emb, &embs);
                 }
             }
         }
@@ -445,8 +481,13 @@ impl SemanticIndex {
         eprintln!("[hnsw] merge_delta_into_base: merging {} nodes into base", ids.len());
         for id in ids {
             if self.deleted.contains(&id) { continue; }
-            if let Some(emb) = self.embeddings.get(&id).cloned() {
-                self.hnsw.insert(id, &emb, &self.embeddings);
+            let emb_owned = {
+                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                embs.get(id).map(|s| s.to_vec())
+            };
+            if let Some(emb) = emb_owned {
+                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                self.hnsw.insert(id, &emb, &embs);
             }
         }
         self.delta_hnsw = HnswGraph::new();
@@ -477,8 +518,10 @@ impl SemanticIndex {
     }
 
     /// Iterator over all memory IDs that have an embedding (including soft-deleted).
+    /// Covers both heap-stored and mmap-backed embeddings.
     pub fn all_ids(&self) -> impl Iterator<Item = MemoryId> + '_ {
         self.embeddings.keys().copied()
+            .chain(self.emb_offsets.keys().copied())
     }
 
     /// Activate mmap mode: build offset index from .emb sidecar, then clear the heap HashMap.
@@ -547,10 +590,11 @@ impl SemanticIndex {
 
         if !self.inhibit_hnsw && self.use_hnsw() && embedding_ready {
             let emb = self.embeddings[&memory_id].clone();
+            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
             if self.use_tier2() {
-                self.delta_hnsw.insert(memory_id, &emb, &self.embeddings);
+                self.delta_hnsw.insert(memory_id, &emb, &embs);
             } else {
-                self.hnsw.insert(memory_id, &emb, &self.embeddings);
+                self.hnsw.insert(memory_id, &emb, &embs);
             }
         }
     }
@@ -629,7 +673,8 @@ impl SemanticIndex {
 
         // Binary Hamming pre-filter: primary path when codes are fully in sync.
         // O(N × 12 u64) scan + float rescore of top-HAMMING_CANDIDATES — replaces HNSW.
-        if self.binary_codes.len() == self.embeddings.len()
+        let total = self.total_embedding_count();
+        if self.binary_codes.len() == total
             && self.binary_vec.len() == self.binary_codes.len()
             && !self.binary_codes.is_empty() {
             let query_bits = binarize(&query_unit);
@@ -637,7 +682,7 @@ impl SemanticIndex {
             if !candidates.is_empty() {
                 let mut top_k = BinaryHeap::new();
                 for memory_id in candidates {
-                    let Some(embedding) = self.embeddings.get(&memory_id) else { continue; };
+                    let Some(embedding) = self.get_embedding(memory_id) else { continue; };
                     let sim = dot(&query_unit, embedding);
                     push_top_k(&mut top_k, k, memory_id, sim);
                 }
@@ -648,13 +693,14 @@ impl SemanticIndex {
         // Fallback: HNSW when active and binary codes are absent/stale.
         // In two-tier mode, search both base and delta graphs, merge by similarity.
         if self.use_hnsw() && (!self.hnsw.is_empty() || !self.delta_hnsw.is_empty()) {
+            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
             let mut pairs: Vec<(MemoryId, f32)> = if !self.hnsw.is_empty() {
-                self.hnsw.search(&query_unit, k, allowed, &self.deleted, &self.embeddings)
+                self.hnsw.search(&query_unit, k, allowed, &self.deleted, &embs)
             } else {
                 vec![]
             };
             if self.use_tier2() && !self.delta_hnsw.is_empty() {
-                let delta_pairs = self.delta_hnsw.search(&query_unit, k, allowed, &self.deleted, &self.embeddings);
+                let delta_pairs = self.delta_hnsw.search(&query_unit, k, allowed, &self.deleted, &embs);
                 pairs.extend(delta_pairs);
                 pairs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
                 pairs.dedup_by_key(|p| p.0);
@@ -712,7 +758,7 @@ impl SemanticIndex {
             return vec![];
         };
 
-        let binary_ready = self.binary_codes.len() == self.embeddings.len() && !self.binary_codes.is_empty();
+        let binary_ready = self.binary_codes.len() == self.total_embedding_count() && !self.binary_codes.is_empty();
         let candidates = if let Some(allowed_ids) = allowed {
             if allowed_ids.len() <= MIN_CANDIDATES {
                 allowed_ids.iter().copied().collect::<Vec<_>>()
@@ -748,7 +794,7 @@ impl SemanticIndex {
             if self.deleted.contains(&memory_id) {
                 continue;
             }
-            let Some(embedding) = self.embeddings.get(&memory_id) else {
+            let Some(embedding) = self.get_embedding(memory_id) else {
                 continue;
             };
             let base_sim = dot(&query_unit, embedding);
@@ -785,7 +831,7 @@ impl SemanticIndex {
             if self.deleted.contains(&memory_id) {
                 continue;
             }
-            let Some(embedding) = self.embeddings.get(&memory_id) else {
+            let Some(embedding) = self.get_embedding(memory_id) else {
                 continue;
             };
             let sim = dot(&query_unit, embedding);
@@ -796,11 +842,11 @@ impl SemanticIndex {
     }
 
     pub fn len(&self) -> usize {
-        self.embeddings.len()
+        self.total_embedding_count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.embeddings.is_empty()
+        self.total_embedding_count() == 0
     }
 
     /// Drop all embeddings whose length doesn't match EMBED_DIM (model-swap migration).
@@ -834,7 +880,7 @@ impl SemanticIndex {
         for embedding in self.embeddings.values_mut() {
             normalize_in_place(embedding);
         }
-        if self.binary_codes.len() != self.embeddings.len() {
+        if self.binary_codes.len() != self.total_embedding_count() {
             self.binary_codes = self.embeddings.iter()
                 .map(|(&id, emb)| (id, binarize(emb)))
                 .collect();
@@ -856,9 +902,10 @@ impl SemanticIndex {
         }
         // Coarse, LSH, and HNSW are all snapshot-serialized (or sidecar) and kept in sync
         // by incremental upsert/remove during WAL replay — skip O(N) rebuilds when consistent.
-        let coarse_ok = self.mem_coarse.len() == self.embeddings.len();
-        let lsh_ok    = self.mem_lsh.len()    == self.embeddings.len();
-        let hnsw_ok   = !self.hnsw.is_empty() && self.hnsw.len() == self.embeddings.len();
+        let total = self.total_embedding_count();
+        let coarse_ok = self.mem_coarse.len() == total;
+        let lsh_ok    = self.mem_lsh.len()    == total;
+        let hnsw_ok   = !self.hnsw.is_empty() && self.hnsw.len() == total;
         if !coarse_ok {
             self.rebuild_ann();
         } else {
@@ -869,15 +916,13 @@ impl SemanticIndex {
                 // mem_lsh is snapshot-restored — rebuild inverted index from it (O(N), no math)
                 self.rebuild_lsh_buckets_from_mem();
             }
-            let binary_covers = self.binary_codes.len() == self.embeddings.len()
+            let binary_covers = self.binary_codes.len() == total
                 && !self.binary_codes.is_empty();
             if !hnsw_ok && self.use_hnsw() {
                 if binary_covers && !self.hnsw.is_empty() {
-                    // HNSW is partially stale (WAL replay added delta without inserting into HNSW).
-                    // Incremental O(K log N) insert instead of O(N log N) full rebuild.
                     self.backfill_hnsw_delta();
                 } else if !binary_covers {
-                    eprintln!("[hnsw] rebuild_hnsw: hnsw={} embeddings={} — rebuilding", self.hnsw.len(), self.embeddings.len());
+                    eprintln!("[hnsw] rebuild_hnsw: hnsw={} total={} — rebuilding", self.hnsw.len(), total);
                     self.rebuild_hnsw();
                 }
                 // binary_covers && hnsw.is_empty(): binary Hamming is the active path, skip rebuild.
@@ -1094,7 +1139,7 @@ impl SemanticIndex {
     }
 
     pub fn embeddings_count(&self) -> usize {
-        self.embeddings.len()
+        self.total_embedding_count()
     }
 
     /// Clear embeddings (called on snapshot clone before bincode serialization in v10+).
@@ -1169,7 +1214,7 @@ impl SemanticIndex {
 
     fn rebuild_ann(&mut self) {
         let hnsw_valid = (!self.hnsw.is_empty() || !self.delta_hnsw.is_empty())
-            && (self.hnsw.len() + self.delta_hnsw.len() == self.embeddings.len());
+            && (self.hnsw.len() + self.delta_hnsw.len() == self.total_embedding_count());
         self.coarse_members.clear();
         self.mem_coarse.clear();
         self.lsh_buckets = vec![HashMap::new(); LSH_TABLES];
@@ -1212,12 +1257,20 @@ impl SemanticIndex {
     fn rebuild_hnsw(&mut self) {
         self.hnsw = HnswGraph::new();
         self.delta_hnsw = HnswGraph::new();
-        // Insert in insertion order (by id for determinism) to build graph
-        let mut ids: Vec<MemoryId> = self.embeddings.keys().copied().collect();
+        let mut ids: Vec<MemoryId> = self.embeddings.keys()
+            .chain(self.emb_offsets.keys())
+            .copied()
+            .collect();
         ids.sort_unstable();
         for id in ids {
-            let emb = self.embeddings[&id].clone();
-            self.hnsw.insert(id, &emb, &self.embeddings);
+            let emb_owned = {
+                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                embs.get(id).map(|s| s.to_vec())
+            };
+            if let Some(emb) = emb_owned {
+                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                self.hnsw.insert(id, &emb, &embs);
+            }
         }
     }
 
