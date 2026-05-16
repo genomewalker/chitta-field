@@ -12,7 +12,7 @@ use crate::organ::pq::ProductQuantizer;
 use crate::organ::symbol::SymbolEntry;
 use crate::organ::triplet::TripletEntry;
 use crate::payload::MemoryPayload;
-use crate::recall::{RecallHit, SessionRecallHit, SpreadingRecallHit};
+use crate::recall::{RecallHit, SpreadingRecallHit};
 use crate::scoring::{RecallMode, ScoringContext};
 use crate::state::MemoryState;
 use std::collections::HashSet;

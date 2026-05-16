@@ -258,6 +258,7 @@ pub struct InterventionStore {
     open_interventions: HashSet<u64>,
     by_session: HashMap<String, Vec<u64>>,
     by_realm: HashMap<String, Vec<u64>>,
+    #[allow(dead_code)]
     config: InterventionConfig,
 }
 

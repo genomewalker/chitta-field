@@ -1456,9 +1456,7 @@ fn default_coarse_centroids() -> Vec<Vec<f32>> {
         .collect()
 }
 
-fn default_lsh_buckets() -> Vec<HashMap<u16, Vec<MemoryId>>> {
-    vec![HashMap::new(); LSH_TABLES]
-}
+
 
 fn default_lsh_planes() -> Vec<Vec<Vec<f32>>> {
     (0..LSH_TABLES)
