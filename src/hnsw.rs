@@ -936,6 +936,16 @@ impl SemanticIndex {
                 // binary_covers && hnsw.is_empty(): binary Hamming is the active path, skip rebuild.
             }
         }
+        self.trim_deleted();
+    }
+
+    /// Remove IDs from `deleted` that are no longer reachable via either HNSW graph.
+    /// Safe to call any time; called at the end of normalize_all() so it runs once per WAL replay.
+    pub fn trim_deleted(&mut self) {
+        self.deleted.retain(|id| {
+            self.hnsw.contains(*id) || self.delta_hnsw.contains(*id)
+        });
+        self.deleted.shrink_to_fit();
     }
 
     /// Rebuild lsh_buckets from existing mem_lsh (no embedding math — O(N) HashMap inserts only).
