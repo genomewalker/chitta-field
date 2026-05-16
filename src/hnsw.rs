@@ -605,6 +605,7 @@ impl SemanticIndex {
         self.delta_hnsw.remove(memory_id);
         self.deleted.insert(memory_id);
         self.embeddings.remove(&memory_id);
+        self.emb_offsets.remove(&memory_id);
         if let Some(&pos) = self.binary_vec_pos.get(&memory_id) {
             let last = self.binary_vec.len().saturating_sub(1);
             if !self.binary_vec.is_empty() {
@@ -864,9 +865,11 @@ impl SemanticIndex {
             self.deleted.remove(&id);
         }
         if !bad.is_empty() {
-            // Reset coarse/LSH structures — they are also wrong-dim.
+            // Reset coarse/LSH/binary_vec — they are also wrong-dim.
             self.coarse_members.clear();
             self.lsh_buckets = vec![std::collections::HashMap::new(); LSH_TABLES];
+            self.binary_vec.clear();
+            self.binary_vec_pos.clear();
             eprintln!(
                 "[chitta-field] purged {} wrong-dim embeddings (model swap migration)",
                 bad.len()
