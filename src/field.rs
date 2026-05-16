@@ -413,8 +413,9 @@ impl ChittaField {
             }
             // .bin: binary codes sidecar — skip O(N×256) reconstruction in normalize_all.
             let _ = semantic_idx.load_binary_sidecar(&snap_path.with_extension("bin"));
-            // .emb mmap: above 200K, serve embeddings from mmap to free 1GB+ of heap.
-            if semantic_idx.embeddings_count() > 200_000 {
+            // .emb mmap: serve embeddings from mmap whenever sidecar exists — avoids 1GB+ heap
+            // copy regardless of collection size.
+            if emb_loaded {
                 let _ = semantic_idx.activate_mmap_embeddings(&snap_path.with_extension("emb"));
             }
             // .hnsw + .delta.hnsw: load both tiers; backfill handles WAL-replay additions.
