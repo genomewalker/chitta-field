@@ -34,8 +34,13 @@ const FULL_SNAPSHOT_MAGIC_V7: u64 = 0xF011_5741_7E00_0007;
 const FULL_SNAPSHOT_MAGIC_V8: u64 = 0xF011_5741_7E00_0008;
 /// v1.0.9: FullSnapshot with ack_scores + correction_states; embeddings in bincode.
 const FULL_SNAPSHOT_MAGIC_V9: u64 = 0xF011_5741_7E00_0009;
-/// Current magic (v1.0.10+): embeddings moved to .emb sidecar; bincode field is empty.
-const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_000A;
+/// v1.0.10: embeddings moved to .emb sidecar; content still in bincode.
+const FULL_SNAPSHOT_MAGIC_V10: u64 = 0xF011_5741_7E00_000A;
+/// Current magic (v1.0.11+): content moved to .pld sidecar; bincode field is empty Vec.
+const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_000B;
+
+/// Magic for the payload content sidecar (.pld).
+const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
 
 // ── Compile-time guard: MemoryState size must match snapshot magic ────────────
 // If you add/remove fields to MemoryState, this assert will fail.
@@ -445,6 +450,49 @@ impl FullSnapshot {
         Ok(())
     }
 
+    /// Save payload content to a `.pld` sidecar.
+    /// Format: [PLD_MAGIC:u64][count:u64]([id:u64][len:u32][bytes:u8×len])×count
+    pub fn save_payload_sidecar(path: &Path, payloads: &HashMap<MemoryId, crate::payload::MemoryPayload>) -> std::io::Result<()> {
+        let tmp = path.with_extension("pld.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&PLD_MAGIC.to_le_bytes())?;
+            f.write_all(&(payloads.len() as u64).to_le_bytes())?;
+            for (&id, payload) in payloads {
+                f.write_all(&id.to_le_bytes())?;
+                f.write_all(&(payload.content.len() as u32).to_le_bytes())?;
+                f.write_all(&payload.content)?;
+            }
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load payload content from a `.pld` sidecar into an existing payload map.
+    /// Returns false if the file is missing or corrupt (caller falls back to bincode content).
+    pub fn load_payload_sidecar(path: &Path, payloads: &mut HashMap<MemoryId, crate::payload::MemoryPayload>) -> bool {
+        let bytes = match std::fs::read(path) { Ok(b) => b, Err(_) => return false };
+        if bytes.len() < 16 { return false; }
+        let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        if magic != PLD_MAGIC { return false; }
+        let count = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let mut off = 16usize;
+        for _ in 0..count {
+            if off + 12 > bytes.len() { return false; }
+            let id = u64::from_le_bytes(bytes[off..off+8].try_into().unwrap());
+            let len = u32::from_le_bytes(bytes[off+8..off+12].try_into().unwrap()) as usize;
+            off += 12;
+            if off + len > bytes.len() { return false; }
+            if let Some(payload) = payloads.get_mut(&id) {
+                payload.content = bytes[off..off+len].to_vec();
+            }
+            off += len;
+        }
+        eprintln!("[chitta-field] loaded .pld sidecar: {} content entries", count);
+        true
+    }
+
     /// Read only the magic and snapshot_seqno without deserializing the full snapshot.
     pub fn peek_seqno(path: &Path) -> Result<u64> {
         let f = std::fs::File::open(path)?;
@@ -453,6 +501,7 @@ impl FullSnapshot {
         r.read_exact(&mut buf)?;
         let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         if magic != FULL_SNAPSHOT_MAGIC
+            && magic != FULL_SNAPSHOT_MAGIC_V10
             && magic != FULL_SNAPSHOT_MAGIC_V9
             && magic != FULL_SNAPSHOT_MAGIC_V8
             && magic != FULL_SNAPSHOT_MAGIC_V7
@@ -475,8 +524,18 @@ impl FullSnapshot {
         let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
 
         if magic == FULL_SNAPSHOT_MAGIC {
-            // v10: same struct as v9, but semantic_idx.embeddings is empty in bincode.
-            // Caller (field.rs) populates embeddings from the .emb sidecar after this returns.
+            // v11: embeddings in .emb sidecar, content in .pld sidecar; both Vec fields empty in bincode.
+            // Caller (field.rs) populates both from sidecars after this returns.
+            let r = BufReader::new(&bytes[8..]);
+            let mut snap: Self = bincode::deserialize_from(r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            for state in snap.states.values_mut() { state.sanitize(); }
+            return Ok(snap);
+        }
+
+        if magic == FULL_SNAPSHOT_MAGIC_V10 {
+            // v10: embeddings in .emb sidecar, content still in bincode.
+            // Caller (field.rs) populates embeddings from .emb; content already present.
             let r = BufReader::new(&bytes[8..]);
             let mut snap: Self = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;

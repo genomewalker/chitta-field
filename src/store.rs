@@ -3741,6 +3741,7 @@ impl ChittaField {
         let bin_path   = path.with_extension("bin");
         let hnsw_path  = path.with_extension("hnsw");
         let delta_path = path.with_extension("delta.hnsw");
+        let pld_path   = path.with_extension("pld");
         {
             // Merge delta into base if threshold exceeded, then persist both sidecars.
             let mut idx = self.semantic_idx.write();
@@ -3752,8 +3753,14 @@ impl ChittaField {
             let _ = idx.save_hnsw(&hnsw_path);
             let _ = idx.save_delta_hnsw(&delta_path);
         }
-        // Remove embeddings from the bincode snapshot (they live in the .emb sidecar now).
+        // Save payload content sidecar (.pld) before clearing from bincode.
         let mut snap = snap;
+        let _ = FullSnapshot::save_payload_sidecar(&pld_path, &snap.payloads);
+        // Strip content and embeddings from bincode (live in sidecars now).
+        for payload in snap.payloads.values_mut() {
+            payload.content.clear();
+            payload.content.shrink_to_fit();
+        }
         snap.semantic_idx.clear_embeddings();
         snap.save(&path)?;
         Ok(())
