@@ -1025,13 +1025,14 @@ impl SemanticIndex {
                 return false;
             }
         };
-        if graph.len() > self.embeddings.len() {
+        let total = self.total_embedding_count();
+        if graph.len() > total {
             // Sidecar is LARGER than the snapshot — can't happen with normal flow, reject.
             eprintln!("[hnsw] load_hnsw: sidecar ({} nodes) exceeds snapshot ({} entries) — discarding",
-                graph.len(), self.embeddings.len());
+                graph.len(), total);
             return false;
         }
-        let delta = self.embeddings.len().saturating_sub(graph.len());
+        let delta = total.saturating_sub(graph.len());
         if delta > 0 {
             eprintln!("[hnsw] load_hnsw: partial sidecar ({} nodes, {} delta will be backfilled after WAL replay)",
                 graph.len(), delta);
