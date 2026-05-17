@@ -5867,6 +5867,49 @@ pub extern "C" fn cf_prune_episodes(h: *mut CfHandle, max_age_days: u64, max_cou
     }
 }
 
+/// Return JSON: {"staged_count": N, "oldest_staged_age_days": F}.
+#[no_mangle]
+pub extern "C" fn cf_write_gate_stats(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let states = handle.field.states.read();
+    let mut count = 0usize;
+    let mut oldest_ms: i64 = now;
+    for s in states.values() {
+        if !s.deleted && s.staged {
+            count += 1;
+            if s.created_at_ms < oldest_ms {
+                oldest_ms = s.created_at_ms;
+            }
+        }
+    }
+    drop(states);
+    let oldest_days = if count > 0 {
+        (now - oldest_ms).max(0) as f64 / 86_400_000.0
+    } else { 0.0 };
+    let j = format!(r#"{{"staged_count":{},"oldest_staged_age_days":{:.2}}}"#, count, oldest_days);
+    match std::ffi::CString::new(j) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Promote staged memories that have been recalled; prune stale ones.
+/// Returns (promoted as u32) << 32 | (pruned as u32). Returns 0 on error.
+#[no_mangle]
+pub extern "C" fn cf_promote_staged_memories(h: *mut CfHandle) -> u64 {
+    if h.is_null() { return 0; }
+    let handle = unsafe { &*h };
+    match handle.field.promote_staged_memories() {
+        Ok((promoted, pruned)) => ((promoted as u64) << 32) | (pruned as u64),
+        Err(e) => { handle.err(e); 0 }
+    }
+}
+
 // ── Scoring Pipeline Config FFI ───────────────────────────────────────────────
 
 /// Reload scoring config from scoring.json in the data directory.

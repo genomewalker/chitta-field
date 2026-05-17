@@ -134,7 +134,18 @@ pub struct MemoryState {
     /// of inter-retrieval intervals in access_timestamps. Well-spaced = high quality.
     #[serde(default)]
     pub spacing_quality: f32,
+
+    /// True until recalled at least once. Staged memories rank 0.80× lower;
+    /// auto-pruned after 7 days if never recalled.
+    #[serde(default = "default_true")]
+    pub staged: bool,
+
+    /// Commit hash or symbol-change ID that deterministically invalidated this memory.
+    #[serde(default)]
+    pub invalidated_by: Option<String>,
 }
+
+fn default_true() -> bool { true }
 
 impl MemoryState {
     pub fn new(memory_id: MemoryId, chunk_hash: ChunkHash, created_at_ms: i64) -> Self {
@@ -164,6 +175,8 @@ impl MemoryState {
             competitive_weight: 0.0,
             lure_risk: 0.0,
             spacing_quality: 0.0,
+            staged: true,
+            invalidated_by: None,
         }
     }
 
@@ -247,6 +260,12 @@ impl MemoryState {
                 3 => EpistemicStatus::AutonomousSynthesis,
                 _ => EpistemicStatus::ToolDerived,
             };
+        }
+        if let Some(s) = delta.staged {
+            self.staged = s;
+        }
+        if delta.invalidated_by.is_some() {
+            self.invalidated_by = delta.invalidated_by.clone();
         }
     }
 

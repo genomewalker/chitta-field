@@ -118,6 +118,7 @@ impl ScoringPipeline {
             Box::new(IntegrationWeightFactor),
             Box::new(AckScoreFactor),
             Box::new(RareEntityFactor),
+            Box::new(StagedFactor),
         ];
         Self { factors, config }
     }

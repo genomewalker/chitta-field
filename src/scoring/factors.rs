@@ -430,3 +430,20 @@ impl ScoringFactor for RareEntityFactor {
         Some(boost)
     }
 }
+
+// ── Write-gate staged penalty ────────────────────────────────────────────────
+
+pub struct StagedFactor;
+
+impl ScoringFactor for StagedFactor {
+    fn name(&self) -> &'static str { "staged" }
+
+    fn compute(
+        &self,
+        ctx: &ScoringContext,
+        _config: &ScoringConfig,
+        _decomp: &mut ScoreDecomposition,
+    ) -> Option<f32> {
+        if ctx.state.staged { Some(0.80) } else { Some(1.0) }
+    }
+}
