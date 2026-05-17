@@ -1002,6 +1002,12 @@ pub extern "C" fn cf_pending_count(h: *const CfHandle) -> usize {
     unsafe { (*h).field.raw_pending_count() }
 }
 
+#[no_mangle]
+pub extern "C" fn cf_requeue_ghost_embeddings(h: *const CfHandle) -> usize {
+    if h.is_null() { return 0; }
+    unsafe { &*h }.field.requeue_ghost_embeddings()
+}
+
 // ── Code Intelligence ─────────────────────────────────────────────────────────
 
 /// A single symbol search result. Fixed-size POD struct for C interop.

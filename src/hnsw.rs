@@ -88,6 +88,7 @@ impl HnswGraph {
         self.neighbors.len()
     }
 
+
     pub(crate) fn contains(&self, id: MemoryId) -> bool {
         self.neighbors.contains_key(&id)
     }
@@ -515,6 +516,16 @@ impl SemanticIndex {
             }
         }
         self.embeddings.get(&id).map(|v| v.as_slice())
+    }
+
+    /// True if this memory has a usable (non-zero norm) embedding in the index.
+    /// Returns false for missing, zero-vector, or NaN embeddings — those score 0.0
+    /// against every query and need to be re-embedded.
+    pub fn contains(&self, id: MemoryId) -> bool {
+        match self.get_embedding(id) {
+            None => false,
+            Some(emb) => emb.iter().map(|&v| v * v).sum::<f32>() > 1e-6,
+        }
     }
 
     /// Iterator over all memory IDs that have an embedding (including soft-deleted).
