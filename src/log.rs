@@ -775,6 +775,8 @@ mod tests {
             op_ts_ms: 0,
             status: None,
             epistemic_status: None,
+            staged: None,
+            invalidated_by: None,
         })
     }
 
