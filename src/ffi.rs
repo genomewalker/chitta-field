@@ -7963,6 +7963,83 @@ pub extern "C" fn cf_resolve_contradiction(
     }
 }
 
+// ── Symbol event log FFI ─────────────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn cf_log_symbol_event(
+    h: *mut CfHandle,
+    params_json: *const c_char,
+) -> u64 {
+    if h.is_null() || params_json.is_null() { return 0; }
+    let handle = unsafe { &*h };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
+        Ok(s) => s, Err(_) => return 0,
+    }};
+    let p: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v, Err(_) => return 0,
+    };
+    use crate::organ::symbol_events::SymbolEventKind;
+    let symbol_name = p["symbol_name"].as_str().unwrap_or("").to_string();
+    let file_path   = p["file_path"].as_str().unwrap_or("").to_string();
+    let symbol_id   = p["symbol_id"].as_u64();
+    let kind        = SymbolEventKind::from_u8(p["kind"].as_u64().unwrap_or(0) as u8);
+    let session_id  = p["session_id"].as_str().unwrap_or("").to_string();
+    let harness     = p["harness"].as_str().unwrap_or("").to_string();
+    let memory_id   = p["memory_id"].as_u64().filter(|&v| v != 0);
+    let notes       = p["notes"].as_str().map(|s| s.to_string());
+    let timestamp_ms = p["timestamp_ms"].as_i64().unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+    });
+    handle.field.log_symbol_event(
+        symbol_name, file_path, symbol_id, kind,
+        session_id, harness, memory_id, notes, timestamp_ms,
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cf_query_symbol_events(
+    h: *const CfHandle,
+    params_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let (symbol_name, file_path, limit) = if params_json.is_null() {
+        (None, None, 50usize)
+    } else {
+        let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
+            Ok(s) => s, Err(_) => return std::ptr::null_mut(),
+        }};
+        let p: serde_json::Value = serde_json::from_str(json_str).unwrap_or_default();
+        let sn = p["symbol_name"].as_str().map(|s| s.to_string());
+        let fp = p["file_path"].as_str().map(|s| s.to_string());
+        let lim = p["limit"].as_u64().unwrap_or(50) as usize;
+        (sn, fp, lim)
+    };
+    let json = handle.field.query_symbol_events(
+        symbol_name.as_deref(),
+        file_path.as_deref(),
+        limit,
+    );
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_mark_memory_invalidated(
+    h: *mut CfHandle,
+    memory_id: u64,
+    reason: *const c_char,
+) -> i32 {
+    if h.is_null() || reason.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let reason_str = unsafe { match CStr::from_ptr(reason).to_str() {
+        Ok(s) => s.to_string(), Err(_) => return -1,
+    }};
+    if handle.field.mark_memory_invalidated(memory_id, reason_str) { 0 } else { -1 }
+}
+
 #[inline]
 fn handle_from(h: *const CfHandle) -> &'static CfHandle {
     unsafe { &*h }

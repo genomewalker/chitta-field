@@ -30,3 +30,4 @@ pub mod wisdom_promotion;
 pub mod intervention;
 pub mod agent_protocol;
 pub mod wisdom_lineage;
+pub mod symbol_events;

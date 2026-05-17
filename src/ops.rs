@@ -74,6 +74,7 @@ pub enum Op {
     CloseRederive(CloseRederiveOp),
     InvalidateTripletsBySourceFile(InvalidateTripletsBySourceFileOp),
     UpdateMemoryKind(UpdateMemoryKindOp),
+    SymbolEvent(SymbolEventOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -127,6 +128,7 @@ pub const OP_RECORD_CHALLENGER: u8 = 63;
 pub const OP_CLOSE_REDERIVE: u8 = 64;
 pub const OP_INVALIDATE_TRIPLETS_BY_SOURCE_FILE: u8 = 65;
 pub const OP_UPDATE_MEMORY_KIND: u8 = 66;
+pub const OP_SYMBOL_EVENT: u8 = 67;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -861,4 +863,18 @@ pub struct CloseRederiveOp {
     pub fork_claim: Option<String>,
     pub fork_lineage_id: Option<u64>,
     pub closed_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolEventOp {
+    pub id: u64,
+    pub symbol_name: String,
+    pub file_path: String,
+    pub symbol_id: Option<u64>,
+    pub kind: u8,
+    pub session_id: String,
+    pub harness: String,
+    pub memory_id: Option<u64>,
+    pub timestamp_ms: i64,
+    pub notes: Option<String>,
 }
