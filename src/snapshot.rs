@@ -36,8 +36,12 @@ const FULL_SNAPSHOT_MAGIC_V8: u64 = 0xF011_5741_7E00_0008;
 const FULL_SNAPSHOT_MAGIC_V9: u64 = 0xF011_5741_7E00_0009;
 /// v1.0.10: embeddings moved to .emb sidecar; content still in bincode.
 const FULL_SNAPSHOT_MAGIC_V10: u64 = 0xF011_5741_7E00_000A;
-/// Current magic (v1.0.11+): content moved to .pld sidecar; bincode field is empty Vec.
-const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_000B;
+/// v1.0.11: content moved to .pld sidecar; bincode field is empty Vec.
+/// MemoryState did NOT yet have `staged`/`invalidated_by`.
+const FULL_SNAPSHOT_MAGIC_V11: u64 = 0xF011_5741_7E00_000B;
+/// Current magic (v1.0.12+): same sidecar layout as V11; MemoryState gains
+/// `staged: bool` + `invalidated_by: Option<String>` (Phase 5, write-gate).
+const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_000C;
 
 /// Magic for the payload content sidecar (.pld).
 const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
@@ -47,7 +51,7 @@ const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
 // You MUST: (1) bump FULL_SNAPSHOT_MAGIC, (2) add a LegacyMemoryStateVN,
 // (3) add migration in FullSnapshot::load(), (4) update this constant.
 // bincode is positional — #[serde(default)] does NOT work with it.
-// V10: added `staged: bool` + `invalidated_by: Option<String>`. Exact size depends on
+// V12: added `staged: bool` + `invalidated_by: Option<String>`. Exact size depends on
 // compiler field-reordering (repr(Rust) may pack bools together). Guard is a range check.
 const _: () = assert!(
     std::mem::size_of::<MemoryState>() >= 200,
@@ -399,11 +403,101 @@ struct LegacyFullSnapshotV7 {
 
 // ── V8 snapshot struct (no top-level sidecars) ───────────────────────────────
 
+/// MemoryState as it existed before Phase 5 write-gate (v1.0.12).
+/// Identical to current MemoryState minus `staged` and `invalidated_by`.
+/// Used to deserialise V8–V11 snapshots written by older binaries.
+#[derive(Serialize, Deserialize)]
+struct LegacyMemoryStateV11 {
+    pub memory_id: MemoryId,
+    pub current_version: u32,
+    pub current_chunk_hash: crate::ids::ChunkHash,
+    pub deleted: bool,
+    pub strength: f32,
+    pub decay_rate: f32,
+    pub confidence: f32,
+    pub access_count: u32,
+    pub last_accessed_ms: i64,
+    pub last_strengthened_ms: i64,
+    pub created_at_ms: i64,
+    pub pinned: bool,
+    pub tier: u8,
+    pub last_state_op_ts_ms: i64,
+    pub retrieval_history: RetrievalHistory,
+    pub embed_pending: bool,
+    pub status: MemoryStatus,
+    pub epistemic_status: EpistemicStatus,
+    pub surprise: f32,
+    pub affect_valence: f32,
+    pub affect_arousal: f32,
+    pub access_timestamps: Vec<i64>,
+    pub competitive_weight: f32,
+    pub lure_risk: f32,
+    pub spacing_quality: f32,
+}
+
+impl LegacyMemoryStateV11 {
+    fn upgrade(self) -> MemoryState {
+        MemoryState {
+            memory_id: self.memory_id,
+            current_version: self.current_version,
+            current_chunk_hash: self.current_chunk_hash,
+            deleted: self.deleted,
+            strength: self.strength,
+            decay_rate: self.decay_rate,
+            confidence: self.confidence,
+            access_count: self.access_count,
+            last_accessed_ms: self.last_accessed_ms,
+            last_strengthened_ms: self.last_strengthened_ms,
+            created_at_ms: self.created_at_ms,
+            pinned: self.pinned,
+            tier: self.tier,
+            last_state_op_ts_ms: self.last_state_op_ts_ms,
+            retrieval_history: self.retrieval_history,
+            embed_pending: self.embed_pending,
+            status: self.status,
+            epistemic_status: self.epistemic_status,
+            surprise: self.surprise,
+            affect_valence: self.affect_valence,
+            affect_arousal: self.affect_arousal,
+            access_timestamps: self.access_timestamps,
+            competitive_weight: self.competitive_weight,
+            lure_risk: self.lure_risk,
+            spacing_quality: self.spacing_quality,
+            staged: false,
+            invalidated_by: None,
+        }
+    }
+}
+
+/// V11 snapshot layout (magic 0xF011_5741_7E00_000B): same sidecar layout as
+/// current but MemoryState lacks `staged`/`invalidated_by`.
+/// Also used for V9 and V10 which share the same MemoryState binary layout.
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV11 {
+    pub snapshot_seqno: u64,
+    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub states: HashMap<MemoryId, LegacyMemoryStateV11>,
+    pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts: HashMap<String, ArtifactId>,
+    pub artifact_paths: HashMap<ArtifactId, String>,
+    pub time_idx: TemporalIndex,
+    pub keyword_idx: KeywordIndex,
+    pub artifact_idx: ArtifactIndex,
+    pub triplet_store: TripletStore,
+    pub symbol_idx: SymbolIndex,
+    pub call_graph: CallGraph,
+    pub code_files: CodeFileIndex,
+    pub semantic_idx: SemanticIndex,
+    pub coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats>,
+    pub ack_scores: HashMap<MemoryId, i32>,
+    pub correction_states: HashMap<u64, CorrectionState>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct LegacyFullSnapshotV8 {
     pub snapshot_seqno: u64,
     pub payloads: HashMap<MemoryId, MemoryPayload>,
-    pub states: HashMap<MemoryId, MemoryState>,
+    pub states: HashMap<MemoryId, LegacyMemoryStateV11>,
     pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
     pub artifacts: HashMap<String, ArtifactId>,
     pub artifact_paths: HashMap<ArtifactId, String>,
@@ -509,6 +603,7 @@ impl FullSnapshot {
         r.read_exact(&mut buf)?;
         let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         if magic != FULL_SNAPSHOT_MAGIC
+            && magic != FULL_SNAPSHOT_MAGIC_V11
             && magic != FULL_SNAPSHOT_MAGIC_V10
             && magic != FULL_SNAPSHOT_MAGIC_V9
             && magic != FULL_SNAPSHOT_MAGIC_V8
@@ -532,8 +627,7 @@ impl FullSnapshot {
         let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
 
         if magic == FULL_SNAPSHOT_MAGIC {
-            // v11: embeddings in .emb sidecar, content in .pld sidecar; both Vec fields empty in bincode.
-            // Caller (field.rs) populates both from sidecars after this returns.
+            // v12: same sidecar layout as v11; MemoryState now has staged + invalidated_by.
             let r = BufReader::new(&bytes[8..]);
             let mut snap: Self = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
@@ -541,33 +635,54 @@ impl FullSnapshot {
             return Ok(snap);
         }
 
-        if magic == FULL_SNAPSHOT_MAGIC_V10 {
-            // v10: embeddings in .emb sidecar, content still in bincode.
-            // Caller (field.rs) populates embeddings from .emb; content already present.
+        if magic == FULL_SNAPSHOT_MAGIC_V11
+            || magic == FULL_SNAPSHOT_MAGIC_V10
+            || magic == FULL_SNAPSHOT_MAGIC_V9
+        {
+            // v9/v10/v11: same MemoryState layout (no staged/invalidated_by). Upgrade states.
+            if magic == FULL_SNAPSHOT_MAGIC_V11 {
+                eprintln!("[chitta-field] migrating v11 snapshot → v12 (adding staged + invalidated_by)");
+            } else {
+                eprintln!("[chitta-field] migrating v9/v10 snapshot → v12");
+            }
             let r = BufReader::new(&bytes[8..]);
-            let mut snap: Self = bincode::deserialize_from(r)
+            let leg: LegacyFullSnapshotV11 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
-            for state in snap.states.values_mut() { state.sanitize(); }
-            return Ok(snap);
-        }
-
-        if magic == FULL_SNAPSHOT_MAGIC_V9 {
-            // v9: embeddings included in bincode (pre-sidecar format).
-            let r = BufReader::new(&bytes[8..]);
-            let mut snap: Self = bincode::deserialize_from(r)
-                .map_err(|e| FieldError::Serialization(e.to_string()))?;
-            for state in snap.states.values_mut() { state.sanitize(); }
-            return Ok(snap);
+            let states: HashMap<MemoryId, MemoryState> = leg.states
+                .into_iter()
+                .map(|(id, s)| { let mut m = s.upgrade(); m.sanitize(); (id, m) })
+                .collect();
+            return Ok(FullSnapshot {
+                snapshot_seqno: leg.snapshot_seqno,
+                payloads: leg.payloads,
+                states,
+                assoc_edges: leg.assoc_edges,
+                artifacts: leg.artifacts,
+                artifact_paths: leg.artifact_paths,
+                time_idx: leg.time_idx,
+                keyword_idx: leg.keyword_idx,
+                artifact_idx: leg.artifact_idx,
+                triplet_store: leg.triplet_store,
+                symbol_idx: leg.symbol_idx,
+                call_graph: leg.call_graph,
+                code_files: leg.code_files,
+                semantic_idx: leg.semantic_idx,
+                coactivation_stats: leg.coactivation_stats,
+                ack_scores: leg.ack_scores,
+                correction_states: leg.correction_states,
+            });
         }
 
         if magic == FULL_SNAPSHOT_MAGIC_V8 {
-            // V8: no top-level sidecars — migrate to v9 with empty sidecars.
-            eprintln!("[chitta-field] migrating v8 snapshot → v9 (adding ack_scores + correction_states)");
+            // V8: no top-level sidecars; MemoryState also lacks staged/invalidated_by.
+            eprintln!("[chitta-field] migrating v8 snapshot → v12");
             let r = BufReader::new(&bytes[8..]);
             let v8: LegacyFullSnapshotV8 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
-            let mut states = v8.states;
-            for s in states.values_mut() { s.sanitize(); }
+            let states: HashMap<MemoryId, MemoryState> = v8.states
+                .into_iter()
+                .map(|(id, s)| { let mut m = s.upgrade(); m.sanitize(); (id, m) })
+                .collect();
             return Ok(FullSnapshot {
                 snapshot_seqno: v8.snapshot_seqno,
                 payloads: v8.payloads,
