@@ -3998,6 +3998,64 @@ impl ChittaField {
         serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
     }
 
+    pub fn symbol_stale_for_memory(&self, id: crate::ids::MemoryId) -> Option<String> {
+        // 1. Definitive WAL-written invalidation.
+        {
+            let states = self.states.read();
+            match states.get(&id) {
+                None => return Some("memory not found".to_string()),
+                Some(s) => if let Some(ref reason) = s.invalidated_by {
+                    return Some(reason.clone());
+                },
+            }
+        }
+        // 2. Check artifact refs: if source file no longer indexed or line range gone.
+        let artifact_refs = {
+            let payloads = self.payloads.read();
+            match payloads.get(&id) {
+                Some(p) => p.artifact_refs.clone(),
+                None => return None,
+            }
+        };
+        if artifact_refs.is_empty() { return None; }
+        let artifact_paths = self.artifact_paths.read();
+        let symbol_idx = self.symbol_idx.read();
+        for aref in &artifact_refs {
+            if let Some(file_path) = artifact_paths.get(&aref.artifact_id) {
+                let syms = symbol_idx.by_file(file_path);
+                if syms.is_empty() {
+                    return Some(format!("source file {} no longer indexed", file_path));
+                }
+                if aref.line_start > 0 {
+                    let covered = syms.iter().any(|s| {
+                        s.line_start <= aref.line_start && s.line_end >= aref.line_end
+                    });
+                    if !covered {
+                        return Some(format!("symbol at {}:{} no longer present", file_path, aref.line_start));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn memory_claim_info_json(&self, id: crate::ids::MemoryId, now_ms: i64) -> String {
+        let states = self.states.read();
+        let payloads = self.payloads.read();
+        let state = match states.get(&id) { Some(s) => s, None => return "{}".to_string() };
+        let payload = match payloads.get(&id) { Some(p) => p, None => return "{}".to_string() };
+        let age_days = (now_ms - state.created_at_ms).max(0) as f64 / 86_400_000.0;
+        let j = serde_json::json!({
+            "staged": state.staged,
+            "invalidated_by": state.invalidated_by,
+            "source_session": payload.source_session,
+            "source_tool": payload.source_tool,
+            "created_at_ms": state.created_at_ms,
+            "age_days": age_days,
+        });
+        j.to_string()
+    }
+
     pub fn mark_memory_invalidated(&self, memory_id: crate::ids::MemoryId, reason: String) -> bool {
         let exists = self.states.read().contains_key(&memory_id);
         if !exists { return false; }
