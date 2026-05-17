@@ -29,6 +29,7 @@ use crate::organ::integration::IntegrationKernel;
 use crate::organ::surprise_learning::SurpriseLearningStore;
 use crate::organ::wisdom_promotion::WisdomPromotionStore;
 use crate::organ::intervention::InterventionStore;
+use crate::organ::symbol_events::{SymbolEvent, SymbolEventKind, SymbolEventLog};
 use crate::scoring::learned::LearnedScoringModel;
 use crate::organ::pq::ProductQuantizer;
 use crate::organ::session::SessionRegistry;
@@ -147,6 +148,7 @@ pub struct ChittaField {
     pub(crate) intervention_store: RwLock<InterventionStore>,
     pub(crate) agent_protocol_store: RwLock<AgentProtocolStore>,
     pub(crate) wisdom_lineage_store: RwLock<WisdomLineageStore>,
+    pub(crate) symbol_event_log: RwLock<SymbolEventLog>,
     pub(crate) lite_encoder: RwLock<Option<LiteEncoder>>,
     /// Byte offsets for each foreign segment file, used by sync_foreign().
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
@@ -236,6 +238,7 @@ impl ChittaField {
         let mut intervention_store = InterventionStore::new();
         let mut agent_protocol_store = AgentProtocolStore::new();
         let mut wisdom_lineage_store = WisdomLineageStore::new();
+        let mut symbol_event_log = SymbolEventLog::new();
         let mut chunk_hash_idx: HashMap<crate::ids::ChunkHash, MemoryId> = HashMap::new();
         let mut snapshot_coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats> = HashMap::new();
         let mut snap_ack_scores: HashMap<MemoryId, i32> = HashMap::new();
@@ -490,6 +493,7 @@ impl ChittaField {
                 &mut intervention_store,
                 &mut agent_protocol_store,
                 &mut wisdom_lineage_store,
+                &mut symbol_event_log,
                 &mut chunk_hash_idx,
                 &mut replay_realm_members,
                 &mut replay_kind_members,
@@ -629,6 +633,7 @@ impl ChittaField {
             intervention_store: RwLock::new(intervention_store),
             agent_protocol_store: RwLock::new(agent_protocol_store),
             wisdom_lineage_store: RwLock::new(wisdom_lineage_store),
+            symbol_event_log: RwLock::new(symbol_event_log),
             lite_encoder: RwLock::new(loaded_lite_encoder),
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
@@ -733,6 +738,7 @@ impl ChittaField {
         let mut intervention_store_reg = self.intervention_store.write();
         let mut agent_protocol_store_reg = self.agent_protocol_store.write();
         let mut wisdom_lineage_store_reg = self.wisdom_lineage_store.write();
+        let mut symbol_event_log_reg = self.symbol_event_log.write();
         let mut chunk_hash_idx = self.chunk_hash_idx.write();
         let mut realm_members = self.realm_members.write();
         let mut kind_members  = self.kind_members.write();
@@ -775,6 +781,7 @@ impl ChittaField {
                 &mut *intervention_store_reg,
                 &mut *agent_protocol_store_reg,
                 &mut *wisdom_lineage_store_reg,
+                &mut *symbol_event_log_reg,
                 &mut *chunk_hash_idx,
                 &mut *realm_members,
                 &mut *kind_members,
@@ -934,6 +941,7 @@ pub(crate) fn apply_op(
     intervention_store: &mut InterventionStore,
     agent_protocol_store: &mut AgentProtocolStore,
     wisdom_lineage_store: &mut WisdomLineageStore,
+    symbol_event_log: &mut SymbolEventLog,
     chunk_hash_idx: &mut HashMap<crate::ids::ChunkHash, MemoryId>,
     realm_members: &mut HashMap<String, HashSet<MemoryId>>,
     kind_members:  &mut HashMap<String, HashSet<MemoryId>>,
@@ -1784,6 +1792,21 @@ pub(crate) fn apply_op(
                 r.fork_lineage_id,
                 r.closed_ms,
             );
+        }
+
+        Op::SymbolEvent(e) => {
+            symbol_event_log.replay(SymbolEvent {
+                id: e.id,
+                symbol_name: e.symbol_name,
+                file_path: e.file_path,
+                symbol_id: e.symbol_id,
+                kind: SymbolEventKind::from_u8(e.kind),
+                session_id: e.session_id,
+                harness: e.harness,
+                memory_id: e.memory_id,
+                timestamp_ms: e.timestamp_ms,
+                notes: e.notes,
+            });
         }
     }
 }

@@ -3933,6 +3933,95 @@ impl ChittaField {
         Ok((promoted, pruned))
     }
 
+    pub fn log_symbol_event(
+        &self,
+        symbol_name: String,
+        file_path: String,
+        symbol_id: Option<u64>,
+        kind: crate::organ::symbol_events::SymbolEventKind,
+        session_id: String,
+        harness: String,
+        memory_id: Option<crate::ids::MemoryId>,
+        notes: Option<String>,
+        timestamp_ms: i64,
+    ) -> u64 {
+        let ev = crate::organ::symbol_events::SymbolEvent {
+            id: 0,
+            symbol_name: symbol_name.clone(),
+            file_path: file_path.clone(),
+            symbol_id,
+            kind,
+            session_id: session_id.clone(),
+            harness: harness.clone(),
+            memory_id,
+            timestamp_ms,
+            notes: notes.clone(),
+        };
+        let id = self.symbol_event_log.write().log(ev);
+        let _ = self.log.write().append(&crate::ops::Op::SymbolEvent(
+            crate::ops::SymbolEventOp {
+                id,
+                symbol_name,
+                file_path,
+                symbol_id,
+                kind: kind.to_u8(),
+                session_id,
+                harness,
+                memory_id,
+                timestamp_ms,
+                notes,
+            },
+        ));
+        id
+    }
+
+    pub fn query_symbol_events(
+        &self,
+        symbol_name: Option<&str>,
+        file_path: Option<&str>,
+        limit: usize,
+    ) -> String {
+        let log = self.symbol_event_log.read();
+        let hits = log.query(symbol_name, file_path, limit);
+        let arr: Vec<serde_json::Value> = hits.iter().map(|e| serde_json::json!({
+            "id": e.id,
+            "symbol_name": e.symbol_name,
+            "file_path": e.file_path,
+            "symbol_id": e.symbol_id,
+            "kind": e.kind.as_str(),
+            "session_id": e.session_id,
+            "harness": e.harness,
+            "memory_id": e.memory_id,
+            "timestamp_ms": e.timestamp_ms,
+            "notes": e.notes,
+        })).collect();
+        serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    pub fn mark_memory_invalidated(&self, memory_id: crate::ids::MemoryId, reason: String) -> bool {
+        let exists = self.states.read().contains_key(&memory_id);
+        if !exists { return false; }
+        let now = now_ms();
+        let delta = crate::ops::StateDeltaOp {
+            memory_id,
+            op_ts_ms: now,
+            strength_delta: None,
+            confidence_delta: None,
+            decay_rate: None,
+            touch: false,
+            pin: None,
+            status: None,
+            epistemic_status: None,
+            staged: None,
+            invalidated_by: Some(reason.clone()),
+        };
+        let _ = self.log.write().append(&crate::ops::Op::UpdateState(delta.clone()));
+        if let Some(s) = self.states.write().get_mut(&memory_id) {
+            s.invalidated_by = Some(reason);
+        }
+        true
+    }
+
     /// Run a single tier demotion pass over all memories.
     /// Returns `(demoted_count, deleted_count)`.
     ///
