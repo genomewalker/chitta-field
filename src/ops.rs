@@ -163,6 +163,8 @@ pub struct PutPayloadOp {
     pub artifact_refs: Vec<ArtifactRef>,
     pub source_session: Option<String>,
     pub source_tool: Option<String>,
+    #[serde(default)]
+    pub harness: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

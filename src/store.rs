@@ -384,6 +384,10 @@ impl ChittaField {
             embedding_model: if embed_pending { "none".to_string() } else { "bge-base-en-v1.5".to_string() },
             embedding: embedding.to_vec(),
             artifact_refs: artifact_refs.clone(),
+            harness: source_tool.as_deref().map(|t| {
+                if t.starts_with("codex") { "codex".to_string() }
+                else { "claude-code".to_string() }
+            }),
             source_session,
             source_tool,
         };
@@ -4050,10 +4054,75 @@ impl ChittaField {
             "invalidated_by": state.invalidated_by,
             "source_session": payload.source_session,
             "source_tool": payload.source_tool,
+            "harness": payload.harness,
             "created_at_ms": state.created_at_ms,
             "age_days": age_days,
         });
         j.to_string()
+    }
+
+    /// Find pairs of memories that disagree across harnesses (claude-code vs codex).
+    /// Returns JSON array of conflict pairs sorted by cosine distance (most divergent first).
+    pub fn query_cross_harness_conflicts(&self, realm: &str, limit: usize, min_score: f32) -> String {
+        let payloads = self.payloads.read();
+        let states   = self.states.read();
+        let idx      = self.semantic_idx.read();
+
+        // Collect all live, non-staged memories with a harness tag
+        let candidates: Vec<(crate::ids::MemoryId, &[f32], &str)> = payloads.iter()
+            .filter_map(|(id, p)| {
+                let s = states.get(id)?;
+                if s.deleted || s.staged { return None; }
+                if !realm.is_empty() && p.realm != realm { return None; }
+                let harness = p.harness.as_deref()?;
+                if p.embedding.is_empty() { return None; }
+                Some((*id, p.embedding.as_slice(), harness))
+            })
+            .collect();
+
+        // For each candidate, find its nearest cross-harness neighbour
+        let mut conflicts: Vec<serde_json::Value> = Vec::new();
+        let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+
+        for (id_a, emb_a, harness_a) in &candidates {
+            let neighbors = idx.search(emb_a, 20, None);
+            for nb in &neighbors {
+                if nb.memory_id == *id_a { continue; }
+                let id_b = nb.memory_id;
+                let key = if *id_a < id_b { (*id_a, id_b) } else { (id_b, *id_a) };
+                if seen.contains(&key) { continue; }
+                let harness_b = match payloads.get(&id_b) {
+                    Some(p) => match p.harness.as_deref() { Some(h) => h, None => continue },
+                    None => continue,
+                };
+                if harness_a == &harness_b { continue; }
+                // semantic similarity → disagreement = 1 - similarity
+                let disagreement = 1.0 - nb.cosine_similarity;
+                if disagreement < min_score { continue; }
+                seen.insert(key);
+                let content_a = String::from_utf8_lossy(payloads[id_a].content.as_slice()).into_owned();
+                let content_b = String::from_utf8_lossy(payloads[&id_b].content.as_slice()).into_owned();
+                conflicts.push(serde_json::json!({
+                    "harness_a": harness_a,
+                    "memory_a_id": id_a,
+                    "harness_b": harness_b,
+                    "memory_b_id": id_b,
+                    "disagreement_score": disagreement,
+                    "snippet_a": &content_a[..content_a.len().min(200)],
+                    "snippet_b": &content_b[..content_b.len().min(200)],
+                }));
+                if conflicts.len() >= limit { break; }
+            }
+            if conflicts.len() >= limit { break; }
+        }
+
+        conflicts.sort_by(|a, b| {
+            let da = a["disagreement_score"].as_f64().unwrap_or(0.0);
+            let db = b["disagreement_score"].as_f64().unwrap_or(0.0);
+            db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        serde_json::to_string(&conflicts).unwrap_or_else(|_| "[]".to_string())
     }
 
     pub fn mark_memory_invalidated(&self, memory_id: crate::ids::MemoryId, reason: String) -> bool {

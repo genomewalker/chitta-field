@@ -18,6 +18,8 @@ pub struct MemoryPayload {
     pub artifact_refs: Vec<ArtifactRef>,
     pub source_session: Option<String>,
     pub source_tool: Option<String>,
+    #[serde(default)]
+    pub harness: Option<String>,
 }
 
 impl From<PutPayloadOp> for MemoryPayload {
@@ -36,6 +38,7 @@ impl From<PutPayloadOp> for MemoryPayload {
             artifact_refs: op.artifact_refs,
             source_session: op.source_session,
             source_tool: op.source_tool,
+            harness: op.harness,
         }
     }
 }

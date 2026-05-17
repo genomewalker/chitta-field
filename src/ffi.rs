@@ -8069,6 +8069,26 @@ pub extern "C" fn cf_mark_memory_invalidated(
     if handle.field.mark_memory_invalidated(memory_id, reason_str) { 0 } else { -1 }
 }
 
+#[no_mangle]
+pub extern "C" fn cf_query_cross_harness_conflicts(
+    h: *const CfHandle,
+    realm: *const c_char,
+    limit: u32,
+    min_score: f32,
+) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let realm_str = if realm.is_null() { "".to_string() } else {
+        unsafe { CStr::from_ptr(realm).to_str().unwrap_or("").to_string() }
+    };
+    let lim = if limit == 0 { 20 } else { limit as usize };
+    let json = handle.field.query_cross_harness_conflicts(&realm_str, lim, min_score);
+    match CString::new(json) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 #[inline]
 fn handle_from(h: *const CfHandle) -> &'static CfHandle {
     unsafe { &*h }

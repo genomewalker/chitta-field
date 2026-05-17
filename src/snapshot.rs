@@ -1,7 +1,7 @@
 use crate::error::{FieldError, Result};
 use crate::field::{AssocEdge, CoActivationStats};
 use crate::hnsw::SemanticIndex;
-use crate::ids::{ArtifactId, MemoryId};
+use crate::ids::{ArtifactId, ChunkHash, MemoryId};
 use crate::organ::artifact::ArtifactIndex;
 use crate::organ::callgraph::CallGraph;
 use crate::organ::codefile::CodeFileIndex;
@@ -39,9 +39,11 @@ const FULL_SNAPSHOT_MAGIC_V10: u64 = 0xF011_5741_7E00_000A;
 /// v1.0.11: content moved to .pld sidecar; bincode field is empty Vec.
 /// MemoryState did NOT yet have `staged`/`invalidated_by`.
 const FULL_SNAPSHOT_MAGIC_V11: u64 = 0xF011_5741_7E00_000B;
-/// Current magic (v1.0.12+): same sidecar layout as V11; MemoryState gains
+/// V12: MemoryState gains `staged` + `invalidated_by`. MemoryPayload unchanged.
+const FULL_SNAPSHOT_MAGIC_V12: u64 = 0xF011_5741_7E00_000C;
+/// Current magic (v1.0.13+): MemoryPayload gains `harness: Option<String>`.
 /// `staged: bool` + `invalidated_by: Option<String>` (Phase 5, write-gate).
-const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_000C;
+const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_000D;
 
 /// Magic for the payload content sidecar (.pld).
 const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
@@ -67,6 +69,52 @@ struct LegacySemanticIndex {
 }
 
 // ── Legacy MemoryState (V4 and V5 snapshots, 14-field layout) ────────────────
+
+/// MemoryPayload as serialized in V1–V12 snapshots (pre-Phase-4).
+/// Lacks `harness: Option<String>`.
+#[derive(Serialize, Deserialize)]
+struct LegacyMemoryPayloadV12 {
+    pub memory_id: MemoryId,
+    pub version: u32,
+    pub chunk_hash: ChunkHash,
+    pub created_at_ms: i64,
+    pub authored_at_ms: i64,
+    pub kind: String,
+    pub realm: String,
+    pub content: Vec<u8>,
+    pub embedding_model: String,
+    pub embedding: Vec<f32>,
+    pub artifact_refs: Vec<crate::ops::ArtifactRef>,
+    pub source_session: Option<String>,
+    pub source_tool: Option<String>,
+}
+impl LegacyMemoryPayloadV12 {
+    fn upgrade(self) -> MemoryPayload {
+        let harness = self.source_tool.as_deref().map(|t| {
+            if t.starts_with("codex") { "codex".to_string() } else { "claude-code".to_string() }
+        });
+        MemoryPayload {
+            memory_id: self.memory_id,
+            version: self.version,
+            chunk_hash: self.chunk_hash,
+            created_at_ms: self.created_at_ms,
+            authored_at_ms: self.authored_at_ms,
+            kind: self.kind,
+            realm: self.realm,
+            content: self.content,
+            embedding_model: self.embedding_model,
+            embedding: self.embedding,
+            artifact_refs: self.artifact_refs,
+            source_session: self.source_session,
+            source_tool: self.source_tool,
+            harness,
+        }
+    }
+}
+
+fn upgrade_payloads(m: std::collections::HashMap<MemoryId, LegacyMemoryPayloadV12>) -> std::collections::HashMap<MemoryId, MemoryPayload> {
+    m.into_iter().map(|(id, p)| (id, p.upgrade())).collect()
+}
 
 /// MemoryState as serialized in V4 snapshots (pre-CTM, 14 fields).
 /// Lacks RetrievalHistory, embed_pending, MemoryStatus, and EpistemicStatus.
@@ -307,7 +355,7 @@ impl LegacyMemoryStateV7 {
 #[derive(Serialize, Deserialize)]
 struct LegacyFullSnapshotV1 {
     pub snapshot_seqno: u64,
-    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub payloads: HashMap<MemoryId, LegacyMemoryPayloadV12>,
     pub states: HashMap<MemoryId, LegacyMemoryStateV4>,
     pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
     pub artifacts: HashMap<String, ArtifactId>,
@@ -326,7 +374,7 @@ struct LegacyFullSnapshotV1 {
 #[derive(Serialize, Deserialize)]
 struct LegacyFullSnapshotV4 {
     pub snapshot_seqno: u64,
-    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub payloads: HashMap<MemoryId, LegacyMemoryPayloadV12>,
     pub states: HashMap<MemoryId, LegacyMemoryStateV4>,
     pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
     pub artifacts: HashMap<String, ArtifactId>,
@@ -345,7 +393,7 @@ struct LegacyFullSnapshotV4 {
 #[derive(Serialize, Deserialize)]
 struct LegacyFullSnapshotV5 {
     pub snapshot_seqno: u64,
-    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub payloads: HashMap<MemoryId, LegacyMemoryPayloadV12>,
     pub states: HashMap<MemoryId, LegacyMemoryStateV5>,
     pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
     pub artifacts: HashMap<String, ArtifactId>,
@@ -365,7 +413,7 @@ struct LegacyFullSnapshotV5 {
 #[derive(Serialize, Deserialize)]
 struct LegacyFullSnapshotV6 {
     pub snapshot_seqno: u64,
-    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub payloads: HashMap<MemoryId, LegacyMemoryPayloadV12>,
     pub states: HashMap<MemoryId, LegacyMemoryStateV6>,
     pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
     pub artifacts: HashMap<String, ArtifactId>,
@@ -385,7 +433,7 @@ struct LegacyFullSnapshotV6 {
 #[derive(Serialize, Deserialize)]
 struct LegacyFullSnapshotV7 {
     pub snapshot_seqno: u64,
-    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub payloads: HashMap<MemoryId, LegacyMemoryPayloadV12>,
     pub states: HashMap<MemoryId, LegacyMemoryStateV7>,
     pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
     pub artifacts: HashMap<String, ArtifactId>,
@@ -475,7 +523,7 @@ impl LegacyMemoryStateV11 {
 #[derive(Serialize, Deserialize)]
 struct LegacyFullSnapshotV11 {
     pub snapshot_seqno: u64,
-    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub payloads: HashMap<MemoryId, LegacyMemoryPayloadV12>,
     pub states: HashMap<MemoryId, LegacyMemoryStateV11>,
     pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
     pub artifacts: HashMap<String, ArtifactId>,
@@ -496,7 +544,7 @@ struct LegacyFullSnapshotV11 {
 #[derive(Serialize, Deserialize)]
 struct LegacyFullSnapshotV8 {
     pub snapshot_seqno: u64,
-    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub payloads: HashMap<MemoryId, LegacyMemoryPayloadV12>,
     pub states: HashMap<MemoryId, LegacyMemoryStateV11>,
     pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
     pub artifacts: HashMap<String, ArtifactId>,
@@ -513,6 +561,29 @@ struct LegacyFullSnapshotV8 {
 }
 
 // ── Current snapshot struct (v9+) ────────────────────────────────────────────
+
+/// V12 snapshot layout: same sidecar layout as V11; MemoryState has staged+invalidated_by;
+/// MemoryPayload lacks `harness`.
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV12 {
+    pub snapshot_seqno: u64,
+    pub payloads: HashMap<MemoryId, LegacyMemoryPayloadV12>,
+    pub states: HashMap<MemoryId, MemoryState>,
+    pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts: HashMap<String, ArtifactId>,
+    pub artifact_paths: HashMap<ArtifactId, String>,
+    pub time_idx: TemporalIndex,
+    pub keyword_idx: KeywordIndex,
+    pub artifact_idx: ArtifactIndex,
+    pub triplet_store: TripletStore,
+    pub symbol_idx: SymbolIndex,
+    pub call_graph: CallGraph,
+    pub code_files: CodeFileIndex,
+    pub semantic_idx: SemanticIndex,
+    pub coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats>,
+    pub ack_scores: HashMap<MemoryId, i32>,
+    pub correction_states: HashMap<u64, CorrectionState>,
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct FullSnapshot {
@@ -603,6 +674,7 @@ impl FullSnapshot {
         r.read_exact(&mut buf)?;
         let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         if magic != FULL_SNAPSHOT_MAGIC
+            && magic != FULL_SNAPSHOT_MAGIC_V12
             && magic != FULL_SNAPSHOT_MAGIC_V11
             && magic != FULL_SNAPSHOT_MAGIC_V10
             && magic != FULL_SNAPSHOT_MAGIC_V9
@@ -627,10 +699,39 @@ impl FullSnapshot {
         let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
 
         if magic == FULL_SNAPSHOT_MAGIC {
-            // v12: same sidecar layout as v11; MemoryState now has staged + invalidated_by.
+            // v13: MemoryPayload gains harness.
             let r = BufReader::new(&bytes[8..]);
             let mut snap: Self = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            for state in snap.states.values_mut() { state.sanitize(); }
+            return Ok(snap);
+        }
+
+        if magic == FULL_SNAPSHOT_MAGIC_V12 {
+            // v12: MemoryState has staged+invalidated_by; MemoryPayload lacks harness.
+            eprintln!("[chitta-field] migrating v12 snapshot → v13 (adding harness to payloads)");
+            let r = BufReader::new(&bytes[8..]);
+            let leg: LegacyFullSnapshotV12 = bincode::deserialize_from(r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            let mut snap = FullSnapshot {
+                snapshot_seqno: leg.snapshot_seqno,
+                payloads: upgrade_payloads(leg.payloads),
+                states: leg.states,
+                assoc_edges: leg.assoc_edges,
+                artifacts: leg.artifacts,
+                artifact_paths: leg.artifact_paths,
+                time_idx: leg.time_idx,
+                keyword_idx: leg.keyword_idx,
+                artifact_idx: leg.artifact_idx,
+                triplet_store: leg.triplet_store,
+                symbol_idx: leg.symbol_idx,
+                call_graph: leg.call_graph,
+                code_files: leg.code_files,
+                semantic_idx: leg.semantic_idx,
+                coactivation_stats: leg.coactivation_stats,
+                ack_scores: leg.ack_scores,
+                correction_states: leg.correction_states,
+            };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
         }
@@ -639,11 +740,11 @@ impl FullSnapshot {
             || magic == FULL_SNAPSHOT_MAGIC_V10
             || magic == FULL_SNAPSHOT_MAGIC_V9
         {
-            // v9/v10/v11: same MemoryState layout (no staged/invalidated_by). Upgrade states.
+            // v9/v10/v11: MemoryState lacks staged/invalidated_by; MemoryPayload lacks harness.
             if magic == FULL_SNAPSHOT_MAGIC_V11 {
-                eprintln!("[chitta-field] migrating v11 snapshot → v12 (adding staged + invalidated_by)");
+                eprintln!("[chitta-field] migrating v11 snapshot → v13");
             } else {
-                eprintln!("[chitta-field] migrating v9/v10 snapshot → v12");
+                eprintln!("[chitta-field] migrating v9/v10 snapshot → v13");
             }
             let r = BufReader::new(&bytes[8..]);
             let leg: LegacyFullSnapshotV11 = bincode::deserialize_from(r)
@@ -654,7 +755,7 @@ impl FullSnapshot {
                 .collect();
             return Ok(FullSnapshot {
                 snapshot_seqno: leg.snapshot_seqno,
-                payloads: leg.payloads,
+                payloads: upgrade_payloads(leg.payloads),
                 states,
                 assoc_edges: leg.assoc_edges,
                 artifacts: leg.artifacts,
@@ -674,8 +775,8 @@ impl FullSnapshot {
         }
 
         if magic == FULL_SNAPSHOT_MAGIC_V8 {
-            // V8: no top-level sidecars; MemoryState also lacks staged/invalidated_by.
-            eprintln!("[chitta-field] migrating v8 snapshot → v12");
+            // V8: no top-level sidecars; MemoryState lacks staged/invalidated_by; payload lacks harness.
+            eprintln!("[chitta-field] migrating v8 snapshot → v13");
             let r = BufReader::new(&bytes[8..]);
             let v8: LegacyFullSnapshotV8 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
@@ -685,7 +786,7 @@ impl FullSnapshot {
                 .collect();
             return Ok(FullSnapshot {
                 snapshot_seqno: v8.snapshot_seqno,
-                payloads: v8.payloads,
+                payloads: upgrade_payloads(v8.payloads),
                 states,
                 assoc_edges: v8.assoc_edges,
                 artifacts: v8.artifacts,
@@ -713,7 +814,7 @@ impl FullSnapshot {
             let states = v7.states.into_iter().map(|(id, s)| { let mut m = s.upgrade(); m.sanitize(); (id, m) }).collect();
             return Ok(FullSnapshot {
                 snapshot_seqno: v7.snapshot_seqno,
-                payloads: v7.payloads,
+                payloads: upgrade_payloads(v7.payloads),
                 states,
                 assoc_edges: v7.assoc_edges,
                 artifacts: v7.artifacts,
@@ -741,7 +842,7 @@ impl FullSnapshot {
             let states = v6.states.into_iter().map(|(id, s)| { let mut m = s.upgrade(); m.sanitize(); (id, m) }).collect();
             return Ok(FullSnapshot {
                 snapshot_seqno: v6.snapshot_seqno,
-                payloads: v6.payloads,
+                payloads: upgrade_payloads(v6.payloads),
                 states,
                 assoc_edges: v6.assoc_edges,
                 artifacts: v6.artifacts,
@@ -769,7 +870,7 @@ impl FullSnapshot {
             let states = v5.states.into_iter().map(|(id, s)| { let mut m = s.upgrade(); m.sanitize(); (id, m) }).collect();
             return Ok(FullSnapshot {
                 snapshot_seqno: v5.snapshot_seqno,
-                payloads: v5.payloads,
+                payloads: upgrade_payloads(v5.payloads),
                 states,
                 assoc_edges: v5.assoc_edges,
                 artifacts: v5.artifacts,
@@ -797,7 +898,7 @@ impl FullSnapshot {
             let states = v4.states.into_iter().map(|(id, s)| { let mut m = s.upgrade(); m.sanitize(); (id, m) }).collect();
             return Ok(FullSnapshot {
                 snapshot_seqno: v4.snapshot_seqno,
-                payloads: v4.payloads,
+                payloads: upgrade_payloads(v4.payloads),
                 states,
                 assoc_edges: v4.assoc_edges,
                 artifacts: v4.artifacts,
@@ -829,7 +930,7 @@ impl FullSnapshot {
             let states = v1.states.into_iter().map(|(id, s)| (id, s.upgrade())).collect::<HashMap<_, _>>();
             return Ok(FullSnapshot {
                 snapshot_seqno: v1.snapshot_seqno,
-                payloads: v1.payloads,
+                payloads: upgrade_payloads(v1.payloads),
                 states,
                 assoc_edges: v1.assoc_edges,
                 artifacts: v1.artifacts,
