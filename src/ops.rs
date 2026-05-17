@@ -179,6 +179,12 @@ pub struct StateDeltaOp {
     /// Epistemic status (0=UserStated, 1=ToolDerived, 2=ModelInferred, 3=AutonomousSynthesis); None = no change
     #[serde(default)]
     pub epistemic_status: Option<u8>,
+    /// Override staged flag; None = no change.
+    #[serde(default)]
+    pub staged: Option<bool>,
+    /// Set invalidated_by; None = no change.
+    #[serde(default)]
+    pub invalidated_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

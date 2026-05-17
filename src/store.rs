@@ -548,6 +548,8 @@ impl ChittaField {
             op_ts_ms: ts,
             status: None,
             epistemic_status: None,
+            staged: None,
+            invalidated_by: None,
         };
         let _seqno = self.log.write().append(&Op::UpdateState(delta.clone()))?;
 
@@ -605,6 +607,8 @@ impl ChittaField {
             op_ts_ms: ts,
             status: None,
             epistemic_status: None,
+            staged: None,
+            invalidated_by: None,
         };
         let _seqno = self.log.write().append(&Op::UpdateState(delta.clone()))?;
 
@@ -1643,6 +1647,8 @@ impl ChittaField {
             op_ts_ms: now_ms(),
             status: Some(status_u8),
             epistemic_status: None,
+            staged: None,
+            invalidated_by: None,
         };
         self.log.write().append(&Op::UpdateState(delta.clone()))?;
         let _ = self.log.write().sync(); // status transitions are critical lifecycle events
@@ -1682,6 +1688,8 @@ impl ChittaField {
             op_ts_ms: now_ms(),
             status: None,
             epistemic_status: Some(es_u8),
+            staged: None,
+            invalidated_by: None,
         };
         self.log.write().append(&Op::UpdateState(delta.clone()))?;
         let _ = self.log.write().sync();
@@ -2799,6 +2807,8 @@ impl ChittaField {
                     op_ts_ms: now,
                     status: None,
                     epistemic_status: None,
+                    staged: None,
+                    invalidated_by: None,
                 };
                 if let Some(state) = self.states.write().get_mut(&cr.memory_id) {
                     state.apply_delta(&delta_op, now);
@@ -3874,6 +3884,53 @@ impl ChittaField {
             eprintln!("[store] prune_episodes: deleted {} episode memories", deleted);
         }
         Ok(deleted)
+    }
+
+    /// Promote staged memories that have been recalled (access_count >= 1),
+    /// and prune staged memories older than 7 days that were never recalled.
+    /// Returns (promoted, pruned).
+    pub fn promote_staged_memories(&self) -> Result<(usize, usize)> {
+        let cutoff_ms = now_ms() - 7 * 86_400_000;
+        let candidates: Vec<(MemoryId, i64, u32)> = {
+            let states = self.states.read();
+            states.values()
+                .filter(|s| !s.deleted && s.staged)
+                .map(|s| (s.memory_id, s.created_at_ms, s.access_count))
+                .collect()
+        };
+
+        let mut promoted = 0usize;
+        let mut pruned   = 0usize;
+        let ts = now_ms();
+        for (id, created_ms, access_count) in candidates {
+            if access_count >= 1 {
+                let delta = crate::ops::StateDeltaOp {
+                    memory_id: id,
+                    strength_delta: None,
+                    confidence_delta: None,
+                    decay_rate: None,
+                    touch: false,
+                    pin: None,
+                    op_ts_ms: ts,
+                    status: None,
+                    epistemic_status: None,
+                    staged: Some(false),
+                    invalidated_by: None,
+                };
+                let _ = self.log.write().append(&crate::ops::Op::UpdateState(delta.clone()));
+                if let Some(s) = self.states.write().get_mut(&id) {
+                    s.staged = false;
+                }
+                promoted += 1;
+            } else if created_ms < cutoff_ms {
+                let _ = self.forget(id);
+                pruned += 1;
+            }
+        }
+        if promoted > 0 || pruned > 0 {
+            eprintln!("[store] write_gate: promoted={} pruned={}", promoted, pruned);
+        }
+        Ok((promoted, pruned))
     }
 
     /// Run a single tier demotion pass over all memories.

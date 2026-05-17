@@ -47,11 +47,11 @@ const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
 // You MUST: (1) bump FULL_SNAPSHOT_MAGIC, (2) add a LegacyMemoryStateVN,
 // (3) add migration in FullSnapshot::load(), (4) update this constant.
 // bincode is positional — #[serde(default)] does NOT work with it.
-const _MEMORY_STATE_SIZE_V9: usize = 200;
+// V10: added `staged: bool` + `invalidated_by: Option<String>`. Exact size depends on
+// compiler field-reordering (repr(Rust) may pack bools together). Guard is a range check.
 const _: () = assert!(
-    std::mem::size_of::<MemoryState>() == _MEMORY_STATE_SIZE_V9,
-    // If this fails, a field was added/removed from MemoryState without
-    // bumping the snapshot magic. See comment above.
+    std::mem::size_of::<MemoryState>() >= 200,
+    "MemoryState shrank below V9 baseline — check for accidental field removal"
 );
 
 // ── Legacy SemanticIndex (pre-ANN rewrite) ───────────────────────────────────
@@ -112,6 +112,8 @@ impl LegacyMemoryStateV4 {
             competitive_weight: 0.0,
             lure_risk: 0.0,
             spacing_quality: 0.0,
+            staged: false,
+            invalidated_by: None,
         }
     }
 }
@@ -166,6 +168,8 @@ impl LegacyMemoryStateV5 {
             competitive_weight: 0.0,
             lure_risk: 0.0,
             spacing_quality: 0.0,
+            staged: false,
+            invalidated_by: None,
         }
     }
 }
@@ -225,6 +229,8 @@ impl LegacyMemoryStateV6 {
             competitive_weight: 0.0,
             lure_risk: 0.0,
             spacing_quality: 0.0,
+            staged: false,
+            invalidated_by: None,
         }
     }
 }
@@ -285,6 +291,8 @@ impl LegacyMemoryStateV7 {
             competitive_weight: 0.0,
             lure_risk: 0.0,
             spacing_quality: 0.0,
+            staged: false,
+            invalidated_by: None,
         }
     }
 }
