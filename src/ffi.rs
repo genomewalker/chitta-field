@@ -7963,6 +7963,35 @@ pub extern "C" fn cf_resolve_contradiction(
     }
 }
 
+// ── Introspection FFI ────────────────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn cf_symbol_stale_for_memory(
+    h: *const CfHandle,
+    memory_id: u64,
+) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let reason = handle.field.symbol_stale_for_memory(memory_id);
+    let json = serde_json::json!({
+        "stale": reason.is_some(),
+        "reason": reason,
+    });
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn cf_memory_claim_info(
+    h: *const CfHandle,
+    memory_id: u64,
+    now_ms: i64,
+) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let json = handle.field.memory_claim_info_json(memory_id, now_ms);
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
 // ── Symbol event log FFI ─────────────────────────────────────────────────────
 
 #[no_mangle]
