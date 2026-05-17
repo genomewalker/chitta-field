@@ -310,8 +310,10 @@ impl ChittaField {
         source_session: Option<String>,
         source_tool: Option<String>,
     ) -> Result<(MemoryId, ChunkHash)> {
-        let embed_pending = embedding.is_empty();
-        if !embed_pending && embedding.len() != EMBED_DIM {
+        // Memories shorter than this can't produce a useful BGE embedding; store as keyword-only.
+        const MIN_EMBED_CHARS: usize = 20;
+        let embed_pending = embedding.is_empty() && content.len() >= MIN_EMBED_CHARS;
+        if !embedding.is_empty() && embedding.len() != EMBED_DIM {
             return Err(FieldError::InvalidEmbedDim {
                 expected: EMBED_DIM,
                 actual: embedding.len(),
@@ -1939,6 +1941,51 @@ impl ChittaField {
             }
         }
         n
+    }
+
+    /// Re-queue memories that have no embedding but are embeddable (ghost backfill failures).
+    /// A ghost has embed_pending=false, embedding_model="none", empty embedding, and content
+    /// long enough for BGE. Sets embed_pending=true so the backfill thread picks them up.
+    /// Returns count of memories re-queued.
+    pub fn requeue_ghost_embeddings(&self) -> usize {
+        const MIN_EMBED_CHARS: usize = 20;
+
+        // Pass 1: collect candidates — states+payloads locked briefly, then released.
+        let candidates: Vec<MemoryId> = {
+            let states   = self.states.read();
+            let payloads = self.payloads.read();
+            states.iter()
+                .filter(|(id, st)| {
+                    !st.deleted && !st.embed_pending &&
+                    payloads.get(id)
+                        .map(|p| p.content.len() >= MIN_EMBED_CHARS)
+                        .unwrap_or(false)
+                })
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        if candidates.is_empty() { return 0; }
+
+        // Pass 2: filter to those absent from HNSW — semantic_idx locked briefly, then released.
+        let ghost_ids: Vec<MemoryId> = {
+            let idx = self.semantic_idx.read();
+            candidates.into_iter().filter(|id| !idx.contains(*id)).collect()
+        };
+        if ghost_ids.is_empty() { return 0; }
+
+        // Pass 3: mark ghosts as embed_pending — states write-locked briefly.
+        let mut states = self.states.write();
+        let mut count = 0usize;
+        for id in &ghost_ids {
+            if let Some(st) = states.get_mut(id) {
+                if !st.embed_pending && !st.deleted {
+                    st.embed_pending = true;
+                    self.pending_embed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 
     /// Remove triplet by subject+predicate+object (invalidates first matching entry).
