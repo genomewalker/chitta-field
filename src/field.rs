@@ -396,9 +396,44 @@ impl ChittaField {
                 .filter_map(|p| FullSnapshot::peek_seqno(p).ok().map(|s| (s, p)))
                 .collect();
             stale_by_seqno.sort_by(|a, b| b.0.cmp(&a.0));
-            // Skip the most recent stale (keep as backup), delete the rest.
+            // Skip the most recent stale (keep as backup), delete the rest + their sidecars.
             for (_, path) in stale_by_seqno.iter().skip(1) {
                 let _ = std::fs::remove_file(path);
+                for ext in &["emb", "bin", "hnsw", "pld", "snapshot.tmp"] {
+                    let _ = std::fs::remove_file(path.with_extension(ext));
+                }
+                // delta.hnsw: with_extension replaces only last component, handle separately
+                let delta = path.with_extension("delta.hnsw");
+                let _ = std::fs::remove_file(&delta);
+            }
+
+            // Prune orphaned sidecars: files whose snapshot hash is not current best or backup.
+            let mut live_hashes = std::collections::HashSet::new();
+            let extract_hash = |p: &std::path::Path| -> Option<String> {
+                p.file_name()?.to_str()?.splitn(3, '.').nth(1).map(String::from)
+            };
+            if let Some(ref p) = best_full_path {
+                if let Some(h) = extract_hash(p) { live_hashes.insert(h); }
+            }
+            if let Some((_, p)) = stale_by_seqno.first() {
+                if let Some(h) = extract_hash(p) { live_hashes.insert(h); }
+            }
+            if let Ok(entries) = std::fs::read_dir(&data_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if !name.starts_with("chitta.") { continue; }
+                    let parts: Vec<&str> = name.splitn(3, '.').collect();
+                    if parts.len() < 3 { continue; }
+                    let hash = parts[1];
+                    if live_hashes.contains(hash) { continue; }
+                    let ext = parts[2];
+                    if matches!(ext, "emb" | "bin" | "hnsw" | "pld" | "delta.hnsw" | "snapshot.tmp") {
+                        let removed = std::fs::remove_file(entry.path()).is_ok();
+                        if removed {
+                            eprintln!("[chitta-field] pruned orphaned sidecar: {}", name);
+                        }
+                    }
+                }
             }
         }
 
