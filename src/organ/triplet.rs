@@ -103,6 +103,41 @@ impl TripletStore {
         }
     }
 
+    /// Deduplicate entries in-place: for live (valid_to_ms==0) entries with identical
+    /// (subject, predicate, object), keep only the highest-weight one. Returns removed count.
+    pub fn dedup_entries(&mut self) -> usize {
+        use std::collections::hash_map::Entry;
+        // Owned keys to avoid borrow conflicts during retain.
+        let mut live_best: HashMap<(String, String, String), usize> = HashMap::new();
+        let mut to_remove = std::collections::HashSet::new();
+
+        for (idx, e) in self.entries.iter().enumerate() {
+            if e.valid_to_ms != 0 { continue; }
+            let key = (e.subject.clone(), e.predicate.clone(), e.object.clone());
+            match live_best.entry(key) {
+                Entry::Vacant(v) => { v.insert(idx); }
+                Entry::Occupied(mut o) => {
+                    let best_idx = *o.get();
+                    if e.weight > self.entries[best_idx].weight {
+                        to_remove.insert(best_idx);
+                        *o.get_mut() = idx;
+                    } else {
+                        to_remove.insert(idx);
+                    }
+                }
+            }
+        }
+
+        let removed = to_remove.len();
+        if removed == 0 { return 0; }
+
+        let mut i = 0usize;
+        self.entries.retain(|_| { let keep = !to_remove.contains(&i); i += 1; keep });
+        self.rebuild_indexes();
+        self.entries.shrink_to_fit();
+        removed
+    }
+
     pub fn correction_state(&self, id: u64) -> CorrectionState {
         self.correction_states.get(&id).copied().unwrap_or_default()
     }

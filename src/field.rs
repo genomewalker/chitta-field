@@ -663,7 +663,15 @@ impl ChittaField {
             time_idx: RwLock::new(time_idx),
             artifact_idx: RwLock::new(artifact_idx),
             keyword_idx: RwLock::new(keyword_idx),
-            triplet_store: RwLock::new(triplet_store),
+            triplet_store: RwLock::new({
+                let before = triplet_store.triplet_count();
+                let removed = triplet_store.dedup_entries();
+                if removed > 0 {
+                    eprintln!("[chitta-field] deduped {} triplet entries on load ({} → {})",
+                        removed, before, triplet_store.triplet_count());
+                }
+                triplet_store
+            }),
             triplet_id_alloc,
             symbol_idx: RwLock::new(symbol_idx),
             call_graph: RwLock::new(call_graph),
