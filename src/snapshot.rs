@@ -691,16 +691,25 @@ impl FullSnapshot {
     }
 
     /// Load a full snapshot from disk. Transparently migrates all legacy formats.
+    /// Uses a streaming BufReader — never reads the whole file into a Vec<u8>.
     pub fn load(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)?;
-        if bytes.len() < 8 {
-            return Err(FieldError::Manifest("snapshot too short".to_string()));
-        }
-        let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let mut snap = Self::load_inner(path)?;
+        snap.triplet_store.rebuild_indexes();
+        Ok(snap)
+    }
+
+    fn load_inner(path: &Path) -> Result<Self> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| FieldError::Manifest(e.to_string()))?;
+        let mut r = BufReader::with_capacity(1 << 20, file);
+        let mut magic_buf = [0u8; 8];
+        r.read_exact(&mut magic_buf)
+            .map_err(|_| FieldError::Manifest("snapshot too short".to_string()))?;
+        let magic = u64::from_le_bytes(magic_buf);
 
         if magic == FULL_SNAPSHOT_MAGIC {
             // v13: MemoryPayload gains harness.
-            let r = BufReader::new(&bytes[8..]);
+            let r = &mut r;
             let mut snap: Self = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
             for state in snap.states.values_mut() { state.sanitize(); }
@@ -710,7 +719,7 @@ impl FullSnapshot {
         if magic == FULL_SNAPSHOT_MAGIC_V12 {
             // v12: MemoryState has staged+invalidated_by; MemoryPayload lacks harness.
             eprintln!("[chitta-field] migrating v12 snapshot → v13 (adding harness to payloads)");
-            let r = BufReader::new(&bytes[8..]);
+            let r = &mut r;
             let leg: LegacyFullSnapshotV12 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
             let mut snap = FullSnapshot {
@@ -746,7 +755,7 @@ impl FullSnapshot {
             } else {
                 eprintln!("[chitta-field] migrating v9/v10 snapshot → v13");
             }
-            let r = BufReader::new(&bytes[8..]);
+            let r = &mut r;
             let leg: LegacyFullSnapshotV11 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
             let states: HashMap<MemoryId, MemoryState> = leg.states
@@ -777,7 +786,7 @@ impl FullSnapshot {
         if magic == FULL_SNAPSHOT_MAGIC_V8 {
             // V8: no top-level sidecars; MemoryState lacks staged/invalidated_by; payload lacks harness.
             eprintln!("[chitta-field] migrating v8 snapshot → v13");
-            let r = BufReader::new(&bytes[8..]);
+            let r = &mut r;
             let v8: LegacyFullSnapshotV8 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
             let states: HashMap<MemoryId, MemoryState> = v8.states
@@ -808,7 +817,7 @@ impl FullSnapshot {
         if magic == FULL_SNAPSHOT_MAGIC_V7 {
             // V7: access_timestamps but no interference fields.
             eprintln!("[chitta-field] migrating v7 snapshot → v9");
-            let r = BufReader::new(&bytes[8..]);
+            let r = &mut r;
             let v7: LegacyFullSnapshotV7 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
             let states = v7.states.into_iter().map(|(id, s)| { let mut m = s.upgrade(); m.sanitize(); (id, m) }).collect();
@@ -836,7 +845,7 @@ impl FullSnapshot {
         if magic == FULL_SNAPSHOT_MAGIC_V6 {
             // V6: MemoryState with affect/surprise but no access_timestamps.
             eprintln!("[chitta-field] migrating v6 snapshot → v9");
-            let r = BufReader::new(&bytes[8..]);
+            let r = &mut r;
             let v6: LegacyFullSnapshotV6 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
             let states = v6.states.into_iter().map(|(id, s)| { let mut m = s.upgrade(); m.sanitize(); (id, m) }).collect();
@@ -864,7 +873,7 @@ impl FullSnapshot {
         if magic == FULL_SNAPSHOT_MAGIC_V5 {
             // V5: 14-field MemoryState + coactivation_stats.
             eprintln!("[chitta-field] migrating v5 snapshot → v9");
-            let r = BufReader::new(&bytes[8..]);
+            let r = &mut r;
             let v5: LegacyFullSnapshotV5 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
             let states = v5.states.into_iter().map(|(id, s)| { let mut m = s.upgrade(); m.sanitize(); (id, m) }).collect();
@@ -892,7 +901,7 @@ impl FullSnapshot {
         if magic == FULL_SNAPSHOT_MAGIC_V4 {
             // V4: 14-field MemoryState, no coactivation_stats.
             eprintln!("[chitta-field] migrating v4 snapshot → v9");
-            let r = BufReader::new(&bytes[8..]);
+            let r = &mut r;
             let v4: LegacyFullSnapshotV4 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
             let states = v4.states.into_iter().map(|(id, s)| { let mut m = s.upgrade(); m.sanitize(); (id, m) }).collect();
@@ -920,7 +929,7 @@ impl FullSnapshot {
         if magic == FULL_SNAPSHOT_MAGIC_V1 {
             // V1: pre-ANN SemanticIndex + 14-field MemoryState.
             eprintln!("[chitta-field] migrating v1 snapshot → v6 (ANN index + MemoryStatus + EpistemicStatus)");
-            let r = BufReader::new(&bytes[8..]);
+            let r = &mut r;
             let v1: LegacyFullSnapshotV1 = bincode::deserialize_from(r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
             let mut semantic_idx = SemanticIndex::new();

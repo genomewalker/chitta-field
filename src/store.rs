@@ -817,15 +817,15 @@ impl ChittaField {
         });
         let _seqno = self.log.write().append(&op)?;
 
-        self.assoc_edges
-            .write()
-            .entry(src)
-            .or_insert_with(Vec::new)
-            .push(AssocEdge {
-                dst,
-                edge_type,
-                weight,
-            });
+        {
+            let mut edges = self.assoc_edges.write();
+            let list = edges.entry(src).or_insert_with(Vec::new);
+            if let Some(existing) = list.iter_mut().find(|e| e.dst == dst && e.edge_type == edge_type) {
+                existing.weight = existing.weight.max(weight);
+            } else {
+                list.push(AssocEdge { dst, edge_type, weight });
+            }
+        }
 
         Ok(())
     }
@@ -3790,7 +3790,13 @@ impl ChittaField {
             call_graph: self.call_graph.read().clone(),
             code_files: self.code_files.read().clone(),
             semantic_idx: self.semantic_idx.read().clone(),
-            coactivation_stats: self.coactivation_stats.read().clone(),
+            coactivation_stats: {
+                let mut cs = self.coactivation_stats.read().clone();
+                let before = cs.len();
+                let removed = crate::field::prune_coactivation_stats(&mut cs, 20);
+                eprintln!("[chitta-field] coactivation_stats: {} pairs before prune, {} removed (cap=20/memory)", before, removed);
+                cs
+            },
             ack_scores: self.ack_scores.read().clone(),
             correction_states: self.triplet_store.read().correction_states.clone(),
         };
@@ -3823,6 +3829,26 @@ impl ChittaField {
             payload.content.shrink_to_fit();
         }
         snap.semantic_idx.clear_embeddings();
+        snap.triplet_store.clear_indexes_for_save();
+        // Diagnostic: per-field serialized sizes to identify snapshot bloat.
+        {
+            let sz = |v: u64| format!("{:.1}MB", v as f64 / 1_000_000.0);
+            eprintln!("[size] payloads:          {}", sz(bincode::serialized_size(&snap.payloads).unwrap_or(0)));
+            eprintln!("[size] states:            {}", sz(bincode::serialized_size(&snap.states).unwrap_or(0)));
+            eprintln!("[size] assoc_edges:       {}", sz(bincode::serialized_size(&snap.assoc_edges).unwrap_or(0)));
+            eprintln!("[size] artifacts:         {}", sz(bincode::serialized_size(&snap.artifacts).unwrap_or(0)));
+            eprintln!("[size] time_idx:          {}", sz(bincode::serialized_size(&snap.time_idx).unwrap_or(0)));
+            eprintln!("[size] keyword_idx:       {}", sz(bincode::serialized_size(&snap.keyword_idx).unwrap_or(0)));
+            eprintln!("[size] triplet_store:     {}", sz(bincode::serialized_size(&snap.triplet_store).unwrap_or(0)));
+            eprintln!("[size] symbol_idx:        {}", sz(bincode::serialized_size(&snap.symbol_idx).unwrap_or(0)));
+            eprintln!("[size] call_graph:        {}", sz(bincode::serialized_size(&snap.call_graph).unwrap_or(0)));
+            eprintln!("[size] code_files:        {}", sz(bincode::serialized_size(&snap.code_files).unwrap_or(0)));
+            eprintln!("[size] semantic_idx:      {}", sz(bincode::serialized_size(&snap.semantic_idx).unwrap_or(0)));
+            eprintln!("[size] coactivation:      {}", sz(bincode::serialized_size(&snap.coactivation_stats).unwrap_or(0)));
+            eprintln!("[size] ack_scores:        {}", sz(bincode::serialized_size(&snap.ack_scores).unwrap_or(0)));
+            eprintln!("[size] artifact_paths:    {}", sz(bincode::serialized_size(&snap.artifact_paths).unwrap_or(0)));
+            eprintln!("[size] artifact_idx:      {}", sz(bincode::serialized_size(&snap.artifact_idx).unwrap_or(0)));
+        }
         snap.save(&path)?;
         Ok(())
     }
