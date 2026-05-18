@@ -8138,6 +8138,84 @@ pub extern "C" fn cf_triplet_supersede(
     0
 }
 
+/// BFS graph traversal from `start`. Returns JSON array of TraversalHit.
+/// edge_types_json: JSON array of strings ([] = all). direction: "outgoing"|"incoming"|"both".
+/// Caller must free with cf_free_string().
+#[no_mangle]
+pub extern "C" fn cf_graph_traverse(
+    h: *mut CfHandle,
+    start: *const c_char,
+    edge_types_json: *const c_char,
+    max_hops: usize,
+    max_results: usize,
+    direction: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || start.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let start_str = unsafe {
+        match CStr::from_ptr(start).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        }
+    };
+    let edge_types_str: Vec<String> = if edge_types_json.is_null() {
+        vec![]
+    } else {
+        unsafe {
+            CStr::from_ptr(edge_types_json).to_str().ok()
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .unwrap_or_default()
+        }
+    };
+    let edge_refs: Vec<&str> = edge_types_str.iter().map(|s| s.as_str()).collect();
+    let dir = if direction.is_null() {
+        crate::graph::Direction::Outgoing
+    } else {
+        unsafe {
+            CStr::from_ptr(direction).to_str().ok()
+                .map(crate::graph::Direction::from_str)
+                .unwrap_or(crate::graph::Direction::Outgoing)
+        }
+    };
+    let hits = handle.field.graph_traverse(start_str, &edge_refs, max_hops, max_results, dir);
+    let json = serde_json::to_string(&hits).unwrap_or_else(|_| "[]".to_string());
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Personalized PageRank over the triplet graph. Returns JSON array of [node, score] pairs.
+/// seeds_json: JSON array of seed node strings. Caller must free with cf_free_string().
+#[no_mangle]
+pub extern "C" fn cf_graph_pagerank(
+    h: *mut CfHandle,
+    seeds_json: *const c_char,
+    edge_types_json: *const c_char,
+    damping: f32,
+    iterations: u8,
+    top_k: usize,
+) -> *mut c_char {
+    if h.is_null() || seeds_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let seeds_str: Vec<String> = unsafe {
+        CStr::from_ptr(seeds_json).to_str().ok()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .unwrap_or_default()
+    };
+    let seed_refs: Vec<&str> = seeds_str.iter().map(|s| s.as_str()).collect();
+    let edge_types_str: Vec<String> = if edge_types_json.is_null() {
+        vec![]
+    } else {
+        unsafe {
+            CStr::from_ptr(edge_types_json).to_str().ok()
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .unwrap_or_default()
+        }
+    };
+    let edge_refs: Vec<&str> = edge_types_str.iter().map(|s| s.as_str()).collect();
+    let results = handle.field.graph_pagerank(&seed_refs, &edge_refs, damping, iterations, top_k);
+    let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
 #[inline]
 fn handle_from(h: *const CfHandle) -> &'static CfHandle {
     unsafe { &*h }
