@@ -28,6 +28,8 @@ typedef struct {
     float    arousal_boost;
     float    mood_congruence;
     float    frustration_boost;
+    float    interference_factor;
+    float    spacing_boost;
 } CfRecallHit;
 
 /* Lifecycle */
