@@ -5140,7 +5140,7 @@ mod tests {
         let id = {
             let field = ChittaField::open(data_dir.clone()).unwrap();
             // Empty embedding slice → embed_pending = true
-            let (id, _) = field.put_memory("wisdom", "test", b"needs-embed", &[], 1.0, 0.001, 0, vec![], None, None).unwrap();
+            let (id, _) = field.put_memory("wisdom", "test", b"this memory needs an embedding backfill", &[], 1.0, 0.001, 0, vec![], None, None).unwrap();
             let emb = vec![0.2f32; crate::ops::EMBED_DIM];
             field.backfill_embedding(id, &emb).unwrap();
             field.flush().unwrap();
