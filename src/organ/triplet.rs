@@ -466,6 +466,24 @@ impl TripletStore {
         self.next_id
     }
 
+    // ── pub(crate) accessors for graph.rs ─────────────────────────────────────
+
+    pub(crate) fn subject_ids(&self, node: &str) -> Option<&Vec<u64>> {
+        self.by_subject.get(node)
+    }
+
+    pub(crate) fn object_ids(&self, node: &str) -> Option<&Vec<u64>> {
+        self.by_object.get(node)
+    }
+
+    pub(crate) fn entry_by_id_crate(&self, id: u64) -> Option<&TripletEntry> {
+        self.entry_by_id(id)
+    }
+
+    pub(crate) fn is_superseded_crate(&self, id: u64) -> bool {
+        self.supersession_map.contains_key(&id)
+    }
+
     /// Mark `old_id` as superseded by `new_id` at ingestion-time `at_ms`.
     /// `query_as_of` and `query_believed_at` will exclude superseded entries.
     pub fn supersede(&mut self, old_id: u64, new_id: u64, at_ms: i64) {

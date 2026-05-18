@@ -2068,6 +2068,30 @@ impl ChittaField {
         self.triplet_store.write().supersede(old_id, new_id, at_ms);
     }
 
+    /// BFS graph traversal from `start` node.
+    pub fn graph_traverse(
+        &self,
+        start: &str,
+        edge_types: &[&str],
+        max_hops: usize,
+        max_results: usize,
+        direction: crate::graph::Direction,
+    ) -> Vec<crate::graph::TraversalHit> {
+        self.triplet_store.read().graph_traverse(start, edge_types, max_hops, max_results, direction)
+    }
+
+    /// Personalized PageRank over the triplet graph.
+    pub fn graph_pagerank(
+        &self,
+        seeds: &[&str],
+        edge_types: &[&str],
+        damping: f32,
+        iterations: u8,
+        top_k: usize,
+    ) -> Vec<(String, f32)> {
+        self.triplet_store.read().graph_pagerank(seeds, edge_types, damping, iterations, top_k)
+    }
+
     /// Get memory IDs that contradict the given memory (bidirectional).
     pub fn get_conflicts(&self, memory_id: MemoryId) -> Result<Vec<MemoryId>> {
         let id_str = memory_id.to_string();
