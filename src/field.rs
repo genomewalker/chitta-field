@@ -92,6 +92,33 @@ impl CoActivationStats {
     }
 }
 
+/// Cap coactivation_stats to `max_per_memory` strongest pairs per memory.
+/// Returns the number of entries removed.
+pub(crate) fn prune_coactivation_stats(
+    stats: &mut HashMap<(MemoryId, MemoryId), CoActivationStats>,
+    max_per_memory: usize,
+) -> usize {
+    use std::collections::HashSet;
+    let mut per_memory: HashMap<MemoryId, Vec<((MemoryId, MemoryId), u32)>> =
+        HashMap::with_capacity(stats.len().min(65536));
+    for (key, stat) in stats.iter() {
+        per_memory.entry(key.0).or_default().push((*key, stat.sim_count));
+        per_memory.entry(key.1).or_default().push((*key, stat.sim_count));
+    }
+    let mut to_remove: HashSet<(MemoryId, MemoryId)> = HashSet::new();
+    for (_mem, mut pairs) in per_memory {
+        if pairs.len() > max_per_memory {
+            pairs.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            for (key, _) in pairs.into_iter().skip(max_per_memory) {
+                to_remove.insert(key);
+            }
+        }
+    }
+    let removed = to_remove.len();
+    for key in &to_remove { stats.remove(key); }
+    removed
+}
+
 #[derive(Default)]
 pub(crate) struct PendingRecallEffects {
     pub strengthen: HashSet<MemoryId>,
@@ -681,7 +708,16 @@ impl ChittaField {
             ack_scores:  RwLock::new(snap_ack_scores),
             repl_sessions: RwLock::new(loaded_repl_sessions),
             pending_recall: Mutex::new(PendingRecallEffects::default()),
-            coactivation_stats: RwLock::new(replay_coactivation_stats),
+            coactivation_stats: RwLock::new({
+                let mut cs = replay_coactivation_stats;
+                let n = cs.len();
+                // Prune to 100 pairs/memory to bound startup RAM on old snapshots.
+                crate::field::prune_coactivation_stats(&mut cs, 20);
+                if cs.len() < n {
+                    eprintln!("[chitta-field] pruned {} coactivation pairs on load", n - cs.len());
+                }
+                cs
+            }),
             hopfield: RwLock::new(HopfieldNetwork::new()),
             filter_level: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             scoring_pipeline: RwLock::new(crate::scoring::ScoringPipeline::new(scoring_config)),

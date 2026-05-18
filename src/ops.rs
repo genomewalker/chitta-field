@@ -197,7 +197,7 @@ pub struct DeleteMemoryOp {
     pub deleted_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EdgeType {
     DerivedFrom,
     SameSession,

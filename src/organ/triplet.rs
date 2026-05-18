@@ -49,14 +49,16 @@ impl TripletEntry {
 pub struct TripletStore {
     next_id: u64,
     entries: Vec<TripletEntry>,
-    id_to_index: HashMap<u64, usize>,
 
+    // Derived indexes. Serialized for backward compat with old snapshots, but cleared
+    // before save (save_full_snapshot calls clear_indexes_for_save()) so new snapshots
+    // store empty maps here. rebuild_indexes() must be called after deserialization.
+    id_to_index: HashMap<u64, usize>,
     by_subject: HashMap<String, Vec<u64>>,
     by_object: HashMap<String, Vec<u64>>,
     by_predicate: HashMap<String, Vec<u64>>,
 
-    // Sidecar — not serialized (bincode ignores serde(default); skip = ephemeral).
-    // Absent entries are implicitly Emitted.
+    // Ephemeral — absent entries are implicitly Emitted.
     #[serde(skip)]
     pub correction_states: HashMap<u64, CorrectionState>,
 }
@@ -74,11 +76,40 @@ impl TripletStore {
         }
     }
 
+    /// Clear derived indexes before serialization so new snapshots stay small.
+    /// Call rebuild_indexes() after any deserialization to restore them.
+    pub fn clear_indexes_for_save(&mut self) {
+        self.id_to_index.clear();
+        self.id_to_index.shrink_to_fit();
+        self.by_subject.clear();
+        self.by_subject.shrink_to_fit();
+        self.by_object.clear();
+        self.by_object.shrink_to_fit();
+        self.by_predicate.clear();
+        self.by_predicate.shrink_to_fit();
+    }
+
+    /// Rebuild all derived indexes from `entries`. Must be called after deserialization.
+    pub fn rebuild_indexes(&mut self) {
+        self.id_to_index = HashMap::with_capacity(self.entries.len());
+        self.by_subject   = HashMap::new();
+        self.by_object    = HashMap::new();
+        self.by_predicate = HashMap::new();
+        for (idx, e) in self.entries.iter().enumerate() {
+            self.id_to_index.insert(e.id, idx);
+            self.by_subject.entry(e.subject.clone()).or_default().push(e.id);
+            self.by_object.entry(e.object.clone()).or_default().push(e.id);
+            self.by_predicate.entry(e.predicate.clone()).or_default().push(e.id);
+        }
+    }
+
     pub fn correction_state(&self, id: u64) -> CorrectionState {
         self.correction_states.get(&id).copied().unwrap_or_default()
     }
 
     /// Add a triplet fact, allocating a new ID. Returns the new triplet ID.
+    /// Deduplicates: if an identical (subject, predicate, object) with valid_to_ms==0
+    /// already exists, bumps its weight and returns the existing ID instead.
     pub fn add(
         &mut self,
         subject: String,
@@ -89,19 +120,34 @@ impl TripletStore {
         source_memory_id: Option<MemoryId>,
         source_file: Option<String>,
     ) -> u64 {
+        // Check for existing live (valid_to_ms==0) entry with same (s,p,o).
+        if let Some(existing_id) = self.find_exact_live(&subject, &predicate, &object) {
+            if let Some(&idx) = self.id_to_index.get(&existing_id) {
+                if let Some(e) = self.entries.get_mut(idx) {
+                    e.weight = e.weight.max(weight);
+                }
+            }
+            return existing_id;
+        }
         let id = self.next_id;
         self.next_id += 1;
-        self.insert_with_id(
-            id,
-            subject,
-            predicate,
-            object,
-            weight,
-            valid_from_ms,
-            source_memory_id,
-            source_file,
-        );
+        self.insert_with_id(id, subject, predicate, object, weight, valid_from_ms,
+            source_memory_id, source_file);
         id
+    }
+
+    fn find_exact_live(&self, subject: &str, predicate: &str, object: &str) -> Option<u64> {
+        let ids = self.by_subject.get(subject)?;
+        for &id in ids {
+            if let Some(&idx) = self.id_to_index.get(&id) {
+                if let Some(e) = self.entries.get(idx) {
+                    if e.valid_to_ms == 0 && e.predicate == predicate && e.object == object {
+                        return Some(id);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Add a triplet with an explicit ID (used during log replay).
