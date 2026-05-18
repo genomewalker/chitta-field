@@ -103,6 +103,18 @@ impl TripletStore {
         }
     }
 
+    /// Remove invalidated (valid_to_ms != 0) entries. Returns removed count.
+    pub fn purge_invalidated(&mut self) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.valid_to_ms == 0);
+        let removed = before - self.entries.len();
+        if removed > 0 {
+            self.entries.shrink_to_fit();
+            self.rebuild_indexes();
+        }
+        removed
+    }
+
     /// Deduplicate entries in-place: for live (valid_to_ms==0) entries with identical
     /// (subject, predicate, object), keep only the highest-weight one. Returns removed count.
     pub fn dedup_entries(&mut self) -> usize {

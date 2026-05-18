@@ -665,10 +665,11 @@ impl ChittaField {
             keyword_idx: RwLock::new(keyword_idx),
             triplet_store: RwLock::new({
                 let before = triplet_store.triplet_count();
-                let removed = triplet_store.dedup_entries();
-                if removed > 0 {
-                    eprintln!("[chitta-field] deduped {} triplet entries on load ({} → {})",
-                        removed, before, triplet_store.triplet_count());
+                let purged = triplet_store.purge_invalidated();
+                let deduped = triplet_store.dedup_entries();
+                if purged > 0 || deduped > 0 {
+                    eprintln!("[chitta-field] triplet migration on load: purged {} invalidated, deduped {} duplicates ({} → {})",
+                        purged, deduped, before, triplet_store.triplet_count());
                 }
                 triplet_store
             }),

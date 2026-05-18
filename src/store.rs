@@ -3829,6 +3829,7 @@ impl ChittaField {
             payload.content.shrink_to_fit();
         }
         snap.semantic_idx.clear_embeddings();
+        snap.triplet_store.purge_invalidated();
         snap.triplet_store.clear_indexes_for_save();
         // Diagnostic: per-field serialized sizes to identify snapshot bloat.
         {
