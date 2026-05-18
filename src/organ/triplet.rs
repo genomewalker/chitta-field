@@ -61,6 +61,14 @@ pub struct TripletStore {
     // Ephemeral — absent entries are implicitly Emitted.
     #[serde(skip)]
     pub correction_states: HashMap<u64, CorrectionState>,
+    // Bi-temporal supersession: old_id → (new_id, superseded_at_ingest_ms).
+    // Stored in a .sup.json sidecar; not in the bincode snapshot.
+    #[serde(skip)]
+    supersession_map: HashMap<u64, (u64, i64)>,
+    // Ingestion timestamps: id → ms when the agent first stored the fact.
+    // Backfilled from valid_from_ms on load if sidecar absent.
+    #[serde(skip)]
+    ingestion_times: HashMap<u64, i64>,
 }
 
 impl TripletStore {
@@ -73,6 +81,8 @@ impl TripletStore {
             by_object: HashMap::new(),
             by_predicate: HashMap::new(),
             correction_states: HashMap::new(),
+            supersession_map: HashMap::new(),
+            ingestion_times: HashMap::new(),
         }
     }
 
@@ -236,6 +246,11 @@ impl TripletStore {
         source_memory_id: Option<MemoryId>,
         source_file: Option<String>,
     ) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.ingestion_times.insert(id, now_ms);
         let idx = self.entries.len();
         self.id_to_index.insert(id, idx);
 
@@ -449,6 +464,99 @@ impl TripletStore {
 
     pub fn next_id(&self) -> u64 {
         self.next_id
+    }
+
+    /// Mark `old_id` as superseded by `new_id` at ingestion-time `at_ms`.
+    /// `query_as_of` and `query_believed_at` will exclude superseded entries.
+    pub fn supersede(&mut self, old_id: u64, new_id: u64, at_ms: i64) {
+        self.supersession_map.insert(old_id, (new_id, at_ms));
+    }
+
+    /// Query facts about `subject` valid in the world at world-clock `world_ms`,
+    /// excluding entries that have been superseded.
+    pub fn query_as_of(&self, subject: &str, world_ms: i64) -> Vec<&TripletEntry> {
+        match self.by_subject.get(subject) {
+            None => Vec::new(),
+            Some(ids) => ids.iter()
+                .filter_map(|&id| self.entry_by_id(id))
+                .filter(|e| {
+                    let world_valid = (e.valid_from_ms == 0 || e.valid_from_ms <= world_ms)
+                        && (e.valid_to_ms == 0 || world_ms < e.valid_to_ms);
+                    let not_superseded = !self.supersession_map.contains_key(&e.id);
+                    world_valid && not_superseded
+                })
+                .collect(),
+        }
+    }
+
+    /// Query what the agent believed about `subject` at ingestion-time `ingest_ms`:
+    /// entries ingested on or before `ingest_ms` that had not yet been superseded.
+    pub fn query_believed_at(&self, subject: &str, ingest_ms: i64) -> Vec<&TripletEntry> {
+        match self.by_subject.get(subject) {
+            None => Vec::new(),
+            Some(ids) => ids.iter()
+                .filter_map(|&id| self.entry_by_id(id))
+                .filter(|e| {
+                    let ingested = self.ingestion_times
+                        .get(&e.id)
+                        .copied()
+                        .unwrap_or(e.valid_from_ms); // fallback for pre-migration entries
+                    if ingested > ingest_ms { return false; }
+                    // Not yet superseded as of ingest_ms?
+                    match self.supersession_map.get(&e.id) {
+                        Some(&(_, sup_at)) => sup_at > ingest_ms,
+                        None => true,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Persist supersession + ingestion data to a JSON sidecar alongside the snapshot.
+    pub fn save_supersession_sidecar(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let data = serde_json::json!({
+            "supersession_map": self.supersession_map.iter()
+                .map(|(k, v)| (k.to_string(), [v.0, v.1 as u64]))
+                .collect::<std::collections::HashMap<_,_>>(),
+            "ingestion_times": self.ingestion_times.iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect::<std::collections::HashMap<_,_>>(),
+        });
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, data.to_string())?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Load supersession + ingestion data from a JSON sidecar. No-op if file absent.
+    pub fn load_supersession_sidecar(&mut self, path: &std::path::Path) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if let Some(obj) = v["supersession_map"].as_object() {
+            for (k, arr) in obj {
+                if let (Ok(old_id), Some(arr)) = (k.parse::<u64>(), arr.as_array()) {
+                    if arr.len() == 2 {
+                        let new_id = arr[0].as_u64().unwrap_or(0);
+                        let at_ms  = arr[1].as_i64().unwrap_or(0);
+                        self.supersession_map.insert(old_id, (new_id, at_ms));
+                    }
+                }
+            }
+        }
+        if let Some(obj) = v["ingestion_times"].as_object() {
+            for (k, ts) in obj {
+                if let (Ok(id), Some(ms)) = (k.parse::<u64>(), ts.as_i64()) {
+                    self.ingestion_times.insert(id, ms);
+                }
+            }
+        }
+        eprintln!("[chitta-field] .sup sidecar: {} supersessions, {} ingestion times",
+            self.supersession_map.len(), self.ingestion_times.len());
     }
 }
 

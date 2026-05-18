@@ -2051,6 +2051,23 @@ impl ChittaField {
             .collect())
     }
 
+    /// Query triplets about `subject` valid in the world at `world_ms`, excluding superseded.
+    pub fn query_subject_as_of(&self, subject: &str, world_ms: i64) -> Result<Vec<TripletEntry>> {
+        let store = self.triplet_store.read();
+        Ok(store.query_as_of(subject, world_ms).into_iter().cloned().collect())
+    }
+
+    /// Query what the agent believed about `subject` at ingestion-time `ingest_ms`.
+    pub fn query_subject_believed_at(&self, subject: &str, ingest_ms: i64) -> Result<Vec<TripletEntry>> {
+        let store = self.triplet_store.read();
+        Ok(store.query_believed_at(subject, ingest_ms).into_iter().cloned().collect())
+    }
+
+    /// Mark triplet `old_id` as superseded by `new_id` at `at_ms`.
+    pub fn triplet_supersede(&self, old_id: u64, new_id: u64, at_ms: i64) {
+        self.triplet_store.write().supersede(old_id, new_id, at_ms);
+    }
+
     /// Get memory IDs that contradict the given memory (bidirectional).
     pub fn get_conflicts(&self, memory_id: MemoryId) -> Result<Vec<MemoryId>> {
         let id_str = memory_id.to_string();
@@ -3809,6 +3826,7 @@ impl ChittaField {
         let hnsw_path  = path.with_extension("hnsw");
         let delta_path = path.with_extension("delta.hnsw");
         let pld_path   = path.with_extension("pld");
+        let sup_path   = path.with_extension("sup.json");
         {
             // Merge delta into base if threshold exceeded, then persist both sidecars.
             let mut idx = self.semantic_idx.write();
@@ -3829,6 +3847,7 @@ impl ChittaField {
             payload.content.shrink_to_fit();
         }
         snap.semantic_idx.clear_embeddings();
+        let _ = snap.triplet_store.save_supersession_sidecar(&sup_path);
         snap.triplet_store.purge_invalidated();
         snap.triplet_store.clear_indexes_for_save();
         // Diagnostic: per-field serialized sizes to identify snapshot bloat.

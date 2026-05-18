@@ -8095,6 +8095,49 @@ pub extern "C" fn cf_query_cross_harness_conflicts(
     }
 }
 
+/// Query triplets for `subject` valid in the world at `world_ms`.
+/// Excludes tombstoned and superseded entries. Returns JSON array of TripletEntry objects.
+/// Caller must free the returned string with cf_free_string().
+#[no_mangle]
+pub extern "C" fn cf_triplet_query_as_of(
+    h: *mut CfHandle,
+    subject: *const c_char,
+    world_ms: i64,
+) -> *mut c_char {
+    if h.is_null() || subject.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let subject_str = unsafe {
+        match CStr::from_ptr(subject).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        }
+    };
+    let entries = match handle.field.query_subject_as_of(subject_str, world_ms) {
+        Ok(e) => e,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+    match CString::new(json) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Mark triplet `old_id` as superseded by `new_id` at ingestion-time `at_ms`.
+/// Returns 0 on success, -1 if handle is null.
+#[no_mangle]
+pub extern "C" fn cf_triplet_supersede(
+    h: *mut CfHandle,
+    old_id: u64,
+    new_id: u64,
+    at_ms: i64,
+) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    handle.field.triplet_supersede(old_id, new_id, at_ms);
+    0
+}
+
 #[inline]
 fn handle_from(h: *const CfHandle) -> &'static CfHandle {
     unsafe { &*h }

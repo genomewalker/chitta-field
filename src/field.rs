@@ -378,6 +378,7 @@ impl ChittaField {
                     full_snapshot_seqno = snap.snapshot_seqno;
                     // v11+: content in .pld sidecar; v10: content already in bincode (no-op).
                     FullSnapshot::load_payload_sidecar(&candidate.with_extension("pld"), &mut snap.payloads);
+                    snap.triplet_store.load_supersession_sidecar(&candidate.with_extension("sup.json"));
                     payloads = snap.payloads;
                     states = snap.states;
                     assoc_edges = snap.assoc_edges;
