@@ -110,6 +110,21 @@ impl EventTape {
 
     /// Compute the packed symbol without appending (lookup existing interners).
     /// Interns tool/entity if not present (side effect on interner, not tape).
+    /// Read-only symbol probe: returns 0 if tool/entity are not yet interned.
+    pub fn symbol_of_ro(&self, tool: &str, entity: &str, outcome: u8) -> u64 {
+        let tool_id = match self.tool_interner.get(tool) {
+            Some(&id) => id,
+            None => return 0,
+        };
+        let canon = canonicalize_entity(entity);
+        let hash  = fnv1a_64(canon.as_bytes());
+        let entity_key = match self.entity_interner.get(&hash) {
+            Some(&k) => k,
+            None => return 0,
+        };
+        TurnEvent { turn_id: 0, tool_id, entity_key, outcome_class: outcome, session_id: 0, ts_ms: 0 }.pack()
+    }
+
     pub fn symbol_of(&mut self, tool: &str, entity: &str, outcome: u8) -> u64 {
         let tool_id    = self.intern_tool(tool);
         let entity_key = self.intern_entity(entity);

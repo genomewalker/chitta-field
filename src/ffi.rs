@@ -923,6 +923,84 @@ pub extern "C" fn cf_refutation_stats(h: *mut CfHandle, k: usize) -> *mut c_char
     }
 }
 
+/// Log an event with cost metadata for regret-shaped Q-value update (Phase 10).
+#[no_mangle]
+pub extern "C" fn cf_log_event_ex(
+    h: *mut CfHandle,
+    tool: *const c_char, entity: *const c_char,
+    outcome: u8, session_id: u64, ts_ms: i64,
+    token_cost: u32, latency_ms: u32, retry_count: u8,
+) -> c_int {
+    if h.is_null() || tool.is_null() || entity.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let t = unsafe { match CStr::from_ptr(tool).to_str()   { Ok(s) => s, Err(e) => return handle.err(e) } };
+    let e = unsafe { match CStr::from_ptr(entity).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+    handle.field.log_event_ex(t, e, outcome, session_id, ts_ms, token_cost, latency_ms, retry_count);
+    handle.ok()
+}
+
+/// Record an explicit decision point into the DecisionTape.
+/// `rejected_json`: JSON array of [sym_u64, reason_u8] pairs.
+#[no_mangle]
+pub extern "C" fn cf_log_decision(
+    h: *mut CfHandle,
+    chosen_tool: *const c_char, chosen_entity: *const c_char, chosen_outcome: u8,
+    rejected_json: *const c_char,
+    confidence_delta: f32, ts_ms: i64,
+) -> c_int {
+    if h.is_null() || chosen_tool.is_null() || chosen_entity.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let ct = unsafe { match CStr::from_ptr(chosen_tool).to_str()   { Ok(s) => s, Err(e) => return handle.err(e) } };
+    let ce = unsafe { match CStr::from_ptr(chosen_entity).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+    let rejected: Vec<(u64, u8)> = if rejected_json.is_null() {
+        Vec::new()
+    } else {
+        let raw = unsafe { CStr::from_ptr(rejected_json) }.to_string_lossy();
+        serde_json::from_str::<Vec<(u64, u8)>>(&raw).unwrap_or_default()
+    };
+    handle.field.log_decision(ct, ce, chosen_outcome, rejected, confidence_delta, ts_ms);
+    handle.ok()
+}
+
+/// Recall true counterfactuals from DecisionTape for (tool, entity, outcome).
+#[no_mangle]
+pub extern "C" fn cf_recall_true_counterfactual(
+    h: *mut CfHandle,
+    tool: *const c_char, entity: *const c_char, outcome: u8, k: usize,
+) -> *mut c_char {
+    if h.is_null() || tool.is_null() || entity.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let t = unsafe { CStr::from_ptr(tool).to_string_lossy() };
+    let e = unsafe { CStr::from_ptr(entity).to_string_lossy() };
+    let hits = match handle.field.recall_true_counterfactual(&t, &e, outcome, if k == 0 { 5 } else { k }) {
+        Ok(h) => h,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let json = serde_json::to_string(&hits.iter().map(|h| serde_json::json!({
+        "turn_id": h.memory_id,
+        "score": h.score,
+        "ts_ms": h.ts_ms,
+        "content": h.content,
+        "confidence_delta": h.confidence,
+    })).collect::<Vec<_>>()).unwrap_or_else(|_| "[]".to_string());
+    match CString::new(json) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Return top-k hypothesis probes as JSON (rules with highest expected info gain).
+#[no_mangle]
+pub extern "C" fn cf_hypothesis_probes(h: *mut CfHandle, k: usize) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let s = handle.field.hypothesis_probes(if k == 0 { 10 } else { k });
+    match CString::new(s) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cf_executor_flush(h: *mut CfHandle) -> *mut c_char {
     if h.is_null() { return std::ptr::null_mut(); }

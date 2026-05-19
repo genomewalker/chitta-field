@@ -1411,9 +1411,10 @@ impl ChittaField {
         if tool != "legacy" && tool != "remember" {
             let delta = if outcome == 0 { 0.1_f32 } else { -0.2_f32 };
             cdawg.push_td_credit(&last_n, delta, 0.9);
-            // Q-value update: reward +1 success, -1 failure
-            let reward = if outcome == 0 { 1.0_f32 } else { -1.0_f32 };
-            cdawg.update_q(sym, reward, 0.05, 0.95);
+            // Regret-shaped utility (Phase 10): base reward minus cost axes.
+            // token_cost/latency_ms/retry_count default to 0 in basic log_event path.
+            let base = if outcome == 0 { 1.0_f32 } else { -1.0_f32 };
+            cdawg.update_q(sym, base, 0.05, 0.95);
         }
         drop(cdawg);
         self.episode_hdc.write().log_episode(tool, entity, outcome);
@@ -1763,6 +1764,8 @@ impl ChittaField {
 
         // Seed refutation ledger with current rule set
         self.refutation_ledger.write().seed_from_rules(&rules_for_ledger);
+        // Rebuild hypothesis market from updated ledger (Phase 10)
+        self.hypothesis_market.write().update_from_ledger(&self.refutation_ledger.read());
 
         let total = rule_data.len();
         let mut promoted = 0usize;
@@ -1852,6 +1855,110 @@ impl ChittaField {
     /// List intervention policies as JSON.
     pub fn list_policies(&self, active_only: bool) -> String {
         self.cec_policy_store.read().list_json(active_only)
+    }
+
+    /// Record an explicit decision point: what was chosen, what was rejected and why.
+    /// `rejected` is a slice of (packed_symbol, RejectionReason as u8).
+    pub fn log_decision(
+        &self,
+        chosen_tool: &str, chosen_entity: &str, chosen_outcome: u8,
+        rejected: Vec<(u64, u8)>,
+        confidence_delta: f32,
+        ts_ms: i64,
+    ) {
+        let chosen_sym = self.event_tape.read().symbol_of_ro(chosen_tool, chosen_entity, chosen_outcome);
+        let turn_id = self.event_tape.read().events.len() as u32;
+        self.decision_tape.write().log(turn_id, chosen_sym, rejected, confidence_delta, ts_ms);
+    }
+
+    /// Log an event with cost metadata for regret-shaped Q-value update (Phase 10 Part B).
+    pub fn log_event_ex(
+        &self,
+        tool: &str, entity: &str, outcome: u8,
+        session_id: u64, ts_ms: i64,
+        token_cost: u32, latency_ms: u32, retry_count: u8,
+    ) {
+        const ALPHA_COST:    f32 = 0.001;
+        const BETA_LATENCY:  f32 = 0.00001;
+        const GAMMA_RETRIES: f32 = 0.1;
+        let (sym, turn, last_n) = {
+            let mut tape = self.event_tape.write();
+            let s = tape.log(tool, entity, outcome, session_id, ts_ms);
+            let t = tape.events.len() as u32 - 1;
+            let n = tape.last_n_syms(16);
+            (s, t, n)
+        };
+        let mut cdawg = self.cdawg.write();
+        cdawg.extend(sym, turn);
+        if tool != "legacy" && tool != "remember" {
+            let base = if outcome == 0 { 1.0_f32 } else { -1.0_f32 };
+            let utility = base
+                - ALPHA_COST    * token_cost  as f32
+                - BETA_LATENCY  * latency_ms  as f32
+                - GAMMA_RETRIES * retry_count as f32;
+            let delta = if outcome == 0 { 0.1_f32 } else { -0.2_f32 };
+            cdawg.push_td_credit(&last_n, delta, 0.9);
+            cdawg.update_q(sym, utility, 0.05, 0.95);
+        }
+        drop(cdawg);
+        self.episode_hdc.write().log_episode(tool, entity, outcome);
+    }
+
+    /// True counterfactual recall: use DecisionTape to find cases where (tool, entity) was
+    /// explicitly considered and rejected, and report the chosen alternative's outcome.
+    pub fn recall_true_counterfactual(
+        &self, tool: &str, entity: &str, outcome: u8, k: usize,
+    ) -> Result<Vec<RecallHit>> {
+        let sym = self.event_tape.read().symbol_of_ro(tool, entity, outcome);
+        let tape = self.decision_tape.read();
+        let hits = tape.rejected_alternatives(sym, k)
+            .into_iter()
+            .enumerate()
+            .map(|(i, (dp, reason_u8))| {
+                let reason = crate::organ::decision_tape::RejectionReason::from_u8(reason_u8);
+                let chosen_tool_id  = (dp.chosen_sym >> 40) as u16;
+                let chosen_entity_k = (dp.chosen_sym & 0xffff_ffff) as u32;
+                let etape = self.event_tape.read();
+                let chosen_tool_name   = etape.tool_name(chosen_tool_id);
+                let chosen_entity_name = etape.entity_name(chosen_entity_k);
+                let content = format!(
+                    "[counterfactual turn={}] rejected {}({}) reason={} → chose {}({}) confidence_delta={:.3}",
+                    dp.turn_id, tool, entity, reason.label(),
+                    chosen_tool_name, chosen_entity_name, dp.confidence_delta
+                );
+                RecallHit {
+                    memory_id:           dp.turn_id as u64,
+                    score:               1.0 - i as f32 * 0.1,
+                    semantic_score:      0.0,
+                    ts_ms:               dp.ts_ms,
+                    kind:                "counterfactual".to_string(),
+                    realm:               "cec".to_string(),
+                    strength:            dp.confidence_delta.abs(),
+                    confidence:          dp.confidence_delta.abs().min(1.0),
+                    access_count:        0,
+                    content,
+                    semantic_weight:     0.0,
+                    status_mul:          1.0,
+                    epistemic_mul:       1.0,
+                    strength_factor:     1.0,
+                    affect_valence:      dp.confidence_delta.clamp(-1.0, 1.0),
+                    affect_arousal:      dp.confidence_delta.abs().clamp(0.0, 1.0),
+                    actr_activation:     0.0,
+                    surprise_boost:      0.0,
+                    arousal_boost:       0.0,
+                    mood_congruence:     1.0,
+                    frustration_boost:   0.0,
+                    interference_factor: 1.0,
+                    spacing_boost:       1.0,
+                }
+            })
+            .collect();
+        Ok(hits)
+    }
+
+    /// Top-k rules by expected information gain (Wilson probe_value). Highest = most uncertain.
+    pub fn hypothesis_probes(&self, k: usize) -> String {
+        self.hypothesis_market.read().stats_json(k)
     }
 
     /// Keyword (BM25) recall with affective context.
@@ -4379,7 +4486,8 @@ impl ChittaField {
             },
             ack_scores: self.ack_scores.read().clone(),
             correction_states: self.triplet_store.read().correction_states.clone(),
-            event_tape: self.event_tape.read().clone(),
+            event_tape:    self.event_tape.read().clone(),
+            decision_tape: self.decision_tape.read().clone(),
         };
         let path = self
             .data_dir

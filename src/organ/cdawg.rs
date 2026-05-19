@@ -427,9 +427,9 @@ impl CdawgOrgan {
     }
 
     /// TD(0) Q-value update propagated up the suffix-link tree from a terminal state.
-    /// `reward`: +1.0 for success, -1.0 for failure.
+    /// `utility`: regret-shaped value — `outcome_reward - α·cost - β·latency - γ·retries`.
     /// Credit is weighted by 1/|endpos| so generic states don't absorb all signal.
-    pub fn update_q(&mut self, terminal_sym: u64, reward: f32, alpha: f32, gamma: f32) {
+    pub fn update_q(&mut self, terminal_sym: u64, utility: f32, alpha: f32, gamma: f32) {
         // Find the state reached by the terminal symbol
         let terminal_state = match self.states[0].transitions.get(&terminal_sym).copied() {
             Some(s) => s,
@@ -453,7 +453,7 @@ impl CdawgOrgan {
             let endpos_size = self.states[sid as usize].endpos.len().max(1) as f32;
             let weight = 1.0 / endpos_size;
             let q_old = self.states[sid as usize].q_value;
-            let td_target = reward + gamma * max_succ_q;
+            let td_target = utility + gamma * max_succ_q;
             self.states[sid as usize].q_value = q_old + alpha * weight * decay * (td_target - q_old);
             let link = self.states[sid as usize].link;
             if link == sid || link == 0 { break; }

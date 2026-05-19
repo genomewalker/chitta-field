@@ -203,6 +203,9 @@ pub struct ChittaField {
     pub(crate) episode_hdc:        RwLock<crate::hdc::EpisodeHdcStore>,
     pub(crate) refutation_ledger:  RwLock<crate::organ::refutation_ledger::RefutationLedger>,
     pub(crate) cec_policy_store:   RwLock<crate::organ::intervention_store::InterventionStore>,
+    pub(crate) decision_tape:      RwLock<crate::organ::decision_tape::DecisionTape>,
+    /// Ephemeral — rebuilt from refutation_ledger after each consolidation_pass.
+    pub(crate) hypothesis_market:  RwLock<crate::organ::hypothesis_market::HypothesisMarket>,
 }
 
 impl Drop for ChittaField {
@@ -277,6 +280,8 @@ impl ChittaField {
         let mut snapshot_coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats> = HashMap::new();
         let mut snap_ack_scores: HashMap<MemoryId, i32> = HashMap::new();
         let mut snap_correction_states: HashMap<u64, crate::organ::triplet::CorrectionState> = HashMap::new();
+        let mut snap_event_tape    = crate::organ::event_tape::EventTape::new();
+        let mut snap_decision_tape = crate::organ::decision_tape::DecisionTape::new();
 
         // Find best cortical snapshot by peeking seqno (16-byte read per file), then load only that one.
         let mut snapshot_seqno: u64 = 0;
@@ -402,6 +407,8 @@ impl ChittaField {
                     snapshot_coactivation_stats = snap.coactivation_stats;
                     snap_ack_scores = snap.ack_scores;
                     snap_correction_states = snap.correction_states;
+                    snap_event_tape    = snap.event_tape;
+                    snap_decision_tape = snap.decision_tape;
                     eprintln!(
                         "[chitta-field] loaded full snapshot seqno={} ({} memories) from {:?}",
                         full_snapshot_seqno, payloads.len(), candidate
@@ -667,29 +674,30 @@ impl ChittaField {
 
         // Build EventTape from snapshot, seed entity interner from triplets, synthesize
         // legacy events for existing memories, then rebuild CDAWG from the tape.
-        let mut event_tape = crate::organ::event_tape::EventTape::new();
-        // (event_tape will be overwritten by snap.event_tape during snapshot load above)
-        // Seed entity interner from triplet subjects/objects.
-        {
+        // Use persisted EventTape from snapshot if available; otherwise synthesize from memories.
+        let mut event_tape = if !snap_event_tape.events.is_empty() {
+            snap_event_tape
+        } else {
+            let mut tape = crate::organ::event_tape::EventTape::new();
             let subjects: Vec<String> = triplet_store.all_subjects();
-            event_tape.seed_from_triplets(subjects.iter().map(|s| s.as_str()));
-        }
-        // Synthesize legacy events for existing memories so CDAWG has a warm start.
-        {
+            tape.seed_from_triplets(subjects.iter().map(|s| s.as_str()));
             let mut sorted_payloads: Vec<_> = payloads.iter()
                 .filter(|(id, _)| states.get(id).map(|s| !s.deleted).unwrap_or(false))
                 .collect();
             sorted_payloads.sort_by_key(|(_, p)| p.authored_at_ms);
             for (_, p) in sorted_payloads {
-                event_tape.synthesize_legacy(&p.realm, p.authored_at_ms);
+                tape.synthesize_legacy(&p.realm, p.authored_at_ms);
             }
-        }
+            tape
+        };
         let mut cdawg = crate::organ::cdawg::CdawgOrgan::new();
         cdawg.rebuild_from_tape(&event_tape);
         let mut episode_hdc = crate::hdc::EpisodeHdcStore::new();
         episode_hdc.rebuild(&event_tape);
         let refutation_ledger = crate::organ::refutation_ledger::RefutationLedger::new();
         let cec_policy_store  = crate::organ::intervention_store::InterventionStore::new();
+        let decision_tape     = snap_decision_tape;
+        let hypothesis_market = crate::organ::hypothesis_market::HypothesisMarket::new();
 
         Ok(Self {
             data_dir,
@@ -779,6 +787,8 @@ impl ChittaField {
             episode_hdc:        RwLock::new(episode_hdc),
             refutation_ledger:  RwLock::new(refutation_ledger),
             cec_policy_store:   RwLock::new(cec_policy_store),
+            decision_tape:      RwLock::new(decision_tape),
+            hypothesis_market:  RwLock::new(hypothesis_market),
         })
     }
 }
