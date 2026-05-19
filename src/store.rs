@@ -8,7 +8,9 @@ use crate::ops::{
     EdgeType, InvalidateTripletOp, Op, PutPayloadOp, RemoveSymbolOp, StateDeltaOp, TrainPQOp,
     UpdateResidualPQOp, UpdateSparseCodeOp, UpsertArtifactOp, UpsertCodeFileOp, UpsertSymbolOp,
 };
+use crate::organ::memory_kind::{edge_legal, MemoryKind};
 use crate::organ::pq::ProductQuantizer;
+use crate::organ::query_router::{DispatchKind, QueryRouter, RecallRequest};
 use crate::organ::symbol::SymbolEntry;
 use crate::organ::triplet::TripletEntry;
 use crate::payload::MemoryPayload;
@@ -838,6 +840,30 @@ impl ChittaField {
             let dst_state = states.get(&dst).ok_or(FieldError::NotFound(dst))?;
             if dst_state.deleted {
                 return Err(FieldError::Deleted(dst));
+            }
+        }
+
+        // Phase 16: edge-legality check — prevent rationalization chains.
+        {
+            let payloads = self.payloads.read();
+            let src_payload = payloads.get(&src);
+            let dst_payload = payloads.get(&dst);
+            if let (Some(sp), Some(dp)) = (src_payload, dst_payload) {
+                let src_kind = MemoryKind::infer(&sp.kind, &sp.realm,
+                    std::str::from_utf8(&sp.content).unwrap_or("").get(..200).unwrap_or(""));
+                let dst_kind = MemoryKind::infer(&dp.kind, &dp.realm,
+                    std::str::from_utf8(&dp.content).unwrap_or("").get(..200).unwrap_or(""));
+                if !edge_legal(src_kind, dst_kind) {
+                    eprintln!("[cec:p16] illegal edge blocked: {}({})→{}({})",
+                        src_kind.label(), src, dst_kind.label(), dst);
+                    let _ = self.add_triplet(
+                        "cec:contradiction_yield".into(),
+                        "illegal_edge_blocked".into(),
+                        format!("{}→{} id={src}→{dst}", src_kind.label(), dst_kind.label()),
+                        1.0, None, None,
+                    );
+                    return Err(FieldError::NotFound(dst)); // repurposed: illegal edge
+                }
             }
         }
 
@@ -1822,6 +1848,23 @@ impl ChittaField {
             eprintln!("[cec] turiya→HighUncertainty: auto-queued experiments: {result}");
         }
 
+        // Phase 16: write falsifiability metrics to triplet KG.
+        {
+            let now = now_ms();
+            let tape_len = self.event_tape.read().events.len();
+            let contradiction_count = self.triplet_store.read()
+                .query_predicate("illegal_edge_blocked", now).len();
+            let _ = self.add_triplet(
+                "cec:contradiction_yield".into(), "total_blocked".into(),
+                contradiction_count.to_string(), 1.0, None, None,
+            );
+            let _ = self.add_triplet(
+                "cec:router_ready".into(), "tape_events".into(),
+                tape_len.to_string(), 1.0, None, None,
+            );
+            eprintln!("[cec:p16] metrics: contradiction_yield={contradiction_count} tape={tape_len}");
+        }
+
         Ok((total, promoted))
     }
 
@@ -1833,6 +1876,108 @@ impl ChittaField {
     /// Return EventTape statistics including compression totals.
     pub fn fep_status(&self) -> String {
         self.fep_prior.read().status_json()
+    }
+
+    /// Phase 16: CPU-native routed recall. Dispatches to the cheapest lane that
+    /// can answer the request without an LLM call. Returns JSON with dispatch_label
+    /// and the resulting recall hits.
+    pub fn routed_recall(&self, req: RecallRequest) -> String {
+        let router = QueryRouter::new();
+        let dispatch = router.route(&req);
+        let label = dispatch.label();
+        let k = req.k.max(1);
+
+        let hits: Vec<String> = match dispatch {
+            DispatchKind::Exact => {
+                let now = now_ms();
+                let ts = self.triplet_store.read();
+                let entries = match (&req.subject, &req.predicate) {
+                    (Some(s), _) => ts.query_subject(s, now),
+                    (_, Some(p)) => ts.query_predicate(p, now),
+                    _ => vec![],
+                };
+                entries.iter().take(k).map(|e| {
+                    format!(r#"{{"subject":"{}","predicate":"{}","object":"{}","weight":{:.3}}}"#,
+                        e.subject.replace('"', "\\\""),
+                        e.predicate.replace('"', "\\\""),
+                        e.object.replace('"', "\\\""),
+                        e.weight)
+                }).collect()
+            }
+            DispatchKind::Fuzzy => {
+                self.recall_keyword(req.freetext.as_deref().unwrap_or(""), k)
+                    .unwrap_or_default()
+                    .iter().map(|h| format!(
+                        r#"{{"memory_id":{},"score":{:.4},"content":"{}"}}"#,
+                        h.memory_id, h.score,
+                        h.content.replace('"', "\\\"").chars().take(120).collect::<String>()
+                    )).collect()
+            }
+            DispatchKind::Temporal => {
+                let from = req.time_from_ms.unwrap_or(0);
+                let to   = req.time_to_ms.unwrap_or(i64::MAX);
+                self.recall_temporal(from, to, None, k)
+                    .unwrap_or_default()
+                    .iter().map(|h| format!(
+                        r#"{{"memory_id":{},"score":{:.4},"content":"{}"}}"#,
+                        h.memory_id, h.score,
+                        h.content.replace('"', "\\\"").chars().take(120).collect::<String>()
+                    )).collect()
+            }
+            DispatchKind::Causal => {
+                let tool   = req.causal_tool.as_deref().unwrap_or("");
+                let entity = req.causal_entity.as_deref().unwrap_or("");
+                self.recall_causal(tool, entity, k)
+                    .unwrap_or_default()
+                    .iter().map(|h| format!(
+                        r#"{{"memory_id":{},"score":{:.4},"content":"{}"}}"#,
+                        h.memory_id, h.score,
+                        h.content.replace('"', "\\\"").chars().take(120).collect::<String>()
+                    )).collect()
+            }
+            DispatchKind::Hybrid => {
+                // Exact lane first, fuzzy fills remaining slots.
+                let now = now_ms();
+                let ts = self.triplet_store.read();
+                let mut out: Vec<String> = match (&req.subject, &req.predicate) {
+                    (Some(s), _) => ts.query_subject(s, now),
+                    (_, Some(p)) => ts.query_predicate(p, now),
+                    _ => vec![],
+                }.iter().take(k / 2 + 1).map(|e| {
+                    format!(r#"{{"lane":"exact","subject":"{}","predicate":"{}","object":"{}"}}"#,
+                        e.subject.replace('"', "\\\""),
+                        e.predicate.replace('"', "\\\""),
+                        e.object.replace('"', "\\\""))
+                }).collect();
+                drop(ts);
+                if out.len() < k {
+                    let fuzzy = self.recall_keyword(
+                        req.freetext.as_deref().unwrap_or(""), k - out.len()
+                    ).unwrap_or_default();
+                    out.extend(fuzzy.iter().map(|h| format!(
+                        r#"{{"lane":"fuzzy","memory_id":{},"score":{:.4},"content":"{}"}}"#,
+                        h.memory_id, h.score,
+                        h.content.replace('"', "\\\"").chars().take(120).collect::<String>()
+                    )));
+                }
+                out
+            }
+            DispatchKind::NeedsDisambiguation(slots) => {
+                let slot_json: Vec<String> = slots.iter().map(|s| {
+                    format!(r#"{{"slot":"{}","context":"{}"}}"#,
+                        s.name, s.context.replace('"', "\\\""))
+                }).collect();
+                return format!(
+                    r#"{{"dispatch":"needs_disambiguation","unbound_slots":[{}],"hits":[]}}"#,
+                    slot_json.join(",")
+                );
+            }
+        };
+
+        format!(
+            r#"{{"dispatch":"{label}","token_cost":0,"hits":[{}]}}"#,
+            hits.join(",")
+        )
     }
 
     pub fn tape_stats(&self) -> String {

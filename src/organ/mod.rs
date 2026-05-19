@@ -40,3 +40,6 @@ pub mod decision_tape;
 pub mod hypothesis_market;
 pub mod turiya_monitor;
 pub mod fep_prior;
+
+pub mod memory_kind;
+pub mod query_router;
