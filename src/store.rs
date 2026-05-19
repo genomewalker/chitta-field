@@ -467,11 +467,34 @@ impl ChittaField {
         self.keyword_idx.write().index(memory_id, &index_text);
         self.hdc_idx.write().insert(memory_id, &content_str, realm);
 
-        // Log structured event to CEC tape and extend CDAWG.
+        // Log structured event to CEC tape; compute surprisal for strength gating.
         {
-            let sym = self.event_tape.write().log("remember", realm, 0, 0, authored_at_ms);
-            let turn = self.event_tape.read().events.len() as u32 - 1;
-            self.cdawg.write().extend(sym, turn);
+            let (sym, turn, last_n, surprisal) = {
+                let mut tape = self.event_tape.write();
+                let context = tape.last_n_syms(8);
+                let preview = tape.symbol_of("remember", realm, 0);
+                let surprisal = self.cdawg.read().surprisal(&context, preview);
+                let s = tape.log("remember", realm, 0, 0, authored_at_ms);
+                let t = tape.events.len() as u32 - 1;
+                let n = tape.last_n_syms(16);
+                (s, t, n, surprisal)
+            };
+            let mut cdawg = self.cdawg.write();
+            cdawg.extend(sym, turn);
+            // Surprisal-gated burn-in: surprising memories get lower decay_rate.
+            // Threshold 2.0 nats ≈ top ~13% of events; cap boost at 0.5× decay.
+            const SURPRISAL_THRESHOLD: f32 = 2.0;
+            const SURPRISAL_DECAY_FACTOR: f32 = 0.5;
+            if let Some(h) = surprisal {
+                if h > SURPRISAL_THRESHOLD {
+                    if let Some(st) = self.states.write().get_mut(&memory_id) {
+                        // Burn surprising memories in: halve the forgetting rate.
+                        st.decay_rate = (st.decay_rate * SURPRISAL_DECAY_FACTOR).max(1e-6);
+                    }
+                }
+            }
+            // Positive TD credit for successful memory formation.
+            cdawg.push_td_credit(&last_n, 0.05, 0.9);
         }
 
         // Update temporal index.
