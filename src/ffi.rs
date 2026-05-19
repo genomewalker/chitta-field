@@ -750,6 +750,38 @@ pub extern "C" fn cf_recall_failure_pattern(
     }
 }
 
+/// Return top-k PMI-ranked causal antecedents for (tool, entity) as JSON.
+/// JSON array: [{rank, content, pmi, count}]
+#[no_mangle]
+pub extern "C" fn cf_recall_causal_antecedent(
+    h: *mut CfHandle,
+    tool: *const c_char,
+    entity: *const c_char,
+    k: usize,
+) -> *mut c_char {
+    if h.is_null() || tool.is_null() || entity.is_null() {
+        return std::ptr::null_mut();
+    }
+    let handle = unsafe { &*h };
+    let tool_str   = unsafe { match CStr::from_ptr(tool).to_str()   { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let entity_str = unsafe { match CStr::from_ptr(entity).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    match handle.field.recall_causal_antecedent(tool_str, entity_str, k) {
+        Ok(hits) => {
+            let arr: Vec<serde_json::Value> = hits.iter().map(|h| serde_json::json!({
+                "rank":    h.memory_id + 1,
+                "content": h.content,
+                "pmi":     h.score,
+                "count":   h.access_count,
+            })).collect();
+            match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
+                Ok(s) => s.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // ── Triplet operations ────────────────────────────────────────────────────────
 
 /// Add a triplet fact. Returns triplet_id via out_triplet_id.

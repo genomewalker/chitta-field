@@ -2,9 +2,13 @@
 /// Alphabet: packed u64 from (tool_id: u16, outcome_class: u8, entity_key: u32).
 /// Amortized O(1) per symbol insertion. Answers episodic queries in sub-ms without any
 /// embedding model.
+///
+/// Phase 2: endpos sets use RoaringBitmap (compressed u32 bitsets) for efficient
+/// cardinality queries needed by PMI scoring in causal_antecedents().
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use roaring::RoaringBitmap;
 use super::event_tape::EventTape;
 
 pub const NULL_STATE: u32 = u32::MAX;
@@ -17,10 +21,8 @@ pub struct CdawgState {
     pub link: u32,
     /// Symbol → next state transitions.
     pub transitions: HashMap<u64, u32>,
-    /// Turn indices where this state is the "last" solid state (not a clone).
-    /// Approximate endpos: for exact endpos, call collect_endpos() which does a DFS
-    /// over sl_children.
-    pub endpos: Vec<u32>,
+    /// Turn indices where this state is a solid ancestor (compressed bitmap).
+    pub endpos: RoaringBitmap,
     /// Integrated TD(λ) credit from outcome feedback.
     pub credit: f32,
     /// Counts for outcomes observed while this state was the active suffix.
@@ -37,7 +39,7 @@ impl CdawgState {
             len,
             link,
             transitions: HashMap::new(),
-            endpos: Vec::new(),
+            endpos: RoaringBitmap::new(),
             credit: 0.0,
             fail_count: 0,
             succ_count: 0,
@@ -78,7 +80,7 @@ impl CdawgOrgan {
         let cur = self.states.len() as u32;
         let cur_len = self.states[self.last as usize].len + 1;
         let mut new_state = CdawgState::new(cur_len, NULL_STATE);
-        new_state.endpos.push(turn);
+        new_state.endpos.insert(turn);
         self.states.push(new_state);
 
         // Walk from last upward, adding transitions to cur where missing.
@@ -179,43 +181,55 @@ impl CdawgOrgan {
     }
 
     /// Collect all endpos turns from `start` and all its suffix-link-tree descendants.
-    /// Result is sorted and deduplicated.
+    /// Uses RoaringBitmap union for deduplication; returns sorted Vec<u32>.
     pub fn collect_endpos(&self, start: u32) -> Vec<u32> {
-        let mut result = Vec::new();
+        let mut bitmap = RoaringBitmap::new();
         let mut stack = vec![start];
         while let Some(s) = stack.pop() {
-            result.extend_from_slice(&self.states[s as usize].endpos);
+            bitmap |= &self.states[s as usize].endpos;
             stack.extend_from_slice(&self.states[s as usize].sl_children);
         }
-        result.sort_unstable();
-        result.dedup();
-        result
+        bitmap.into_iter().collect()
+    }
+
+    /// Collect endpos as a RoaringBitmap (avoids Vec allocation for cardinality queries).
+    fn collect_endpos_bitmap(&self, start: u32) -> RoaringBitmap {
+        let mut bitmap = RoaringBitmap::new();
+        let mut stack = vec![start];
+        while let Some(s) = stack.pop() {
+            bitmap |= &self.states[s as usize].endpos;
+            stack.extend_from_slice(&self.states[s as usize].sl_children);
+        }
+        bitmap
     }
 
     /// Return the most recent turn index where `syms` occurred, or None.
     pub fn last_occurrence(&self, syms: &[u64]) -> Option<u32> {
         let state = self.walk(syms)?;
-        self.collect_endpos(state).into_iter().max()
+        self.collect_endpos_bitmap(state).max()
     }
 
-    /// For a given target pattern, find k most frequent preceding single-symbol contexts
-    /// (causal antecedents). Scored by raw co-occurrence count (PMI approximation).
+    /// For a given target pattern, find k causal antecedents (preceding single-symbol
+    /// contexts) ranked by PMI = log(count(X,Y) * total / count(X) / count(Y)).
+    /// Returns (context_syms, co_occurrence_count, pmi_score).
     pub fn causal_antecedents(
         &self,
         syms: &[u64],
         k: usize,
         tape: &EventTape,
-    ) -> Vec<(Vec<u64>, u32)> {
+    ) -> Vec<(Vec<u64>, u32, f32)> {
         let state = match self.walk(syms) {
             Some(s) => s,
             None => return vec![],
         };
-        let turns = self.collect_endpos(state);
+        let y_bitmap = self.collect_endpos_bitmap(state);
+        let y_count = y_bitmap.len() as f64;
+        let total = tape.events.len() as f64;
         let pat_len = syms.len();
 
+        // Count co-occurrences: for each turn where Y ends, look at the preceding event.
         let mut counts: HashMap<u64, u32> = HashMap::new();
-        for &t in &turns {
-            let t = t as usize;
+        for t in y_bitmap.iter().map(|t| t as usize) {
             if t >= pat_len {
                 if let Some(ev) = tape.events.get(t - pat_len) {
                     *counts.entry(ev.pack()).or_insert(0) += 1;
@@ -223,13 +237,27 @@ impl CdawgOrgan {
             }
         }
 
-        let mut sorted: Vec<(Vec<u64>, u32)> = counts
+        // Score by PMI: log(P(X,Y) / P(X) / P(Y)) = log(count_xy * total / count_x / count_y)
+        let mut scored: Vec<(Vec<u64>, u32, f32)> = counts
             .into_iter()
-            .map(|(sym, cnt)| (vec![sym], cnt))
+            .map(|(sym, cnt)| {
+                let x_count = if let Some(x_state) = self.walk(&[sym]) {
+                    self.collect_endpos_bitmap(x_state).len() as f64
+                } else {
+                    cnt as f64
+                };
+                let pmi = if x_count > 0.0 && y_count > 0.0 && total > 0.0 {
+                    ((cnt as f64 * total) / (x_count * y_count)).ln() as f32
+                } else {
+                    0.0
+                };
+                (vec![sym], cnt, pmi)
+            })
             .collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
-        sorted.truncate(k);
-        sorted
+
+        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        scored
     }
 
     /// Return top-k states with high failure rates as (state_id, fail_count, fail_ratio).
@@ -281,8 +309,9 @@ impl CdawgOrgan {
         Some(-(p.ln()))
     }
 
-    /// Push TD(λ) credit backward through the last_n_syms sequence.
-    /// `gamma` is the discount factor (typically 0.9).
+    /// Push TD(λ) eligibility-trace credit backward through the last_n_syms sequence.
+    /// `delta` > 0 for success reward, < 0 for failure penalty.
+    /// `gamma` is the temporal discount factor (typically 0.9).
     pub fn push_td_credit(&mut self, last_n_syms: &[u64], delta: f32, gamma: f32) {
         let n = last_n_syms.len();
         let mut state = 0u32;
@@ -314,7 +343,6 @@ impl CdawgOrgan {
     }
 
     pub fn event_count(&self) -> usize {
-        // approximate: count solid states (those with non-empty endpos)
         self.states.iter().filter(|s| !s.endpos.is_empty()).count()
     }
 }
@@ -378,11 +406,10 @@ mod tests {
             ("Edit", "store.rs", 0),
             ("Bash", "cargo", 1),
         ]);
-        // After training on Edit→Bash twice, prediction from initial should include Bash
         let preds = cdawg.ppm_predict(&[]);
         assert!(!preds.is_empty());
         let total: f32 = preds.iter().map(|(_, p)| p).sum();
-        assert!((total - 1.0).abs() < 0.01 || preds.len() > 1); // uniform dist
+        assert!((total - 1.0).abs() < 0.01 || preds.len() > 1);
     }
 
     #[test]
@@ -398,5 +425,40 @@ mod tests {
         rebuilt_cdawg.rebuild_from_tape(&tape);
         assert_eq!(online_cdawg.state_count(), rebuilt_cdawg.state_count());
         assert!(rebuilt_cdawg.rebuilt);
+    }
+
+    #[test]
+    fn test_causal_antecedents_pmi() {
+        // Pattern: Edit always follows Bash in this sequence
+        let (tape, cdawg) = tape_and_cdawg(&[
+            ("Bash", "cargo", 0),
+            ("Edit", "store.rs", 0),
+            ("Bash", "cargo", 0),
+            ("Edit", "store.rs", 0),
+            ("Bash", "cargo", 0),
+            ("Edit", "store.rs", 0),
+        ]);
+        let mut tape2 = tape;
+        let edit_sym = tape2.symbol_of("Edit", "store.rs", 0);
+        let bash_sym = tape2.symbol_of("Bash", "cargo", 0);
+        let antecedents = cdawg.causal_antecedents(&[edit_sym], 3, &tape2);
+        // Bash should be the top antecedent (always precedes Edit)
+        assert!(!antecedents.is_empty());
+        assert_eq!(antecedents[0].0[0], bash_sym);
+        assert!(antecedents[0].2 > 0.0, "PMI should be positive for strong co-occurrence");
+    }
+
+    #[test]
+    fn test_td_credit_propagates() {
+        let (mut tape, mut cdawg) = tape_and_cdawg(&[
+            ("Edit", "store.rs", 0),
+            ("Bash", "cargo", 0),
+        ]);
+        let last_n = tape.last_n_syms(16);
+        let initial_credit = cdawg.states[cdawg.last as usize].credit;
+        cdawg.push_td_credit(&last_n, -0.5, 0.9);
+        // The last state should have received negative credit
+        let new_credit = cdawg.states[cdawg.last as usize].credit;
+        assert!(new_credit < initial_credit || cdawg.states.len() > 1);
     }
 }

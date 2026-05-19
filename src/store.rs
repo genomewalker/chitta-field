@@ -1374,10 +1374,21 @@ impl ChittaField {
 
     /// Log a structured action event to the CEC tape and extend the CDAWG.
     /// `outcome`: 0=success 1=fail 2=error 3=partial.
+    /// Also pushes TD(λ) eligibility-trace credit for non-synthetic events.
     pub fn log_event(&self, tool: &str, entity: &str, outcome: u8, session_id: u64, ts_ms: i64) {
-        let sym = self.event_tape.write().log(tool, entity, outcome, session_id, ts_ms);
-        let turn = self.event_tape.read().events.len() as u32 - 1;
-        self.cdawg.write().extend(sym, turn);
+        let (sym, turn, last_n) = {
+            let mut tape = self.event_tape.write();
+            let s = tape.log(tool, entity, outcome, session_id, ts_ms);
+            let t = tape.events.len() as u32 - 1;
+            let n = tape.last_n_syms(16);
+            (s, t, n)
+        };
+        let mut cdawg = self.cdawg.write();
+        cdawg.extend(sym, turn);
+        if tool != "legacy" && tool != "remember" {
+            let delta = if outcome == 0 { 0.1_f32 } else { -0.2_f32 };
+            cdawg.push_td_credit(&last_n, delta, 0.9);
+        }
     }
 
     /// Record an outcome (success/failure) for the most recent action on (tool, entity).
@@ -1486,6 +1497,67 @@ impl ChittaField {
                 spacing_boost:      1.0,
             })
         }).collect();
+        Ok(hits)
+    }
+
+    /// PMI-ranked causal antecedents: what actions typically precede (tool, entity)?
+    /// Returns RecallHit stubs ranked by pointwise mutual information.
+    pub fn recall_causal_antecedent(&self, tool: &str, entity: &str, k: usize) -> Result<Vec<RecallHit>> {
+        let sym = {
+            let mut tape = self.event_tape.write();
+            tape.symbol_of(tool, entity, 0)
+        };
+        let cdawg = self.cdawg.read();
+        let tape  = self.event_tape.read();
+        let antecedents = cdawg.causal_antecedents(&[sym], k, &tape);
+        let hits = antecedents
+            .into_iter()
+            .enumerate()
+            .map(|(i, (syms, count, pmi))| {
+                let desc = syms
+                    .iter()
+                    .map(|&s| {
+                        let tool_id    = (s >> 40) as u16;
+                        let outcome_cl = ((s >> 32) & 0xff) as u8;
+                        let entity_k   = (s & 0xffff_ffff) as u32;
+                        let outcome_str = match outcome_cl {
+                            0 => "success", 1 => "fail", 2 => "error", _ => "partial",
+                        };
+                        format!("{} on {} → {}", tape.tool_name(tool_id), tape.entity_name(entity_k), outcome_str)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let content = format!(
+                    "[causal-antecedent rank={}] {} (count={} pmi={:.3})",
+                    i + 1, desc, count, pmi
+                );
+                RecallHit {
+                    memory_id:           i as u64,
+                    score:               pmi.max(0.0),
+                    semantic_score:      0.0,
+                    ts_ms:               0,
+                    kind:                "causal-antecedent".to_string(),
+                    realm:               "cec".to_string(),
+                    strength:            count as f32,
+                    confidence:          (pmi / 10.0).clamp(0.0, 1.0),
+                    access_count:        count,
+                    content,
+                    semantic_weight:     0.0,
+                    status_mul:          1.0,
+                    epistemic_mul:       1.0,
+                    strength_factor:     1.0,
+                    affect_valence:      0.0,
+                    affect_arousal:      0.0,
+                    actr_activation:     0.0,
+                    surprise_boost:      0.0,
+                    arousal_boost:       0.0,
+                    mood_congruence:     1.0,
+                    frustration_boost:   0.0,
+                    interference_factor: 1.0,
+                    spacing_boost:       1.0,
+                }
+            })
+            .collect();
         Ok(hits)
     }
 
