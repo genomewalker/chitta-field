@@ -683,6 +683,73 @@ pub extern "C" fn cf_recall_hdc(
     }
 }
 
+// ── CEC: Event tape + CDAWG ──────────────────────────────────────────────────
+
+/// Log a structured action event to the CEC tape and extend the CDAWG.
+/// outcome: 0=success 1=fail 2=error 3=partial.
+#[no_mangle]
+pub extern "C" fn cf_log_event(
+    h: *mut CfHandle,
+    tool: *const c_char,
+    entity: *const c_char,
+    outcome: u8,
+    session_id: u64,
+    ts_ms: i64,
+) -> c_int {
+    if h.is_null() || tool.is_null() || entity.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let tool_str = unsafe { match CStr::from_ptr(tool).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+    let entity_str = unsafe { match CStr::from_ptr(entity).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+    handle.field.log_event(tool_str, entity_str, outcome, session_id, ts_ms);
+    handle.ok()
+}
+
+/// Recall the last k occurrences of (tool, entity) from the CDAWG event tape.
+#[no_mangle]
+pub extern "C" fn cf_recall_last_action(
+    h: *mut CfHandle,
+    tool: *const c_char,
+    entity: *const c_char,
+    k: usize,
+    hits_buf: *mut CfRecallHit,
+    hits_cap: usize,
+    hits_written: *mut usize,
+) -> c_int {
+    if h.is_null() || tool.is_null() || entity.is_null() || hits_buf.is_null() || hits_written.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let tool_str   = unsafe { match CStr::from_ptr(tool).to_str()   { Ok(s) => s, Err(e) => return handle.err(e) } };
+    let entity_str = unsafe { match CStr::from_ptr(entity).to_str() { Ok(s) => s, Err(e) => return handle.err(e) } };
+    match handle.field.recall_causal(tool_str, entity_str, k) {
+        Ok(hits) => { write_hits(hits, hits_buf, hits_cap, hits_written); handle.ok() }
+        Err(e)   => handle.err(e),
+    }
+}
+
+/// Return top-k failure patterns from the CDAWG as JSON.
+#[no_mangle]
+pub extern "C" fn cf_recall_failure_pattern(
+    h: *mut CfHandle,
+    k: usize,
+) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    match handle.field.recall_failure_pattern(k) {
+        Ok(hits) => {
+            let arr: Vec<serde_json::Value> = hits.iter().map(|h| serde_json::json!({
+                "state_id":   h.memory_id,
+                "fail_ratio": h.strength,
+                "content":    h.content,
+                "ts_ms":      h.ts_ms,
+            })).collect();
+            match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
+                Ok(s) => s.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // ── Triplet operations ────────────────────────────────────────────────────────
 
 /// Add a triplet fact. Returns triplet_id via out_triplet_id.

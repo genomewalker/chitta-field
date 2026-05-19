@@ -406,6 +406,10 @@ impl TripletStore {
         }
     }
 
+    pub fn all_subjects(&self) -> Vec<String> {
+        self.by_subject.keys().cloned().collect()
+    }
+
     pub fn triplet_count(&self) -> usize {
         self.entries.len()
     }
