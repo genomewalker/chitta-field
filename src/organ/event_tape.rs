@@ -156,4 +156,86 @@ impl EventTape {
         let start = self.events.len().saturating_sub(n);
         self.events[start..].iter().map(|e| e.pack()).collect()
     }
+
+    /// Phase 12 — Temporal compression.
+    ///
+    /// Tombstones (removes) events whose PPM prediction confidence exceeds
+    /// `threshold` (e.g. 0.85), meaning the CDAWG predicted them with high
+    /// confidence — they carry little new information.
+    ///
+    /// Preserves: failure events (outcome_class != 0), the first and last
+    /// event of each session, and any event the CDAWG cannot predict (novel).
+    ///
+    /// Returns the number of events removed.
+    pub fn compress_low_surprisal(
+        &mut self,
+        cdawg: &crate::organ::cdawg::CdawgOrgan,
+        threshold: f32,
+    ) -> usize {
+        const MIN_TAPE: usize = 200;
+        const CTX_WINDOW: usize = 4;
+
+        if self.events.len() < MIN_TAPE { return 0; }
+
+        // Collect session boundary indices (first and last per session_id).
+        let mut session_bounds = std::collections::HashSet::new();
+        {
+            let mut last_session = u64::MAX;
+            for (i, e) in self.events.iter().enumerate() {
+                if e.session_id != last_session {
+                    session_bounds.insert(i);
+                    if i > 0 { session_bounds.insert(i - 1); }
+                    last_session = e.session_id;
+                }
+            }
+            if !self.events.is_empty() {
+                session_bounds.insert(self.events.len() - 1);
+            }
+        }
+
+        let mut remove = vec![false; self.events.len()];
+        let n = self.events.len();
+
+        for i in CTX_WINDOW..n.saturating_sub(1) {
+            // Always keep failure/error events and session boundaries.
+            if self.events[i].outcome_class != 0 { continue; }
+            if session_bounds.contains(&i) { continue; }
+
+            let ctx: Vec<u64> = self.events[i.saturating_sub(CTX_WINDOW)..i]
+                .iter().map(|e| e.pack()).collect();
+            let sym = self.events[i].pack();
+
+            if let Some(surprisal) = cdawg.surprisal(&ctx, sym) {
+                // surprisal = -log2(p) → confidence = 2^(-surprisal)
+                let confidence = 2f32.powf(-surprisal);
+                if confidence > threshold {
+                    remove[i] = true;
+                }
+            }
+        }
+
+        let removed = remove.iter().filter(|&&r| r).count();
+        if removed == 0 { return 0; }
+
+        let mut new_events = Vec::with_capacity(n - removed);
+        for (i, e) in self.events.drain(..).enumerate() {
+            if !remove[i] { new_events.push(e); }
+        }
+        self.events = new_events;
+        removed
+    }
+
+    /// Return tape statistics as a JSON string.
+    pub fn stats_json(&self, tombstoned_total: u64) -> String {
+        let n = self.events.len();
+        let failures = self.events.iter().filter(|e| e.outcome_class == 1).count();
+        let sessions: std::collections::HashSet<u64> =
+            self.events.iter().map(|e| e.session_id).collect();
+        format!(
+            r#"{{"events":{n},"tombstoned_total":{tombstoned_total},"failure_events":{failures},"sessions":{ses},"tool_count":{tc},"entity_count":{ec}}}"#,
+            ses = sessions.len(),
+            tc  = self.tool_names.len(),
+            ec  = self.entity_names.len(),
+        )
+    }
 }

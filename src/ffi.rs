@@ -1035,6 +1035,18 @@ pub extern "C" fn cf_turiya_status(h: *const CfHandle) -> *mut c_char {
     }
 }
 
+/// CEC Phase 12: EventTape statistics + compression totals. Caller must free with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_tape_stats(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let s = handle.field.tape_stats();
+    match CString::new(s) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // ── Triplet operations ────────────────────────────────────────────────────────
 
 /// Add a triplet fact. Returns triplet_id via out_triplet_id.
