@@ -198,8 +198,9 @@ pub struct ChittaField {
     pub(crate) repl_sessions: RwLock<crate::repl_sessions::ReplSessionStore>,
     /// Hyperdimensional Computing index — O(n) Hamming recall, no floats.
     pub(crate) hdc_idx:    RwLock<crate::hdc::HdcStore>,
-    pub(crate) event_tape: RwLock<crate::organ::event_tape::EventTape>,
-    pub(crate) cdawg:      RwLock<crate::organ::cdawg::CdawgOrgan>,
+    pub(crate) event_tape:   RwLock<crate::organ::event_tape::EventTape>,
+    pub(crate) cdawg:        RwLock<crate::organ::cdawg::CdawgOrgan>,
+    pub(crate) episode_hdc:  RwLock<crate::hdc::EpisodeHdcStore>,
 }
 
 impl Drop for ChittaField {
@@ -683,6 +684,8 @@ impl ChittaField {
         }
         let mut cdawg = crate::organ::cdawg::CdawgOrgan::new();
         cdawg.rebuild_from_tape(&event_tape);
+        let mut episode_hdc = crate::hdc::EpisodeHdcStore::new();
+        episode_hdc.rebuild(&event_tape);
 
         Ok(Self {
             data_dir,
@@ -767,8 +770,9 @@ impl ChittaField {
             filter_level: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             scoring_pipeline: RwLock::new(crate::scoring::ScoringPipeline::new(scoring_config)),
             hdc_idx:    RwLock::new(hdc_store),
-            event_tape: RwLock::new(event_tape),
-            cdawg:      RwLock::new(cdawg),
+            event_tape:   RwLock::new(event_tape),
+            cdawg:        RwLock::new(cdawg),
+            episode_hdc:  RwLock::new(episode_hdc),
         })
     }
 }
