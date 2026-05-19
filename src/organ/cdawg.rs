@@ -37,6 +37,8 @@ pub struct CdawgState {
     pub endpos: RoaringBitmap,
     /// Integrated TD(λ) credit from outcome feedback.
     pub credit: f32,
+    /// Q-value: expected future success rate (cross-session TD target).
+    pub q_value: f32,
     /// Counts for outcomes observed while this state was the active suffix.
     pub fail_count: u32,
     pub succ_count: u32,
@@ -53,6 +55,7 @@ impl CdawgState {
             transitions: HashMap::new(),
             endpos: RoaringBitmap::new(),
             credit: 0.0,
+            q_value: 0.0,
             fail_count: 0,
             succ_count: 0,
             sl_children: Vec::new(),
@@ -132,6 +135,7 @@ impl CdawgOrgan {
                     transitions: self.states[q as usize].transitions.clone(),
                     endpos:      self.states[q as usize].endpos.clone(),
                     credit:      0.0,
+                    q_value:     0.0,
                     fail_count:  0,
                     succ_count:  0,
                     sl_children: Vec::new(),
@@ -420,6 +424,66 @@ impl CdawgOrgan {
         });
         hits.truncate(k);
         hits
+    }
+
+    /// TD(0) Q-value update propagated up the suffix-link tree from a terminal state.
+    /// `reward`: +1.0 for success, -1.0 for failure.
+    /// Credit is weighted by 1/|endpos| so generic states don't absorb all signal.
+    pub fn update_q(&mut self, terminal_sym: u64, reward: f32, alpha: f32, gamma: f32) {
+        // Find the state reached by the terminal symbol
+        let terminal_state = match self.states[0].transitions.get(&terminal_sym).copied() {
+            Some(s) => s,
+            None    => return,
+        };
+
+        // Compute max Q of successors of terminal state
+        let max_succ_q = self.states[terminal_state as usize]
+            .transitions
+            .values()
+            .map(|&sid| self.states[sid as usize].q_value)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let max_succ_q = if max_succ_q == f32::NEG_INFINITY { 0.0 } else { max_succ_q };
+
+        // Walk suffix links upward, decaying by gamma per hop
+        let mut sid = terminal_state;
+        let mut decay = 1.0_f32;
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if !visited.insert(sid) { break; }
+            let endpos_size = self.states[sid as usize].endpos.len().max(1) as f32;
+            let weight = 1.0 / endpos_size;
+            let q_old = self.states[sid as usize].q_value;
+            let td_target = reward + gamma * max_succ_q;
+            self.states[sid as usize].q_value = q_old + alpha * weight * decay * (td_target - q_old);
+            let link = self.states[sid as usize].link;
+            if link == sid || link == 0 { break; }
+            sid = link;
+            decay *= gamma;
+        }
+    }
+
+    /// Return top-k states reachable from (tool, entity) prefix sorted by Q-value.
+    /// Each entry: (state_id, q_value, endpos_count).
+    pub fn top_q_states(&self, prefix_syms: &[u64], k: usize) -> Vec<(u32, f32, u32)> {
+        let start = match self.walk(prefix_syms) {
+            Some(s) => s,
+            None    => 0,
+        };
+        // BFS/DFS from start, collect all reachable states
+        let mut reachable: Vec<(u32, f32, u32)> = Vec::new();
+        let mut stack = vec![start];
+        let mut seen  = std::collections::HashSet::new();
+        while let Some(sid) = stack.pop() {
+            if !seen.insert(sid) { continue; }
+            let s = &self.states[sid as usize];
+            reachable.push((sid, s.q_value, s.endpos.len() as u32));
+            for &child in s.transitions.values() {
+                stack.push(child);
+            }
+        }
+        reachable.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        reachable.truncate(k);
+        reachable
     }
 }
 

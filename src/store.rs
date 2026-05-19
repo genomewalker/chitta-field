@@ -1411,6 +1411,9 @@ impl ChittaField {
         if tool != "legacy" && tool != "remember" {
             let delta = if outcome == 0 { 0.1_f32 } else { -0.2_f32 };
             cdawg.push_td_credit(&last_n, delta, 0.9);
+            // Q-value update: reward +1 success, -1 failure
+            let reward = if outcome == 0 { 1.0_f32 } else { -1.0_f32 };
+            cdawg.update_q(sym, reward, 0.05, 0.95);
         }
         drop(cdawg);
         self.episode_hdc.write().log_episode(tool, entity, outcome);
@@ -1758,6 +1761,56 @@ impl ChittaField {
             promoted += 1;
         }
         Ok((total, promoted))
+    }
+
+    /// Return top-k CDAWG states reachable from (tool, entity) ranked by Q-value.
+    pub fn recall_motif_value(&self, tool: &str, entity: &str, k: usize) -> Result<Vec<RecallHit>> {
+        let sym = {
+            let mut tape = self.event_tape.write();
+            tape.symbol_of(tool, entity, 0)
+        };
+        let cdawg = self.cdawg.read();
+        let tape  = self.event_tape.read();
+        let rows = cdawg.top_q_states(&[sym], k.max(1));
+        let hits = rows.into_iter().map(|(state_id, q_val, support)| {
+            let next_syms: Vec<String> = cdawg.states.get(state_id as usize)
+                .map(|s| s.transitions.keys().take(3).map(|&sym| {
+                    let tn = tape.tool_name((sym >> 40) as u16);
+                    let en = tape.entity_name((sym & 0xffff_ffff) as u32);
+                    format!("{tn}({en})")
+                }).collect())
+                .unwrap_or_default();
+            let content = format!(
+                "[motif state={}] q={:.3} support={} next=[{}]",
+                state_id, q_val, support, next_syms.join(", ")
+            );
+            RecallHit {
+                memory_id:           state_id as u64,
+                score:               (q_val + 1.0) / 2.0,
+                semantic_score:      0.0,
+                ts_ms:               0,
+                kind:                "motif".to_string(),
+                realm:               "cec".to_string(),
+                strength:            (q_val + 1.0) / 2.0,
+                confidence:          support as f32 / (support as f32 + 1.0),
+                access_count:        support,
+                content,
+                semantic_weight:     0.0,
+                status_mul:          1.0,
+                epistemic_mul:       1.0,
+                strength_factor:     1.0,
+                affect_valence:      q_val.clamp(-1.0, 1.0),
+                affect_arousal:      q_val.abs().clamp(0.0, 1.0),
+                actr_activation:     0.0,
+                surprise_boost:      0.0,
+                arousal_boost:       0.0,
+                mood_congruence:     (q_val + 1.0) / 2.0,
+                frustration_boost:   0.0,
+                interference_factor: 1.0,
+                spacing_boost:       1.0,
+            }
+        }).collect();
+        Ok(hits)
     }
 
     /// Return top-k rules by refute_ratio as a plain-text summary.
