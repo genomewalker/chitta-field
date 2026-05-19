@@ -209,6 +209,8 @@ pub struct ChittaField {
     /// CEC Phase 11 — Turīya Monitor: read-only organ that watches CEC organ health.
     /// Serialized in snapshot (rolling 100-sample window persists across sessions).
     pub(crate) turiya_monitor:     RwLock<crate::organ::turiya_monitor::TuriyaMonitor>,
+    /// Ephemeral — rebuilt from EventTape alongside CDAWG at load.
+    pub(crate) fep_prior:          RwLock<crate::organ::fep_prior::FepPriorOrgan>,
     /// CEC Phase 12 — cumulative count of events tombstoned by temporal compression.
     /// Ephemeral (not in snapshot) — lifetime of this daemon process.
     pub(crate) tape_tombstoned:    std::sync::atomic::AtomicU64,
@@ -705,6 +707,7 @@ impl ChittaField {
         let decision_tape     = snap_decision_tape;
         let hypothesis_market = crate::organ::hypothesis_market::HypothesisMarket::new();
         let turiya_monitor    = crate::organ::turiya_monitor::TuriyaMonitor::new();
+        let fep_prior         = crate::organ::fep_prior::FepPriorOrgan::new();
 
         Ok(Self {
             data_dir,
@@ -797,6 +800,7 @@ impl ChittaField {
             decision_tape:      RwLock::new(decision_tape),
             hypothesis_market:  RwLock::new(hypothesis_market),
             turiya_monitor:     RwLock::new(turiya_monitor),
+            fep_prior:          RwLock::new(fep_prior),
             tape_tombstoned:    std::sync::atomic::AtomicU64::new(0),
         })
     }

@@ -481,16 +481,16 @@ impl ChittaField {
             };
             let mut cdawg = self.cdawg.write();
             cdawg.extend(sym, turn);
-            // Surprisal-gated burn-in: surprising memories get lower decay_rate.
-            // Threshold 2.0 nats ≈ top ~13% of events; cap boost at 0.5× decay.
+            // Phase 15: update FEP model and blend surprisal signal.
+            let fep_free_energy = self.fep_prior.write().observe_packed(sym, &cdawg).free_energy;
+            // Surprisal-gated burn-in: blend PPM surprisal with FEP free energy.
+            // High free_energy (>2.0 nats) OR high PPM surprisal → burn in memory.
             const SURPRISAL_THRESHOLD: f32 = 2.0;
             const SURPRISAL_DECAY_FACTOR: f32 = 0.5;
-            if let Some(h) = surprisal {
-                if h > SURPRISAL_THRESHOLD {
-                    if let Some(st) = self.states.write().get_mut(&memory_id) {
-                        // Burn surprising memories in: halve the forgetting rate.
-                        st.decay_rate = (st.decay_rate * SURPRISAL_DECAY_FACTOR).max(1e-6);
-                    }
+            let combined_surprisal = surprisal.unwrap_or(0.0) * 0.5 + fep_free_energy * 0.5;
+            if combined_surprisal > SURPRISAL_THRESHOLD {
+                if let Some(st) = self.states.write().get_mut(&memory_id) {
+                    st.decay_rate = (st.decay_rate * SURPRISAL_DECAY_FACTOR).max(1e-6);
                 }
             }
             // Positive TD credit for successful memory formation.
@@ -1792,6 +1792,16 @@ impl ChittaField {
             }
         }
 
+        // Phase 15: rebuild FEP model from (compressed) tape.
+        {
+            let tape = self.event_tape.read();
+            self.fep_prior.write().rebuild_from_tape(&tape);
+            eprintln!("[cec] fep rebuilt: {} states modeled, drift={:.3}, shock={:.3}",
+                self.fep_prior.read().state_emission_len(),
+                self.fep_prior.read().ewma_drift,
+                self.fep_prior.read().ewma_shock);
+        }
+
         // Phase 11: take a Turīya health sample after each consolidation_pass.
         let diagnosis = {
             let ts = now_ms();
@@ -1799,7 +1809,8 @@ impl ChittaField {
             let tape    = self.event_tape.read();
             let ledger  = self.refutation_ledger.read();
             let market  = self.hypothesis_market.read();
-            self.turiya_monitor.write().sample(ts, &cdawg, &tape, &ledger, &market);
+            let fep     = self.fep_prior.read();
+            self.turiya_monitor.write().sample(ts, &cdawg, &tape, &ledger, &market, &fep);
             self.turiya_monitor.read().latest()
                 .map(|s| s.diagnose())
                 .unwrap_or(crate::organ::turiya_monitor::Diagnosis::Healthy)
@@ -1820,6 +1831,10 @@ impl ChittaField {
     }
 
     /// Return EventTape statistics including compression totals.
+    pub fn fep_status(&self) -> String {
+        self.fep_prior.read().status_json()
+    }
+
     pub fn tape_stats(&self) -> String {
         let tombstoned = self.tape_tombstoned.load(std::sync::atomic::Ordering::Relaxed);
         self.event_tape.read().stats_json(tombstoned)
