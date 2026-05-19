@@ -4,6 +4,7 @@ pub mod error;
 pub mod ffi;
 pub mod field;
 pub mod graph;
+pub mod hdc;
 pub mod hnsw;
 pub mod ids;
 pub mod learner;

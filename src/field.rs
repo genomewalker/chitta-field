@@ -196,6 +196,8 @@ pub struct ChittaField {
     pub(crate) ack_scores: RwLock<HashMap<MemoryId, i32>>,
     /// Soul REPL session namespaces — persisted to repl_sessions.json (not in snapshot).
     pub(crate) repl_sessions: RwLock<crate::repl_sessions::ReplSessionStore>,
+    /// Hyperdimensional Computing index — O(n) Hamming recall, no floats.
+    pub(crate) hdc_idx: RwLock<crate::hdc::HdcStore>,
 }
 
 impl Drop for ChittaField {
@@ -649,6 +651,15 @@ impl ChittaField {
         let scoring_config = crate::scoring::config::ScoringConfig::load(&data_dir);
         let loaded_repl_sessions = crate::repl_sessions::ReplSessionStore::load(&data_dir);
 
+        // Build HDC index from persisted payloads (skips deleted memories via states map).
+        let mut hdc_store = crate::hdc::HdcStore::new();
+        {
+            let entries = payloads.iter()
+                .filter(|(id, _)| states.get(id).map(|s| !s.deleted).unwrap_or(false))
+                .map(|(id, p)| (*id, std::str::from_utf8(&p.content).unwrap_or(""), p.realm.as_str()));
+            hdc_store.rebuild(entries);
+        }
+
         Ok(Self {
             data_dir,
             instance_id,
@@ -731,6 +742,7 @@ impl ChittaField {
             hopfield: RwLock::new(HopfieldNetwork::new()),
             filter_level: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             scoring_pipeline: RwLock::new(crate::scoring::ScoringPipeline::new(scoring_config)),
+            hdc_idx: RwLock::new(hdc_store),
         })
     }
 }
