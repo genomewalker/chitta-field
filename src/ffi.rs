@@ -1023,6 +1023,18 @@ pub extern "C" fn cf_list_policies(h: *mut CfHandle, active_only: bool) -> *mut 
     }
 }
 
+/// CEC Phase 11: Turīya Monitor status. Caller must free with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_turiya_status(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let s = handle.field.turiya_status();
+    match CString::new(s) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // ── Triplet operations ────────────────────────────────────────────────────────
 
 /// Add a triplet fact. Returns triplet_id via out_triplet_id.

@@ -206,6 +206,9 @@ pub struct ChittaField {
     pub(crate) decision_tape:      RwLock<crate::organ::decision_tape::DecisionTape>,
     /// Ephemeral — rebuilt from refutation_ledger after each consolidation_pass.
     pub(crate) hypothesis_market:  RwLock<crate::organ::hypothesis_market::HypothesisMarket>,
+    /// CEC Phase 11 — Turīya Monitor: read-only organ that watches CEC organ health.
+    /// Serialized in snapshot (rolling 100-sample window persists across sessions).
+    pub(crate) turiya_monitor:     RwLock<crate::organ::turiya_monitor::TuriyaMonitor>,
 }
 
 impl Drop for ChittaField {
@@ -698,6 +701,7 @@ impl ChittaField {
         let cec_policy_store  = crate::organ::intervention_store::InterventionStore::new();
         let decision_tape     = snap_decision_tape;
         let hypothesis_market = crate::organ::hypothesis_market::HypothesisMarket::new();
+        let turiya_monitor    = crate::organ::turiya_monitor::TuriyaMonitor::new();
 
         Ok(Self {
             data_dir,
@@ -789,6 +793,7 @@ impl ChittaField {
             cec_policy_store:   RwLock::new(cec_policy_store),
             decision_tape:      RwLock::new(decision_tape),
             hypothesis_market:  RwLock::new(hypothesis_market),
+            turiya_monitor:     RwLock::new(turiya_monitor),
         })
     }
 }
