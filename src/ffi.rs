@@ -648,6 +648,41 @@ pub extern "C" fn cf_recall_keyword(
     }
 }
 
+#[no_mangle]
+pub extern "C" fn cf_recall_hdc(
+    h: *mut CfHandle,
+    query: *const c_char,
+    realm: *const c_char,
+    k: usize,
+    hits_buf: *mut CfRecallHit,
+    hits_cap: usize,
+    hits_written: *mut usize,
+) -> c_int {
+    if h.is_null() || query.is_null() || hits_buf.is_null() || hits_written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let query_str = unsafe {
+        match CStr::from_ptr(query).to_str() {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let realm_opt = if realm.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(realm).to_str().ok() }
+    };
+
+    match handle.field.recall_hdc(query_str, k, realm_opt) {
+        Ok(hits) => {
+            write_hits(hits, hits_buf, hits_cap, hits_written);
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
 // ── Triplet operations ────────────────────────────────────────────────────────
 
 /// Add a triplet fact. Returns triplet_id via out_triplet_id.
