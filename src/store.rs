@@ -1639,6 +1639,62 @@ impl ChittaField {
         Ok(hits)
     }
 
+    /// Counterfactual recall: given (tool, entity, outcome), what alternative tools/entities
+    /// would have had a lower failure rate in the same context?
+    pub fn recall_counterfactual(
+        &self,
+        tool:    &str,
+        entity:  &str,
+        outcome: u8,
+        k:       usize,
+    ) -> Result<Vec<RecallHit>> {
+        use crate::organ::cdawg::CounterfactualHit;
+        let taken_sym = self.event_tape.write().symbol_of(tool, entity, outcome);
+        let context   = self.event_tape.read().last_n_syms(4);
+        let cdawg     = self.cdawg.read();
+        let tape      = self.event_tape.read();
+        let hits: Vec<CounterfactualHit> = cdawg.counterfactual_alternatives(&context, taken_sym, 5, k);
+        let result = hits.into_iter().enumerate().map(|(i, h)| {
+            let tool_id   = (h.symbol >> 40) as u16;
+            let out_cl    = ((h.symbol >> 32) & 0xff) as u8;
+            let entity_k  = (h.symbol & 0xffff_ffff) as u32;
+            let alt_tool  = tape.tool_name(tool_id);
+            let alt_ent   = tape.entity_name(entity_k);
+            let out_str   = match out_cl { 0=>"success",1=>"fail",2=>"error",_=>"partial" };
+            let content = format!(
+                "[counterfactual rank={}] use {}({}) → {} instead: fail_rate {:.0}% vs {:.0}% taken (Δ={:+.0}%, n={})",
+                i+1, alt_tool, alt_ent, out_str,
+                h.fail_ratio * 100.0, h.taken_fail_ratio * 100.0, h.delta * 100.0, h.support
+            );
+            RecallHit {
+                memory_id:           i as u64,
+                score:               h.delta.max(0.0),
+                semantic_score:      0.0,
+                ts_ms:               0,
+                kind:                "counterfactual".to_string(),
+                realm:               "cec".to_string(),
+                strength:            h.delta.max(0.0),
+                confidence:          1.0 - h.wilson_fail_lower,
+                access_count:        h.support,
+                content,
+                semantic_weight:     0.0,
+                status_mul:          1.0,
+                epistemic_mul:       1.0,
+                strength_factor:     1.0,
+                affect_valence:      h.delta,
+                affect_arousal:      h.delta.abs(),
+                actr_activation:     0.0,
+                surprise_boost:      0.0,
+                arousal_boost:       0.0,
+                mood_congruence:     1.0,
+                frustration_boost:   0.0,
+                interference_factor: 1.0,
+                spacing_boost:       1.0,
+            }
+        }).collect();
+        Ok(result)
+    }
+
     /// Preview the top-k rules that consolidation_pass would promote (no writes).
     pub fn consolidation_preview(&self, k: usize) -> Vec<(String, u32)> {
         use crate::organ::sequitur::run_sequitur;
