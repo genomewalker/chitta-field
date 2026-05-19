@@ -1035,6 +1035,19 @@ pub extern "C" fn cf_turiya_status(h: *const CfHandle) -> *mut c_char {
     }
 }
 
+/// CEC Phase 14: queue deliberate micro-experiments for uncertain Sequitur rules.
+/// Returns JSON: {"queued":N,"skipped_refuted":M,"skipped_certain":L}. Caller must free with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_queue_experiments(h: *mut CfHandle, k: usize) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let s = handle.field.queue_experiments(if k == 0 { 5 } else { k });
+    match CString::new(s) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// CEC Phase 13: top-k verbalized Sequitur rules. Caller must free with cf_free_string.
 #[no_mangle]
 pub extern "C" fn cf_verbalize_rules(h: *const CfHandle, k: usize) -> *mut c_char {

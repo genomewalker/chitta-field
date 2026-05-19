@@ -1793,13 +1793,22 @@ impl ChittaField {
         }
 
         // Phase 11: take a Turīya health sample after each consolidation_pass.
-        {
+        let diagnosis = {
             let ts = now_ms();
             let cdawg   = self.cdawg.read();
             let tape    = self.event_tape.read();
             let ledger  = self.refutation_ledger.read();
             let market  = self.hypothesis_market.read();
             self.turiya_monitor.write().sample(ts, &cdawg, &tape, &ledger, &market);
+            self.turiya_monitor.read().latest()
+                .map(|s| s.diagnose())
+                .unwrap_or(crate::organ::turiya_monitor::Diagnosis::Healthy)
+        };
+
+        // Phase 14: auto-queue experiments when Turīya detects high uncertainty.
+        if diagnosis == crate::organ::turiya_monitor::Diagnosis::HighUncertainty {
+            let result = self.queue_experiments(5);
+            eprintln!("[cec] turiya→HighUncertainty: auto-queued experiments: {result}");
         }
 
         Ok((total, promoted))
@@ -1814,6 +1823,48 @@ impl ChittaField {
     pub fn tape_stats(&self) -> String {
         let tombstoned = self.tape_tombstoned.load(std::sync::atomic::Ordering::Relaxed);
         self.event_tape.read().stats_json(tombstoned)
+    }
+
+    /// Phase 14 — Queue deliberate micro-experiments for uncertain Sequitur rules.
+    ///
+    /// Reads HypothesisMarket::top_probes(k) and files an OpenTask intervention
+    /// for each rule whose probe_value > 0.4 AND refutation_ratio < 0.3 (safety gate).
+    /// Returns JSON: {"queued": N, "skipped_refuted": M, "skipped_certain": L}
+    pub fn queue_experiments(&self, k: usize) -> String {
+        use crate::organ::intervention_store::{InterventionKind, InterventionPolicy};
+        let probes = {
+            let market = self.hypothesis_market.read();
+            market.top_probes(k.max(1)).to_vec()
+        };
+        let ledger = self.refutation_ledger.read();
+        let mut store = self.cec_policy_store.write();
+        let ts = now_ms();
+        let mut queued = 0usize;
+        let mut skipped_refuted = 0usize;
+        let mut skipped_certain = 0usize;
+        for h in &probes {
+            if h.probe_value <= 0.4 {
+                skipped_certain += 1;
+                continue;
+            }
+            // Adversarial gate: don't experiment on rules being actively refuted.
+            let refute_ratio = ledger.refute_ratio_for_rule(h.rule_id);
+            if refute_ratio >= 0.3 {
+                skipped_refuted += 1;
+                continue;
+            }
+            let title = format!("probe_rule_{}", h.rule_id);
+            let desc = format!(
+                "CEC Phase 14 experiment: rule {} has p_hat={:.3} (probe_value={:.3}). \
+                 Deliberately execute its antecedent and observe whether the consequent follows.",
+                h.rule_id, h.p_hat, h.probe_value
+            );
+            store.propose(h.rule_id, InterventionKind::OpenTask { title, description: desc }, ts);
+            queued += 1;
+        }
+        format!(
+            r#"{{"queued":{queued},"skipped_refuted":{skipped_refuted},"skipped_certain":{skipped_certain}}}"#
+        )
     }
 
     /// Phase 13 — Return top-k verbalized Sequitur rules ranked by support.
