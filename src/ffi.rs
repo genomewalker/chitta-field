@@ -1107,6 +1107,43 @@ pub extern "C" fn cf_routed_recall(
     CString::new(result).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
+// ── Phase 17 exports ─────────────────────────────────────────────────────────
+
+/// Promote a candidate memory to established band. witness_kind: correction|outcome|hit_rate_delta.
+/// Returns JSON. Caller must free with cf_free_string().
+#[no_mangle]
+pub extern "C" fn cf_witness_memory(
+    h: *mut CfHandle,
+    memory_id: u64,
+    witness_kind: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || witness_kind.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let wk = unsafe { std::ffi::CStr::from_ptr(witness_kind) }.to_string_lossy();
+    let json = handle.field.witness_memory(memory_id, &wk);
+    CString::new(json).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// R0 reconcile pass: scan assoc_edges for legality violations + detect contradictions.
+/// Returns JSON summary. Caller must free with cf_free_string().
+#[no_mangle]
+pub extern "C" fn cf_reconcile_pass(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let json = handle.field.reconcile_pass();
+    CString::new(json).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Produce a harvest scope document from Turīya anomalies + router misses.
+/// Returns JSON. Caller must free with cf_free_string().
+#[no_mangle]
+pub extern "C" fn cf_harvest_scope(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let json = handle.field.harvest_scope();
+    CString::new(json).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
 // ── Triplet operations ────────────────────────────────────────────────────────
 
 /// Add a triplet fact. Returns triplet_id via out_triplet_id.

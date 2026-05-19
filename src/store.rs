@@ -9,8 +9,10 @@ use crate::ops::{
     UpdateResidualPQOp, UpdateSparseCodeOp, UpsertArtifactOp, UpsertCodeFileOp, UpsertSymbolOp,
 };
 use crate::organ::memory_kind::{edge_legal, MemoryKind};
+use crate::organ::provenance::{MemProvenance, WitnessKind};
 use crate::organ::pq::ProductQuantizer;
 use crate::organ::query_router::{DispatchKind, QueryRouter, RecallRequest};
+use crate::organ::reconciler::Reconciler;
 use crate::organ::symbol::SymbolEntry;
 use crate::organ::triplet::TripletEntry;
 use crate::payload::MemoryPayload;
@@ -843,7 +845,7 @@ impl ChittaField {
             }
         }
 
-        // Phase 16: edge-legality check — prevent rationalization chains.
+        // Phase 16/17: edge-legality + candidate-band checks.
         {
             let payloads = self.payloads.read();
             let src_payload = payloads.get(&src);
@@ -853,6 +855,19 @@ impl ChittaField {
                     std::str::from_utf8(&sp.content).unwrap_or("").get(..200).unwrap_or(""));
                 let dst_kind = MemoryKind::infer(&dp.kind, &dp.realm,
                     std::str::from_utf8(&dp.content).unwrap_or("").get(..200).unwrap_or(""));
+
+                // Phase 17: candidate citing established = laundering
+                if sp.candidate && !dp.candidate {
+                    eprintln!("[cec:p17] candidate→established edge blocked: {}→{}", src, dst);
+                    let _ = self.add_triplet(
+                        "cec:contradiction_yield".into(),
+                        "candidate_laundering_blocked".into(),
+                        format!("id={src}→{dst}"),
+                        1.0, None, None,
+                    );
+                    return Err(FieldError::NotFound(dst));
+                }
+
                 if !edge_legal(src_kind, dst_kind) {
                     eprintln!("[cec:p16] illegal edge blocked: {}({})→{}({})",
                         src_kind.label(), src, dst_kind.label(), dst);
@@ -862,7 +877,7 @@ impl ChittaField {
                         format!("{}→{} id={src}→{dst}", src_kind.label(), dst_kind.label()),
                         1.0, None, None,
                     );
-                    return Err(FieldError::NotFound(dst)); // repurposed: illegal edge
+                    return Err(FieldError::NotFound(dst));
                 }
             }
         }
@@ -1848,6 +1863,12 @@ impl ChittaField {
             eprintln!("[cec] turiya→HighUncertainty: auto-queued experiments: {result}");
         }
 
+        // Phase 17: reconcile pass — detect and log illegal edges + contradictions.
+        {
+            let reconcile_json = self.reconcile_pass();
+            eprintln!("[cec:p17] reconcile: {reconcile_json}");
+        }
+
         // Phase 16: write falsifiability metrics to triplet KG.
         {
             let now = now_ms();
@@ -2045,6 +2066,108 @@ impl ChittaField {
             )
         }).collect();
         format!(r#"{{"total":{},"rules":[{}]}}"#, items.len(), items.join(","))
+    }
+
+    /// Phase 17: Promote a candidate memory to established band once a witness arrives.
+    /// Returns JSON status.
+    pub fn witness_memory(&self, memory_id: MemoryId, witness_kind: &str) -> String {
+        let wk = WitnessKind::from_str(witness_kind);
+        let mut payloads = self.payloads.write();
+        let Some(payload) = payloads.get_mut(&memory_id) else {
+            return format!(r#"{{"ok":false,"error":"not_found","memory_id":{memory_id}}}"#);
+        };
+        if !payload.candidate {
+            return format!(r#"{{"ok":true,"status":"already_established","memory_id":{memory_id}}}"#);
+        }
+        if wk.is_none() {
+            return format!(r#"{{"ok":false,"error":"unknown_witness_kind","memory_id":{memory_id}}}"#);
+        }
+        payload.candidate = false;
+        eprintln!("[cec:p17] memory {memory_id} promoted from candidate via witness={witness_kind}");
+        let _ = self.add_triplet(
+            format!("cec:witness:{memory_id}"),
+            "promoted_by".into(),
+            witness_kind.to_string(),
+            1.0, None, None,
+        );
+        format!(r#"{{"ok":true,"status":"promoted","memory_id":{memory_id},"witness_kind":"{witness_kind}"}}"#)
+    }
+
+    /// Phase 17: Run the R0 reconcile pass — scan assoc_edges for legality violations
+    /// and detect content contradictions. Returns JSON summary.
+    pub fn reconcile_pass(&self) -> String {
+        let payloads    = self.payloads.read();
+        let assoc_edges = self.assoc_edges.read();
+        let rec = Reconciler::new();
+
+        let result = rec.reconcile_all(&payloads, &assoc_edges);
+        let contras = rec.detect_contradictions(&payloads);
+
+        let now = now_ms();
+        // Log illegal edges to triplet KG
+        for (src, dst, reason) in &result.illegal_edges {
+            let _ = self.add_triplet(
+                format!("cec:reconcile:{src}→{dst}"),
+                "illegal_reason".into(),
+                reason.clone(),
+                1.0, None, None,
+            );
+        }
+        // Log contradictions
+        for (a, b, score) in &contras {
+            let _ = self.add_triplet(
+                format!("contradiction:{a}-{b}"),
+                "conflict_score".into(),
+                format!("{score:.2}"),
+                1.0, None, None,
+            );
+        }
+        let _ = now; // suppress unused warning
+
+        format!(
+            r#"{{"illegal_edges":{},"contradictions":{},"unresolved":{},"ok":true}}"#,
+            result.illegal_edges.len(),
+            contras.len(),
+            result.unresolved.len(),
+        )
+    }
+
+    /// Phase 17: Produce a harvest scope document from current Turīya anomalies
+    /// and router miss patterns. Used by `scripts/harvest_ow.py` to target extraction.
+    pub fn harvest_scope(&self) -> String {
+        let turiya_json = self.turiya_status();
+        let turiya: serde_json::Value = serde_json::from_str(&turiya_json)
+            .unwrap_or(serde_json::Value::Null);
+        let diagnosis = turiya.get("diagnosis")
+            .and_then(|v| v.as_str()).unwrap_or("unknown");
+
+        // Top router misses from contradiction_yield triplets
+        let now = now_ms();
+        let ts_guard = self.triplet_store.read();
+        let miss_entries = ts_guard.query_predicate("illegal_edge_blocked", now);
+        let miss_count = miss_entries.len();
+
+        let sample_misses: Vec<serde_json::Value> = miss_entries.iter().take(5).map(|e| {
+            serde_json::json!({
+                "pattern": e.object,
+                "miss_count": 1,
+                "suggested_corpus": if e.object.contains("code") {
+                    "code_editing_failures"
+                } else {
+                    "session_continuity"
+                }
+            })
+        }).collect();
+
+        let scope = serde_json::json!({
+            "generated_at_ms": now,
+            "turiya_diagnosis": diagnosis,
+            "top_router_misses": sample_misses,
+            "total_router_misses": miss_count,
+            "harvest_budget_items": 500_usize.min(miss_count * 10 + 50),
+        });
+
+        scope.to_string()
     }
 
     /// Return top-k CDAWG states reachable from (tool, entity) ranked by Q-value.
