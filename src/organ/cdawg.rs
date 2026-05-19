@@ -183,6 +183,16 @@ impl CdawgOrgan {
         for ev in &tape.events {
             self.extend(ev.pack(), ev.turn_id);
         }
+        // Seed Q-values from empirical success ratio so variance is non-zero on cold start.
+        // States with no observations stay at 0.5 (maximum uncertainty prior).
+        for s in &mut self.states {
+            let total = s.succ_count + s.fail_count;
+            s.q_value = if total == 0 {
+                0.5
+            } else {
+                s.succ_count as f32 / total as f32
+            };
+        }
         self.rebuilt = true;
     }
 

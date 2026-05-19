@@ -15,6 +15,7 @@ use crate::organ::cdawg::CdawgOrgan;
 use crate::organ::event_tape::EventTape;
 use crate::organ::refutation_ledger::{RefutationLedger, RefutStatus};
 use crate::organ::hypothesis_market::HypothesisMarket;
+use crate::organ::fep_prior::FepPriorOrgan;
 
 const MAX_SAMPLES: usize = 100;
 
@@ -42,6 +43,10 @@ pub struct HealthSample {
     pub delta_events:      i64,
     /// Rules promoted since previous sample.
     pub delta_rules:       i64,
+    /// FEP EWMA of KL(q||prior_z). Rising trend → world-model drifting.
+    pub fep_drift:         f32,
+    /// FEP EWMA of emission shock events. High → known contexts, novel outcomes.
+    pub fep_shock:         f32,
 }
 
 /// High-level diagnosis derived from a HealthSample.
@@ -58,6 +63,12 @@ pub enum Diagnosis {
     /// Mean probe_value > 0.65 → most hypotheses are maximally uncertain.
     /// Experimentation (Phase 14) should be triggered.
     HighUncertainty,
+    /// FEP EWMA drift > 0.5 → generative model predictions are degrading
+    /// even though Q-values look stable. World-model going silently stale.
+    FepContextDrift,
+    /// FEP emission shock EWMA > 0.3 → known contexts producing novel outcomes.
+    /// Learned rules are being violated in practice.
+    FepEmissionShock,
 }
 
 impl HealthSample {
@@ -77,6 +88,12 @@ impl HealthSample {
         if self.mean_probe_value > 0.65 && self.hypotheses >= 5 {
             return Diagnosis::HighUncertainty;
         }
+        if self.fep_drift > 0.5 {
+            return Diagnosis::FepContextDrift;
+        }
+        if self.fep_shock > 0.3 {
+            return Diagnosis::FepEmissionShock;
+        }
         Diagnosis::Healthy
     }
 
@@ -87,6 +104,8 @@ impl HealthSample {
             Diagnosis::QCollapse        => "q_collapse",
             Diagnosis::RefutationFlood  => "refutation_flood",
             Diagnosis::HighUncertainty  => "high_uncertainty",
+            Diagnosis::FepContextDrift  => "fep_context_drift",
+            Diagnosis::FepEmissionShock => "fep_emission_shock",
         }
     }
 }
@@ -116,6 +135,7 @@ impl TuriyaMonitor {
         tape:    &EventTape,
         ledger:  &RefutationLedger,
         market:  &HypothesisMarket,
+        fep:     &FepPriorOrgan,
     ) {
         let cdawg_states = cdawg.state_count();
         let tape_events  = tape.events.len();
@@ -166,6 +186,8 @@ impl TuriyaMonitor {
             delta_states,
             delta_events,
             delta_rules,
+            fep_drift:  fep.ewma_drift,
+            fep_shock:  fep.ewma_shock,
         };
 
         self.samples.push_back(s);
@@ -206,7 +228,7 @@ impl TuriyaMonitor {
             .collect();
 
         format!(
-            r#"{{"status":"ok","diagnosis":"{diagnosis}","trend":"{trend}","samples":{samples},"latest":{{"ts_ms":{ts},"cdawg_states":{cs},"tape_events":{te},"tracked_rules":{tr},"refuted_rules":{rr},"hypotheses":{hy},"mean_probe_value":{mpv:.4},"q_variance":{qv:.6},"delta_states":{ds},"delta_events":{de}}},"recent_diagnoses":{rd_json}}}"#,
+            r#"{{"status":"ok","diagnosis":"{diagnosis}","trend":"{trend}","samples":{samples},"latest":{{"ts_ms":{ts},"cdawg_states":{cs},"tape_events":{te},"tracked_rules":{tr},"refuted_rules":{rr},"hypotheses":{hy},"mean_probe_value":{mpv:.4},"q_variance":{qv:.6},"delta_states":{ds},"delta_events":{de},"fep_drift":{fd:.4},"fep_shock":{fs:.4}}},"recent_diagnoses":{rd_json}}}"#,
             samples   = self.sample_count,
             ts        = latest.ts_ms,
             cs        = latest.cdawg_states,
@@ -218,6 +240,8 @@ impl TuriyaMonitor {
             qv        = latest.q_variance,
             ds        = latest.delta_states,
             de        = latest.delta_events,
+            fd        = latest.fep_drift,
+            fs        = latest.fep_shock,
             rd_json   = format_str_array(&recent_streak),
         )
     }
