@@ -38,3 +38,4 @@ pub mod refutation_ledger;
 pub mod intervention_store;
 pub mod decision_tape;
 pub mod hypothesis_market;
+pub mod turiya_monitor;

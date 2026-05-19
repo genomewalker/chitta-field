@@ -1779,7 +1779,22 @@ impl ChittaField {
             let _ = self.add_triplet(key,         "tape_range".into(),  range,   1.0, None, None);
             promoted += 1;
         }
+        // Phase 11: take a Turīya health sample after each consolidation_pass.
+        {
+            let ts = now_ms();
+            let cdawg   = self.cdawg.read();
+            let tape    = self.event_tape.read();
+            let ledger  = self.refutation_ledger.read();
+            let market  = self.hypothesis_market.read();
+            self.turiya_monitor.write().sample(ts, &cdawg, &tape, &ledger, &market);
+        }
+
         Ok((total, promoted))
+    }
+
+    /// Return the current Turīya health vector as a JSON string.
+    pub fn turiya_status(&self) -> String {
+        self.turiya_monitor.read().status_json()
     }
 
     /// Return top-k CDAWG states reachable from (tool, entity) ranked by Q-value.
@@ -4486,8 +4501,9 @@ impl ChittaField {
             },
             ack_scores: self.ack_scores.read().clone(),
             correction_states: self.triplet_store.read().correction_states.clone(),
-            event_tape:    self.event_tape.read().clone(),
-            decision_tape: self.decision_tape.read().clone(),
+            event_tape:     self.event_tape.read().clone(),
+            decision_tape:  self.decision_tape.read().clone(),
+            turiya_monitor: self.turiya_monitor.read().clone(),
         };
         let path = self
             .data_dir

@@ -10,6 +10,7 @@ use crate::organ::symbol::SymbolIndex;
 use crate::organ::temporal::TemporalIndex;
 use crate::organ::event_tape::EventTape;
 use crate::organ::decision_tape::DecisionTape;
+use crate::organ::turiya_monitor::TuriyaMonitor;
 use crate::organ::triplet::{CorrectionState, TripletStore};
 use crate::payload::MemoryPayload;
 use crate::state::{EpistemicStatus, MemoryState, MemoryStatus, RetrievalHistory};
@@ -47,8 +48,10 @@ const FULL_SNAPSHOT_MAGIC_V12: u64 = 0xF011_5741_7E00_000C;
 const FULL_SNAPSHOT_MAGIC_V13: u64 = 0xF011_5741_7E00_000D;
 /// V14: FullSnapshot gains `event_tape: EventTape` (CEC Phase 1).
 const FULL_SNAPSHOT_MAGIC_V14: u64 = 0xF011_5741_7E00_000E;
-/// Current magic (v5.34+): FullSnapshot gains `decision_tape: DecisionTape` (CEC Phase 10).
-const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_000F;
+/// V15: FullSnapshot gains `decision_tape: DecisionTape` (CEC Phase 10).
+const FULL_SNAPSHOT_MAGIC_V15: u64 = 0xF011_5741_7E00_000F;
+/// Current magic (v5.35+): FullSnapshot gains `turiya_monitor: TuriyaMonitor` (CEC Phase 11).
+const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_0010;
 
 /// Magic for the payload content sidecar (.pld).
 const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
@@ -615,6 +618,32 @@ pub struct FullSnapshot {
     pub event_tape: EventTape,
     /// CEC Phase 10: branch-point memory — chosen actions and rejected alternatives.
     pub decision_tape: DecisionTape,
+    /// CEC Phase 11: Turīya Monitor — rolling health samples across CEC organs.
+    pub turiya_monitor: TuriyaMonitor,
+}
+
+/// V15 snapshot layout — FullSnapshot without turiya_monitor.
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV15 {
+    pub snapshot_seqno: u64,
+    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub states: HashMap<MemoryId, MemoryState>,
+    pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts: HashMap<String, ArtifactId>,
+    pub artifact_paths: HashMap<ArtifactId, String>,
+    pub time_idx: TemporalIndex,
+    pub keyword_idx: KeywordIndex,
+    pub artifact_idx: ArtifactIndex,
+    pub triplet_store: TripletStore,
+    pub symbol_idx: SymbolIndex,
+    pub call_graph: CallGraph,
+    pub code_files: CodeFileIndex,
+    pub semantic_idx: SemanticIndex,
+    pub coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats>,
+    pub ack_scores: HashMap<MemoryId, i32>,
+    pub correction_states: HashMap<u64, CorrectionState>,
+    pub event_tape: EventTape,
+    pub decision_tape: DecisionTape,
 }
 
 /// V14 snapshot layout — FullSnapshot without decision_tape.
@@ -728,6 +757,7 @@ impl FullSnapshot {
         r.read_exact(&mut buf)?;
         let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         if magic != FULL_SNAPSHOT_MAGIC
+            && magic != FULL_SNAPSHOT_MAGIC_V15
             && magic != FULL_SNAPSHOT_MAGIC_V14
             && magic != FULL_SNAPSHOT_MAGIC_V13
             && magic != FULL_SNAPSHOT_MAGIC_V12
@@ -771,6 +801,37 @@ impl FullSnapshot {
             return Ok(snap);
         }
 
+        if magic == FULL_SNAPSHOT_MAGIC_V15 {
+            // V15→V16: add empty TuriyaMonitor.
+            eprintln!("[chitta-field] migrating v15 snapshot → v16 (adding turiya_monitor)");
+            let leg: LegacyFullSnapshotV15 = bincode::deserialize_from(&mut r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            let mut snap = FullSnapshot {
+                snapshot_seqno:    leg.snapshot_seqno,
+                payloads:          leg.payloads,
+                states:            leg.states,
+                assoc_edges:       leg.assoc_edges,
+                artifacts:         leg.artifacts,
+                artifact_paths:    leg.artifact_paths,
+                time_idx:          leg.time_idx,
+                keyword_idx:       leg.keyword_idx,
+                artifact_idx:      leg.artifact_idx,
+                triplet_store:     leg.triplet_store,
+                symbol_idx:        leg.symbol_idx,
+                call_graph:        leg.call_graph,
+                code_files:        leg.code_files,
+                semantic_idx:      leg.semantic_idx,
+                coactivation_stats:leg.coactivation_stats,
+                ack_scores:        leg.ack_scores,
+                correction_states: leg.correction_states,
+                event_tape:        leg.event_tape,
+                decision_tape:     leg.decision_tape,
+                turiya_monitor:    TuriyaMonitor::new(),
+            };
+            for state in snap.states.values_mut() { state.sanitize(); }
+            return Ok(snap);
+        }
+
         if magic == FULL_SNAPSHOT_MAGIC_V14 {
             // V14→V15: add empty DecisionTape.
             eprintln!("[chitta-field] migrating v14 snapshot → v15 (adding decision_tape)");
@@ -796,6 +857,7 @@ impl FullSnapshot {
                 correction_states: leg.correction_states,
                 event_tape:        leg.event_tape,
                 decision_tape:     DecisionTape::new(),
+                turiya_monitor:    TuriyaMonitor::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -826,6 +888,7 @@ impl FullSnapshot {
                 correction_states:  leg.correction_states,
                 event_tape:         EventTape::new(),
                 decision_tape:      DecisionTape::new(),
+                turiya_monitor:     TuriyaMonitor::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -857,6 +920,7 @@ impl FullSnapshot {
                 correction_states: leg.correction_states,
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
+                turiya_monitor: TuriyaMonitor::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -899,6 +963,7 @@ impl FullSnapshot {
                 correction_states: leg.correction_states,
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
+                turiya_monitor: TuriyaMonitor::new(),
             });
         }
 
@@ -932,6 +997,7 @@ impl FullSnapshot {
                 correction_states: HashMap::new(),
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
+                turiya_monitor: TuriyaMonitor::new(),
             });
         }
 
@@ -962,6 +1028,7 @@ impl FullSnapshot {
                 correction_states: HashMap::new(),
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
+                turiya_monitor: TuriyaMonitor::new(),
             });
         }
 
@@ -992,6 +1059,7 @@ impl FullSnapshot {
                 correction_states: HashMap::new(),
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
+                turiya_monitor: TuriyaMonitor::new(),
             });
         }
 
@@ -1022,6 +1090,7 @@ impl FullSnapshot {
                 correction_states: HashMap::new(),
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
+                turiya_monitor: TuriyaMonitor::new(),
             });
         }
 
@@ -1052,6 +1121,7 @@ impl FullSnapshot {
                 correction_states: HashMap::new(),
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
+                turiya_monitor: TuriyaMonitor::new(),
             });
         }
 
@@ -1086,6 +1156,7 @@ impl FullSnapshot {
                 correction_states: HashMap::new(),
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
+                turiya_monitor: TuriyaMonitor::new(),
             });
         }
 
