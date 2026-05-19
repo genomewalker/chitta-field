@@ -116,6 +116,8 @@ impl LegacyMemoryPayloadV12 {
             source_session: self.source_session,
             source_tool: self.source_tool,
             harness,
+            provenance: "human".to_string(),
+            candidate: false,
         }
     }
 }
