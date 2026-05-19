@@ -95,6 +95,13 @@ impl RefutationLedger {
         changed
     }
 
+    pub fn refute_ratio_for_rule(&self, rule_id: u32) -> f32 {
+        self.antecedent_index.values().flatten()
+            .find(|e| e.rule_id == rule_id)
+            .map(|e| e.refute_ratio())
+            .unwrap_or(0.0)
+    }
+
     pub fn status(&self, rule_id: u32) -> RefutStatus {
         self.rule_status.get(&rule_id).cloned().unwrap_or(RefutStatus::Live)
     }

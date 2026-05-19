@@ -1433,6 +1433,23 @@ impl ChittaField {
                             format!("contradict_at_ts={ts}"),
                             1.0, None, None
                         );
+                        // Auto-file a task so the executor pathway has a concrete work item.
+                        self.task_registry.write().create(
+                            format!("cec-refuted-rule-{rule_id}"),
+                            "cec-refutation".into(),
+                            format!("{{\"rule_id\":{rule_id},\"ts\":{ts}}}"),
+                            ts, rule_id as u64,
+                        );
+                        // Propose an intervention policy in shadow mode.
+                        use crate::organ::intervention_store::InterventionKind;
+                        self.cec_policy_store.write().propose(
+                            rule_id,
+                            InterventionKind::TurnInjection {
+                                message: format!("⚠ CEC rule_{rule_id} refuted — this pattern's predictions are no longer reliable"),
+                                priority: 80,
+                            },
+                            ts,
+                        );
                     }
                 }
             }
@@ -1817,6 +1834,24 @@ impl ChittaField {
         let ledger = self.refutation_ledger.read();
         let tape   = self.event_tape.read();
         ledger.stats_json(&tape, k)
+    }
+
+    /// Promote eligible shadow policies, demote drifted ones, return JSON summary.
+    pub fn executor_flush(&self) -> String {
+        let ledger = self.refutation_ledger.read();
+        let mut store = self.cec_policy_store.write();
+        let promoted = store.promote_eligible();
+        let demoted  = store.auto_demote_drifted(&ledger);
+        let stats    = store.stats_json();
+        format!(
+            "{{\"promoted\":{:?},\"demoted\":{:?},\"store\":{}}}",
+            promoted, demoted, stats
+        )
+    }
+
+    /// List intervention policies as JSON.
+    pub fn list_policies(&self, active_only: bool) -> String {
+        self.cec_policy_store.read().list_json(active_only)
     }
 
     /// Keyword (BM25) recall with affective context.
