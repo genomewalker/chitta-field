@@ -1084,6 +1084,29 @@ pub extern "C" fn cf_fep_status(h: *const CfHandle) -> *mut c_char {
     }
 }
 
+/// Phase 16: CPU-native routed recall. Accepts a JSON RecallRequest, dispatches
+/// to the cheapest lane (exact/fuzzy/temporal/causal/hybrid), returns JSON hits.
+/// Caller must free with cf_free_string().
+#[no_mangle]
+pub extern "C" fn cf_routed_recall(
+    h: *const CfHandle,
+    request_json: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || request_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let req_str = unsafe { std::ffi::CStr::from_ptr(request_json) }.to_string_lossy();
+    let req: crate::organ::query_router::RecallRequest =
+        match serde_json::from_str(&req_str) {
+            Ok(r) => r,
+            Err(e) => {
+                let s = format!(r#"{{"error":"bad request: {}"}}"#, e);
+                return CString::new(s).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut());
+            }
+        };
+    let result = handle.field.routed_recall(req);
+    CString::new(result).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
 // ── Triplet operations ────────────────────────────────────────────────────────
 
 /// Add a triplet fact. Returns triplet_id via out_triplet_id.
