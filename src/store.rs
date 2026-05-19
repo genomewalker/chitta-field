@@ -467,6 +467,13 @@ impl ChittaField {
         self.keyword_idx.write().index(memory_id, &index_text);
         self.hdc_idx.write().insert(memory_id, &content_str, realm);
 
+        // Log structured event to CEC tape and extend CDAWG.
+        {
+            let sym = self.event_tape.write().log("remember", realm, 0, 0, authored_at_ms);
+            let turn = self.event_tape.read().events.len() as u32 - 1;
+            self.cdawg.write().extend(sym, turn);
+        }
+
         // Update temporal index.
         {
             use crate::organ::temporal::TemporalEntry;
@@ -1362,6 +1369,123 @@ impl ChittaField {
         }
         hits.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         hits.truncate(k);
+        Ok(hits)
+    }
+
+    /// Log a structured action event to the CEC tape and extend the CDAWG.
+    /// `outcome`: 0=success 1=fail 2=error 3=partial.
+    pub fn log_event(&self, tool: &str, entity: &str, outcome: u8, session_id: u64, ts_ms: i64) {
+        let sym = self.event_tape.write().log(tool, entity, outcome, session_id, ts_ms);
+        let turn = self.event_tape.read().events.len() as u32 - 1;
+        self.cdawg.write().extend(sym, turn);
+    }
+
+    /// Record an outcome (success/failure) for the most recent action on (tool, entity).
+    pub fn record_action_outcome(&self, tool: &str, entity: &str, outcome: u8, success: bool) {
+        let sym = self.event_tape.write().symbol_of(tool, entity, outcome);
+        self.cdawg.write().record_outcome(&[sym], success);
+    }
+
+    /// Causal recall: return the last N events matching (tool, entity) as RecallHit stubs.
+    /// Content field contains a human-readable description of the event sequence.
+    pub fn recall_causal(&self, tool: &str, entity: &str, k: usize) -> Result<Vec<RecallHit>> {
+        let sym = {
+            let mut tape = self.event_tape.write();
+            tape.symbol_of(tool, entity, 0) // outcome=0 as probe; CDAWG walk ignores outcome bits via partial match
+        };
+        let cdawg = self.cdawg.read();
+        let tape  = self.event_tape.read();
+
+        // Try exact match first, then fall back to tool-only by zeroing entity_key bits.
+        let turns = if let Some(state) = cdawg.walk(&[sym]) {
+            cdawg.collect_endpos(state)
+        } else {
+            Vec::new()
+        };
+
+        let mut hits: Vec<RecallHit> = turns.iter().rev().take(k).filter_map(|&t| {
+            let ev = tape.events.get(t as usize)?;
+            let tool_name   = tape.tool_name(ev.tool_id);
+            let entity_name = tape.entity_name(ev.entity_key);
+            let outcome_str = match ev.outcome_class {
+                0 => "success", 1 => "fail", 2 => "error", _ => "partial"
+            };
+            let content = format!(
+                "[turn {}] {} on {} → {} (ts: {})",
+                t, tool_name, entity_name, outcome_str, ev.ts_ms
+            );
+            Some(RecallHit {
+                memory_id:          0,
+                score:              1.0 - (t as f32 / (tape.events.len() as f32 + 1.0)),
+                semantic_score:     0.0,
+                ts_ms:              ev.ts_ms,
+                kind:               "event".to_string(),
+                realm:              "cec".to_string(),
+                strength:           1.0,
+                confidence:         1.0,
+                access_count:       0,
+                content,
+                semantic_weight:    0.0,
+                status_mul:         1.0,
+                epistemic_mul:      1.0,
+                strength_factor:    1.0,
+                affect_valence:     0.0,
+                affect_arousal:     0.0,
+                actr_activation:    0.0,
+                surprise_boost:     0.0,
+                arousal_boost:      0.0,
+                mood_congruence:    1.0,
+                frustration_boost:  0.0,
+                interference_factor:1.0,
+                spacing_boost:      1.0,
+            })
+        }).collect();
+
+        hits.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+        Ok(hits)
+    }
+
+    /// Return top-k failure patterns from the CDAWG as RecallHit stubs.
+    pub fn recall_failure_pattern(&self, k: usize) -> Result<Vec<RecallHit>> {
+        let cdawg = self.cdawg.read();
+        let tape  = self.event_tape.read();
+        let patterns = cdawg.failure_patterns(3, k);
+        let hits = patterns.into_iter().filter_map(|(state_id, fail_count, ratio)| {
+            let turns = cdawg.collect_endpos(state_id);
+            let last_ts = turns.iter()
+                .filter_map(|&t| tape.events.get(t as usize).map(|e| e.ts_ms))
+                .max()
+                .unwrap_or(0);
+            let content = format!(
+                "[failure-pattern state={}] fail_count={} fail_ratio={:.2} last_seen_turn={}",
+                state_id, fail_count, ratio, turns.iter().max().copied().unwrap_or(0)
+            );
+            Some(RecallHit {
+                memory_id:          state_id as u64,
+                score:              ratio * fail_count as f32,
+                semantic_score:     0.0,
+                ts_ms:              last_ts,
+                kind:               "failure-pattern".to_string(),
+                realm:              "cec".to_string(),
+                strength:           ratio,
+                confidence:         ratio,
+                access_count:       fail_count,
+                content,
+                semantic_weight:    0.0,
+                status_mul:         1.0,
+                epistemic_mul:      1.0,
+                strength_factor:    1.0,
+                affect_valence:    -ratio,
+                affect_arousal:     ratio,
+                actr_activation:    0.0,
+                surprise_boost:     0.0,
+                arousal_boost:      0.0,
+                mood_congruence:    1.0 - ratio,
+                frustration_boost:  ratio,
+                interference_factor:1.0,
+                spacing_boost:      1.0,
+            })
+        }).collect();
         Ok(hits)
     }
 
@@ -3890,6 +4014,7 @@ impl ChittaField {
             },
             ack_scores: self.ack_scores.read().clone(),
             correction_states: self.triplet_store.read().correction_states.clone(),
+            event_tape: self.event_tape.read().clone(),
         };
         let path = self
             .data_dir

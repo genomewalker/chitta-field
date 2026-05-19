@@ -8,6 +8,7 @@ use crate::organ::codefile::CodeFileIndex;
 use crate::organ::keyword::KeywordIndex;
 use crate::organ::symbol::SymbolIndex;
 use crate::organ::temporal::TemporalIndex;
+use crate::organ::event_tape::EventTape;
 use crate::organ::triplet::{CorrectionState, TripletStore};
 use crate::payload::MemoryPayload;
 use crate::state::{EpistemicStatus, MemoryState, MemoryStatus, RetrievalHistory};
@@ -41,9 +42,10 @@ const FULL_SNAPSHOT_MAGIC_V10: u64 = 0xF011_5741_7E00_000A;
 const FULL_SNAPSHOT_MAGIC_V11: u64 = 0xF011_5741_7E00_000B;
 /// V12: MemoryState gains `staged` + `invalidated_by`. MemoryPayload unchanged.
 const FULL_SNAPSHOT_MAGIC_V12: u64 = 0xF011_5741_7E00_000C;
-/// Current magic (v1.0.13+): MemoryPayload gains `harness: Option<String>`.
-/// `staged: bool` + `invalidated_by: Option<String>` (Phase 5, write-gate).
-const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_000D;
+/// V13: MemoryPayload gains `harness: Option<String>`.
+const FULL_SNAPSHOT_MAGIC_V13: u64 = 0xF011_5741_7E00_000D;
+/// Current magic (v1.0.14+): FullSnapshot gains `event_tape: EventTape` (CEC Phase 1).
+const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_000E;
 
 /// Magic for the payload content sidecar (.pld).
 const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
@@ -606,6 +608,31 @@ pub struct FullSnapshot {
     pub ack_scores: HashMap<MemoryId, i32>,
     /// Persistent correction lifecycle states keyed by triplet id.
     pub correction_states: HashMap<u64, CorrectionState>,
+    /// CEC Phase 1: append-only structured event tape for CDAWG reconstruction.
+    #[serde(default)]
+    pub event_tape: EventTape,
+}
+
+/// V13 snapshot layout — FullSnapshot without event_tape.
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV13 {
+    pub snapshot_seqno: u64,
+    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub states: HashMap<MemoryId, MemoryState>,
+    pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts: HashMap<String, ArtifactId>,
+    pub artifact_paths: HashMap<ArtifactId, String>,
+    pub time_idx: TemporalIndex,
+    pub keyword_idx: KeywordIndex,
+    pub artifact_idx: ArtifactIndex,
+    pub triplet_store: TripletStore,
+    pub symbol_idx: SymbolIndex,
+    pub call_graph: CallGraph,
+    pub code_files: CodeFileIndex,
+    pub semantic_idx: SemanticIndex,
+    pub coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats>,
+    pub ack_scores: HashMap<MemoryId, i32>,
+    pub correction_states: HashMap<u64, CorrectionState>,
 }
 
 impl FullSnapshot {
@@ -674,6 +701,7 @@ impl FullSnapshot {
         r.read_exact(&mut buf)?;
         let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         if magic != FULL_SNAPSHOT_MAGIC
+            && magic != FULL_SNAPSHOT_MAGIC_V13
             && magic != FULL_SNAPSHOT_MAGIC_V12
             && magic != FULL_SNAPSHOT_MAGIC_V11
             && magic != FULL_SNAPSHOT_MAGIC_V10
@@ -708,10 +736,38 @@ impl FullSnapshot {
         let magic = u64::from_le_bytes(magic_buf);
 
         if magic == FULL_SNAPSHOT_MAGIC {
-            // v13: MemoryPayload gains harness.
-            let r = &mut r;
-            let mut snap: Self = bincode::deserialize_from(r)
+            // v14: EventTape added. Uses #[serde(default)] so forward-compatible.
+            let mut snap: Self = bincode::deserialize_from(&mut r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            for state in snap.states.values_mut() { state.sanitize(); }
+            return Ok(snap);
+        }
+
+        if magic == FULL_SNAPSHOT_MAGIC_V13 {
+            // v13→v14: add empty EventTape.
+            eprintln!("[chitta-field] migrating v13 snapshot → v14 (adding event_tape)");
+            let leg: LegacyFullSnapshotV13 = bincode::deserialize_from(&mut r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            let mut snap = FullSnapshot {
+                snapshot_seqno:     leg.snapshot_seqno,
+                payloads:           leg.payloads,
+                states:             leg.states,
+                assoc_edges:        leg.assoc_edges,
+                artifacts:          leg.artifacts,
+                artifact_paths:     leg.artifact_paths,
+                time_idx:           leg.time_idx,
+                keyword_idx:        leg.keyword_idx,
+                artifact_idx:       leg.artifact_idx,
+                triplet_store:      leg.triplet_store,
+                symbol_idx:         leg.symbol_idx,
+                call_graph:         leg.call_graph,
+                code_files:         leg.code_files,
+                semantic_idx:       leg.semantic_idx,
+                coactivation_stats: leg.coactivation_stats,
+                ack_scores:         leg.ack_scores,
+                correction_states:  leg.correction_states,
+                event_tape:         EventTape::new(),
+            };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
         }
@@ -740,6 +796,7 @@ impl FullSnapshot {
                 coactivation_stats: leg.coactivation_stats,
                 ack_scores: leg.ack_scores,
                 correction_states: leg.correction_states,
+                event_tape: EventTape::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -780,6 +837,7 @@ impl FullSnapshot {
                 coactivation_stats: leg.coactivation_stats,
                 ack_scores: leg.ack_scores,
                 correction_states: leg.correction_states,
+                event_tape: EventTape::new(),
             });
         }
 
@@ -811,6 +869,7 @@ impl FullSnapshot {
                 coactivation_stats: v8.coactivation_stats,
                 ack_scores: HashMap::new(),
                 correction_states: HashMap::new(),
+                event_tape: EventTape::new(),
             });
         }
 
@@ -839,6 +898,7 @@ impl FullSnapshot {
                 coactivation_stats: v7.coactivation_stats,
                 ack_scores: HashMap::new(),
                 correction_states: HashMap::new(),
+                event_tape: EventTape::new(),
             });
         }
 
@@ -867,6 +927,7 @@ impl FullSnapshot {
                 coactivation_stats: v6.coactivation_stats,
                 ack_scores: HashMap::new(),
                 correction_states: HashMap::new(),
+                event_tape: EventTape::new(),
             });
         }
 
@@ -895,6 +956,7 @@ impl FullSnapshot {
                 coactivation_stats: v5.coactivation_stats,
                 ack_scores: HashMap::new(),
                 correction_states: HashMap::new(),
+                event_tape: EventTape::new(),
             });
         }
 
@@ -923,6 +985,7 @@ impl FullSnapshot {
                 coactivation_stats: HashMap::new(),
                 ack_scores: HashMap::new(),
                 correction_states: HashMap::new(),
+                event_tape: EventTape::new(),
             });
         }
 
@@ -955,6 +1018,7 @@ impl FullSnapshot {
                 coactivation_stats: HashMap::new(),
                 ack_scores: HashMap::new(),
                 correction_states: HashMap::new(),
+                event_tape: EventTape::new(),
             });
         }
 

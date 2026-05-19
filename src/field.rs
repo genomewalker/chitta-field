@@ -197,7 +197,9 @@ pub struct ChittaField {
     /// Soul REPL session namespaces — persisted to repl_sessions.json (not in snapshot).
     pub(crate) repl_sessions: RwLock<crate::repl_sessions::ReplSessionStore>,
     /// Hyperdimensional Computing index — O(n) Hamming recall, no floats.
-    pub(crate) hdc_idx: RwLock<crate::hdc::HdcStore>,
+    pub(crate) hdc_idx:    RwLock<crate::hdc::HdcStore>,
+    pub(crate) event_tape: RwLock<crate::organ::event_tape::EventTape>,
+    pub(crate) cdawg:      RwLock<crate::organ::cdawg::CdawgOrgan>,
 }
 
 impl Drop for ChittaField {
@@ -660,6 +662,28 @@ impl ChittaField {
             hdc_store.rebuild(entries);
         }
 
+        // Build EventTape from snapshot, seed entity interner from triplets, synthesize
+        // legacy events for existing memories, then rebuild CDAWG from the tape.
+        let mut event_tape = crate::organ::event_tape::EventTape::new();
+        // (event_tape will be overwritten by snap.event_tape during snapshot load above)
+        // Seed entity interner from triplet subjects/objects.
+        {
+            let subjects: Vec<String> = triplet_store.all_subjects();
+            event_tape.seed_from_triplets(subjects.iter().map(|s| s.as_str()));
+        }
+        // Synthesize legacy events for existing memories so CDAWG has a warm start.
+        {
+            let mut sorted_payloads: Vec<_> = payloads.iter()
+                .filter(|(id, _)| states.get(id).map(|s| !s.deleted).unwrap_or(false))
+                .collect();
+            sorted_payloads.sort_by_key(|(_, p)| p.authored_at_ms);
+            for (_, p) in sorted_payloads {
+                event_tape.synthesize_legacy(&p.realm, p.authored_at_ms);
+            }
+        }
+        let mut cdawg = crate::organ::cdawg::CdawgOrgan::new();
+        cdawg.rebuild_from_tape(&event_tape);
+
         Ok(Self {
             data_dir,
             instance_id,
@@ -742,7 +766,9 @@ impl ChittaField {
             hopfield: RwLock::new(HopfieldNetwork::new()),
             filter_level: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             scoring_pipeline: RwLock::new(crate::scoring::ScoringPipeline::new(scoring_config)),
-            hdc_idx: RwLock::new(hdc_store),
+            hdc_idx:    RwLock::new(hdc_store),
+            event_tape: RwLock::new(event_tape),
+            cdawg:      RwLock::new(cdawg),
         })
     }
 }

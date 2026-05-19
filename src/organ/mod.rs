@@ -1,5 +1,7 @@
 pub mod analytics;
 pub mod artifact;
+pub mod cdawg;
+pub mod event_tape;
 pub mod callgraph;
 pub mod codefile;
 pub mod cortex;
