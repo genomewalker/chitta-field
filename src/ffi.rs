@@ -882,6 +882,18 @@ pub extern "C" fn cf_consolidation_pass(h: *mut CfHandle) -> *mut c_char {
     }
 }
 
+/// Return top-k refuted/live Sequitur rules as a plain-text stats string.
+#[no_mangle]
+pub extern "C" fn cf_refutation_stats(h: *mut CfHandle, k: usize) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let s = handle.field.refutation_stats(if k == 0 { 10 } else { k });
+    match CString::new(s) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // ── Triplet operations ────────────────────────────────────────────────────────
 
 /// Add a triplet fact. Returns triplet_id via out_triplet_id.

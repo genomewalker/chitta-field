@@ -200,7 +200,8 @@ pub struct ChittaField {
     pub(crate) hdc_idx:    RwLock<crate::hdc::HdcStore>,
     pub(crate) event_tape:   RwLock<crate::organ::event_tape::EventTape>,
     pub(crate) cdawg:        RwLock<crate::organ::cdawg::CdawgOrgan>,
-    pub(crate) episode_hdc:  RwLock<crate::hdc::EpisodeHdcStore>,
+    pub(crate) episode_hdc:        RwLock<crate::hdc::EpisodeHdcStore>,
+    pub(crate) refutation_ledger:  RwLock<crate::organ::refutation_ledger::RefutationLedger>,
 }
 
 impl Drop for ChittaField {
@@ -686,6 +687,7 @@ impl ChittaField {
         cdawg.rebuild_from_tape(&event_tape);
         let mut episode_hdc = crate::hdc::EpisodeHdcStore::new();
         episode_hdc.rebuild(&event_tape);
+        let refutation_ledger = crate::organ::refutation_ledger::RefutationLedger::new();
 
         Ok(Self {
             data_dir,
@@ -772,7 +774,8 @@ impl ChittaField {
             hdc_idx:    RwLock::new(hdc_store),
             event_tape:   RwLock::new(event_tape),
             cdawg:        RwLock::new(cdawg),
-            episode_hdc:  RwLock::new(episode_hdc),
+            episode_hdc:        RwLock::new(episode_hdc),
+            refutation_ledger:  RwLock::new(refutation_ledger),
         })
     }
 }

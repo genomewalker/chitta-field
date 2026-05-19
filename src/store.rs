@@ -1414,6 +1414,26 @@ impl ChittaField {
         }
         drop(cdawg);
         self.episode_hdc.write().log_episode(tool, entity, outcome);
+        // Refutation ledger: observe the (prev, curr) bigram
+        if turn > 0 {
+            let tape = self.event_tape.read();
+            if let (Some(prev_ev), Some(curr_ev)) = (tape.events.get(turn as usize - 1), tape.events.get(turn as usize)) {
+                let prev_sym = prev_ev.pack();
+                let curr_sym = curr_ev.pack();
+                let ts = curr_ev.ts_ms;
+                drop(tape);
+                let changed = self.refutation_ledger.write().observe(prev_sym, curr_sym, ts);
+                for (rule_id, status) in changed {
+                    if let crate::organ::refutation_ledger::RefutStatus::Refuted(_) = status {
+                        let _ = self.add_triplet(
+                            format!("rule_{rule_id}"), "refuted_by".into(),
+                            format!("contradict_at_ts={ts}"),
+                            1.0, None, None
+                        );
+                    }
+                }
+            }
+        }
         // Auto-consolidate every 500 events
         if (turn + 1) % 500 == 0 {
             let _ = self.consolidation_pass();
@@ -1709,17 +1729,21 @@ impl ChittaField {
         use crate::organ::sequitur::run_sequitur;
         const MIN_SUPPORT: u32 = 5;
 
-        let rule_data: Vec<(String, String, String, String, String)> = {
+        let (rule_data, rules_for_ledger): (Vec<(String, String, String, String, String)>, Vec<crate::organ::sequitur::SequiturRule>) = {
             let tape = self.event_tape.read();
             let rules = run_sequitur(&tape, MIN_SUPPORT);
-            rules.iter().map(|r| (
+            let data = rules.iter().map(|r| (
                 r.rule_key(&tape),
                 r.seq_repr(&tape),
                 r.avg_outcome_label().to_string(),
                 r.support.to_string(),
                 format!("{}:{}", r.tape_start, r.tape_end),
-            )).collect()
+            )).collect();
+            (data, rules)
         };
+
+        // Seed refutation ledger with current rule set
+        self.refutation_ledger.write().seed_from_rules(&rules_for_ledger);
 
         let total = rule_data.len();
         let mut promoted = 0usize;
@@ -1734,6 +1758,13 @@ impl ChittaField {
             promoted += 1;
         }
         Ok((total, promoted))
+    }
+
+    /// Return top-k rules by refute_ratio as a plain-text summary.
+    pub fn refutation_stats(&self, k: usize) -> String {
+        let ledger = self.refutation_ledger.read();
+        let tape   = self.event_tape.read();
+        ledger.stats_json(&tape, k)
     }
 
     /// Keyword (BM25) recall with affective context.
