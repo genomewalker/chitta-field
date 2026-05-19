@@ -15,6 +15,7 @@ pub struct SequiturRule {
     pub avg_outcome: f32,  // 0.0=all-success .. 1.0=all-fail
     pub tape_start:  u32,  // turn index of first occurrence
     pub tape_end:    u32,  // turn index of last occurrence
+    pub contradict_count: u32,  // times sym_a appeared but NOT followed by sym_b
 }
 
 impl SequiturRule {
@@ -92,6 +93,7 @@ pub fn run_sequitur(tape: &EventTape, min_support: u32) -> Vec<SequiturRule> {
             avg_outcome,
             tape_start,
             tape_end,
+            contradict_count: 0,
         });
         next_id += 1;
     }
