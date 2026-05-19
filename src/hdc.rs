@@ -316,6 +316,185 @@ impl HdcStore {
     }
 }
 
+// ── Episode HDC Binder ────────────────────────────────────────────────────────
+//
+// Heteroassociative memory over CEC events. Each event is encoded as:
+//   E = bind(R_tool, t_hv) XOR bind(R_entity, e_hv) XOR bind(R_outcome, o_hv)
+//
+// Role vectors are deterministic (hash-derived). Episodes are accumulated into
+// per-role-value bundles. Query: given known_role=known_val, retrieve top-k
+// candidates for query_role via XOR-unbind + codebook cleanup.
+//
+// EpisodeHdcStore is ephemeral — rebuilt from EventTape at startup, not serialized.
+
+#[inline] fn role_tool()    -> HdcVec { word_hv("ROLE:TOOL") }
+#[inline] fn role_entity()  -> HdcVec { word_hv("ROLE:ENTITY") }
+#[inline] fn role_outcome() -> HdcVec { word_hv("ROLE:OUTCOME") }
+
+#[inline]
+pub fn outcome_class_name(c: u8) -> &'static str {
+    match c { 0 => "success", 1 => "fail", 2 => "error", _ => "partial" }
+}
+
+fn encode_episode_hv(tool_name: &str, entity_name: &str, outcome: u8) -> HdcVec {
+    let bt = bind(&role_tool(),    &word_hv(tool_name));
+    let be = bind(&role_entity(),  &encode(entity_name));
+    let bo = bind(&role_outcome(), &word_hv(outcome_class_name(outcome)));
+    let mut out = bt;
+    for i in 0..D { out[i] ^= be[i] ^ bo[i]; }
+    out
+}
+
+/// Bit-count accumulator for a set of episode hypervectors.
+/// Identical to RealmBundle but independent so EpisodeHdcStore has no snapshot dependency.
+#[derive(Default, Clone)]
+struct EpBundle {
+    counts: Vec<u16>,
+    n: u32,
+}
+
+impl EpBundle {
+    fn add(&mut self, hv: &HdcVec) {
+        if self.counts.is_empty() { self.counts = vec![0u16; D * 64]; }
+        for (wi, &w) in hv.iter().enumerate() {
+            for bit in 0u32..64 {
+                if (w >> bit) & 1 == 1 {
+                    self.counts[wi * 64 + bit as usize] =
+                        self.counts[wi * 64 + bit as usize].saturating_add(1);
+                }
+            }
+        }
+        self.n += 1;
+    }
+
+    fn to_hv(&self) -> HdcVec {
+        if self.n == 0 { return [0u64; D]; }
+        let threshold = self.n / 2 + 1;
+        let mut out = [0u64; D];
+        for wi in 0..D {
+            for bit in 0u32..64 {
+                if self.counts[wi * 64 + bit as usize] as u32 >= threshold {
+                    out[wi] |= 1u64 << bit;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Episode-level HDC heteroassociative index.
+/// Not serialized: rebuilt from EventTape at startup via `rebuild()`.
+#[derive(Default)]
+pub struct EpisodeHdcStore {
+    /// Episodes grouped by tool name
+    by_tool:    std::collections::HashMap<String, EpBundle>,
+    /// Episodes grouped by entity name (canonical)
+    by_entity:  std::collections::HashMap<String, EpBundle>,
+    /// Episodes grouped by outcome class name ("success"/"fail"/"error"/"partial")
+    by_outcome: std::collections::HashMap<String, EpBundle>,
+    /// All observed tool names (for codebook cleanup)
+    tools:    std::collections::HashSet<String>,
+    /// All observed entity names
+    entities: std::collections::HashSet<String>,
+}
+
+impl EpisodeHdcStore {
+    pub fn new() -> Self { Self::default() }
+
+    /// Encode one episode and add it to the per-role-value bundles.
+    pub fn log_episode(&mut self, tool_name: &str, entity_name: &str, outcome: u8) {
+        let ep = encode_episode_hv(tool_name, entity_name, outcome);
+        self.by_tool.entry(tool_name.to_string()).or_default().add(&ep);
+        self.by_entity.entry(entity_name.to_string()).or_default().add(&ep);
+        let oname = outcome_class_name(outcome);
+        self.by_outcome.entry(oname.to_string()).or_default().add(&ep);
+        self.tools.insert(tool_name.to_string());
+        self.entities.insert(entity_name.to_string());
+    }
+
+    /// Rebuild from all events in the tape.
+    pub fn rebuild(&mut self, tape: &super::organ::event_tape::EventTape) {
+        *self = Self::new();
+        for ev in &tape.events {
+            let tn = tape.tool_name(ev.tool_id);
+            let en = tape.entity_name(ev.entity_key);
+            self.log_episode(tn, en, ev.outcome_class);
+        }
+    }
+
+    /// Heteroassociative query: given `known_role = known_val`, return top-k
+    /// candidates for `query_role` ranked by Hamming similarity after XOR-unbind.
+    ///
+    /// known_role / query_role: "tool" | "entity" | "outcome"
+    pub fn recall_hdcbind(
+        &self,
+        known_role: &str,
+        known_val: &str,
+        query_role: &str,
+        k: usize,
+    ) -> Vec<(String, f32)> {
+        // 1. Get aggregate episode bundle for known value
+        let bundle_hv = match known_role {
+            "tool"    => self.by_tool.get(known_val).map(|b| b.to_hv()),
+            "entity"  => self.by_entity.get(known_val).map(|b| b.to_hv()),
+            "outcome" => self.by_outcome.get(known_val).map(|b| b.to_hv()),
+            _ => return vec![],
+        };
+        let bundle_hv = match bundle_hv {
+            Some(hv) => hv,
+            None => return vec![],
+        };
+
+        // 2. known_binding = bind(R_known, val_hv(known_val))
+        let r_known = Self::role_hv(known_role);
+        let val_hv  = Self::val_hv(known_role, known_val);
+        let known_binding = bind(&r_known, &val_hv);
+
+        // 3. Unbind: probe = bundle XOR known_binding
+        let probe = bind(&bundle_hv, &known_binding);
+
+        // 4. Project: probe2 = probe XOR R_query  →  ≈ val_hv(query answer)
+        let r_query = Self::role_hv(query_role);
+        let projected = bind(&probe, &r_query);
+
+        // 5. Compare against codebook for query_role
+        let mut scores: Vec<(String, f32)> = match query_role {
+            "tool" => self.tools.iter().map(|name| {
+                (name.clone(), similarity(&projected, &word_hv(name)))
+            }).collect(),
+            "entity" => self.entities.iter().map(|name| {
+                (name.clone(), similarity(&projected, &encode(name)))
+            }).collect(),
+            "outcome" => ["success", "fail", "error", "partial"].iter().map(|&name| {
+                (name.to_string(), similarity(&projected, &word_hv(name)))
+            }).collect(),
+            _ => return vec![],
+        };
+
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scores.truncate(k);
+        scores
+    }
+
+    fn role_hv(role: &str) -> HdcVec {
+        match role {
+            "tool"    => role_tool(),
+            "entity"  => role_entity(),
+            "outcome" => role_outcome(),
+            _ => [0u64; D],
+        }
+    }
+
+    fn val_hv(role: &str, val: &str) -> HdcVec {
+        if role == "entity" { encode(val) } else { word_hv(val) }
+    }
+
+    pub fn event_count(&self) -> usize {
+        self.by_tool.values().map(|b| b.n as usize).sum::<usize>()
+            / self.by_tool.len().max(1)
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

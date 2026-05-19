@@ -1412,6 +1412,8 @@ impl ChittaField {
             let delta = if outcome == 0 { 0.1_f32 } else { -0.2_f32 };
             cdawg.push_td_credit(&last_n, delta, 0.9);
         }
+        drop(cdawg);
+        self.episode_hdc.write().log_episode(tool, entity, outcome);
     }
 
     /// Record an outcome (success/failure) for the most recent action on (tool, entity).
@@ -1564,6 +1566,55 @@ impl ChittaField {
                     strength:            count as f32,
                     confidence:          (pmi / 10.0).clamp(0.0, 1.0),
                     access_count:        count,
+                    content,
+                    semantic_weight:     0.0,
+                    status_mul:          1.0,
+                    epistemic_mul:       1.0,
+                    strength_factor:     1.0,
+                    affect_valence:      0.0,
+                    affect_arousal:      0.0,
+                    actr_activation:     0.0,
+                    surprise_boost:      0.0,
+                    arousal_boost:       0.0,
+                    mood_congruence:     1.0,
+                    frustration_boost:   0.0,
+                    interference_factor: 1.0,
+                    spacing_boost:       1.0,
+                }
+            })
+            .collect();
+        Ok(hits)
+    }
+
+    /// Heteroassociative HDC recall: given a known role/value, infer the unknown role.
+    /// known_role: "tool" | "entity" | "outcome"
+    /// query_role: "tool" | "entity" | "outcome"
+    pub fn recall_hdcbind(
+        &self,
+        known_role: &str,
+        known_val: &str,
+        query_role: &str,
+        k: usize,
+    ) -> Result<Vec<RecallHit>> {
+        let results = self.episode_hdc.read().recall_hdcbind(known_role, known_val, query_role, k);
+        let hits = results
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, sim))| {
+                let content = format!(
+                    "[hdcbind] given {}={} → {}={} (sim={:.3})",
+                    known_role, known_val, query_role, name, sim
+                );
+                RecallHit {
+                    memory_id:           i as u64,
+                    score:               sim,
+                    semantic_score:      0.0,
+                    ts_ms:               0,
+                    kind:                "hdcbind".to_string(),
+                    realm:               "cec".to_string(),
+                    strength:            sim,
+                    confidence:          sim,
+                    access_count:        0,
                     content,
                     semantic_weight:     0.0,
                     status_mul:          1.0,

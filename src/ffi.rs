@@ -782,6 +782,46 @@ pub extern "C" fn cf_recall_causal_antecedent(
     }
 }
 
+#[no_mangle]
+pub extern "C" fn cf_recall_hdcbind(
+    h: *mut CfHandle,
+    known_role: *const c_char,
+    known_val: *const c_char,
+    query_role: *const c_char,
+    k: usize,
+) -> *mut c_char {
+    if h.is_null() || known_role.is_null() || known_val.is_null() || query_role.is_null() {
+        return std::ptr::null_mut();
+    }
+    let handle = unsafe { &*h };
+    let kr = unsafe { match CStr::from_ptr(known_role).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let kv = unsafe { match CStr::from_ptr(known_val).to_str()  { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let qr = unsafe { match CStr::from_ptr(query_role).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    match handle.field.recall_hdcbind(kr, kv, qr, k) {
+        Ok(hits) => {
+            let arr: Vec<serde_json::Value> = hits.iter().map(|h| {
+                // content: "[hdcbind] given role=val → qrole=NAME (sim=...)"
+                // extract NAME: after "→ ", take everything after '=' before ' ' or '('
+                let name = h.content.split("→ ").nth(1)
+                    .and_then(|s| s.splitn(2, '=').nth(1))
+                    .and_then(|s| s.split(|c| c == ' ' || c == '(').next())
+                    .unwrap_or("");
+                serde_json::json!({
+                    "rank":       h.memory_id + 1,
+                    "name":       name,
+                    "similarity": h.score,
+                    "content":    h.content,
+                })
+            }).collect();
+            match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
+                Ok(s) => s.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // ── Triplet operations ────────────────────────────────────────────────────────
 
 /// Add a triplet fact. Returns triplet_id via out_triplet_id.
