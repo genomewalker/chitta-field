@@ -1414,6 +1414,10 @@ impl ChittaField {
         }
         drop(cdawg);
         self.episode_hdc.write().log_episode(tool, entity, outcome);
+        // Auto-consolidate every 500 events
+        if (turn + 1) % 500 == 0 {
+            let _ = self.consolidation_pass();
+        }
     }
 
     /// Record an outcome (success/failure) for the most recent action on (tool, entity).
@@ -1633,6 +1637,47 @@ impl ChittaField {
             })
             .collect();
         Ok(hits)
+    }
+
+    /// Preview the top-k rules that consolidation_pass would promote (no writes).
+    pub fn consolidation_preview(&self, k: usize) -> Vec<(String, u32)> {
+        use crate::organ::sequitur::run_sequitur;
+        let tape = self.event_tape.read();
+        let rules = run_sequitur(&tape, 5);
+        rules.iter().take(k).map(|r| (r.rule_key(&tape), r.support)).collect()
+    }
+
+    /// Sequitur consolidation: find frequent bigrams in EventTape, promote to triplet KG.
+    /// Returns (rules_found, rules_promoted).
+    pub fn consolidation_pass(&self) -> Result<(usize, usize)> {
+        use crate::organ::sequitur::run_sequitur;
+        const MIN_SUPPORT: u32 = 5;
+
+        let rule_data: Vec<(String, String, String, String, String)> = {
+            let tape = self.event_tape.read();
+            let rules = run_sequitur(&tape, MIN_SUPPORT);
+            rules.iter().map(|r| (
+                r.rule_key(&tape),
+                r.seq_repr(&tape),
+                r.avg_outcome_label().to_string(),
+                r.support.to_string(),
+                format!("{}:{}", r.tape_start, r.tape_end),
+            )).collect()
+        };
+
+        let total = rule_data.len();
+        let mut promoted = 0usize;
+        let now = now_ms();
+        for (key, seq, outcome, support, range) in rule_data {
+            // Skip if this rule key is already in the KG (dedup across runs).
+            if !self.triplet_store.read().query_subject(&key, now).is_empty() { continue; }
+            if self.add_triplet(key.clone(), "compresses".into(),  seq,     1.0, None, None).is_err() { continue; }
+            let _ = self.add_triplet(key.clone(), "avg_outcome".into(), outcome, 1.0, None, None);
+            let _ = self.add_triplet(key.clone(), "support".into(),     support, 1.0, None, None);
+            let _ = self.add_triplet(key,         "tape_range".into(),  range,   1.0, None, None);
+            promoted += 1;
+        }
+        Ok((total, promoted))
     }
 
     /// Keyword (BM25) recall with affective context.
