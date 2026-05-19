@@ -1779,6 +1779,17 @@ impl ChittaField {
             let _ = self.add_triplet(key,         "tape_range".into(),  range,   1.0, None, None);
             promoted += 1;
         }
+        // Phase 12: compress low-surprisal events from the tape.
+        {
+            let cdawg = self.cdawg.read();
+            let removed = self.event_tape.write()
+                .compress_low_surprisal(&cdawg, 0.85);
+            if removed > 0 {
+                self.tape_tombstoned.fetch_add(removed as u64, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[cec] temporal compression: tombstoned {removed} low-surprisal events");
+            }
+        }
+
         // Phase 11: take a Turīya health sample after each consolidation_pass.
         {
             let ts = now_ms();
@@ -1795,6 +1806,12 @@ impl ChittaField {
     /// Return the current Turīya health vector as a JSON string.
     pub fn turiya_status(&self) -> String {
         self.turiya_monitor.read().status_json()
+    }
+
+    /// Return EventTape statistics including compression totals.
+    pub fn tape_stats(&self) -> String {
+        let tombstoned = self.tape_tombstoned.load(std::sync::atomic::Ordering::Relaxed);
+        self.event_tape.read().stats_json(tombstoned)
     }
 
     /// Return top-k CDAWG states reachable from (tool, entity) ranked by Q-value.
