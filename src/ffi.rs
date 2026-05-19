@@ -822,6 +822,36 @@ pub extern "C" fn cf_recall_hdcbind(
     }
 }
 
+#[no_mangle]
+pub extern "C" fn cf_consolidation_preview(h: *mut CfHandle, k: usize) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let items = handle.field.consolidation_preview(k);
+    let arr: Vec<serde_json::Value> = items.iter().map(|(key, support)| {
+        serde_json::json!({"key": key, "support": support})
+    }).collect();
+    match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_consolidation_pass(h: *mut CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    match handle.field.consolidation_pass() {
+        Ok((total, promoted)) => {
+            let s = format!("{{\"rules_found\":{total},\"rules_promoted\":{promoted}}}");
+            match CString::new(s) {
+                Ok(cs) => cs.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // ── Triplet operations ────────────────────────────────────────────────────────
 
 /// Add a triplet fact. Returns triplet_id via out_triplet_id.
