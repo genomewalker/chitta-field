@@ -882,6 +882,35 @@ pub extern "C" fn cf_consolidation_pass(h: *mut CfHandle) -> *mut c_char {
     }
 }
 
+/// Return top-k CDAWG motif states ranked by Q-value as a JSON array.
+#[no_mangle]
+pub extern "C" fn cf_recall_motif_value(
+    h: *mut CfHandle,
+    tool: *const c_char,
+    entity: *const c_char,
+    k: usize,
+) -> *mut c_char {
+    if h.is_null() || tool.is_null() || entity.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let tool_s   = unsafe { match CStr::from_ptr(tool).to_str()   { Ok(s)=>s, Err(_)=>return std::ptr::null_mut() } };
+    let entity_s = unsafe { match CStr::from_ptr(entity).to_str() { Ok(s)=>s, Err(_)=>return std::ptr::null_mut() } };
+    match handle.field.recall_motif_value(tool_s, entity_s, if k == 0 { 5 } else { k }) {
+        Ok(hits) => {
+            let arr: Vec<serde_json::Value> = hits.iter().map(|h| serde_json::json!({
+                "state_id": h.memory_id,
+                "q_value":  h.score * 2.0 - 1.0,
+                "support":  h.access_count,
+                "content":  h.content,
+            })).collect();
+            match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
+                Ok(s) => s.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Return top-k refuted/live Sequitur rules as a plain-text stats string.
 #[no_mangle]
 pub extern "C" fn cf_refutation_stats(h: *mut CfHandle, k: usize) -> *mut c_char {
