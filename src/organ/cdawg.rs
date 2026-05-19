@@ -13,6 +13,18 @@ use super::event_tape::EventTape;
 
 pub const NULL_STATE: u32 = u32::MAX;
 
+/// Result of a counterfactual alternative query.
+#[derive(Debug, Clone)]
+pub struct CounterfactualHit {
+    pub symbol:            u64,
+    pub fail_ratio:        f32,
+    pub taken_fail_ratio:  f32,
+    /// taken_fail_ratio - fail_ratio: positive means alternative is better
+    pub delta:             f32,
+    pub support:           u32,
+    pub wilson_fail_lower: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CdawgState {
     /// Length of the longest suffix in this equivalence class.
@@ -344,6 +356,70 @@ impl CdawgOrgan {
 
     pub fn event_count(&self) -> usize {
         self.states.iter().filter(|s| !s.endpos.is_empty()).count()
+    }
+
+    /// Counterfactual alternatives: given prefix context and the symbol actually taken,
+    /// compare fail_ratio of sibling edges at the same CDAWG state.
+    /// Returns alternatives where fail_ratio is lower than the taken path (better choices).
+    pub fn counterfactual_alternatives(
+        &self,
+        context:     &[u64],
+        taken_sym:   u64,
+        min_support: u32,
+        k:           usize,
+    ) -> Vec<CounterfactualHit> {
+        // Walk to the state reached by context prefix
+        let state_id = match self.walk(context) {
+            Some(s) => s,
+            None    => 0,  // fall back to initial state
+        };
+        let state = &self.states[state_id as usize];
+
+        // Fail ratio of the path actually taken
+        let taken_child = state.transitions.get(&taken_sym).copied();
+        let taken_fail_ratio = taken_child.map(|sid| {
+            let s = &self.states[sid as usize];
+            let total = s.fail_count + s.succ_count;
+            if total == 0 { 0.5_f32 } else { s.fail_count as f32 / total as f32 }
+        }).unwrap_or(0.5_f32);
+
+        // Compare against all sibling edges
+        let mut hits: Vec<CounterfactualHit> = state.transitions.iter()
+            .filter(|(&sym, _)| sym != taken_sym)
+            .filter_map(|(&sym, &child_id)| {
+                let child  = &self.states[child_id as usize];
+                let n      = child.endpos.len() as u32;
+                if n < min_support { return None; }
+                let total  = child.fail_count + child.succ_count;
+                let fail_r = if total == 0 { 0.5_f32 } else { child.fail_count as f32 / total as f32 };
+                // Wilson lower bound for ranking under uncertainty
+                let z = 1.645_f32; // 90% CI
+                let wilson = if n == 0 { 0.5 } else {
+                    let p  = fail_r;
+                    let nn = n as f32;
+                    (p + z*z/(2.0*nn) - z*(p*(1.0-p)/nn + z*z/(4.0*nn*nn)).sqrt())
+                        / (1.0 + z*z/nn)
+                };
+                Some(CounterfactualHit {
+                    symbol:           sym,
+                    fail_ratio:       fail_r,
+                    taken_fail_ratio,
+                    delta:            taken_fail_ratio - fail_r,  // positive = alt is better
+                    support:          n,
+                    wilson_fail_lower: wilson,
+                })
+            })
+            .collect();
+
+        // Sort by delta descending (best alternatives first), break ties by wilson lower bound
+        hits.sort_by(|a, b| {
+            b.delta.partial_cmp(&a.delta)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.wilson_fail_lower.partial_cmp(&b.wilson_fail_lower)
+                    .unwrap_or(std::cmp::Ordering::Equal))
+        });
+        hits.truncate(k);
+        hits
     }
 }
 

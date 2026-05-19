@@ -823,6 +823,36 @@ pub extern "C" fn cf_recall_hdcbind(
 }
 
 #[no_mangle]
+pub extern "C" fn cf_recall_counterfactual(
+    h: *mut CfHandle,
+    tool: *const c_char,
+    entity: *const c_char,
+    outcome: u8,
+    k: usize,
+) -> *mut c_char {
+    if h.is_null() || tool.is_null() || entity.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let tool_s   = unsafe { match CStr::from_ptr(tool).to_str()   { Ok(s)=>s, Err(_)=>return std::ptr::null_mut() } };
+    let entity_s = unsafe { match CStr::from_ptr(entity).to_str() { Ok(s)=>s, Err(_)=>return std::ptr::null_mut() } };
+    match handle.field.recall_counterfactual(tool_s, entity_s, outcome, k) {
+        Ok(hits) => {
+            let arr: Vec<serde_json::Value> = hits.iter().map(|h| serde_json::json!({
+                "rank":             h.memory_id + 1,
+                "content":          h.content,
+                "delta_pct":        h.score * 100.0,
+                "confidence":       h.confidence,
+                "support":          h.access_count,
+            })).collect();
+            match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
+                Ok(s) => s.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn cf_consolidation_preview(h: *mut CfHandle, k: usize) -> *mut c_char {
     if h.is_null() { return std::ptr::null_mut(); }
     let handle = unsafe { &*h };
