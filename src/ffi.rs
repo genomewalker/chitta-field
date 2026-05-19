@@ -923,6 +923,28 @@ pub extern "C" fn cf_refutation_stats(h: *mut CfHandle, k: usize) -> *mut c_char
     }
 }
 
+#[no_mangle]
+pub extern "C" fn cf_executor_flush(h: *mut CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let s = handle.field.executor_flush();
+    match CString::new(s) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_list_policies(h: *mut CfHandle, active_only: bool) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let s = handle.field.list_policies(active_only);
+    match CString::new(s) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // ── Triplet operations ────────────────────────────────────────────────────────
 
 /// Add a triplet fact. Returns triplet_id via out_triplet_id.

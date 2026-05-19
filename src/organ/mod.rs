@@ -35,3 +35,4 @@ pub mod wisdom_lineage;
 pub mod symbol_events;
 pub mod sequitur;
 pub mod refutation_ledger;
+pub mod intervention_store;
