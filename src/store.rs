@@ -1437,10 +1437,9 @@ impl ChittaField {
                 }
             }
         }
-        // Auto-consolidate every 500 events
-        if (turn + 1) % 500 == 0 {
-            let _ = self.consolidation_pass();
-        }
+        // Note: consolidation_pass() is NOT called inline here — it runs Sequitur over
+        // the full tape and does O(rules × 4) triplet writes, which would hold rpc_mutex_
+        // for seconds and stall all other tools. Call it explicitly via the MCP tool instead.
     }
 
     /// Record an outcome (success/failure) for the most recent action on (tool, entity).
