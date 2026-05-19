@@ -95,6 +95,11 @@ impl RefutationLedger {
         changed
     }
 
+    /// Iterate all antecedent entry groups (for HypothesisMarket).
+    pub fn antecedent_index_entries(&self) -> impl Iterator<Item = &Vec<RefutEntry>> {
+        self.antecedent_index.values()
+    }
+
     pub fn refute_ratio_for_rule(&self, rule_id: u32) -> f32 {
         self.antecedent_index.values().flatten()
             .find(|e| e.rule_id == rule_id)

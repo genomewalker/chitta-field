@@ -36,3 +36,5 @@ pub mod symbol_events;
 pub mod sequitur;
 pub mod refutation_ledger;
 pub mod intervention_store;
+pub mod decision_tape;
+pub mod hypothesis_market;
