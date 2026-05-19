@@ -1749,7 +1749,7 @@ impl ChittaField {
         use crate::organ::sequitur::run_sequitur;
         const MIN_SUPPORT: u32 = 5;
 
-        let (rule_data, rules_for_ledger): (Vec<(String, String, String, String, String)>, Vec<crate::organ::sequitur::SequiturRule>) = {
+        let (rule_data, rules_for_ledger): (Vec<(String, String, String, String, String, String)>, Vec<crate::organ::sequitur::SequiturRule>) = {
             let tape = self.event_tape.read();
             let rules = run_sequitur(&tape, MIN_SUPPORT);
             let data = rules.iter().map(|r| (
@@ -1758,6 +1758,7 @@ impl ChittaField {
                 r.avg_outcome_label().to_string(),
                 r.support.to_string(),
                 format!("{}:{}", r.tape_start, r.tape_end),
+                r.verbalize(&tape),
             )).collect();
             (data, rules)
         };
@@ -1770,13 +1771,14 @@ impl ChittaField {
         let total = rule_data.len();
         let mut promoted = 0usize;
         let now = now_ms();
-        for (key, seq, outcome, support, range) in rule_data {
+        for (key, seq, outcome, support, range, verbalized) in rule_data {
             // Skip if this rule key is already in the KG (dedup across runs).
             if !self.triplet_store.read().query_subject(&key, now).is_empty() { continue; }
-            if self.add_triplet(key.clone(), "compresses".into(),  seq,     1.0, None, None).is_err() { continue; }
-            let _ = self.add_triplet(key.clone(), "avg_outcome".into(), outcome, 1.0, None, None);
-            let _ = self.add_triplet(key.clone(), "support".into(),     support, 1.0, None, None);
-            let _ = self.add_triplet(key,         "tape_range".into(),  range,   1.0, None, None);
+            if self.add_triplet(key.clone(), "compresses".into(),    seq,        1.0, None, None).is_err() { continue; }
+            let _ = self.add_triplet(key.clone(), "avg_outcome".into(),  outcome,    1.0, None, None);
+            let _ = self.add_triplet(key.clone(), "support".into(),      support,    1.0, None, None);
+            let _ = self.add_triplet(key.clone(), "tape_range".into(),   range,      1.0, None, None);
+            let _ = self.add_triplet(key,         "verbalized_as".into(), verbalized, 1.0, None, None);
             promoted += 1;
         }
         // Phase 12: compress low-surprisal events from the tape.
@@ -1812,6 +1814,26 @@ impl ChittaField {
     pub fn tape_stats(&self) -> String {
         let tombstoned = self.tape_tombstoned.load(std::sync::atomic::Ordering::Relaxed);
         self.event_tape.read().stats_json(tombstoned)
+    }
+
+    /// Phase 13 — Return top-k verbalized Sequitur rules ranked by support.
+    pub fn verbalize_rules(&self, k: usize) -> String {
+        use crate::organ::sequitur::run_sequitur;
+        const MIN_SUPPORT: u32 = 3;
+        let tape = self.event_tape.read();
+        let mut rules = run_sequitur(&tape, MIN_SUPPORT);
+        rules.sort_by(|a, b| b.support.cmp(&a.support));
+        rules.truncate(k.max(1));
+        let items: Vec<String> = rules.iter().map(|r| {
+            let v = r.verbalize(&tape);
+            let key = r.rule_key(&tape);
+            format!(
+                r#"{{"rule_id":{},"support":{},"avg_outcome":"{}","key":"{}","text":"{}"}}"#,
+                r.id, r.support, r.avg_outcome_label(), key,
+                v.replace('"', "\\\"")
+            )
+        }).collect();
+        format!(r#"{{"total":{},"rules":[{}]}}"#, items.len(), items.join(","))
     }
 
     /// Return top-k CDAWG states reachable from (tool, entity) ranked by Q-value.
