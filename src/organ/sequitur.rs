@@ -49,6 +49,50 @@ impl SequiturRule {
         else if self.avg_outcome > 0.65 { "failure" }
         else { "mixed" }
     }
+
+    /// Phase 13 — Deterministic verbalization. No LLM. Pure template.
+    ///
+    /// Template: "Whenever {tool_a}({entity_a}) → {outcome_a},
+    ///            {tool_b}({entity_b}) tends to follow (×N, avg: outcome)."
+    pub fn verbalize(&self, tape: &EventTape) -> String {
+        let tool_a = tape.tool_name((self.sym_a >> 40) as u16);
+        let ent_a  = tape.entity_name((self.sym_a & 0xffff_ffff) as u32);
+        let out_a  = outcome_verb((self.sym_a >> 32) as u8 & 0xff);
+        let tool_b = tape.tool_name((self.sym_b >> 40) as u16);
+        let ent_b  = tape.entity_name((self.sym_b & 0xffff_ffff) as u32);
+        let out_b  = outcome_verb((self.sym_b >> 32) as u8 & 0xff);
+        let avg    = self.avg_outcome_label();
+
+        let ent_a_short = shorten_entity(ent_a);
+        let ent_b_short = shorten_entity(ent_b);
+
+        if ent_a == ent_b {
+            format!(
+                "Whenever {tool_a}({ent_a_short}) {out_a}, {tool_b} on the same entity tends to follow \
+                 (observed ×{}, avg outcome: {avg}).",
+                self.support
+            )
+        } else {
+            format!(
+                "Whenever {tool_a}({ent_a_short}) {out_a}, {tool_b}({ent_b_short}) tends to follow \
+                 (observed ×{}, avg outcome: {avg}).",
+                self.support
+            )
+        }
+    }
+}
+
+fn outcome_verb(c: u8) -> &'static str {
+    match c { 0 => "succeeds", 1 => "fails", 2 => "errors", _ => "completes" }
+}
+
+fn shorten_entity(e: &str) -> &str {
+    // Strip leading path components to keep label readable.
+    if let Some(last_slash) = e.rfind('/') {
+        &e[last_slash + 1..]
+    } else {
+        e
+    }
 }
 
 fn outcome_name(c: u8) -> &'static str {

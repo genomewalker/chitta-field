@@ -1035,6 +1035,18 @@ pub extern "C" fn cf_turiya_status(h: *const CfHandle) -> *mut c_char {
     }
 }
 
+/// CEC Phase 13: top-k verbalized Sequitur rules. Caller must free with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_verbalize_rules(h: *const CfHandle, k: usize) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let s = handle.field.verbalize_rules(if k == 0 { 10 } else { k });
+    match CString::new(s) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// CEC Phase 12: EventTape statistics + compression totals. Caller must free with cf_free_string.
 #[no_mangle]
 pub extern "C" fn cf_tape_stats(h: *const CfHandle) -> *mut c_char {
