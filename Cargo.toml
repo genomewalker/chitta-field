@@ -21,6 +21,7 @@ memmap2 = "0.9"
 thiserror = "1"
 log = "0.4"
 parking_lot = "0.12"
+roaring = { version = "0.10", features = ["serde"] }
 pyo3 = { version = "0.22", features = ["auto-initialize"] }
 
 [[bin]]
