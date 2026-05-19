@@ -465,6 +465,7 @@ impl ChittaField {
         let content_str = std::str::from_utf8(content).unwrap_or("").to_string();
         let index_text = extract_bm25_text(&content_str, self.filter_level());
         self.keyword_idx.write().index(memory_id, &index_text);
+        self.hdc_idx.write().insert(memory_id, &content_str, realm);
 
         // Update temporal index.
         {
@@ -778,6 +779,7 @@ impl ChittaField {
                 if remove_kind {
                     kind_members.remove(&payload.kind);
                 }
+                self.hdc_idx.write().remove(memory_id, &payload.realm);
             }
         }
 
@@ -1313,6 +1315,54 @@ impl ChittaField {
     /// Keyword (BM25) recall.
     pub fn recall_keyword(&self, query: &str, k: usize) -> Result<Vec<RecallHit>> {
         self.recall_keyword_ctx(query, k, None, None)
+    }
+
+    /// HDC recall: O(n) Hamming-distance search over binary hypervectors.
+    /// Returns hits ordered by ascending Hamming distance (smaller = more similar).
+    /// Converts to `RecallHit` with `semantic_score = 1 - hamming/8192`.
+    pub fn recall_hdc(&self, query: &str, k: usize, realm: Option<&str>) -> Result<Vec<RecallHit>> {
+        let hdc_hits = self.hdc_idx.read().query(query, k * 2, realm);
+        if hdc_hits.is_empty() {
+            return Ok(vec![]);
+        }
+        let payloads = self.payloads.read();
+        let states   = self.states.read();
+        let mut hits = Vec::with_capacity(hdc_hits.len());
+        for (id, hamming_dist) in hdc_hits {
+            let Some(payload) = payloads.get(&id) else { continue };
+            let Some(state)   = states.get(&id)   else { continue };
+            if state.deleted { continue; }
+            let sim = 1.0 - hamming_dist as f32 / (128 * 64) as f32;
+            hits.push(RecallHit {
+                memory_id:          id,
+                score:              sim,
+                semantic_score:     sim,
+                ts_ms:              payload.authored_at_ms,
+                kind:               payload.kind.clone(),
+                realm:              payload.realm.clone(),
+                strength:           state.strength,
+                confidence:         state.confidence,
+                access_count:       state.access_count,
+                content:            std::str::from_utf8(&payload.content)
+                                        .unwrap_or("").to_string(),
+                semantic_weight:    1.0,
+                status_mul:         1.0,
+                epistemic_mul:      1.0,
+                strength_factor:    state.strength,
+                affect_valence:     state.affect_valence,
+                affect_arousal:     state.affect_arousal,
+                actr_activation:    0.0,
+                surprise_boost:     1.0,
+                arousal_boost:      1.0,
+                mood_congruence:    1.0,
+                frustration_boost:  1.0,
+                interference_factor: 1.0,
+                spacing_boost:      1.0,
+            });
+        }
+        hits.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(k);
+        Ok(hits)
     }
 
     /// Keyword (BM25) recall with affective context.
