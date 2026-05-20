@@ -50,8 +50,10 @@ const FULL_SNAPSHOT_MAGIC_V13: u64 = 0xF011_5741_7E00_000D;
 const FULL_SNAPSHOT_MAGIC_V14: u64 = 0xF011_5741_7E00_000E;
 /// V15: FullSnapshot gains `decision_tape: DecisionTape` (CEC Phase 10).
 const FULL_SNAPSHOT_MAGIC_V15: u64 = 0xF011_5741_7E00_000F;
-/// Current magic (v5.35+): FullSnapshot gains `turiya_monitor: TuriyaMonitor` (CEC Phase 11).
-const FULL_SNAPSHOT_MAGIC: u64 = 0xF011_5741_7E00_0010;
+/// V16 magic (v5.35–5.41): FullSnapshot gains `turiya_monitor: TuriyaMonitor` (CEC Phase 11).
+const FULL_SNAPSHOT_MAGIC_V16: u64 = 0xF011_5741_7E00_0010;
+/// Current magic (v5.42+): MemoryPayload gains `provenance: String` + `candidate: bool` (CEC Phase 17).
+const FULL_SNAPSHOT_MAGIC: u64    = 0xF011_5741_7E00_0011;
 
 /// Magic for the payload content sidecar (.pld).
 const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
@@ -624,6 +626,79 @@ pub struct FullSnapshot {
     pub turiya_monitor: TuriyaMonitor,
 }
 
+/// MemoryPayload as serialized in V16 snapshots (pre-Phase-17).
+/// Lacks `provenance: String` and `candidate: bool`.
+#[derive(Serialize, Deserialize)]
+struct LegacyMemoryPayloadV16 {
+    pub memory_id:       crate::ids::MemoryId,
+    pub version:         u32,
+    pub chunk_hash:      crate::ids::ChunkHash,
+    pub created_at_ms:   i64,
+    pub authored_at_ms:  i64,
+    pub kind:            String,
+    pub realm:           String,
+    pub content:         Vec<u8>,
+    pub embedding_model: String,
+    pub embedding:       Vec<f32>,
+    pub artifact_refs:   Vec<crate::ops::ArtifactRef>,
+    pub source_session:  Option<String>,
+    pub source_tool:     Option<String>,
+    pub harness:         Option<String>,
+}
+impl LegacyMemoryPayloadV16 {
+    fn upgrade(self) -> crate::payload::MemoryPayload {
+        crate::payload::MemoryPayload {
+            memory_id:       self.memory_id,
+            version:         self.version,
+            chunk_hash:      self.chunk_hash,
+            created_at_ms:   self.created_at_ms,
+            authored_at_ms:  self.authored_at_ms,
+            kind:            self.kind,
+            realm:           self.realm,
+            content:         self.content,
+            embedding_model: self.embedding_model,
+            embedding:       self.embedding,
+            artifact_refs:   self.artifact_refs,
+            source_session:  self.source_session,
+            source_tool:     self.source_tool,
+            harness:         self.harness,
+            provenance:      "human".to_string(),
+            candidate:       false,
+        }
+    }
+}
+
+fn upgrade_payloads_v16(
+    m: std::collections::HashMap<crate::ids::MemoryId, LegacyMemoryPayloadV16>,
+) -> std::collections::HashMap<crate::ids::MemoryId, crate::payload::MemoryPayload> {
+    m.into_iter().map(|(id, p)| (id, p.upgrade())).collect()
+}
+
+/// V16 snapshot layout — FullSnapshot without provenance/candidate on MemoryPayload.
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV16 {
+    pub snapshot_seqno:      u64,
+    pub payloads:            HashMap<MemoryId, LegacyMemoryPayloadV16>,
+    pub states:              HashMap<MemoryId, MemoryState>,
+    pub assoc_edges:         HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts:           HashMap<String, ArtifactId>,
+    pub artifact_paths:      HashMap<ArtifactId, String>,
+    pub time_idx:            TemporalIndex,
+    pub keyword_idx:         KeywordIndex,
+    pub artifact_idx:        ArtifactIndex,
+    pub triplet_store:       TripletStore,
+    pub symbol_idx:          SymbolIndex,
+    pub call_graph:          CallGraph,
+    pub code_files:          CodeFileIndex,
+    pub semantic_idx:        SemanticIndex,
+    pub coactivation_stats:  HashMap<(MemoryId, MemoryId), CoActivationStats>,
+    pub ack_scores:          HashMap<MemoryId, i32>,
+    pub correction_states:   HashMap<u64, CorrectionState>,
+    pub event_tape:          EventTape,
+    pub decision_tape:       DecisionTape,
+    pub turiya_monitor:      TuriyaMonitor,
+}
+
 /// V15 snapshot layout — FullSnapshot without turiya_monitor.
 #[derive(Serialize, Deserialize)]
 struct LegacyFullSnapshotV15 {
@@ -759,6 +834,7 @@ impl FullSnapshot {
         r.read_exact(&mut buf)?;
         let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         if magic != FULL_SNAPSHOT_MAGIC
+            && magic != FULL_SNAPSHOT_MAGIC_V16
             && magic != FULL_SNAPSHOT_MAGIC_V15
             && magic != FULL_SNAPSHOT_MAGIC_V14
             && magic != FULL_SNAPSHOT_MAGIC_V13
@@ -796,9 +872,40 @@ impl FullSnapshot {
         let magic = u64::from_le_bytes(magic_buf);
 
         if magic == FULL_SNAPSHOT_MAGIC {
-            // V15: DecisionTape added.
+            // V17: MemoryPayload gains provenance + candidate (CEC Phase 17).
             let mut snap: Self = bincode::deserialize_from(&mut r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            for state in snap.states.values_mut() { state.sanitize(); }
+            return Ok(snap);
+        }
+
+        if magic == FULL_SNAPSHOT_MAGIC_V16 {
+            // V16→V17: MemoryPayload gains provenance + candidate.
+            eprintln!("[chitta-field] migrating v16 snapshot → v17 (adding provenance+candidate to payloads)");
+            let leg: LegacyFullSnapshotV16 = bincode::deserialize_from(&mut r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            let mut snap = FullSnapshot {
+                snapshot_seqno:     leg.snapshot_seqno,
+                payloads:           upgrade_payloads_v16(leg.payloads),
+                states:             leg.states,
+                assoc_edges:        leg.assoc_edges,
+                artifacts:          leg.artifacts,
+                artifact_paths:     leg.artifact_paths,
+                time_idx:           leg.time_idx,
+                keyword_idx:        leg.keyword_idx,
+                artifact_idx:       leg.artifact_idx,
+                triplet_store:      leg.triplet_store,
+                symbol_idx:         leg.symbol_idx,
+                call_graph:         leg.call_graph,
+                code_files:         leg.code_files,
+                semantic_idx:       leg.semantic_idx,
+                coactivation_stats: leg.coactivation_stats,
+                ack_scores:         leg.ack_scores,
+                correction_states:  leg.correction_states,
+                event_tape:         leg.event_tape,
+                decision_tape:      leg.decision_tape,
+                turiya_monitor:     leg.turiya_monitor,
+            };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
         }

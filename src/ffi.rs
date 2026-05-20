@@ -1144,6 +1144,21 @@ pub extern "C" fn cf_harvest_scope(h: *const CfHandle) -> *mut c_char {
     CString::new(json).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
+/// Seed HDC codebook from a vocab_geometry harvest JSON (Phase 17 Part D).
+/// json_path: path to harvest_ow.py vocab_geometry output file.
+/// Returns JSON: {"ok":true,"seeded_tokens":N,"codebook_len":M,"source":"..."}.
+#[no_mangle]
+pub extern "C" fn cf_seed_hdc_geometry(
+    h: *const CfHandle,
+    json_path: *const c_char,
+) -> *mut c_char {
+    if h.is_null() || json_path.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let path = unsafe { std::ffi::CStr::from_ptr(json_path) }.to_string_lossy();
+    let json = handle.field.seed_hdc_geometry(&path);
+    CString::new(json).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
 // ── Triplet operations ────────────────────────────────────────────────────────
 
 /// Add a triplet fact. Returns triplet_id via out_triplet_id.

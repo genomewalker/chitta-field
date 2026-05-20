@@ -2170,6 +2170,24 @@ impl ChittaField {
         scope.to_string()
     }
 
+    /// Seed the HDC codebook from a vocab_geometry harvest JSON (Phase 17 Part D).
+    /// Reads `json_path`, binarizes each f32 direction, and registers the top tokens
+    /// in the HdcStore seeded codebook. Returns JSON with seeded count and path.
+    pub fn seed_hdc_geometry(&self, json_path: &str) -> String {
+        match self.hdc_idx.write().seed_from_geometry(json_path) {
+            Ok(n) => {
+                let codebook_len = self.hdc_idx.read().codebook_len();
+                serde_json::json!({
+                    "ok": true,
+                    "seeded_tokens": n,
+                    "codebook_len": codebook_len,
+                    "source": json_path,
+                }).to_string()
+            }
+            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }).to_string(),
+        }
+    }
+
     /// Return top-k CDAWG states reachable from (tool, entity) ranked by Q-value.
     pub fn recall_motif_value(&self, tool: &str, entity: &str, k: usize) -> Result<Vec<RecallHit>> {
         let sym = {
