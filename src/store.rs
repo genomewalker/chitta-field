@@ -2170,11 +2170,9 @@ impl ChittaField {
         scope.to_string()
     }
 
-    /// Seed the HDC codebook from a vocab_geometry harvest JSON (Phase 17 Part D).
-    /// Reads `json_path`, binarizes each f32 direction, and registers the top tokens
-    /// in the HdcStore seeded codebook. Returns JSON with seeded count and path.
     pub fn seed_hdc_geometry(&self, json_path: &str) -> String {
-        match self.hdc_idx.write().seed_from_geometry(json_path) {
+        let result = self.hdc_idx.write().seed_from_geometry(json_path);
+        match result {
             Ok(n) => {
                 let codebook_len = self.hdc_idx.read().codebook_len();
                 serde_json::json!({
