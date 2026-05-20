@@ -113,6 +113,33 @@ pub fn encode(text: &str) -> HdcVec {
     bundle(&hvs)
 }
 
+// ── Geometry binarization ─────────────────────────────────────────────────────
+
+/// Convert a continuous f32 direction vector (from embedding matrix PCA) into a
+/// binary HdcVec. Sign-pack 64 floats per u64 word; XOR-rotation-mix to fill D=128.
+///
+/// Similarity order is approximately preserved: directions with small cosine
+/// angle → small Hamming distance (first-order LSH property without a random matrix).
+fn binarize_f32_direction(direction: &[f32]) -> HdcVec {
+    let mut out = [0u64; D];
+    let pack_words = (direction.len() / 64).min(D);
+    for (wi, chunk) in direction.chunks(64).enumerate().take(pack_words) {
+        let mut word = 0u64;
+        for (bi, &v) in chunk.iter().enumerate() {
+            if v > 0.0 { word |= 1u64 << bi; }
+        }
+        out[wi] = word;
+    }
+    // XOR-rotation mix to fill remaining words when direction.len() < D*64.
+    if pack_words > 0 && pack_words < D {
+        for wi in pack_words..D {
+            out[wi] = out[wi % pack_words].rotate_left(13)
+                ^ out[(wi + 1) % pack_words].rotate_right(7);
+        }
+    }
+    out
+}
+
 // ── Incremental realm bundle ──────────────────────────────────────────────────
 
 /// Maintains a running bit-count so a realm's aggregate HdcVec can be recovered
@@ -185,6 +212,9 @@ pub struct HdcStore {
     realm_bundles: HashMap<String, RealmBundle>,
     /// realm → set of memory IDs (for realm-scoped recall)
     realm_members: HashMap<String, HashSet<MemoryId>>,
+    /// token → seeded HdcVec from open-weight geometry harvest
+    /// Checked before hash-derived word_hv() — grounded vectors take precedence.
+    seeded_codebook: HashMap<String, HdcVec>,
 }
 
 impl HdcStore {
@@ -211,9 +241,22 @@ impl HdcStore {
         self.memories.is_empty()
     }
 
+    /// Encode `text` using the seeded codebook (grounded tokens first, then hash fallback).
+    pub fn encode_with_codebook(&self, text: &str) -> HdcVec {
+        let hvs: Vec<HdcVec> = text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| t.len() >= 2)
+            .map(|t| {
+                let lower = t.to_lowercase();
+                self.seeded_codebook.get(&lower).copied().unwrap_or_else(|| word_hv(&lower))
+            })
+            .collect();
+        bundle(&hvs)
+    }
+
     /// Encode `text` and register it under `id` in `realm`.
     pub fn insert(&mut self, id: MemoryId, text: &str, realm: &str) {
-        let hv = encode(text);
+        let hv = self.encode_with_codebook(text);
         self.realm_bundles
             .entry(realm.to_string())
             .or_default()
@@ -290,6 +333,50 @@ impl HdcStore {
             (Some(ha), Some(hb)) => similarity(&ha, &hb),
             _ => 0.0,
         }
+    }
+
+    /// Number of tokens in the seeded codebook.
+    pub fn codebook_len(&self) -> usize { self.seeded_codebook.len() }
+
+    /// Seed the HDC codebook from a vocab_geometry harvest JSON produced by
+    /// `scripts/harvest_ow.py --mode vocab_geometry`.
+    ///
+    /// Each semantic direction (f32[d]) is binarized via sign-packing:
+    /// 64 floats → 1 u64 word (bit = sign(float)), filled to 128 u64s by
+    /// XOR-rotation mixing. This preserves cosine similarity order in Hamming
+    /// space to a first approximation. Returns the number of tokens seeded.
+    pub fn seed_from_geometry(&mut self, json_path: &str) -> std::io::Result<usize> {
+        let bytes = std::fs::read(json_path)?;
+        let val: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let dirs = val["directions"].as_array()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing directions"))?;
+        let mut seeded = 0usize;
+        for dir in dirs {
+            let floats: Vec<f32> = dir["direction"].as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .filter_map(|v| v.as_f64().map(|x| x as f32))
+                .collect();
+            if floats.is_empty() { continue; }
+            let hv = binarize_f32_direction(&floats);
+            if let Some(tokens) = dir["top_tokens"].as_array() {
+                for tok in tokens {
+                    if let Some(s) = tok.as_str() {
+                        let key: String = s.split(|c: char| !c.is_alphanumeric())
+                            .filter(|t| t.len() >= 2)
+                            .next()
+                            .unwrap_or(s)
+                            .to_lowercase();
+                        if !key.is_empty() {
+                            self.seeded_codebook.insert(key, hv);
+                            seeded += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(seeded)
     }
 
     /// Compose a multi-concept query: encode each term, XOR-bind them all,

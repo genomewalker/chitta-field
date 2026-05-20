@@ -18,17 +18,12 @@ pub struct MemoryPayload {
     pub artifact_refs: Vec<ArtifactRef>,
     pub source_session: Option<String>,
     pub source_tool: Option<String>,
-    #[serde(default)]
     pub harness: Option<String>,
     /// Phase 17: source of this memory (human/claude/codex/ow_distilled/ow_generated).
-    #[serde(default = "default_provenance")]
     pub provenance: String,
     /// Phase 17: candidate band — true until promoted by an outcome-witness.
-    #[serde(default)]
     pub candidate: bool,
 }
-
-fn default_provenance() -> String { "human".to_string() }
 
 impl From<PutPayloadOp> for MemoryPayload {
     fn from(op: PutPayloadOp) -> Self {
@@ -47,7 +42,7 @@ impl From<PutPayloadOp> for MemoryPayload {
             source_session: op.source_session,
             source_tool: op.source_tool,
             harness: op.harness,
-            provenance: default_provenance(),
+            provenance: "human".to_string(),
             candidate: false,
         }
     }
