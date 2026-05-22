@@ -23,6 +23,10 @@ pub struct MemoryPayload {
     pub provenance: String,
     /// Phase 17: candidate band — true until promoted by an outcome-witness.
     pub candidate: bool,
+    /// Ollama model id used to produce the embedding (e.g. "nomic-embed-text:v1.5").
+    pub embedding_model_id: String,
+    /// Dimension of the stored embedding vector (0 = unknown/legacy).
+    pub embedding_dim: u32,
 }
 
 impl From<PutPayloadOp> for MemoryPayload {
@@ -44,6 +48,8 @@ impl From<PutPayloadOp> for MemoryPayload {
             harness: op.harness,
             provenance: "human".to_string(),
             candidate: false,
+            embedding_model_id: op.embedding_model_id,
+            embedding_dim: op.embedding_dim,
         }
     }
 }

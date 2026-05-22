@@ -46,3 +46,4 @@ pub mod query_router;
 
 pub mod provenance;
 pub mod reconciler;
+pub mod observer;

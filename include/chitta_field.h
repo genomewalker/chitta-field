@@ -73,6 +73,10 @@ int cf_recall_temporal(CfHandle* h,
     int64_t start_ms, int64_t end_ms, const char* realm, size_t limit,
     CfRecallHit* hits_buf, size_t hits_cap, size_t* hits_written);
 
+int cf_recall_temporal_events(CfHandle* h,
+    int64_t start_ms, int64_t end_ms, size_t limit,
+    CfRecallHit* hits_buf, size_t hits_cap, size_t* hits_written);
+
 int cf_recall_artifact(CfHandle* h,
     const char* normalized_path, size_t limit,
     CfRecallHit* hits_buf, size_t hits_cap, size_t* hits_written);
@@ -110,6 +114,7 @@ int cf_select_route(CfHandle* h, const char* query, uint64_t* out_episode_id, ui
 int cf_route_feedback(CfHandle* h, uint64_t episode_id, float reward);
 int cf_backfill_embedding(CfHandle* h, uint64_t memory_id, const float* embedding_ptr, size_t embedding_len);
 int cf_pending_embeddings(CfHandle* h, uint64_t* out_ids, size_t max_ids, size_t* out_count);
+int64_t cf_requeue_all_embeddings(CfHandle* h, const char* model_id, size_t model_id_len);
 
 int cf_query_subject(CfHandle* h, const char* subject,
     char* buf, size_t buf_cap, size_t* written);

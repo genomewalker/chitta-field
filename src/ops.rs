@@ -1,7 +1,7 @@
 use crate::ids::{ArtifactId, ChunkHash, MemoryId};
 use serde::{Deserialize, Serialize};
 
-pub const EMBED_DIM: usize = 256; // nomic-embed-text-v1 MRL-256
+pub const EMBED_DIM: usize = 768; // nomic-embed-text v1.5 full dimension
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Op {
@@ -165,6 +165,10 @@ pub struct PutPayloadOp {
     pub source_tool: Option<String>,
     #[serde(default)]
     pub harness: Option<String>,
+    #[serde(default)]
+    pub embedding_model_id: String,
+    #[serde(default)]
+    pub embedding_dim: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

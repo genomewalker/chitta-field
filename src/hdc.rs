@@ -14,6 +14,8 @@
 //! - Forgetting without deletion: un-bundle subtracts the vector's bit contribution
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
+use std::path::Path;
 
 use crate::ids::MemoryId;
 
@@ -382,6 +384,111 @@ impl HdcStore {
     /// Compose a multi-concept query: encode each term, XOR-bind them all,
     /// then return nearest memories. XOR binding approximates logical AND in HDC.
     /// E.g., query_and(&["Python", "debugging"]) finds memories about both.
+    /// Persist the full HDC index to a flat binary sidecar file.
+    /// Format: magic(u64) + n_memories(u64) + [(id:u64, hv:[u64;128]); n]
+    ///         + n_realms(u32) + per-realm [name_len(u32), name, n_members(u32),
+    ///         [member_id:u64; n], bundle_n(u32), counts:[u16; D*64]].
+    /// Returns the number of memories written.
+    pub fn save_sidecar(&self, path: &Path) -> std::io::Result<usize> {
+        const MAGIC: u64 = 0xC0DE_BABE_DC51_DE2A;
+        let f = std::fs::File::create(path)?;
+        let mut w = std::io::BufWriter::new(f);
+        w.write_all(&MAGIC.to_le_bytes())?;
+        let n = self.memories.len() as u64;
+        w.write_all(&n.to_le_bytes())?;
+        for (&id, hv) in &self.memories {
+            w.write_all(&id.to_le_bytes())?;
+            for &word in hv.iter() {
+                w.write_all(&word.to_le_bytes())?;
+            }
+        }
+        let n_realms = self.realm_members.len() as u32;
+        w.write_all(&n_realms.to_le_bytes())?;
+        for (realm, members) in &self.realm_members {
+            let name_bytes = realm.as_bytes();
+            w.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
+            w.write_all(name_bytes)?;
+            w.write_all(&(members.len() as u32).to_le_bytes())?;
+            for &mid in members {
+                w.write_all(&mid.to_le_bytes())?;
+            }
+            let bundle = self.realm_bundles.get(realm.as_str());
+            let (bundle_n, counts) = match bundle {
+                Some(b) => (b.n, b.counts.as_slice()),
+                None    => (0u32, &[][..]),
+            };
+            w.write_all(&bundle_n.to_le_bytes())?;
+            if counts.len() == D * 64 {
+                for &c in counts {
+                    w.write_all(&c.to_le_bytes())?;
+                }
+            } else {
+                for _ in 0..D * 64 {
+                    w.write_all(&0u16.to_le_bytes())?;
+                }
+            }
+        }
+        Ok(self.memories.len())
+    }
+
+    /// Load HDC index from a sidecar file written by `save_sidecar`.
+    /// Returns the number of memories loaded, or 0 on any format mismatch.
+    pub fn load_sidecar(&mut self, path: &Path) -> std::io::Result<usize> {
+        const MAGIC: u64 = 0xC0DE_BABE_DC51_DE2A;
+        let f = std::fs::File::open(path)?;
+        let mut r = std::io::BufReader::new(f);
+        let mut buf8 = [0u8; 8];
+        r.read_exact(&mut buf8)?;
+        if u64::from_le_bytes(buf8) != MAGIC {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "hdc sidecar: bad magic"));
+        }
+        r.read_exact(&mut buf8)?;
+        let n_memories = u64::from_le_bytes(buf8) as usize;
+        self.memories.clear();
+        self.realm_bundles.clear();
+        self.realm_members.clear();
+        self.memories.reserve(n_memories);
+        for _ in 0..n_memories {
+            r.read_exact(&mut buf8)?;
+            let id = MemoryId::from_le_bytes(buf8);
+            let mut hv = [0u64; D];
+            for word in hv.iter_mut() {
+                r.read_exact(&mut buf8)?;
+                *word = u64::from_le_bytes(buf8);
+            }
+            self.memories.insert(id, hv);
+        }
+        let mut buf4 = [0u8; 4];
+        r.read_exact(&mut buf4)?;
+        let n_realms = u32::from_le_bytes(buf4) as usize;
+        for _ in 0..n_realms {
+            r.read_exact(&mut buf4)?;
+            let name_len = u32::from_le_bytes(buf4) as usize;
+            let mut name_buf = vec![0u8; name_len];
+            r.read_exact(&mut name_buf)?;
+            let realm = String::from_utf8(name_buf)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            r.read_exact(&mut buf4)?;
+            let n_members = u32::from_le_bytes(buf4) as usize;
+            let mut members = HashSet::with_capacity(n_members);
+            for _ in 0..n_members {
+                r.read_exact(&mut buf8)?;
+                members.insert(MemoryId::from_le_bytes(buf8));
+            }
+            r.read_exact(&mut buf4)?;
+            let bundle_n = u32::from_le_bytes(buf4);
+            let mut counts = vec![0u16; D * 64];
+            let mut buf2 = [0u8; 2];
+            for c in counts.iter_mut() {
+                r.read_exact(&mut buf2)?;
+                *c = u16::from_le_bytes(buf2);
+            }
+            self.realm_members.insert(realm.clone(), members);
+            self.realm_bundles.insert(realm, RealmBundle { counts, n: bundle_n });
+        }
+        Ok(n_memories)
+    }
+
     pub fn query_and(&self, terms: &[&str], k: usize, realm: Option<&str>) -> Vec<(MemoryId, u32)> {
         if terms.is_empty() { return vec![]; }
         let mut q = word_hv(&terms[0].to_lowercase());

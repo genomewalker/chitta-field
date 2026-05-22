@@ -11,6 +11,7 @@ use crate::organ::temporal::TemporalIndex;
 use crate::organ::event_tape::EventTape;
 use crate::organ::decision_tape::DecisionTape;
 use crate::organ::turiya_monitor::TuriyaMonitor;
+use crate::organ::observer::ObserverState;
 use crate::organ::triplet::{CorrectionState, TripletStore};
 use crate::payload::MemoryPayload;
 use crate::state::{EpistemicStatus, MemoryState, MemoryStatus, RetrievalHistory};
@@ -52,8 +53,12 @@ const FULL_SNAPSHOT_MAGIC_V14: u64 = 0xF011_5741_7E00_000E;
 const FULL_SNAPSHOT_MAGIC_V15: u64 = 0xF011_5741_7E00_000F;
 /// V16 magic (v5.35–5.41): FullSnapshot gains `turiya_monitor: TuriyaMonitor` (CEC Phase 11).
 const FULL_SNAPSHOT_MAGIC_V16: u64 = 0xF011_5741_7E00_0010;
-/// Current magic (v5.42+): MemoryPayload gains `provenance: String` + `candidate: bool` (CEC Phase 17).
-const FULL_SNAPSHOT_MAGIC: u64    = 0xF011_5741_7E00_0011;
+/// V17 magic: MemoryPayload gains `provenance: String` + `candidate: bool` (CEC Phase 17).
+const FULL_SNAPSHOT_MAGIC_V17: u64 = 0xF011_5741_7E00_0011;
+/// V18 magic: FullSnapshot gains `observer_state: ObserverState` (Tier-0 observation extraction).
+pub const FULL_SNAPSHOT_MAGIC_V18: u64 = 0xF011_5741_7E00_0012;
+/// V19 magic: MemoryPayload gains `embedding_model_id` + `embedding_dim`; EMBED_DIM 256→768.
+const FULL_SNAPSHOT_MAGIC: u64         = 0xF011_5741_7E00_0013; // V19
 
 /// Magic for the payload content sidecar (.pld).
 const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
@@ -120,6 +125,8 @@ impl LegacyMemoryPayloadV12 {
             harness,
             provenance: "human".to_string(),
             candidate: false,
+            embedding_model_id: "legacy-256".to_string(),
+            embedding_dim: 256,
         }
     }
 }
@@ -624,6 +631,8 @@ pub struct FullSnapshot {
     pub decision_tape: DecisionTape,
     /// CEC Phase 11: Turīya Monitor — rolling health samples across CEC organs.
     pub turiya_monitor: TuriyaMonitor,
+    /// Tier-0 observation extraction state — structured facts extracted from conversational turns.
+    pub observer_state: ObserverState,
 }
 
 /// MemoryPayload as serialized in V16 snapshots (pre-Phase-17).
@@ -662,8 +671,10 @@ impl LegacyMemoryPayloadV16 {
             source_session:  self.source_session,
             source_tool:     self.source_tool,
             harness:         self.harness,
-            provenance:      "human".to_string(),
-            candidate:       false,
+            provenance:          "human".to_string(),
+            candidate:           false,
+            embedding_model_id:  "legacy-256".to_string(),
+            embedding_dim:       256,
         }
     }
 }
@@ -674,11 +685,114 @@ fn upgrade_payloads_v16(
     m.into_iter().map(|(id, p)| (id, p.upgrade())).collect()
 }
 
+/// MemoryPayload as serialized in V18 snapshots (pre-V19).
+/// Lacks `embedding_model_id: String` and `embedding_dim: u32`.
+#[derive(Serialize, Deserialize)]
+struct LegacyMemoryPayloadV18 {
+    pub memory_id:       crate::ids::MemoryId,
+    pub version:         u32,
+    pub chunk_hash:      crate::ids::ChunkHash,
+    pub created_at_ms:   i64,
+    pub authored_at_ms:  i64,
+    pub kind:            String,
+    pub realm:           String,
+    pub content:         Vec<u8>,
+    pub embedding_model: String,
+    pub embedding:       Vec<f32>,
+    pub artifact_refs:   Vec<crate::ops::ArtifactRef>,
+    pub source_session:  Option<String>,
+    pub source_tool:     Option<String>,
+    pub harness:         Option<String>,
+    pub provenance:      String,
+    pub candidate:       bool,
+}
+impl LegacyMemoryPayloadV18 {
+    fn upgrade(self) -> crate::payload::MemoryPayload {
+        crate::payload::MemoryPayload {
+            memory_id:          self.memory_id,
+            version:            self.version,
+            chunk_hash:         self.chunk_hash,
+            created_at_ms:      self.created_at_ms,
+            authored_at_ms:     self.authored_at_ms,
+            kind:               self.kind,
+            realm:              self.realm,
+            content:            self.content,
+            embedding_model:    self.embedding_model,
+            embedding:          vec![],   // cleared — stale 256-d vectors must not enter 768-d HNSW
+            artifact_refs:      self.artifact_refs,
+            source_session:     self.source_session,
+            source_tool:        self.source_tool,
+            harness:            self.harness,
+            provenance:         self.provenance,
+            candidate:          self.candidate,
+            embedding_model_id: "legacy-256".to_string(),
+            embedding_dim:      256,
+        }
+    }
+}
+
+fn upgrade_payloads_v18(
+    m: std::collections::HashMap<crate::ids::MemoryId, LegacyMemoryPayloadV18>,
+) -> std::collections::HashMap<crate::ids::MemoryId, crate::payload::MemoryPayload> {
+    m.into_iter().map(|(id, p)| (id, p.upgrade())).collect()
+}
+
 /// V16 snapshot layout — FullSnapshot without provenance/candidate on MemoryPayload.
 #[derive(Serialize, Deserialize)]
 struct LegacyFullSnapshotV16 {
     pub snapshot_seqno:      u64,
     pub payloads:            HashMap<MemoryId, LegacyMemoryPayloadV16>,
+    pub states:              HashMap<MemoryId, MemoryState>,
+    pub assoc_edges:         HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts:           HashMap<String, ArtifactId>,
+    pub artifact_paths:      HashMap<ArtifactId, String>,
+    pub time_idx:            TemporalIndex,
+    pub keyword_idx:         KeywordIndex,
+    pub artifact_idx:        ArtifactIndex,
+    pub triplet_store:       TripletStore,
+    pub symbol_idx:          SymbolIndex,
+    pub call_graph:          CallGraph,
+    pub code_files:          CodeFileIndex,
+    pub semantic_idx:        SemanticIndex,
+    pub coactivation_stats:  HashMap<(MemoryId, MemoryId), CoActivationStats>,
+    pub ack_scores:          HashMap<MemoryId, i32>,
+    pub correction_states:   HashMap<u64, CorrectionState>,
+    pub event_tape:          EventTape,
+    pub decision_tape:       DecisionTape,
+    pub turiya_monitor:      TuriyaMonitor,
+}
+
+/// V18 snapshot layout — FullSnapshot with observer_state but without embedding_model_id/embedding_dim on payloads.
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV18 {
+    pub snapshot_seqno:      u64,
+    pub payloads:            HashMap<MemoryId, LegacyMemoryPayloadV18>,
+    pub states:              HashMap<MemoryId, MemoryState>,
+    pub assoc_edges:         HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts:           HashMap<String, ArtifactId>,
+    pub artifact_paths:      HashMap<ArtifactId, String>,
+    pub time_idx:            TemporalIndex,
+    pub keyword_idx:         KeywordIndex,
+    pub artifact_idx:        ArtifactIndex,
+    pub triplet_store:       TripletStore,
+    pub symbol_idx:          SymbolIndex,
+    pub call_graph:          CallGraph,
+    pub code_files:          CodeFileIndex,
+    pub semantic_idx:        SemanticIndex,
+    pub coactivation_stats:  HashMap<(MemoryId, MemoryId), CoActivationStats>,
+    pub ack_scores:          HashMap<MemoryId, i32>,
+    pub correction_states:   HashMap<u64, CorrectionState>,
+    pub event_tape:          EventTape,
+    pub decision_tape:       DecisionTape,
+    pub turiya_monitor:      TuriyaMonitor,
+    pub observer_state:      ObserverState,
+}
+
+/// V17 snapshot layout — FullSnapshot without observer_state.
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV17 {
+    pub snapshot_seqno:      u64,
+    pub payloads:            HashMap<MemoryId, MemoryPayload>,
     pub states:              HashMap<MemoryId, MemoryState>,
     pub assoc_edges:         HashMap<MemoryId, Vec<AssocEdge>>,
     pub artifacts:           HashMap<String, ArtifactId>,
@@ -834,6 +948,8 @@ impl FullSnapshot {
         r.read_exact(&mut buf)?;
         let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         if magic != FULL_SNAPSHOT_MAGIC
+            && magic != FULL_SNAPSHOT_MAGIC_V18
+            && magic != FULL_SNAPSHOT_MAGIC_V17
             && magic != FULL_SNAPSHOT_MAGIC_V16
             && magic != FULL_SNAPSHOT_MAGIC_V15
             && magic != FULL_SNAPSHOT_MAGIC_V14
@@ -872,9 +988,86 @@ impl FullSnapshot {
         let magic = u64::from_le_bytes(magic_buf);
 
         if magic == FULL_SNAPSHOT_MAGIC {
-            // V17: MemoryPayload gains provenance + candidate (CEC Phase 17).
+            // V19: MemoryPayload gains embedding_model_id + embedding_dim; EMBED_DIM 256→768.
             let mut snap: Self = bincode::deserialize_from(&mut r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            for state in snap.states.values_mut() { state.sanitize(); }
+            return Ok(snap);
+        }
+
+        if magic == FULL_SNAPSHOT_MAGIC_V18 {
+            // V18→V19: add embedding_model_id/embedding_dim; clear stale 256-d embeddings;
+            // mark all non-deleted memories with content as embed_pending for 768-d re-embedding.
+            eprintln!("[chitta-field] migrating v18 snapshot → v19 (Ollama 768-d re-embedding)");
+            let leg: LegacyFullSnapshotV18 = bincode::deserialize_from(&mut r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            let payloads = upgrade_payloads_v18(leg.payloads);
+            let mut states = leg.states;
+            // Mark every non-deleted memory with content as embed_pending so the
+            // backfill thread re-embeds with nomic-embed-text:v1.5 at 768 dims.
+            for (id, state) in states.iter_mut() {
+                if state.deleted { continue; }
+                let has_content = payloads.get(id)
+                    .map(|p| p.content.len() >= 10)
+                    .unwrap_or(false);
+                if has_content {
+                    state.embed_pending = true;
+                }
+            }
+            for state in states.values_mut() { state.sanitize(); }
+            return Ok(FullSnapshot {
+                snapshot_seqno:     leg.snapshot_seqno,
+                payloads,
+                states,
+                assoc_edges:        leg.assoc_edges,
+                artifacts:          leg.artifacts,
+                artifact_paths:     leg.artifact_paths,
+                time_idx:           leg.time_idx,
+                keyword_idx:        leg.keyword_idx,
+                artifact_idx:       leg.artifact_idx,
+                triplet_store:      leg.triplet_store,
+                symbol_idx:         leg.symbol_idx,
+                call_graph:         leg.call_graph,
+                code_files:         leg.code_files,
+                semantic_idx:       leg.semantic_idx,
+                coactivation_stats: leg.coactivation_stats,
+                ack_scores:         leg.ack_scores,
+                correction_states:  leg.correction_states,
+                event_tape:         leg.event_tape,
+                decision_tape:      leg.decision_tape,
+                turiya_monitor:     leg.turiya_monitor,
+                observer_state:     leg.observer_state,
+            });
+        }
+
+        if magic == FULL_SNAPSHOT_MAGIC_V17 {
+            // V17→V18: add empty ObserverState.
+            eprintln!("[chitta-field] migrating v17 snapshot → v18 (adding observer_state)");
+            let leg: LegacyFullSnapshotV17 = bincode::deserialize_from(&mut r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            let mut snap = FullSnapshot {
+                snapshot_seqno:     leg.snapshot_seqno,
+                payloads:           leg.payloads,
+                states:             leg.states,
+                assoc_edges:        leg.assoc_edges,
+                artifacts:          leg.artifacts,
+                artifact_paths:     leg.artifact_paths,
+                time_idx:           leg.time_idx,
+                keyword_idx:        leg.keyword_idx,
+                artifact_idx:       leg.artifact_idx,
+                triplet_store:      leg.triplet_store,
+                symbol_idx:         leg.symbol_idx,
+                call_graph:         leg.call_graph,
+                code_files:         leg.code_files,
+                semantic_idx:       leg.semantic_idx,
+                coactivation_stats: leg.coactivation_stats,
+                ack_scores:         leg.ack_scores,
+                correction_states:  leg.correction_states,
+                event_tape:         leg.event_tape,
+                decision_tape:      leg.decision_tape,
+                turiya_monitor:     leg.turiya_monitor,
+                observer_state:     ObserverState::default(),
+            };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
         }
@@ -905,6 +1098,7 @@ impl FullSnapshot {
                 event_tape:         leg.event_tape,
                 decision_tape:      leg.decision_tape,
                 turiya_monitor:     leg.turiya_monitor,
+                observer_state:     ObserverState::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -936,6 +1130,7 @@ impl FullSnapshot {
                 event_tape:        leg.event_tape,
                 decision_tape:     leg.decision_tape,
                 turiya_monitor:    TuriyaMonitor::new(),
+                observer_state:    ObserverState::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -967,6 +1162,7 @@ impl FullSnapshot {
                 event_tape:        leg.event_tape,
                 decision_tape:     DecisionTape::new(),
                 turiya_monitor:    TuriyaMonitor::new(),
+                observer_state:    ObserverState::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -998,6 +1194,7 @@ impl FullSnapshot {
                 event_tape:         EventTape::new(),
                 decision_tape:      DecisionTape::new(),
                 turiya_monitor:     TuriyaMonitor::new(),
+                observer_state:     ObserverState::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1030,6 +1227,7 @@ impl FullSnapshot {
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
+                observer_state: ObserverState::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1073,6 +1271,7 @@ impl FullSnapshot {
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
+                observer_state: ObserverState::default(),
             });
         }
 
@@ -1107,6 +1306,7 @@ impl FullSnapshot {
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
+                observer_state: ObserverState::default(),
             });
         }
 
@@ -1138,6 +1338,7 @@ impl FullSnapshot {
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
+                observer_state: ObserverState::default(),
             });
         }
 
@@ -1169,6 +1370,7 @@ impl FullSnapshot {
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
+                observer_state: ObserverState::default(),
             });
         }
 
@@ -1200,6 +1402,7 @@ impl FullSnapshot {
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
+                observer_state: ObserverState::default(),
             });
         }
 
@@ -1231,6 +1434,7 @@ impl FullSnapshot {
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
+                observer_state: ObserverState::default(),
             });
         }
 
@@ -1242,7 +1446,7 @@ impl FullSnapshot {
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
             let mut semantic_idx = SemanticIndex::new();
             for (mem_id, emb) in v1.semantic_idx.embeddings {
-                semantic_idx.upsert(mem_id, emb);
+                semantic_idx.upsert(mem_id, emb, None);
             }
             let states = v1.states.into_iter().map(|(id, s)| (id, s.upgrade())).collect::<HashMap<_, _>>();
             return Ok(FullSnapshot {
@@ -1266,6 +1470,7 @@ impl FullSnapshot {
                 event_tape: EventTape::new(),
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
+                observer_state: ObserverState::default(),
             });
         }
 
