@@ -350,7 +350,7 @@ impl ChittaField {
         // Only deduplicates within the same realm — cross-realm near-matches must
         // produce independent nodes to prevent silent cross-realm reinforcement.
         if !embed_pending {
-            let neighbors = self.semantic_idx.read().search(embedding, 1, None);
+            let neighbors = self.semantic_idx.read().search(embedding, 1, None, None);
             if let Some(top) = neighbors.first() {
                 if top.cosine_similarity >= 0.88 && top.cosine_similarity < 0.9999 {
                     let candidate_realm = self.payloads.read()
@@ -387,7 +387,9 @@ impl ChittaField {
             kind: kind.to_string(),
             realm: realm.to_string(),
             content: content.to_vec(),
-            embedding_model: if embed_pending { "none".to_string() } else { "bge-base-en-v1.5".to_string() },
+            embedding_model: if embed_pending { "none".to_string() } else { "nomic-embed-text:v1.5".to_string() },
+            embedding_model_id: if embed_pending { String::new() } else { "nomic-embed-text:v1.5".to_string() },
+            embedding_dim: if embed_pending { 0 } else { 768 },
             embedding: embedding.to_vec(),
             artifact_refs: artifact_refs.clone(),
             harness: source_tool.as_deref().map(|t| {
@@ -431,14 +433,14 @@ impl ChittaField {
         if !embed_pending {
             self.semantic_idx
                 .write()
-                .upsert(memory_id, embedding.to_vec());
+                .upsert(memory_id, embedding.to_vec(), Some(realm));
 
             // Write-path: compute interference density (competitive_weight + lure_risk).
             // Query k=8 nearest neighbors to measure local crowding.
             // Exclude self and near-exact matches (above dedup threshold) since
             // those represent the same information, not competitors.
             let dedup_upper = self.scoring_pipeline.read().config.dedup_cosine_upper;
-            let neighbors = self.semantic_idx.read().search(embedding, 9, None);
+            let neighbors = self.semantic_idx.read().search(embedding, 9, None, None);
             if neighbors.len() > 1 {
                 let payloads_r = self.payloads.read();
                 let mut cos_sum = 0.0f32;
@@ -467,7 +469,19 @@ impl ChittaField {
             }
         }
         let content_str = std::str::from_utf8(content).unwrap_or("").to_string();
-        let index_text = extract_bm25_text(&content_str, self.filter_level());
+        let observer_canonicals = self.observer.extract(
+            &content_str, memory_id, authored_at_ms, &mut *self.observer_state.write(),
+        );
+        let index_text = if observer_canonicals.is_empty() {
+            extract_bm25_text(&content_str, self.filter_level())
+        } else {
+            let canonical_text = observer_canonicals.join(". ");
+            format!(
+                "{} {}",
+                extract_bm25_text(&content_str, self.filter_level()),
+                extract_bm25_text(&canonical_text, self.filter_level()),
+            )
+        };
         self.keyword_idx.write().index(memory_id, &index_text);
         self.hdc_idx.write().insert(memory_id, &content_str, realm);
 
@@ -1060,7 +1074,7 @@ impl ChittaField {
         let semantic_hits = self
             .semantic_idx
             .read()
-            .search(query_embedding, result_limit, allowed);
+            .search(query_embedding, result_limit, allowed, realm);
 
         let states = self.states.read();
         let payloads = self.payloads.read();
@@ -1434,6 +1448,50 @@ impl ChittaField {
         hits.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         hits.truncate(k);
         Ok(hits)
+    }
+
+    /// Bridge query: find entities active in [start_ms, end_ms] via EventTape, then
+    /// recall their memories from time_idx. Unifies the action-event plane (EventTape)
+    /// with the memory-content plane (time_idx) so temporal queries work without
+    /// knowing the realm in advance.
+    pub fn recall_temporal_events(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<RecallHit>> {
+        // Collect unique entity names from EventTape events in [start_ms, end_ms]
+        let active_entities: Vec<String> = {
+            let tape = self.event_tape.read();
+            let mut seen = std::collections::HashSet::new();
+            tape.events.iter()
+                .filter(|e| e.ts_ms >= start_ms && e.ts_ms <= end_ms)
+                .filter_map(|e| {
+                    let name = tape.entity_name(e.entity_key).to_owned();
+                    if seen.insert(name.clone()) { Some(name) } else { None }
+                })
+                .take(32)
+                .collect()
+        };
+
+        let per_entity = (limit / active_entities.len().max(1)).max(1);
+        let mut all_hits: Vec<RecallHit> = Vec::new();
+        for entity in &active_entities {
+            if let Ok(hits) = self.recall_temporal(start_ms, end_ms, Some(entity.as_str()), per_entity) {
+                all_hits.extend(hits);
+            }
+        }
+        // Also include realm-less global window (entity = None)
+        if let Ok(hits) = self.recall_temporal(start_ms, end_ms, None, limit / 4) {
+            all_hits.extend(hits);
+        }
+
+        // Deduplicate by memory_id, sort recency-first
+        let mut seen_ids = std::collections::HashSet::new();
+        all_hits.retain(|h| seen_ids.insert(h.memory_id));
+        all_hits.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+        all_hits.truncate(limit);
+        Ok(all_hits)
     }
 
     /// Log a structured action event to the CEC tape and extend the CDAWG.
@@ -2908,12 +2966,21 @@ impl ChittaField {
             let mut payloads = self.payloads.write();
             if let Some(p) = payloads.get_mut(&memory_id) {
                 p.embedding = embedding.to_vec();
-                p.embedding_model = "bge-base-en-v1.5".to_string();
+                p.embedding_model = "nomic-embed-text:v1.5".to_string();
+                p.embedding_model_id = "nomic-embed-text:v1.5".to_string();
+                p.embedding_dim = 768;
             }
         }
 
-        // Update semantic index
-        self.semantic_idx.write().upsert(memory_id, embedding.to_vec());
+        // Update semantic index (get realm for per-realm routing)
+        let realm_for_upsert = self.payloads.read()
+            .get(&memory_id)
+            .map(|p| p.realm.clone());
+        self.semantic_idx.write().upsert(
+            memory_id,
+            embedding.to_vec(),
+            realm_for_upsert.as_deref(),
+        );
 
         // Re-encode cortical sparse index (non-fatal)
         let _ = self.encode_memory(memory_id);
@@ -3036,6 +3103,45 @@ impl ChittaField {
             }
         }
         count
+    }
+
+    /// Mark every non-deleted memory with sufficient content as `embed_pending = true`
+    /// so the backfill thread re-embeds them with the new model (e.g. after a dim change).
+    /// Returns the count of memories marked.
+    pub fn requeue_all_embeddings(&self, _model_id: &str) -> Result<usize> {
+        const MIN_EMBED_CHARS: usize = 10;
+
+        // Pass 1: collect candidates — brief shared lock on both maps.
+        let candidates: Vec<MemoryId> = {
+            let states   = self.states.read();
+            let payloads = self.payloads.read();
+            states.iter()
+                .filter(|(id, st)| {
+                    !st.deleted &&
+                    payloads.get(id)
+                        .map(|p| p.content.len() >= MIN_EMBED_CHARS)
+                        .unwrap_or(false)
+                })
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        if candidates.is_empty() { return Ok(0); }
+
+        // Pass 2: mark as embed_pending — exclusive write lock.
+        let mut states = self.states.write();
+        let mut count = 0usize;
+        for id in &candidates {
+            if let Some(st) = states.get_mut(id) {
+                if !st.deleted {
+                    if !st.embed_pending {
+                        st.embed_pending = true;
+                        self.pending_embed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
     }
 
     /// Remove triplet by subject+predicate+object (invalidates first matching entry).
@@ -4893,15 +4999,18 @@ impl ChittaField {
             event_tape:     self.event_tape.read().clone(),
             decision_tape:  self.decision_tape.read().clone(),
             turiya_monitor: self.turiya_monitor.read().clone(),
+            observer_state: self.observer_state.read().clone(),
         };
         let path = self
             .data_dir
             .join(format!("chitta.{:08x}.snapshot", self.instance_id));
         // Write embedding and binary-code sidecars from the live index (before clearing clone).
         let emb_path   = path.with_extension("emb");
+        let hdc_path   = path.with_extension("hdc");
         let bin_path   = path.with_extension("bin");
-        let hnsw_path  = path.with_extension("hnsw");
-        let delta_path = path.with_extension("delta.hnsw");
+        let hnsw_path       = path.with_extension("hnsw");
+        let delta_path      = path.with_extension("delta.hnsw");
+        let realm_hnsw_path = path.with_extension("realm_hnsw");
         let pld_path   = path.with_extension("pld");
         let sup_path   = path.with_extension("sup.json");
         {
@@ -4914,6 +5023,14 @@ impl ChittaField {
             let _ = idx.save_binary_sidecar(&bin_path);
             let _ = idx.save_hnsw(&hnsw_path);
             let _ = idx.save_delta_hnsw(&delta_path);
+            let _ = idx.save_realm_hnsw(&realm_hnsw_path);
+        }
+        // Save HDC sidecar — avoids tokenize+encode rebuild on next startup.
+        {
+            let n = self.hdc_idx.read().save_sidecar(&hdc_path)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|e| format!("err:{e}"));
+            eprintln!("[chitta-field] hdc sidecar: {} memories written to {:?}", n, hdc_path);
         }
         // Save payload content sidecar (.pld) before clearing from bincode.
         let mut snap = snap;
@@ -5255,7 +5372,7 @@ impl ChittaField {
         let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
 
         for (id_a, emb_a, harness_a) in &candidates {
-            let neighbors = idx.search(emb_a, 20, None);
+            let neighbors = idx.search(emb_a, 20, None, None);
             for nb in &neighbors {
                 if nb.memory_id == *id_a { continue; }
                 let id_b = nb.memory_id;

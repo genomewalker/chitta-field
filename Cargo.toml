@@ -23,6 +23,7 @@ log = "0.4"
 parking_lot = "0.12"
 roaring = { version = "0.10", features = ["serde"] }
 pyo3 = { version = "0.22", features = ["auto-initialize"] }
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"] }
 
 [[bin]]
 name = "migrate"

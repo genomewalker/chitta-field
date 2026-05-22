@@ -214,6 +214,8 @@ pub struct ChittaField {
     /// CEC Phase 12 — cumulative count of events tombstoned by temporal compression.
     /// Ephemeral (not in snapshot) — lifetime of this daemon process.
     pub(crate) tape_tombstoned:    std::sync::atomic::AtomicU64,
+    pub(crate) observer:           crate::organ::observer::Observer,
+    pub(crate) observer_state:     RwLock<crate::organ::observer::ObserverState>,
 }
 
 impl Drop for ChittaField {
@@ -671,13 +673,22 @@ impl ChittaField {
         let scoring_config = crate::scoring::config::ScoringConfig::load(&data_dir);
         let loaded_repl_sessions = crate::repl_sessions::ReplSessionStore::load(&data_dir);
 
-        // Build HDC index from persisted payloads (skips deleted memories via states map).
+        // Build HDC index — load from sidecar if available (fast path), else rebuild.
         let mut hdc_store = crate::hdc::HdcStore::new();
         {
-            let entries = payloads.iter()
-                .filter(|(id, _)| states.get(id).map(|s| !s.deleted).unwrap_or(false))
-                .map(|(id, p)| (*id, std::str::from_utf8(&p.content).unwrap_or(""), p.realm.as_str()));
-            hdc_store.rebuild(entries);
+            let hdc_sidecar = best_full_path.as_ref().map(|p| p.with_extension("hdc"));
+            let loaded = hdc_sidecar.as_ref()
+                .and_then(|p| hdc_store.load_sidecar(p).ok())
+                .unwrap_or(0);
+            if loaded > 0 {
+                eprintln!("[chitta-field] hdc sidecar: loaded {} memories (skipped rebuild)", loaded);
+            } else {
+                eprintln!("[chitta-field] hdc sidecar: not found or stale — rebuilding from payloads");
+                let entries = payloads.iter()
+                    .filter(|(id, _)| states.get(id).map(|s| !s.deleted).unwrap_or(false))
+                    .map(|(id, p)| (*id, std::str::from_utf8(&p.content).unwrap_or(""), p.realm.as_str()));
+                hdc_store.rebuild(entries);
+            }
         }
 
         // Build EventTape from snapshot, seed entity interner from triplets, synthesize
@@ -693,7 +704,10 @@ impl ChittaField {
                 .filter(|(id, _)| states.get(id).map(|s| !s.deleted).unwrap_or(false))
                 .collect();
             sorted_payloads.sort_by_key(|(_, p)| p.authored_at_ms);
-            for (_, p) in sorted_payloads {
+            // Cap at 5000 most-recent memories to bound CDAWG rebuild cost on migration.
+            const LEGACY_CAP: usize = 5_000;
+            let skip = sorted_payloads.len().saturating_sub(LEGACY_CAP);
+            for (_, p) in sorted_payloads.into_iter().skip(skip) {
                 tape.synthesize_legacy(&p.realm, p.authored_at_ms);
             }
             tape
@@ -802,6 +816,8 @@ impl ChittaField {
             turiya_monitor:     RwLock::new(turiya_monitor),
             fep_prior:          RwLock::new(fep_prior),
             tape_tombstoned:    std::sync::atomic::AtomicU64::new(0),
+            observer:           crate::organ::observer::Observer::new(),
+            observer_state:     RwLock::new(crate::organ::observer::ObserverState::default()),
         })
     }
 }
@@ -1125,7 +1141,7 @@ pub(crate) fn apply_op(
 
             payloads.insert(memory_id, MemoryPayload::from(put));
             chunk_hash_idx.entry(chunk_hash).or_insert(memory_id);
-            semantic_idx.upsert(memory_id, embedding);
+            semantic_idx.upsert(memory_id, embedding, Some(realm.as_str()));
             keyword_idx.index(memory_id, &content_str);
             realm_members
                 .entry(realm.clone())
@@ -1502,7 +1518,8 @@ pub(crate) fn apply_op(
                 }
             }
             if !umc.embedding.is_empty() {
-                semantic_idx.upsert(umc.memory_id, umc.embedding);
+                let umc_realm = payloads.get(&umc.memory_id).map(|p| p.realm.clone()).unwrap_or_default();
+                semantic_idx.upsert(umc.memory_id, umc.embedding, Some(umc_realm.as_str()));
                 // An UpdateMemoryContent with a real embedding means the backfill
                 // completed. Clear embed_pending so replayed state matches live state.
                 if let Some(st) = states.get_mut(&umc.memory_id) {

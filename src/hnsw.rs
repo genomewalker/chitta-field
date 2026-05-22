@@ -29,6 +29,9 @@ const HNSW_EF_CONSTRUCTION: usize = 200; // candidates during insert
 const HNSW_EF_SEARCH: usize = 64;        // candidates during search
 // 1/ln(M) — controls layer probability distribution
 const HNSW_ML: f64 = 0.36067; // 1/ln(16)
+// Per-realm HNSW activates when a realm exceeds this count.
+// Below this, binary Hamming + linear scan (search_candidates) handles it.
+const PER_REALM_HNSW_THRESHOLD: usize = 500;
 
 // ── Embedding lookup helper ───────────────────────────────────────────────────
 
@@ -383,6 +386,16 @@ pub struct SemanticIndex {
     /// when binary Hamming will be the active search path after normalize_all()).
     #[serde(skip)]
     inhibit_hnsw: bool,
+    /// Per-realm HNSW graphs — built for realms exceeding PER_REALM_HNSW_THRESHOLD.
+    /// Saved to .realm_hnsw sidecar. Seeded by seed_realm_map() at load time.
+    #[serde(skip)]
+    per_realm_hnsw: HashMap<String, HnswGraph>,
+    /// Per-realm embedding counts — tracked at upsert time to decide routing.
+    #[serde(skip)]
+    per_realm_counts: HashMap<String, usize>,
+    /// Memory-to-realm mapping — populated by upsert, consumed by remove.
+    #[serde(skip)]
+    per_id_realm: HashMap<MemoryId, String>,
     /// Mmap of the .emb sidecar file — populated by activate_mmap_embeddings() above 200K.
     /// Wrapped in Arc so SemanticIndex remains Clone (Arc<T>: Clone even when T: !Clone).
     #[serde(skip)]
@@ -409,6 +422,9 @@ impl SemanticIndex {
             binary_vec: Vec::new(),
             binary_vec_pos: HashMap::new(),
             inhibit_hnsw: false,
+            per_realm_hnsw: HashMap::new(),
+            per_realm_counts: HashMap::new(),
+            per_id_realm: HashMap::new(),
             emb_mmap: None,
             emb_offsets: HashMap::new(),
         }
@@ -563,7 +579,7 @@ impl SemanticIndex {
     }
 
     /// Add or update an embedding. Un-deletes the entry if it was soft-deleted.
-    pub fn upsert(&mut self, memory_id: MemoryId, mut embedding: Vec<f32>) {
+    pub fn upsert(&mut self, memory_id: MemoryId, mut embedding: Vec<f32>, realm: Option<&str>) {
         self.remove(memory_id);
         normalize_in_place(&mut embedding);
         self.deleted.remove(&memory_id);
@@ -599,7 +615,18 @@ impl SemanticIndex {
         }
         self.embeddings.insert(memory_id, embedding);
 
-        if !self.inhibit_hnsw && self.use_hnsw() && embedding_ready {
+        // Track realm membership for per-realm HNSW routing.
+        if let Some(r) = realm {
+            *self.per_realm_counts.entry(r.to_string()).or_default() += 1;
+            self.per_id_realm.insert(memory_id, r.to_string());
+        }
+
+        // Global HNSW: skip for small-realm writes — binary Hamming + linear scan handles those.
+        let realm_is_small = realm.map(|r|
+            self.per_realm_counts.get(r).copied().unwrap_or(0) < PER_REALM_HNSW_THRESHOLD
+        ).unwrap_or(false);
+
+        if !self.inhibit_hnsw && self.use_hnsw() && embedding_ready && !realm_is_small {
             let emb = self.embeddings[&memory_id].clone();
             let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
             if self.use_tier2() {
@@ -608,10 +635,27 @@ impl SemanticIndex {
                 self.hnsw.insert(memory_id, &emb, &embs);
             }
         }
+
+        // Per-realm HNSW: build when realm is large enough for its own graph.
+        if embedding_ready {
+            if let Some(r) = realm {
+                if self.per_realm_counts.get(r).copied().unwrap_or(0) >= PER_REALM_HNSW_THRESHOLD {
+                    let emb = self.embeddings[&memory_id].clone();
+                    let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                    self.per_realm_hnsw.entry(r.to_string()).or_default().insert(memory_id, &emb, &embs);
+                }
+            }
+        }
     }
 
     /// Mark a memory as deleted — excluded from future search results.
     pub fn remove(&mut self, memory_id: MemoryId) {
+        if let Some(realm) = self.per_id_realm.remove(&memory_id) {
+            if let Some(graph) = self.per_realm_hnsw.get_mut(&realm) {
+                graph.remove(memory_id);
+            }
+            self.per_realm_counts.entry(realm).and_modify(|c| *c = c.saturating_sub(1));
+        }
         self.hnsw.remove(memory_id);
         self.delta_hnsw.remove(memory_id);
         self.deleted.insert(memory_id);
@@ -669,6 +713,7 @@ impl SemanticIndex {
         query: &[f32],
         k: usize,
         allowed: Option<&HashSet<MemoryId>>,
+        realm: Option<&str>,
     ) -> Vec<SemanticHit> {
         if query.len() != EMBED_DIM {
             return vec![];
@@ -676,6 +721,19 @@ impl SemanticIndex {
         let Some(query_unit) = normalize(query) else {
             return vec![];
         };
+
+        // Per-realm HNSW fast path: bypass global index + allowed-set filter overhead.
+        if let Some(r) = realm {
+            if let Some(graph) = self.per_realm_hnsw.get(r) {
+                if !graph.is_empty() {
+                    let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                    let pairs = graph.search(&query_unit, k, None, &self.deleted, &embs);
+                    return pairs.into_iter()
+                        .map(|(memory_id, cosine_similarity)| SemanticHit { memory_id, cosine_similarity })
+                        .collect();
+                }
+            }
+        }
 
         if let Some(allowed_ids) = allowed {
             if allowed_ids.len() <= MIN_CANDIDATES {
@@ -762,6 +820,7 @@ impl SemanticIndex {
         query_ctx_32: &[f32],
         signatures: &HashMap<MemoryId, Vec<f32>>,
         beta: f32,
+        _realm: Option<&str>,
     ) -> Vec<SemanticHit> {
         if query.len() != EMBED_DIM {
             return vec![];
@@ -1094,11 +1153,62 @@ impl SemanticIndex {
         true
     }
 
+    // ── Per-realm HNSW sidecar (.realm_hnsw) ────────────────────────────────
+
+    /// Populate per-realm tracking from the store's realm_members map.
+    /// Call after snapshot load, before WAL replay.
+    pub fn seed_realm_map(&mut self, realm_members: &HashMap<String, HashSet<MemoryId>>) {
+        self.per_id_realm.clear();
+        self.per_realm_counts.clear();
+        for (realm, members) in realm_members {
+            self.per_realm_counts.insert(realm.clone(), members.len());
+            for &id in members {
+                self.per_id_realm.insert(id, realm.clone());
+            }
+        }
+    }
+
+    pub fn save_realm_hnsw(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if self.per_realm_hnsw.is_empty() {
+            let _ = std::fs::remove_file(path);
+            return Ok(());
+        }
+        let bytes = bincode::serialize(&self.per_realm_hnsw)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let tmp = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(".tmp");
+            std::path::PathBuf::from(s)
+        };
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    pub fn load_realm_hnsw(&mut self, path: &std::path::Path) -> bool {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let graphs: HashMap<String, HnswGraph> = match bincode::deserialize(&bytes) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[hnsw] load_realm_hnsw: deserialize failed: {}", e);
+                return false;
+            }
+        };
+        eprintln!("[hnsw] load_realm_hnsw: loaded {} realm graphs", graphs.len());
+        self.per_realm_hnsw = graphs;
+        true
+    }
+
     // ── Embedding sidecar (.emb) ─────────────────────────────────────────────
     // Format: [magic:u64][count:u64]([id:u64][f32×EMBED_DIM])×count
     // All values little-endian. Atomic write via .tmp rename.
 
-    const EMB_MAGIC: u64 = 0x454D4244_00000001; // "EMBD\0\0\0\x01"
+    const EMB_MAGIC: u64 = 0x454D4244_00000002; // "EMBD\0\0\0\x02" — bumped for EMBED_DIM 256→768
 
     pub fn save_embeddings_sidecar(&self, path: &std::path::Path) -> std::io::Result<()> {
         // When mmap is active the heap holds only the post-activation delta.
@@ -1196,7 +1306,7 @@ impl SemanticIndex {
     // ── Binary codes sidecar (.bin) ──────────────────────────────────────────
     // Format: [magic:u64][count:u64]([id:u64][u64×BINARY_WORDS])×count
 
-    const BIN_MAGIC: u64 = 0x42494E41_00000001; // "BINA\0\0\0\x01"
+    const BIN_MAGIC: u64 = 0x42494E41_00000002; // "BINA\0\0\0\x02" — bumped for EMBED_DIM 256→768
 
     pub fn save_binary_sidecar(&self, path: &std::path::Path) -> std::io::Result<()> {
         let tmp = path.with_extension("bin.tmp");
@@ -1619,11 +1729,11 @@ mod tests {
         let mut e3 = vec![0.0f32; EMBED_DIM];
         e3[0] = 0.9;
         e3[1] = 0.1;
-        idx.upsert(1, e1.clone());
-        idx.upsert(2, e2);
-        idx.upsert(3, e3);
+        idx.upsert(1, e1.clone(), None);
+        idx.upsert(2, e2, None);
+        idx.upsert(3, e3, None);
 
-        let hits = idx.search(&e1, 2, None);
+        let hits = idx.search(&e1, 2, None, None);
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].memory_id, 1); // exact match
                                           // e3 has a larger component on dim 0 (same as query) than e2
@@ -1634,10 +1744,10 @@ mod tests {
     fn test_deleted_not_returned() {
         let mut idx = SemanticIndex::new();
         let e = vec![1.0f32; EMBED_DIM];
-        idx.upsert(1, e.clone());
-        idx.upsert(2, e.clone());
+        idx.upsert(1, e.clone(), None);
+        idx.upsert(2, e.clone(), None);
         idx.remove(1);
-        let hits = idx.search(&e, 10, None);
+        let hits = idx.search(&e, 10, None, None);
         assert!(hits.iter().all(|h| h.memory_id != 1));
     }
 
@@ -1645,12 +1755,12 @@ mod tests {
     fn test_allowed_filter() {
         let mut idx = SemanticIndex::new();
         let e = vec![1.0f32; EMBED_DIM];
-        idx.upsert(1, e.clone());
-        idx.upsert(2, e.clone());
-        idx.upsert(3, e.clone());
+        idx.upsert(1, e.clone(), None);
+        idx.upsert(2, e.clone(), None);
+        idx.upsert(3, e.clone(), None);
 
         let allowed: HashSet<MemoryId> = [2u64, 3u64].into_iter().collect();
-        let hits = idx.search(&e, 10, Some(&allowed));
+        let hits = idx.search(&e, 10, Some(&allowed), None);
         assert!(hits.iter().all(|h| h.memory_id != 1));
         assert_eq!(hits.len(), 2);
     }
@@ -1658,7 +1768,7 @@ mod tests {
     #[test]
     fn test_wrong_dim_returns_empty() {
         let idx = SemanticIndex::new();
-        let hits = idx.search(&[1.0f32; 64], 5, None);
+        let hits = idx.search(&[1.0f32; 64], 5, None, None);
         assert!(hits.is_empty());
     }
 
@@ -1670,11 +1780,11 @@ mod tests {
         let mut e2 = vec![0.0f32; EMBED_DIM];
         e2[1] = 1.0;
 
-        idx.upsert(1, e1);
-        idx.upsert(1, e2.clone()); // overwrite
+        idx.upsert(1, e1, None);
+        idx.upsert(1, e2.clone(), None); // overwrite
 
         // Query aligned with dim-1; id=1 should now match well
-        let hits = idx.search(&e2, 1, None);
+        let hits = idx.search(&e2, 1, None, None);
         assert_eq!(hits[0].memory_id, 1);
     }
 
@@ -1685,8 +1795,8 @@ mod tests {
         e1[0] = 1.0;
         let mut e2 = vec![0.0f32; EMBED_DIM];
         e2[1] = 1.0;
-        idx.upsert(1, e1.clone());
-        idx.upsert(2, e2.clone());
+        idx.upsert(1, e1.clone(), None);
+        idx.upsert(2, e2.clone(), None);
 
         let hits = idx.search_candidates(&e1, [2, 1], 1);
         assert_eq!(hits.len(), 1);

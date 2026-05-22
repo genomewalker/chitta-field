@@ -9,8 +9,8 @@ use std::path::Path;
 
 /// V1 cortex snapshot: PostingEntry without affect_q field.
 const CORTEX_SNAPSHOT_MAGIC_V1: u64 = 0xC417745F3A7_0001;
-/// Current cortex snapshot (V3): EMBED_DIM=256, HALF_DIM=128 (nomic MRL-256).
-const CORTEX_SNAPSHOT_MAGIC: u64 = 0xC417745F3A7_0003;
+/// Current cortex snapshot (V4): EMBED_DIM=768, HALF_DIM=384 (nomic-embed-text v1.5).
+const CORTEX_SNAPSHOT_MAGIC: u64 = 0xC417745F3A7_0004;
 
 // ── Sparse Code ──────────────────────────────────────────────────────────────
 
@@ -73,7 +73,9 @@ impl SparseEncoder {
     /// Encode a 768-dim embedding into a sparse code of K=64 active features.
     /// Product-key top-K: O(128×384 + 128×384 + 256) instead of O(16384×768).
     pub fn encode(&self, embedding: &[f32]) -> SparseCode {
-        assert_eq!(embedding.len(), EMBED_DIM);
+        if embedding.len() != EMBED_DIM {
+            return SparseCode::default();
+        }
         let (e_left, e_right) = embedding.split_at(HALF_DIM);
 
         // Score each half-dictionary

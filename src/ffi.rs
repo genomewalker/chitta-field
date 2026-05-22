@@ -476,6 +476,29 @@ pub extern "C" fn cf_recall_temporal(
 }
 
 #[no_mangle]
+pub extern "C" fn cf_recall_temporal_events(
+    h: *mut CfHandle,
+    start_ms: i64,
+    end_ms: i64,
+    limit: usize,
+    hits_buf: *mut CfRecallHit,
+    hits_cap: usize,
+    hits_written: *mut usize,
+) -> c_int {
+    if h.is_null() || hits_buf.is_null() || hits_written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    match handle.field.recall_temporal_events(start_ms, end_ms, limit) {
+        Ok(hits) => {
+            write_hits(hits, hits_buf, hits_cap, hits_written);
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn cf_recall_artifact(
     h: *mut CfHandle,
     normalized_path: *const c_char,
@@ -1517,6 +1540,25 @@ pub extern "C" fn cf_pending_count(h: *const CfHandle) -> usize {
 pub extern "C" fn cf_requeue_ghost_embeddings(h: *const CfHandle) -> usize {
     if h.is_null() { return 0; }
     unsafe { &*h }.field.requeue_ghost_embeddings()
+}
+
+#[no_mangle]
+pub extern "C" fn cf_requeue_all_embeddings(
+    h: *const CfHandle,
+    model_id_ptr: *const std::os::raw::c_char,
+    model_id_len: usize,
+) -> i64 {
+    if h.is_null() { return -1; }
+    let model_id = if model_id_ptr.is_null() || model_id_len == 0 {
+        "nomic-embed-text:v1.5".to_string()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(model_id_ptr as *const u8, model_id_len) };
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    match unsafe { &*h }.field.requeue_all_embeddings(&model_id) {
+        Ok(n) => n as i64,
+        Err(_) => -1,
+    }
 }
 
 // ── Code Intelligence ─────────────────────────────────────────────────────────
@@ -4993,7 +5035,7 @@ pub extern "C" fn cf_update_memory_content(
         }
     }
     if !new_embedding.is_empty() {
-        handle.field.semantic_idx.write().upsert(id, new_embedding);
+        handle.field.semantic_idx.write().upsert(id, new_embedding, None);
     }
     let content_str = String::from_utf8_lossy(&new_content).to_string();
     handle.field.keyword_idx.write().index(id, &content_str);
