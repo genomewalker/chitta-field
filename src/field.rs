@@ -739,6 +739,7 @@ impl ChittaField {
         let turiya_monitor    = crate::organ::turiya_monitor::TuriyaMonitor::new();
         let fep_prior         = crate::organ::fep_prior::FepPriorOrgan::new();
 
+        let initial_memory_count = payloads.len();
         Ok(Self {
             data_dir,
             instance_id,
@@ -801,7 +802,7 @@ impl ChittaField {
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
             realm_members: RwLock::new(realm_members),
             kind_members:  RwLock::new(kind_members),
-            memory_count: Arc::new(AtomicUsize::new(payloads.len())),
+            memory_count: Arc::new(AtomicUsize::new(initial_memory_count)),
             pending_embed_count: Arc::new(AtomicUsize::new(init_pending)),
             last_compact_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             realm_stats: RwLock::new(HashMap::new()),

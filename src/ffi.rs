@@ -4274,12 +4274,20 @@ pub extern "C" fn cf_list_memories(
         _ => entries.sort_by(|a, b| b.1.created_at_ms.cmp(&a.1.created_at_ms)),
     }
 
+    let triplets = handle.field.triplet_store.read();
     let page: Vec<serde_json::Value> = entries
         .iter()
         .skip(offset)
         .take(limit)
         .map(|(mid, payload, state)| {
             let content_str = String::from_utf8_lossy(&payload.content);
+            let mid_str = mid.to_string();
+            let tags: Vec<&str> = triplets
+                .query_subject(&mid_str, now)
+                .into_iter()
+                .filter(|t| t.predicate == "tagged")
+                .map(|t| t.object.as_str())
+                .collect();
             serde_json::json!({
                 "id": mid,
                 "content": content_str,
@@ -4289,10 +4297,12 @@ pub extern "C" fn cf_list_memories(
                 "strength": state.effective_strength(now),
                 "ts_ms": payload.created_at_ms,
                 "pinned": state.pinned,
+                "tags": tags,
             })
         })
         .collect();
 
+    drop(triplets);
     drop(payloads);
     drop(states);
 
