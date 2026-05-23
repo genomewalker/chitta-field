@@ -182,6 +182,7 @@ pub struct ChittaField {
     pub(crate) chunk_hash_idx: RwLock<HashMap<crate::ids::ChunkHash, MemoryId>>,
     pub(crate) realm_members: RwLock<HashMap<String, HashSet<MemoryId>>>,
     pub(crate) kind_members:  RwLock<HashMap<String, HashSet<MemoryId>>>,
+    pub(crate) memory_count: Arc<AtomicUsize>,
     pub(crate) pending_embed_count: Arc<AtomicUsize>,
     pub(crate) last_compact_ms: Arc<std::sync::atomic::AtomicI64>,
     pub(crate) pending_recall: Mutex<PendingRecallEffects>,
@@ -599,6 +600,21 @@ impl ChittaField {
             }
         }
         semantic_idx.normalize_all();
+        // After WAL replay, the HNSW may have been backfilled with entries beyond the snapshot.
+        // Persist the updated HNSW sidecar now so the next restart loads a complete graph
+        // instead of spending O(N log N) re-inserting the delta.
+        if let Some(ref snap_path) = best_full_path {
+            let hnsw_count = semantic_idx.hnsw_len();
+            let total      = semantic_idx.total_embedding_count();
+            if hnsw_count > 0 && hnsw_count == total {
+                if let Err(e) = semantic_idx.save_hnsw(&snap_path.with_extension("hnsw")) {
+                    eprintln!("[chitta-field] WARNING: failed to save post-replay HNSW: {e}");
+                } else {
+                    eprintln!("[chitta-field] post-replay HNSW saved ({hnsw_count} nodes)");
+                }
+                let _ = semantic_idx.save_delta_hnsw(&snap_path.with_extension("delta.hnsw"));
+            }
+        }
         keyword_idx.rebuild_reverse_index();
 
         // One-time migration: mark SSL memories (content with →) for gloss-baked re-embed.
@@ -785,6 +801,7 @@ impl ChittaField {
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
             realm_members: RwLock::new(realm_members),
             kind_members:  RwLock::new(kind_members),
+            memory_count: Arc::new(AtomicUsize::new(payloads.len())),
             pending_embed_count: Arc::new(AtomicUsize::new(init_pending)),
             last_compact_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             realm_stats: RwLock::new(HashMap::new()),

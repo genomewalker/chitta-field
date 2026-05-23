@@ -415,6 +415,7 @@ impl ChittaField {
             self.pending_embed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.payloads.write().insert(memory_id, payload);
+        self.memory_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.states.write().insert(memory_id, state);
         self.chunk_hash_idx
             .write()
@@ -935,7 +936,7 @@ impl ChittaField {
     /// O(1) upper-bound count — includes soft-deleted entries.
     /// Use for latency-sensitive paths (health_check fast path).
     pub fn raw_memory_count(&self) -> usize {
-        self.payloads.read().len()
+        self.memory_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// O(1) pending-embedding count. Maintained by put_memory/backfill_embedding.
