@@ -4,6 +4,7 @@ use crate::ops::EMBED_DIM;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::Write;
 use memmap2;
+use rayon::prelude::*;
 
 const COARSE_CENTROIDS: usize = 256;
 const COARSE_ASSIGNMENTS: usize = 2;
@@ -32,6 +33,17 @@ const HNSW_ML: f64 = 0.36067; // 1/ln(16)
 // Per-realm HNSW activates when a realm exceeds this count.
 // Below this, binary Hamming + linear scan (search_candidates) handles it.
 const PER_REALM_HNSW_THRESHOLD: usize = 500;
+
+/// Deterministic level assignment seeded by node ID — safe to call from parallel threads.
+fn random_level_from_seed(seed: u64) -> usize {
+    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    s ^= s >> 33;
+    s = s.wrapping_mul(0xff51afd7ed558ccd);
+    s ^= s >> 33;
+    let f = (s >> 11) as f64 / (1u64 << 53) as f64;
+    if f < 1e-15 { return 0; }
+    ((-f.ln() * HNSW_ML).floor() as usize).min(16)
+}
 
 // ── Embedding lookup helper ───────────────────────────────────────────────────
 
@@ -320,6 +332,76 @@ impl HnswGraph {
         let level = (-f.ln() * HNSW_ML).floor() as usize;
         level.min(16) // cap at 16 layers
     }
+
+    /// Read-only plan computation: find neighbor candidates for a new node without
+    /// mutating the graph. Used by backfill_hnsw_delta_parallel to parallelize the
+    /// search phase against a frozen snapshot.
+    pub(crate) fn compute_insert_plan(
+        &self,
+        emb: &[f32],
+        level: usize,
+        embs: &EmbLookup<'_>,
+    ) -> Vec<Vec<MemoryId>> {
+        let current_top = self.entry_point.map(|(_, l)| l).unwrap_or(0);
+        let ep = match self.entry_point {
+            None => return vec![vec![]; level + 1],
+            Some((ep, _)) => ep,
+        };
+        let mut ep_set = vec![ep];
+        for layer in (level + 1..=current_top).rev() {
+            ep_set = self.search_layer(emb, &ep_set, 1, layer, embs);
+        }
+        let mut neighbors_per_layer = vec![vec![]; level + 1];
+        for layer in (0..=level.min(current_top)).rev() {
+            let candidates = self.search_layer(emb, &ep_set, HNSW_EF_CONSTRUCTION, layer, embs);
+            let m = if layer == 0 { HNSW_M0 } else { HNSW_M };
+            neighbors_per_layer[layer] = self.select_neighbors(emb, &candidates, m, embs);
+            ep_set = candidates;
+        }
+        neighbors_per_layer
+    }
+
+    /// Serial apply: wire a pre-computed insert plan into the live graph.
+    /// Called after the parallel search phase in backfill_hnsw_delta_parallel.
+    pub(crate) fn apply_insert_plan(
+        &mut self,
+        id: MemoryId,
+        level: usize,
+        neighbors_per_layer: Vec<Vec<MemoryId>>,
+        embs: &EmbLookup<'_>,
+    ) {
+        let current_top = self.entry_point.map(|(_, l)| l).unwrap_or(0);
+        self.neighbors.insert(id, vec![Vec::new(); level + 1]);
+        if self.entry_point.is_none() {
+            self.entry_point = Some((id, level));
+            return;
+        }
+        for (layer, selected) in neighbors_per_layer.iter().enumerate() {
+            if layer > level.min(current_top) { break; }
+            if let Some(nn) = self.neighbors.get_mut(&id) {
+                if layer < nn.len() { nn[layer] = selected.clone(); }
+            }
+            let m_max = if layer == 0 { HNSW_M0 } else { HNSW_M };
+            for &nbr in selected {
+                let needs_shrink = if let Some(nl) = self.neighbors.get_mut(&nbr) {
+                    if layer < nl.len() { nl[layer].push(id); nl[layer].len() > m_max } else { false }
+                } else { false };
+                if needs_shrink {
+                    let shrunk = self.neighbors.get(&nbr).and_then(|nl| {
+                        nl.get(layer).and_then(|layer_list| {
+                            embs.get(nbr).map(|e| self.select_neighbors(e, layer_list, m_max, embs))
+                        })
+                    });
+                    if let (Some(s), Some(nl)) = (shrunk, self.neighbors.get_mut(&nbr)) {
+                        if layer < nl.len() { nl[layer] = s; }
+                    }
+                }
+            }
+        }
+        if level > current_top {
+            self.entry_point = Some((id, level));
+        }
+    }
 }
 
 /// Newtype for f32 that implements Ord via total_cmp. Used in BinaryHeap.
@@ -436,6 +518,10 @@ impl SemanticIndex {
         self.embeddings.len() + self.emb_offsets.len()
     }
 
+    pub fn hnsw_len(&self) -> usize {
+        self.hnsw.len() + self.delta_hnsw.len()
+    }
+
     /// True when the HNSW graph is the active search path.
     #[inline]
     fn use_hnsw(&self) -> bool {
@@ -480,6 +566,100 @@ impl SemanticIndex {
                 }
             }
         }
+    }
+
+    /// Parallel variant of backfill_hnsw_delta.
+    /// Phase 1 (parallel): clone the current graph and all embeddings into a read-only
+    /// snapshot, then compute neighbor candidates for every delta node concurrently.
+    /// Phase 2 (serial): apply the pre-computed plans into the live graph.
+    /// Falls back to serial for small deltas (< 512 nodes) where overhead dominates.
+    pub fn backfill_hnsw_delta_parallel(&mut self) {
+        if !self.use_hnsw() { return; }
+        if self.hnsw.is_empty() && self.delta_hnsw.is_empty() { return; }
+
+        let delta: Vec<MemoryId> = self.embeddings.keys()
+            .chain(self.emb_offsets.keys())
+            .filter(|&&id| {
+                !self.deleted.contains(&id)
+                    && !self.hnsw.contains(id)
+                    && !self.delta_hnsw.contains(id)
+            })
+            .copied()
+            .collect();
+
+        if delta.is_empty() { return; }
+        if delta.len() < 512 {
+            self.backfill_hnsw_delta();
+            return;
+        }
+
+        eprintln!("[hnsw] backfill_hnsw_delta_parallel: {} delta nodes", delta.len());
+        let t0 = std::time::Instant::now();
+
+        // Materialize all embeddings into an owned map for thread-safe access.
+        let mut snap_embs: HashMap<MemoryId, Vec<f32>> =
+            HashMap::with_capacity(self.embeddings.len() + self.emb_offsets.len());
+        {
+            let lookup = EmbLookup {
+                heap: &self.embeddings,
+                offsets: &self.emb_offsets,
+                mmap: &self.emb_mmap,
+            };
+            for (&id, v) in &self.embeddings {
+                snap_embs.insert(id, v.clone());
+            }
+            for &id in self.emb_offsets.keys() {
+                if let Some(e) = lookup.get(id) {
+                    snap_embs.entry(id).or_insert_with(|| e.to_vec());
+                }
+            }
+        }
+
+        let tier2 = self.use_tier2();
+        let graph_snap: HnswGraph =
+            if tier2 { self.delta_hnsw.clone() } else { self.hnsw.clone() };
+
+        // Parallel search phase: compute plans against the frozen snapshot.
+        let empty_offsets: HashMap<MemoryId, u64> = HashMap::new();
+        let empty_mmap: Option<std::sync::Arc<memmap2::Mmap>> = None;
+        let plans: Vec<(MemoryId, usize, Vec<Vec<MemoryId>>)> = delta
+            .par_iter()
+            .filter_map(|&id| {
+                let emb = snap_embs.get(&id)?;
+                let level = random_level_from_seed(id);
+                let lookup = EmbLookup {
+                    heap: &snap_embs,
+                    offsets: &empty_offsets,
+                    mmap: &empty_mmap,
+                };
+                let plan = graph_snap.compute_insert_plan(emb, level, &lookup);
+                Some((id, level, plan))
+            })
+            .collect();
+
+        eprintln!(
+            "[hnsw] backfill_hnsw_delta_parallel: parallel phase done in {:.1}s, applying {} plans",
+            t0.elapsed().as_secs_f32(),
+            plans.len()
+        );
+
+        // Serial apply phase: use snap_embs (already in RAM) to avoid cold mmap page faults
+        // during neighbor shrinking. This is the key to consistent ~10s vs ~75s apply time.
+        let empty_offsets2: HashMap<MemoryId, u64> = HashMap::new();
+        let empty_mmap2: Option<std::sync::Arc<memmap2::Mmap>> = None;
+        let snap_lookup = EmbLookup { heap: &snap_embs, offsets: &empty_offsets2, mmap: &empty_mmap2 };
+        for (id, level, neighbors_per_layer) in plans {
+            if tier2 {
+                self.delta_hnsw.apply_insert_plan(id, level, neighbors_per_layer, &snap_lookup);
+            } else {
+                self.hnsw.apply_insert_plan(id, level, neighbors_per_layer, &snap_lookup);
+            }
+        }
+
+        eprintln!(
+            "[hnsw] backfill_hnsw_delta_parallel: done in {:.1}s total",
+            t0.elapsed().as_secs_f32()
+        );
     }
 
     /// Returns true when the delta tier should be merged into the base HNSW.
@@ -983,7 +1163,7 @@ impl SemanticIndex {
         let total = self.total_embedding_count();
         let coarse_ok = self.mem_coarse.len() == total;
         let lsh_ok    = self.mem_lsh.len()    == total;
-        let hnsw_ok   = !self.hnsw.is_empty() && self.hnsw.len() == total;
+        let hnsw_ok   = self.hnsw_len() > 0 && self.hnsw_len() == total;
         if !coarse_ok {
             self.rebuild_ann();
         } else {
@@ -998,7 +1178,7 @@ impl SemanticIndex {
                 && !self.binary_codes.is_empty();
             if !hnsw_ok && self.use_hnsw() {
                 if binary_covers && !self.hnsw.is_empty() {
-                    self.backfill_hnsw_delta();
+                    self.backfill_hnsw_delta_parallel();
                 } else if !binary_covers {
                     eprintln!("[hnsw] rebuild_hnsw: hnsw={} total={} — rebuilding", self.hnsw.len(), total);
                     self.rebuild_hnsw();
@@ -1404,30 +1584,39 @@ impl SemanticIndex {
             self.mem_lsh.insert(memory_id, signatures);
         }
 
-        // Rebuild HNSW if collection is large enough
+        // Rebuild HNSW if collection is large enough.
+        // Prefer incremental backfill when HNSW is already loaded and only a small WAL
+        // delta is missing — avoids clearing the loaded sidecar and re-inserting 130K+ nodes.
         if !hnsw_valid && self.use_hnsw() {
-            self.rebuild_hnsw();
+            let total = self.total_embedding_count();
+            let covered = self.hnsw_len();
+            if covered > 0 && total.saturating_sub(covered) < 10_000 {
+                self.backfill_hnsw_delta_parallel();
+            } else {
+                self.rebuild_hnsw();
+            }
         }
     }
 
     fn rebuild_hnsw(&mut self) {
         self.hnsw = HnswGraph::new();
         self.delta_hnsw = HnswGraph::new();
+        // Seed with first node so backfill_hnsw_delta_parallel doesn't exit early.
         let mut ids: Vec<MemoryId> = self.embeddings.keys()
             .chain(self.emb_offsets.keys())
             .copied()
             .collect();
         ids.sort_unstable();
-        for id in ids {
-            let emb_owned = {
-                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
-                embs.get(id).map(|s| s.to_vec())
-            };
-            if let Some(emb) = emb_owned {
-                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
-                self.hnsw.insert(id, &emb, &embs);
+        let Some(&first) = ids.first() else { return };
+        {
+            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+            if let Some(emb) = embs.get(first).map(|s| s.to_vec()) {
+                let embs2 = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                self.hnsw.insert(first, &emb, &embs2);
             }
         }
+        // Parallel phase: remaining nodes computed against growing snapshots.
+        self.backfill_hnsw_delta_parallel();
     }
 
     fn assign_coarse(&self, embedding: &[f32]) -> Vec<u16> {
