@@ -12,6 +12,7 @@ use crate::organ::event_tape::EventTape;
 use crate::organ::decision_tape::DecisionTape;
 use crate::organ::turiya_monitor::TuriyaMonitor;
 use crate::organ::observer::ObserverState;
+use crate::organ::interaction_ledger::InteractionLedger;
 use crate::organ::triplet::{CorrectionState, TripletStore};
 use crate::payload::MemoryPayload;
 use crate::state::{EpistemicStatus, MemoryState, MemoryStatus, RetrievalHistory};
@@ -58,7 +59,9 @@ const FULL_SNAPSHOT_MAGIC_V17: u64 = 0xF011_5741_7E00_0011;
 /// V18 magic: FullSnapshot gains `observer_state: ObserverState` (Tier-0 observation extraction).
 pub const FULL_SNAPSHOT_MAGIC_V18: u64 = 0xF011_5741_7E00_0012;
 /// V19 magic: MemoryPayload gains `embedding_model_id` + `embedding_dim`; EMBED_DIM 256→768.
-const FULL_SNAPSHOT_MAGIC: u64         = 0xF011_5741_7E00_0013; // V19
+const FULL_SNAPSHOT_MAGIC_V19: u64     = 0xF011_5741_7E00_0013;
+/// V20 magic: FullSnapshot gains `interaction_ledger: InteractionLedger`.
+const FULL_SNAPSHOT_MAGIC: u64         = 0xF011_5741_7E00_0014; // V20
 
 /// Magic for the payload content sidecar (.pld).
 const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
@@ -633,6 +636,8 @@ pub struct FullSnapshot {
     pub turiya_monitor: TuriyaMonitor,
     /// Tier-0 observation extraction state — structured facts extracted from conversational turns.
     pub observer_state: ObserverState,
+    /// V20: Interaction Ledger — reads/writes/outcomes as first-class events + versioned assertions.
+    pub interaction_ledger: InteractionLedger,
 }
 
 /// MemoryPayload as serialized in V16 snapshots (pre-Phase-17).
@@ -767,6 +772,32 @@ struct LegacyFullSnapshotV16 {
 struct LegacyFullSnapshotV18 {
     pub snapshot_seqno:      u64,
     pub payloads:            HashMap<MemoryId, LegacyMemoryPayloadV18>,
+    pub states:              HashMap<MemoryId, MemoryState>,
+    pub assoc_edges:         HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts:           HashMap<String, ArtifactId>,
+    pub artifact_paths:      HashMap<ArtifactId, String>,
+    pub time_idx:            TemporalIndex,
+    pub keyword_idx:         KeywordIndex,
+    pub artifact_idx:        ArtifactIndex,
+    pub triplet_store:       TripletStore,
+    pub symbol_idx:          SymbolIndex,
+    pub call_graph:          CallGraph,
+    pub code_files:          CodeFileIndex,
+    pub semantic_idx:        SemanticIndex,
+    pub coactivation_stats:  HashMap<(MemoryId, MemoryId), CoActivationStats>,
+    pub ack_scores:          HashMap<MemoryId, i32>,
+    pub correction_states:   HashMap<u64, CorrectionState>,
+    pub event_tape:          EventTape,
+    pub decision_tape:       DecisionTape,
+    pub turiya_monitor:      TuriyaMonitor,
+    pub observer_state:      ObserverState,
+}
+
+/// V19 snapshot layout — FullSnapshot without interaction_ledger.
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV19 {
+    pub snapshot_seqno:      u64,
+    pub payloads:            HashMap<MemoryId, MemoryPayload>,
     pub states:              HashMap<MemoryId, MemoryState>,
     pub assoc_edges:         HashMap<MemoryId, Vec<AssocEdge>>,
     pub artifacts:           HashMap<String, ArtifactId>,
@@ -964,6 +995,7 @@ impl FullSnapshot {
             && magic != FULL_SNAPSHOT_MAGIC_V5
             && magic != FULL_SNAPSHOT_MAGIC_V4
             && magic != FULL_SNAPSHOT_MAGIC_V1
+            && magic != FULL_SNAPSHOT_MAGIC_V19
         {
             return Err(FieldError::Manifest("invalid full snapshot magic".to_string()));
         }
@@ -988,11 +1020,44 @@ impl FullSnapshot {
         let magic = u64::from_le_bytes(magic_buf);
 
         if magic == FULL_SNAPSHOT_MAGIC {
-            // V19: MemoryPayload gains embedding_model_id + embedding_dim; EMBED_DIM 256→768.
+            // V20: current format with interaction_ledger.
             let mut snap: Self = bincode::deserialize_from(&mut r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
+        }
+
+        if magic == FULL_SNAPSHOT_MAGIC_V19 {
+            // V19→V20: add interaction_ledger (default empty).
+            eprintln!("[chitta-field] migrating v19 snapshot → v20 (interaction ledger)");
+            let leg: LegacyFullSnapshotV19 = bincode::deserialize_from(&mut r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            let mut states = leg.states;
+            for state in states.values_mut() { state.sanitize(); }
+            return Ok(FullSnapshot {
+                snapshot_seqno:     leg.snapshot_seqno,
+                payloads:           leg.payloads,
+                states,
+                assoc_edges:        leg.assoc_edges,
+                artifacts:          leg.artifacts,
+                artifact_paths:     leg.artifact_paths,
+                time_idx:           leg.time_idx,
+                keyword_idx:        leg.keyword_idx,
+                artifact_idx:       leg.artifact_idx,
+                triplet_store:      leg.triplet_store,
+                symbol_idx:         leg.symbol_idx,
+                call_graph:         leg.call_graph,
+                code_files:         leg.code_files,
+                semantic_idx:       leg.semantic_idx,
+                coactivation_stats: leg.coactivation_stats,
+                ack_scores:         leg.ack_scores,
+                correction_states:  leg.correction_states,
+                event_tape:         leg.event_tape,
+                decision_tape:      leg.decision_tape,
+                turiya_monitor:     leg.turiya_monitor,
+                observer_state:     leg.observer_state,
+                interaction_ledger: InteractionLedger::default(),
+            });
         }
 
         if magic == FULL_SNAPSHOT_MAGIC_V18 {
@@ -1037,6 +1102,7 @@ impl FullSnapshot {
                 decision_tape:      leg.decision_tape,
                 turiya_monitor:     leg.turiya_monitor,
                 observer_state:     leg.observer_state,
+                interaction_ledger: InteractionLedger::default(),
             });
         }
 
@@ -1067,6 +1133,7 @@ impl FullSnapshot {
                 decision_tape:      leg.decision_tape,
                 turiya_monitor:     leg.turiya_monitor,
                 observer_state:     ObserverState::default(),
+                interaction_ledger: InteractionLedger::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1099,6 +1166,7 @@ impl FullSnapshot {
                 decision_tape:      leg.decision_tape,
                 turiya_monitor:     leg.turiya_monitor,
                 observer_state:     ObserverState::default(),
+                interaction_ledger: InteractionLedger::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1131,6 +1199,7 @@ impl FullSnapshot {
                 decision_tape:     leg.decision_tape,
                 turiya_monitor:    TuriyaMonitor::new(),
                 observer_state:    ObserverState::default(),
+                interaction_ledger: InteractionLedger::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1163,6 +1232,7 @@ impl FullSnapshot {
                 decision_tape:     DecisionTape::new(),
                 turiya_monitor:    TuriyaMonitor::new(),
                 observer_state:    ObserverState::default(),
+                interaction_ledger: InteractionLedger::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1195,6 +1265,7 @@ impl FullSnapshot {
                 decision_tape:      DecisionTape::new(),
                 turiya_monitor:     TuriyaMonitor::new(),
                 observer_state:     ObserverState::default(),
+                interaction_ledger: InteractionLedger::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1228,6 +1299,7 @@ impl FullSnapshot {
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
+                interaction_ledger: InteractionLedger::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1272,6 +1344,7 @@ impl FullSnapshot {
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
+                interaction_ledger: InteractionLedger::default(),
             });
         }
 
@@ -1307,6 +1380,7 @@ impl FullSnapshot {
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
+                interaction_ledger: InteractionLedger::default(),
             });
         }
 
@@ -1339,6 +1413,7 @@ impl FullSnapshot {
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
+                interaction_ledger: InteractionLedger::default(),
             });
         }
 
@@ -1371,6 +1446,7 @@ impl FullSnapshot {
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
+                interaction_ledger: InteractionLedger::default(),
             });
         }
 
@@ -1403,6 +1479,7 @@ impl FullSnapshot {
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
+                interaction_ledger: InteractionLedger::default(),
             });
         }
 
@@ -1435,6 +1512,7 @@ impl FullSnapshot {
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
+                interaction_ledger: InteractionLedger::default(),
             });
         }
 
@@ -1471,6 +1549,7 @@ impl FullSnapshot {
                 decision_tape: DecisionTape::new(),
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
+                interaction_ledger: InteractionLedger::default(),
             });
         }
 
