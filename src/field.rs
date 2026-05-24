@@ -217,6 +217,7 @@ pub struct ChittaField {
     pub(crate) tape_tombstoned:    std::sync::atomic::AtomicU64,
     pub(crate) observer:           crate::organ::observer::Observer,
     pub(crate) observer_state:     RwLock<crate::organ::observer::ObserverState>,
+    pub(crate) interaction_ledger: RwLock<crate::organ::interaction_ledger::InteractionLedger>,
 }
 
 impl Drop for ChittaField {
@@ -293,6 +294,7 @@ impl ChittaField {
         let mut snap_correction_states: HashMap<u64, crate::organ::triplet::CorrectionState> = HashMap::new();
         let mut snap_event_tape    = crate::organ::event_tape::EventTape::new();
         let mut snap_decision_tape = crate::organ::decision_tape::DecisionTape::new();
+        let mut snap_interaction_ledger = crate::organ::interaction_ledger::InteractionLedger::default();
 
         // Find best cortical snapshot by peeking seqno (16-byte read per file), then load only that one.
         let mut snapshot_seqno: u64 = 0;
@@ -418,8 +420,9 @@ impl ChittaField {
                     snapshot_coactivation_stats = snap.coactivation_stats;
                     snap_ack_scores = snap.ack_scores;
                     snap_correction_states = snap.correction_states;
-                    snap_event_tape    = snap.event_tape;
-                    snap_decision_tape = snap.decision_tape;
+                    snap_event_tape         = snap.event_tape;
+                    snap_decision_tape      = snap.decision_tape;
+                    snap_interaction_ledger = snap.interaction_ledger;
                     eprintln!(
                         "[chitta-field] loaded full snapshot seqno={} ({} memories) from {:?}",
                         full_snapshot_seqno, payloads.len(), candidate
@@ -836,6 +839,7 @@ impl ChittaField {
             tape_tombstoned:    std::sync::atomic::AtomicU64::new(0),
             observer:           crate::organ::observer::Observer::new(),
             observer_state:     RwLock::new(crate::organ::observer::ObserverState::default()),
+            interaction_ledger: RwLock::new(snap_interaction_ledger),
         })
     }
 }

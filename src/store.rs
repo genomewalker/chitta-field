@@ -4967,6 +4967,41 @@ impl ChittaField {
         Ok(completed)
     }
 
+    // ── Interaction Ledger ──────────────────────────────────────────────────────
+
+    pub fn ledger_append(&self, ev: crate::organ::interaction_ledger::InteractionEvent) -> Result<u64> {
+        Ok(self.interaction_ledger.write().append(ev))
+    }
+
+    pub fn ledger_query(
+        &self,
+        kind: Option<crate::organ::interaction_ledger::EventKind>,
+        session_id: Option<&str>,
+        since_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::organ::interaction_ledger::InteractionEvent>> {
+        Ok(self.interaction_ledger.read()
+            .query(kind.as_ref(), session_id, since_ms, limit)
+            .into_iter()
+            .cloned()
+            .collect())
+    }
+
+    pub fn ledger_compile(&self) -> Result<usize> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let mut ledger = self.interaction_ledger.write();
+        let before = ledger.assertions.len();
+        ledger.compile(now);
+        Ok(ledger.assertions.len() - before)
+    }
+
+    pub fn ledger_contradictions(&self) -> Result<Vec<(String, String, Vec<u64>)>> {
+        Ok(self.interaction_ledger.read().contested())
+    }
+
     /// Save full in-memory state to a binary snapshot (chitta.snapshot).
     /// After this, on next open only ops after snapshot_seqno need to be replayed.
     pub fn save_full_snapshot(&self) -> Result<()> {
@@ -5001,6 +5036,7 @@ impl ChittaField {
             decision_tape:  self.decision_tape.read().clone(),
             turiya_monitor: self.turiya_monitor.read().clone(),
             observer_state: self.observer_state.read().clone(),
+            interaction_ledger: self.interaction_ledger.read().clone(),
         };
         let path = self
             .data_dir

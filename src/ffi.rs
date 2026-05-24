@@ -8779,6 +8779,95 @@ pub extern "C" fn cf_graph_pagerank(
     CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
+// ── Interaction Ledger FFI ─────────────────────────────────────────────────────
+
+/// Append an interaction event. `json_in` is a JSON object matching InteractionEvent
+/// (event_id ignored; assigned by ledger). Returns assigned event_id via `out_event_id`.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_ledger_append(
+    h: *const CfHandle,
+    json_in: *const c_char,
+    out_event_id: *mut u64,
+) -> c_int {
+    if h.is_null() || json_in.is_null() || out_event_id.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let s = match unsafe { CStr::from_ptr(json_in) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let ev: crate::organ::interaction_ledger::InteractionEvent = match serde_json::from_str(s) {
+        Ok(e) => e,
+        Err(_) => return -1,
+    };
+    match handle.field.ledger_append(ev) {
+        Ok(id) => { unsafe { *out_event_id = id; } 0 }
+        Err(_) => -1,
+    }
+}
+
+/// Query interaction events. `json_in` = `{"kind":"Retrieve","session_id":"...","since_ms":0,"limit":20}`.
+/// All fields optional. Returns JSON array. Caller must free with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_ledger_query(
+    h: *const CfHandle,
+    json_in: *const c_char,
+) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let args: serde_json::Value = if json_in.is_null() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        match unsafe { CStr::from_ptr(json_in) }.to_str().ok()
+            .and_then(|s| serde_json::from_str(s).ok()) {
+            Some(v) => v,
+            None => return std::ptr::null_mut(),
+        }
+    };
+    use crate::organ::interaction_ledger::EventKind;
+    let kind: Option<EventKind> = args["kind"].as_str().and_then(|k| match k {
+        "Retrieve" => Some(EventKind::Retrieve),
+        "Inject"   => Some(EventKind::Inject),
+        "Outcome"  => Some(EventKind::Outcome),
+        "Override" => Some(EventKind::Override),
+        _ => None,
+    });
+    let session_id_owned = args["session_id"].as_str().map(|s| s.to_owned());
+    let since_ms = args["since_ms"].as_i64();
+    let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+    let results = match handle.field.ledger_query(kind, session_id_owned.as_deref(), since_ms, limit) {
+        Ok(r) => r,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Compile Override events into versioned assertions. Returns number of new assertions via `out_count`.
+#[no_mangle]
+pub extern "C" fn cf_ledger_compile(h: *const CfHandle, out_count: *mut u32) -> c_int {
+    if h.is_null() || out_count.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    match handle.field.ledger_compile() {
+        Ok(n) => { unsafe { *out_count = n as u32; } 0 }
+        Err(_) => -1,
+    }
+}
+
+/// Return contested assertion pairs as JSON array of [subject, predicate, [assertion_ids]].
+/// Caller must free with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_ledger_contradictions(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let results = match handle.field.ledger_contradictions() {
+        Ok(r) => r,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
 #[inline]
 fn handle_from(h: *const CfHandle) -> &'static CfHandle {
     unsafe { &*h }
