@@ -218,6 +218,7 @@ pub struct ChittaField {
     pub(crate) observer:           crate::organ::observer::Observer,
     pub(crate) observer_state:     RwLock<crate::organ::observer::ObserverState>,
     pub(crate) interaction_ledger: RwLock<crate::organ::interaction_ledger::InteractionLedger>,
+    pub(crate) predicate_store:    RwLock<crate::organ::predicate_store::PredicateStore>,
 }
 
 impl Drop for ChittaField {
@@ -295,6 +296,7 @@ impl ChittaField {
         let mut snap_event_tape    = crate::organ::event_tape::EventTape::new();
         let mut snap_decision_tape = crate::organ::decision_tape::DecisionTape::new();
         let mut snap_interaction_ledger = crate::organ::interaction_ledger::InteractionLedger::default();
+        let mut snap_predicate_store    = crate::organ::predicate_store::PredicateStore::default();
 
         // Find best cortical snapshot by peeking seqno (16-byte read per file), then load only that one.
         let mut snapshot_seqno: u64 = 0;
@@ -423,6 +425,7 @@ impl ChittaField {
                     snap_event_tape         = snap.event_tape;
                     snap_decision_tape      = snap.decision_tape;
                     snap_interaction_ledger = snap.interaction_ledger;
+                    snap_predicate_store    = snap.predicate_store;
                     eprintln!(
                         "[chitta-field] loaded full snapshot seqno={} ({} memories) from {:?}",
                         full_snapshot_seqno, payloads.len(), candidate
@@ -840,6 +843,7 @@ impl ChittaField {
             observer:           crate::organ::observer::Observer::new(),
             observer_state:     RwLock::new(crate::organ::observer::ObserverState::default()),
             interaction_ledger: RwLock::new(snap_interaction_ledger),
+            predicate_store:    RwLock::new(snap_predicate_store),
         })
     }
 }

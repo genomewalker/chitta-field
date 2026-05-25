@@ -13,6 +13,7 @@ use crate::organ::decision_tape::DecisionTape;
 use crate::organ::turiya_monitor::TuriyaMonitor;
 use crate::organ::observer::ObserverState;
 use crate::organ::interaction_ledger::InteractionLedger;
+use crate::organ::predicate_store::PredicateStore;
 use crate::organ::triplet::{CorrectionState, TripletStore};
 use crate::payload::MemoryPayload;
 use crate::state::{EpistemicStatus, MemoryState, MemoryStatus, RetrievalHistory};
@@ -61,7 +62,9 @@ pub const FULL_SNAPSHOT_MAGIC_V18: u64 = 0xF011_5741_7E00_0012;
 /// V19 magic: MemoryPayload gains `embedding_model_id` + `embedding_dim`; EMBED_DIM 256→768.
 const FULL_SNAPSHOT_MAGIC_V19: u64     = 0xF011_5741_7E00_0013;
 /// V20 magic: FullSnapshot gains `interaction_ledger: InteractionLedger`.
-const FULL_SNAPSHOT_MAGIC: u64         = 0xF011_5741_7E00_0014; // V20
+const FULL_SNAPSHOT_MAGIC_V20: u64     = 0xF011_5741_7E00_0014;
+/// V21 magic: FullSnapshot gains `predicate_store: PredicateStore`.
+const FULL_SNAPSHOT_MAGIC: u64         = 0xF011_5741_7E00_0015; // V21
 
 /// Magic for the payload content sidecar (.pld).
 const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
@@ -638,6 +641,8 @@ pub struct FullSnapshot {
     pub observer_state: ObserverState,
     /// V20: Interaction Ledger — reads/writes/outcomes as first-class events + versioned assertions.
     pub interaction_ledger: InteractionLedger,
+    /// V21: Predicate Store — executable checks attached to memories for falsifiability.
+    pub predicate_store: PredicateStore,
 }
 
 /// MemoryPayload as serialized in V16 snapshots (pre-Phase-17).
@@ -819,6 +824,33 @@ struct LegacyFullSnapshotV19 {
     pub observer_state:      ObserverState,
 }
 
+/// V20 snapshot layout — FullSnapshot with interaction_ledger but without predicate_store.
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV20 {
+    pub snapshot_seqno:      u64,
+    pub payloads:            HashMap<MemoryId, MemoryPayload>,
+    pub states:              HashMap<MemoryId, MemoryState>,
+    pub assoc_edges:         HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts:           HashMap<String, ArtifactId>,
+    pub artifact_paths:      HashMap<ArtifactId, String>,
+    pub time_idx:            TemporalIndex,
+    pub keyword_idx:         KeywordIndex,
+    pub artifact_idx:        ArtifactIndex,
+    pub triplet_store:       TripletStore,
+    pub symbol_idx:          SymbolIndex,
+    pub call_graph:          CallGraph,
+    pub code_files:          CodeFileIndex,
+    pub semantic_idx:        SemanticIndex,
+    pub coactivation_stats:  HashMap<(MemoryId, MemoryId), CoActivationStats>,
+    pub ack_scores:          HashMap<MemoryId, i32>,
+    pub correction_states:   HashMap<u64, CorrectionState>,
+    pub event_tape:          EventTape,
+    pub decision_tape:       DecisionTape,
+    pub turiya_monitor:      TuriyaMonitor,
+    pub observer_state:      ObserverState,
+    pub interaction_ledger:  InteractionLedger,
+}
+
 /// V17 snapshot layout — FullSnapshot without observer_state.
 #[derive(Serialize, Deserialize)]
 struct LegacyFullSnapshotV17 {
@@ -996,6 +1028,7 @@ impl FullSnapshot {
             && magic != FULL_SNAPSHOT_MAGIC_V4
             && magic != FULL_SNAPSHOT_MAGIC_V1
             && magic != FULL_SNAPSHOT_MAGIC_V19
+        && magic != FULL_SNAPSHOT_MAGIC_V20
         {
             return Err(FieldError::Manifest("invalid full snapshot magic".to_string()));
         }
@@ -1020,11 +1053,45 @@ impl FullSnapshot {
         let magic = u64::from_le_bytes(magic_buf);
 
         if magic == FULL_SNAPSHOT_MAGIC {
-            // V20: current format with interaction_ledger.
+            // V21: current format with predicate_store.
             let mut snap: Self = bincode::deserialize_from(&mut r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
+        }
+
+        if magic == FULL_SNAPSHOT_MAGIC_V20 {
+            // V20→V21: add predicate_store (default empty).
+            eprintln!("[chitta-field] migrating v20 snapshot → v21 (predicate store)");
+            let leg: LegacyFullSnapshotV20 = bincode::deserialize_from(&mut r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            let mut states = leg.states;
+            for state in states.values_mut() { state.sanitize(); }
+            return Ok(FullSnapshot {
+                snapshot_seqno:     leg.snapshot_seqno,
+                payloads:           leg.payloads,
+                states,
+                assoc_edges:        leg.assoc_edges,
+                artifacts:          leg.artifacts,
+                artifact_paths:     leg.artifact_paths,
+                time_idx:           leg.time_idx,
+                keyword_idx:        leg.keyword_idx,
+                artifact_idx:       leg.artifact_idx,
+                triplet_store:      leg.triplet_store,
+                symbol_idx:         leg.symbol_idx,
+                call_graph:         leg.call_graph,
+                code_files:         leg.code_files,
+                semantic_idx:       leg.semantic_idx,
+                coactivation_stats: leg.coactivation_stats,
+                ack_scores:         leg.ack_scores,
+                correction_states:  leg.correction_states,
+                event_tape:         leg.event_tape,
+                decision_tape:      leg.decision_tape,
+                turiya_monitor:     leg.turiya_monitor,
+                observer_state:     leg.observer_state,
+                interaction_ledger: leg.interaction_ledger,
+                predicate_store:    PredicateStore::default(),
+            });
         }
 
         if magic == FULL_SNAPSHOT_MAGIC_V19 {
@@ -1057,6 +1124,7 @@ impl FullSnapshot {
                 turiya_monitor:     leg.turiya_monitor,
                 observer_state:     leg.observer_state,
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             });
         }
 
@@ -1103,6 +1171,7 @@ impl FullSnapshot {
                 turiya_monitor:     leg.turiya_monitor,
                 observer_state:     leg.observer_state,
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             });
         }
 
@@ -1134,6 +1203,7 @@ impl FullSnapshot {
                 turiya_monitor:     leg.turiya_monitor,
                 observer_state:     ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1167,6 +1237,7 @@ impl FullSnapshot {
                 turiya_monitor:     leg.turiya_monitor,
                 observer_state:     ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1200,6 +1271,7 @@ impl FullSnapshot {
                 turiya_monitor:    TuriyaMonitor::new(),
                 observer_state:    ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1233,6 +1305,7 @@ impl FullSnapshot {
                 turiya_monitor:    TuriyaMonitor::new(),
                 observer_state:    ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1266,6 +1339,7 @@ impl FullSnapshot {
                 turiya_monitor:     TuriyaMonitor::new(),
                 observer_state:     ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1300,6 +1374,7 @@ impl FullSnapshot {
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1345,6 +1420,7 @@ impl FullSnapshot {
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             });
         }
 
@@ -1381,6 +1457,7 @@ impl FullSnapshot {
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             });
         }
 
@@ -1414,6 +1491,7 @@ impl FullSnapshot {
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             });
         }
 
@@ -1447,6 +1525,7 @@ impl FullSnapshot {
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             });
         }
 
@@ -1480,6 +1559,7 @@ impl FullSnapshot {
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             });
         }
 
@@ -1513,6 +1593,7 @@ impl FullSnapshot {
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             });
         }
 
@@ -1550,6 +1631,7 @@ impl FullSnapshot {
                 turiya_monitor: TuriyaMonitor::new(),
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
+                predicate_store:    PredicateStore::default(),
             });
         }
 

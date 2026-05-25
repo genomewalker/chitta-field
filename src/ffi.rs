@@ -8868,6 +8868,45 @@ pub extern "C" fn cf_ledger_contradictions(h: *const CfHandle) -> *mut c_char {
     CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
+
+#[no_mangle]
+pub extern "C" fn cf_predicate_attach(
+    h: *const CfHandle,
+    memory_id: u64,
+    check_cmd: *const c_char,
+) -> i64 {
+    if h.is_null() || check_cmd.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let cmd = match unsafe { std::ffi::CStr::from_ptr(check_cmd) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return -1,
+    };
+    match handle.field.predicate_attach(memory_id, cmd) {
+        Ok(id) => id as i64,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_predicate_run(h: *const CfHandle, memory_id: u64) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    match handle.field.predicate_run(memory_id) {
+        Ok(json) => CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cf_predicate_list(h: *const CfHandle, memory_id: u64) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    match handle.field.predicate_list(memory_id) {
+        Ok(json) => CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 #[inline]
 fn handle_from(h: *const CfHandle) -> &'static CfHandle {
     unsafe { &*h }
