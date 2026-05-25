@@ -58,28 +58,24 @@ impl PredicateStore {
         self.predicates.iter().filter(|p| p.memory_id == memory_id).collect()
     }
 
-    /// Run all predicates for a memory. Returns (passed, failed) counts.
-    /// Runs each check_cmd via sh -c with a 5s timeout.
-    pub fn run(&mut self, memory_id: u64, now_ms: i64) -> (usize, usize) {
-        let ids: Vec<u64> = self.predicates.iter()
+    /// Collect (predicate_id, check_cmd) pairs for a memory — read-only, no subprocess.
+    pub fn collect_cmds(&self, memory_id: u64) -> Vec<(u64, String)> {
+        self.predicates.iter()
             .filter(|p| p.memory_id == memory_id)
-            .map(|p| p.predicate_id)
-            .collect();
+            .map(|p| (p.predicate_id, p.check_cmd.clone()))
+            .collect()
+    }
 
+    /// Write back pre-computed results. Call after running subprocesses outside the lock.
+    pub fn apply_results(&mut self, results: &[(u64, bool, String)], now_ms: i64) -> (usize, usize) {
         let mut passed = 0usize;
         let mut failed = 0usize;
-
-        for pred_id in ids {
-            if let Some(p) = self.predicates.iter().find(|p| p.predicate_id == pred_id) {
-                let cmd = p.check_cmd.clone();
-                let result = run_cmd(&cmd);
-                let (ok, out) = result;
-                if let Some(p) = self.predicates.iter_mut().find(|p| p.predicate_id == pred_id) {
-                    p.status = if ok { PredicateStatus::Passed } else { PredicateStatus::Failed };
-                    p.last_checked_ms = Some(now_ms);
-                    p.last_output = Some(out.chars().take(400).collect());
-                }
-                if ok { passed += 1; } else { failed += 1; }
+        for (pred_id, ok, out) in results {
+            if let Some(p) = self.predicates.iter_mut().find(|p| p.predicate_id == *pred_id) {
+                p.status = if *ok { PredicateStatus::Passed } else { PredicateStatus::Failed };
+                p.last_checked_ms = Some(now_ms);
+                p.last_output = Some(out.chars().take(400).collect());
+                if *ok { passed += 1; } else { failed += 1; }
             }
         }
         (passed, failed)
@@ -108,7 +104,7 @@ impl PredicateStore {
 ///
 /// Instead we append a sentinel `__EXIT__:<code>` to the piped output and
 /// parse the exit code ourselves, making us completely independent of pclose().
-fn run_cmd(cmd: &str) -> (bool, String) {
+pub(crate) fn run_cmd(cmd: &str) -> (bool, String) {
     use std::ffi::CString;
 
     // The '; printf ...' runs AFTER timeout completes, at the outer popen shell
