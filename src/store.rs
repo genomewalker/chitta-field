@@ -5017,8 +5017,21 @@ impl ChittaField {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let (passed, failed) = self.predicate_store.write().run(memory_id, now_ms);
-        // Decay confidence if any predicates failed.
+
+        // Phase 1: collect commands under read lock — no subprocess yet.
+        let cmds: Vec<(u64, String)> = self.predicate_store.read().collect_cmds(memory_id);
+
+        // Phase 2: run subprocesses outside any lock to avoid blocking predicate_attach.
+        let results: Vec<(u64, bool, String)> = cmds.iter()
+            .map(|(id, cmd)| {
+                let (ok, out) = crate::organ::predicate_store::run_cmd(cmd);
+                (*id, ok, out)
+            })
+            .collect();
+
+        // Phase 3: write results back under write lock.
+        let (passed, failed) = self.predicate_store.write().apply_results(&results, now_ms);
+
         if failed > 0 {
             let decay = 0.1 * failed as f32;
             if let Some(mut state) = self.states.write().get_mut(&crate::ids::MemoryId::from(memory_id)) {
