@@ -101,39 +101,52 @@ impl PredicateStore {
 
 /// Run a shell command with a 5s timeout. Returns (exit_ok, combined_output).
 ///
-/// The daemon has SIGCHLD set to SIG_IGN (llama.cpp side-effect), which causes
-/// ECHILD from waitpid(). We temporarily restore SIG_DFL under a process-wide
-/// mutex so only one predicate run changes signal disposition at a time.
+/// popen() forks and pipes output correctly even when the daemon has SIGCHLD
+/// set to SIG_IGN (llama.cpp side-effect). However pclose() returns -1/ECHILD
+/// when the child is auto-reaped under SIG_IGN — so we cannot use its return
+/// value for the exit code.
+///
+/// Instead we append a sentinel `__EXIT__:<code>` to the piped output and
+/// parse the exit code ourselves, making us completely independent of pclose().
 fn run_cmd(cmd: &str) -> (bool, String) {
-    use std::sync::Mutex;
-    use std::process::Command;
+    use std::ffi::CString;
 
-    // Serialize all signal-disposition changes; prevents concurrent predicate
-    // runs from racing each other on SIGCHLD.
-    static SIGCHLD_LOCK: Mutex<()> = Mutex::new(());
-    let _guard = SIGCHLD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // The '; printf ...' runs AFTER timeout completes, at the outer popen shell
+    // level, capturing timeout's own exit code (0=pass, non-zero=fail/timeout).
+    let full_cmd = format!(
+        "/usr/bin/timeout 5 sh -c {}; printf '__EXIT__:%d\\n' $?",
+        shell_escape(cmd)
+    );
+    let Ok(cstr) = CString::new(full_cmd) else {
+        return (false, "invalid command bytes".to_string());
+    };
+    let Ok(mode) = CString::new("r") else { unreachable!() };
 
-    // Save old SIGCHLD disposition and reset to SIG_DFL so waitpid() works.
-    let old_sigchld = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+    let fp = unsafe { libc::popen(cstr.as_ptr(), mode.as_ptr()) };
+    if fp.is_null() {
+        let errno = unsafe { *libc::__errno_location() };
+        return (false, format!("popen failed errno={errno}"));
+    }
 
-    let result = Command::new("sh")
-        .args(["-c", &format!("/usr/bin/timeout 5 sh -c {}", shell_escape(cmd))])
-        .output();
+    let mut raw = Vec::<u8>::new();
+    let mut buf = [0u8; 256];
+    loop {
+        let n = unsafe {
+            libc::fread(buf.as_mut_ptr() as *mut libc::c_void, 1, buf.len(), fp)
+        };
+        if n == 0 { break; }
+        raw.extend_from_slice(&buf[..n]);
+    }
+    unsafe { libc::pclose(fp) }; // return value unreliable under SIG_IGN — ignore
 
-    // Restore original disposition before doing anything else.
-    unsafe { libc::signal(libc::SIGCHLD, old_sigchld); }
-    drop(_guard);
-
-    match result {
-        Ok(o) => {
-            let combined = format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            );
-            (o.status.success(), combined.chars().take(400).collect())
-        }
-        Err(e) => (false, e.to_string()),
+    let text = String::from_utf8_lossy(&raw);
+    if let Some(pos) = text.rfind("__EXIT__:") {
+        let code: i32 = text[pos + 9..].trim().parse().unwrap_or(1);
+        let user_output = text[..pos].to_string();
+        (code == 0, user_output.chars().take(400).collect())
+    } else {
+        // Sentinel absent — popen failed or timed out hard before printf ran.
+        (false, text.chars().take(400).collect())
     }
 }
 
