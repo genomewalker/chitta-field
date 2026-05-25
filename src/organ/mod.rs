@@ -48,3 +48,4 @@ pub mod provenance;
 pub mod reconciler;
 pub mod observer;
 pub mod interaction_ledger;
+pub mod predicate_store;

@@ -5002,6 +5002,55 @@ impl ChittaField {
         Ok(self.interaction_ledger.read().contested())
     }
 
+    pub fn predicate_attach(&self, memory_id: u64, check_cmd: String) -> Result<u64> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        Ok(self.predicate_store.write().attach(memory_id, check_cmd, now_ms))
+    }
+
+    /// Run all predicates for a memory. Returns JSON with per-predicate results.
+    /// Weakens memory confidence by 0.1 for each failing predicate (min 0.1).
+    pub fn predicate_run(&self, memory_id: u64) -> Result<String> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let (passed, failed) = self.predicate_store.write().run(memory_id, now_ms);
+        // Decay confidence if any predicates failed.
+        if failed > 0 {
+            let decay = 0.1 * failed as f32;
+            if let Some(mut state) = self.states.write().get_mut(&crate::ids::MemoryId::from(memory_id)) {
+                state.confidence = (state.confidence - decay).max(0.1);
+            }
+        }
+        let result = serde_json::json!({
+            "memory_id": memory_id,
+            "passed": passed,
+            "failed": failed,
+            "epistemic_status": format!("{:?}", self.predicate_store.read().epistemic_status(memory_id)),
+        });
+        Ok(result.to_string())
+    }
+
+    pub fn predicate_list(&self, memory_id: u64) -> Result<String> {
+        let store = self.predicate_store.read();
+        let preds = store.for_memory(memory_id);
+        let result = serde_json::json!({
+            "memory_id": memory_id,
+            "epistemic_status": format!("{:?}", store.epistemic_status(memory_id)),
+            "predicates": preds.iter().map(|p| serde_json::json!({
+                "predicate_id": p.predicate_id,
+                "check_cmd": p.check_cmd,
+                "status": format!("{:?}", p.status),
+                "last_checked_ms": p.last_checked_ms,
+                "last_output": p.last_output,
+            })).collect::<Vec<_>>(),
+        });
+        Ok(result.to_string())
+    }
+
     /// Save full in-memory state to a binary snapshot (chitta.snapshot).
     /// After this, on next open only ops after snapshot_seqno need to be replayed.
     pub fn save_full_snapshot(&self) -> Result<()> {
@@ -5037,6 +5086,7 @@ impl ChittaField {
             turiya_monitor: self.turiya_monitor.read().clone(),
             observer_state: self.observer_state.read().clone(),
             interaction_ledger: self.interaction_ledger.read().clone(),
+            predicate_store:    self.predicate_store.read().clone(),
         };
         let path = self
             .data_dir
