@@ -121,6 +121,8 @@ impl TripletStore {
         if removed > 0 {
             self.entries.shrink_to_fit();
             self.rebuild_indexes();
+            self.ingestion_times.retain(|id, _| self.id_to_index.contains_key(id));
+            self.ingestion_times.shrink_to_fit();
         }
         removed
     }
@@ -157,6 +159,8 @@ impl TripletStore {
         self.entries.retain(|_| { let keep = !to_remove.contains(&i); i += 1; keep });
         self.rebuild_indexes();
         self.entries.shrink_to_fit();
+        self.ingestion_times.retain(|id, _| self.id_to_index.contains_key(id));
+        self.ingestion_times.shrink_to_fit();
         removed
     }
 
