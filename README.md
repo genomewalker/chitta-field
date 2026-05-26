@@ -499,7 +499,7 @@ The keyword index in `keyword.rs` uses BM25 with standard parameters (k1=1.2, b=
 
 ### Embeddings
 
-Semantic recall uses BGE-base-en-v1.5 embeddings (768-dim, from BAAI), provided via the VakYantra ONNX embedder in the cc-soul daemon.
+Semantic recall uses BGE-base-en-v1.5 embeddings (768-dim, from BAAI), provided via the llama.cpp embedder in the cc-soul daemon.
 
 > Xiao, S., Liu, Z., Zhang, P., & Muennighoff, N. (2023). C-Pack: Packaged resources to advance general Chinese embedding. *arXiv:2309.07597*. https://arxiv.org/abs/2309.07597
 
