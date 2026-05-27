@@ -46,7 +46,8 @@ chitta-field/
     ├── WisdomPromotionStore  (candidate lifecycle FSM — Move 5)
     ├── LearnedScoringModel   (outcome-calibrated weight deltas — Move 6)
     ├── InterventionStore     (action/outcome/attribution ledger — Layer 7)
-    └── AgentProtocolStore    (task contracts, delegation, evidence, probes — Layer 8)
+    ├── AgentProtocolStore    (task contracts, delegation, evidence, probes — Layer 8)
+    └── InteractionLedger     (retrieve/inject/outcome/override events + versioned assertions — Layer 9)
 ```
 
 ### Multi-writer design (Upanishads model)
@@ -93,7 +94,7 @@ After the final pass, `cf_record_recall_batch` atomically commits all learning:
 - **Resonance learning** — feedback signal updates retrieval weights via `LearnerSet`
 - **Session / transcript / task registries** — first-class domain objects for AI session management
 - **Snapshot acceleration** — `cf_save_full_snapshot` / `cf_save_snapshot` skip log replay on next open
-- **Meta-memory layers** — eight organ stores beyond core recall: executable constraints (Prolog-style logic), trigger tissue (event-condition-action), predictive memory (Markov chain), surprise memory (prediction error tracking with blind spot detection), epistemic debt (uncertainty boundaries with fragility scoring), integration kernel (learned recall source weights via Bayesian feedback), intervention ledger (action/outcome/attribution tracking with causal routing), and agent protocol memory (task contracts, delegation edges, evidence links, and probes across multi-step agent loops)
+- **Meta-memory layers** — nine organ stores beyond core recall: executable constraints (Prolog-style logic), trigger tissue (event-condition-action), predictive memory (Markov chain), surprise memory (prediction error tracking with blind spot detection), epistemic debt (uncertainty boundaries with fragility scoring), integration kernel (learned recall source weights via Bayesian feedback), intervention ledger (action/outcome/attribution tracking with causal routing), agent protocol memory (task contracts, delegation edges, evidence links, and probes across multi-step agent loops), and interaction ledger (retrieve/inject/outcome/override events with versioned assertions and contested-claim detection)
 
 ## Why not flat files?
 
@@ -499,9 +500,9 @@ The keyword index in `keyword.rs` uses BM25 with standard parameters (k1=1.2, b=
 
 ### Embeddings
 
-Semantic recall uses BGE-base-en-v1.5 embeddings (768-dim, from BAAI), provided via the llama.cpp embedder in the cc-soul daemon.
+Semantic recall uses `nomic-embed-text-v1.5` embeddings (768-dim) by default, provided via the llama.cpp in-process embedder in the cc-soul daemon. The daemon also supports drop-in GGUF replacements via `CHITTA_EMBED_MODEL`; the `ssl_distiller_dpo` fine-tune (1536-dim, DPO-aligned) is the recommended upgrade for personal installs.
 
-> Xiao, S., Liu, Z., Zhang, P., & Muennighoff, N. (2023). C-Pack: Packaged resources to advance general Chinese embedding. *arXiv:2309.07597*. https://arxiv.org/abs/2309.07597
+> Nussbaum, Z., et al. (2024). Nomic Embed: Training a Reproducible Long Context Text Embedder. *arXiv:2402.01613*. https://arxiv.org/abs/2402.01613
 
 The semantic index uses a two-tier ANN strategy: LSH probing (4 tables, 12 bits) for primary candidate generation, falling back to IVF coarse quantizer (256 random-projection centroids) if LSH yields no candidates. Exact cosine reranking runs over the bounded candidate set (1024–16384). This bounds query cost well below brute-force even at 50K+ memories.
 
