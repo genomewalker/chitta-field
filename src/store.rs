@@ -197,6 +197,96 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Delete old snapshot families from `data_dir`, keeping the `keep` most recent.
+/// Identifies families by `chitta.*.snapshot` mtime order; removes all sidecar
+/// extensions for each stale stem.
+fn prune_old_snapshots(data_dir: &std::path::Path, keep: usize) {
+    const SIDECAR_EXTS: &[&str] = &[
+        "snapshot", "hdc", "emb", "bin", "hnsw", "realm_hnsw", "pld", "sup.json",
+    ];
+    let delta_ext = "delta.hnsw";
+
+    // Collect (mtime, stem) for all chitta.*.snapshot files.
+    let mut families: Vec<(std::time::SystemTime, String)> = match std::fs::read_dir(data_dir) {
+        Ok(rd) => rd.filter_map(|e| {
+            let entry = e.ok()?;
+            let name = entry.file_name().into_string().ok()?;
+            if !name.starts_with("chitta.") || !name.ends_with(".snapshot") { return None; }
+            let stem = name.strip_suffix(".snapshot")?.to_string();
+            let mtime = entry.metadata().ok()?.modified().ok()?;
+            Some((mtime, stem))
+        }).collect(),
+        Err(_) => return,
+    };
+
+    families.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    let keep_stems: std::collections::HashSet<String> =
+        families.iter().take(keep).map(|(_, s)| s.clone()).collect();
+
+    let mut removed = 0usize;
+
+    // Delete stale snapshot families (paired sidecars).
+    for (_, stem) in families.iter().skip(keep) {
+        for ext in SIDECAR_EXTS {
+            let p = data_dir.join(format!("{}.{}", stem, ext));
+            if std::fs::remove_file(&p).is_ok() { removed += 1; }
+        }
+        let p = data_dir.join(format!("{}.{}", stem, delta_ext));
+        if std::fs::remove_file(&p).is_ok() { removed += 1; }
+    }
+
+    // Delete orphaned sidecars (chitta.* files with no corresponding .snapshot).
+    if let Ok(rd) = std::fs::read_dir(data_dir) {
+        for entry in rd.filter_map(|e| e.ok()) {
+            let name = match entry.file_name().into_string() { Ok(n) => n, Err(_) => continue };
+            if !name.starts_with("chitta.") { continue; }
+            let stem = name.split('.').take(2).collect::<Vec<_>>().join(".");
+            if keep_stems.contains(&stem) { continue; }
+            // Not a kept family — remove if it's a known sidecar extension.
+            let is_sidecar = SIDECAR_EXTS.iter().any(|e| name.ends_with(&format!(".{}", e)))
+                || name.ends_with(&format!(".{}", delta_ext));
+            if is_sidecar {
+                let p = data_dir.join(&name);
+                if std::fs::remove_file(&p).is_ok() { removed += 1; }
+            }
+        }
+    }
+
+    // Prune old cortex.*.snapshot files (keep same 2 most recent stems).
+    if let Ok(rd) = std::fs::read_dir(data_dir) {
+        let mut cortex: Vec<(std::time::SystemTime, std::path::PathBuf)> = rd.filter_map(|e| {
+            let entry = e.ok()?;
+            let name = entry.file_name().into_string().ok()?;
+            if !name.starts_with("cortex.") || !name.ends_with(".snapshot") { return None; }
+            let mtime = entry.metadata().ok()?.modified().ok()?;
+            Some((mtime, entry.path()))
+        }).collect();
+        cortex.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, p) in cortex.iter().skip(keep) {
+            if std::fs::remove_file(p).is_ok() { removed += 1; }
+        }
+    }
+
+    // Delete stale .emb.tmp files (re-embed leftovers; safe once reembedding is done).
+    if let Ok(rd) = std::fs::read_dir(data_dir) {
+        let threshold = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .unwrap_or(std::time::UNIX_EPOCH);
+        for entry in rd.filter_map(|e| e.ok()) {
+            let name = match entry.file_name().into_string() { Ok(n) => n, Err(_) => continue };
+            if !name.ends_with(".emb.tmp") { continue; }
+            let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            if mtime < threshold {
+                if std::fs::remove_file(entry.path()).is_ok() { removed += 1; }
+            }
+        }
+    }
+
+    if removed > 0 {
+        eprintln!("[chitta-field] prune_old_snapshots: removed {} files (kept {} families)", removed, keep_stems.len());
+    }
+}
+
 // Score multipliers are now driven by the ScoringPipeline (see scoring/mod.rs).
 // Status, kind, and epistemic multipliers live in scoring/config.rs and are
 // configurable via scoring.json at runtime.
@@ -5164,6 +5254,8 @@ impl ChittaField {
             eprintln!("[size] artifact_idx:      {}", sz(bincode::serialized_size(&snap.artifact_idx).unwrap_or(0)));
         }
         snap.save(&path)?;
+        // Prune old snapshot families: keep the 2 most recent chitta.*.snapshot files.
+        prune_old_snapshots(&self.data_dir, 2);
         Ok(())
     }
 
