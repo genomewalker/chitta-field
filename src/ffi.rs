@@ -813,6 +813,38 @@ pub extern "C" fn cf_recall_failure_pattern(
     }
 }
 
+/// Prune (or down-weight) memories whose content matches any pattern, for the
+/// `prune-memories` maintenance command. `patterns_json` is a JSON array of strings.
+/// `apply`: 0=dry-run, nonzero=apply. `action`: 0=delete (forget), 1=archive (down-weight).
+/// Returns a JSON array [{"id","kind","content"}] of matched memories; NULL on error.
+/// Caller frees the result with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_prune_memories(
+    h: *mut CfHandle,
+    patterns_json: *const c_char,
+    apply: c_int,
+    action: c_int,
+) -> *mut c_char {
+    if h.is_null() || patterns_json.is_null() { return std::ptr::null_mut(); }
+    let handle = unsafe { &*h };
+    let pj = unsafe { std::ffi::CStr::from_ptr(patterns_json) }.to_string_lossy().into_owned();
+    let patterns: Vec<String> = serde_json::from_str(&pj).unwrap_or_default();
+    match handle.field.prune_by_content(&patterns, apply != 0, action as u8) {
+        Ok(matches) => {
+            let arr: Vec<serde_json::Value> = matches.iter().map(|(id, kind, content)| serde_json::json!({
+                "id": id,
+                "kind": kind,
+                "content": content,
+            })).collect();
+            match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
+                Ok(s) => s.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Return top-k PMI-ranked causal antecedents for (tool, entity) as JSON.
 /// JSON array: [{rank, content, pmi, count}]
 #[no_mangle]

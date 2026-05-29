@@ -857,6 +857,45 @@ impl ChittaField {
         serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
     }
 
+    /// Find memories whose content contains any of `patterns` (case-insensitive substring),
+    /// for the `prune-memories` maintenance command. Matching runs under read locks that are
+    /// dropped before any mutation. When `apply` is true: `action` 0 deletes (forget), 1
+    /// archives (down-weight via MemoryStatus::Archived). Returns (id, kind, ≤80-char snippet)
+    /// per live match. Skips already-deleted memories.
+    pub fn prune_by_content(&self, patterns: &[String], apply: bool, action: u8)
+        -> Result<Vec<(u64, String, String)>>
+    {
+        let pats: Vec<String> = patterns.iter()
+            .map(|p| p.trim().to_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if pats.is_empty() { return Ok(Vec::new()); }
+        let matches: Vec<(u64, String, String)> = {
+            let payloads = self.payloads.read();
+            let states = self.states.read();
+            payloads.iter().filter_map(|(&id, p)| {
+                if states.get(&id).map(|s| s.deleted).unwrap_or(false) { return None; }
+                let content = String::from_utf8_lossy(&p.content);
+                let lc = content.to_lowercase();
+                if pats.iter().any(|pat| lc.contains(pat.as_str())) {
+                    Some((id, p.kind.clone(), content.chars().take(80).collect()))
+                } else {
+                    None
+                }
+            }).collect()
+        };
+        if apply {
+            for (id, _, _) in &matches {
+                if action == 1 {
+                    let _ = self.set_memory_status(*id, crate::state::MemoryStatus::Archived);
+                } else {
+                    let _ = self.forget(*id);
+                }
+            }
+        }
+        Ok(matches)
+    }
+
     /// Soft-delete a memory.
     pub fn forget(&self, memory_id: MemoryId) -> Result<()> {
         {
