@@ -131,6 +131,10 @@ pub struct ChittaField {
     pub(crate) data_dir: PathBuf,
     #[allow(dead_code)]
     pub(crate) instance_id: InstanceId,
+    /// Store-identity lineage (PR3): bumped each open; persisted in the `.shdr` sidecar.
+    pub(crate) lineage_epoch: u64,
+    /// Stable writer identity for this lineage; carried forward across opens.
+    pub(crate) writer_uuid: u128,
     pub(crate) log: RwLock<OpLog>,
     pub(crate) id_alloc: Arc<MemoryIdAllocator>,
     pub(crate) artifact_id_alloc: Arc<ArtifactIdAllocator>,
@@ -399,6 +403,7 @@ impl ChittaField {
         for (_, p) in stale_with_seqno {
             candidates.push(p);
         }
+        let mut loaded_header: Option<crate::snapshot::StoreHeader> = None;
         for candidate in &candidates {
             match FullSnapshot::load(candidate) {
                 Ok(mut snap) => {
@@ -448,6 +453,27 @@ impl ChittaField {
                                 candidate, embedded, foreign_dim, crate::ops::EMBED_DIM
                             );
                             continue;
+                        }
+                    }
+                    // Store-identity fencing (PR3): refuse a snapshot whose .shdr records a
+                    // different vector space (foreign model/dim/text-format) than this binary.
+                    // Fail-safe: a missing/legacy/corrupt .shdr is treated as same-lineage and
+                    // allowed (the dim-fence above still guards wholesale foreign-dim snapshots).
+                    {
+                        let shdr_path = candidate.with_extension("shdr");
+                        if let Some(hdr) = crate::snapshot::StoreHeader::load(&shdr_path) {
+                            if !hdr.matches_compiled() {
+                                eprintln!(
+                                    "[chitta-field] REFUSING snapshot {:?}: .shdr vector_space \
+                                     (model={} dim={} tfv={}) != compiled (model={} dim={} tfv={}); \
+                                     trying fallback",
+                                    candidate, hdr.model_id, hdr.embed_dim, hdr.text_format_version,
+                                    crate::ops::EMBED_MODEL_ID, crate::ops::EMBED_DIM,
+                                    crate::ops::TEXT_FORMAT_VERSION
+                                );
+                                continue;
+                            }
+                            loaded_header = Some(hdr);
                         }
                     }
                     snap.triplet_store.load_supersession_sidecar(&candidate.with_extension("sup.json"));
@@ -503,7 +529,7 @@ impl ChittaField {
             // Skip the most recent stale (keep as backup), delete the rest + their sidecars.
             for (_, path) in stale_by_seqno.iter().skip(1) {
                 let _ = std::fs::remove_file(path);
-                for ext in &["emb", "bin", "mu", "hnsw", "pld", "snapshot.tmp"] {
+                for ext in &["emb", "bin", "mu", "shdr", "hnsw", "pld", "snapshot.tmp"] {
                     let _ = std::fs::remove_file(path.with_extension(ext));
                 }
                 // delta.hnsw: with_extension replaces only last component, handle separately
@@ -821,9 +847,25 @@ impl ChittaField {
         let fep_prior         = crate::organ::fep_prior::FepPriorOrgan::new();
 
         let initial_memory_count = payloads.len();
+        // Store identity (PR3): carry the lineage forward from the loaded .shdr — bumping
+        // the epoch to mark this new write session — or mint a fresh lineage for a legacy
+        // store (no/!matching .shdr). writer_uuid mixes instance_id with open-time nanos.
+        let (prior_epoch, writer_uuid) = match &loaded_header {
+            Some(h) => (h.lineage_epoch, h.writer_uuid),
+            None => {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                (0u64, ((instance_id as u128) << 96) ^ nanos)
+            }
+        };
+        let lineage_epoch = prior_epoch.saturating_add(1);
         Ok(Self {
             data_dir,
             instance_id,
+            lineage_epoch,
+            writer_uuid,
             log: RwLock::new(log),
             id_alloc,
             artifact_id_alloc,

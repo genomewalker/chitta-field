@@ -1765,7 +1765,10 @@ impl SemanticIndex {
         // Rebuild HNSW if collection is large enough.
         // Prefer incremental backfill when HNSW is already loaded and only a small WAL
         // delta is missing — avoids clearing the loaded sidecar and re-inserting 130K+ nodes.
-        if !hnsw_valid && self.use_hnsw() {
+        // Skipped while centering is active: centered queries never traverse the raw-space
+        // HNSW graph (search() gates it off), so the graph would be dead weight — the
+        // binary-Hamming path covers the full corpus.
+        if !hnsw_valid && self.use_hnsw() && self.centroid.is_empty() {
             let total = self.total_embedding_count();
             let covered = self.hnsw_len();
             if covered > 0 && total.saturating_sub(covered) < 10_000 {

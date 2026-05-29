@@ -69,6 +69,104 @@ const FULL_SNAPSHOT_MAGIC: u64         = 0xF011_5741_7E00_0015; // V21
 /// Magic for the payload content sidecar (.pld).
 const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
 
+/// Magic for the store-identity sidecar (.shdr).
+const SHDR_MAGIC: u64 = 0x5348_4452_0000_0001; // "SHDR\0\0\0\x01"
+/// On-disk store format version (independent of the snapshot bincode magic).
+pub const STORE_FORMAT_VERSION: u32 = 1;
+
+/// Store identity recorded alongside each snapshot family in a `.shdr` sidecar.
+///
+/// Purpose: make snapshot selection and WAL replay aware of the *vector space* a store
+/// was written in, so a foreign-dim/foreign-model snapshot can never win on max-seqno
+/// (the root cause of the 768→1536 migration contamination). `vector_space_id` is a
+/// stable hash of (model_id, embed_dim, text_format_version) — deterministic from the
+/// compiled constants, so it can be computed without loading anything.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StoreHeader {
+    pub format_version: u32,
+    pub embed_dim: u32,
+    pub model_id: String,
+    pub text_format_version: u32,
+    /// Monotonic per-write-session counter; bumped each time the store is opened for
+    /// writing. Lets a reader detect a newer writer (PR4 single-writer hygiene).
+    pub lineage_epoch: u64,
+    /// Identity of the writer that first stamped this lineage (entropy from instance_id
+    /// + open time). Stable across the lineage; carried forward on each save.
+    pub writer_uuid: u128,
+    /// Stable hash of (model_id, embed_dim, text_format_version).
+    pub vector_space_id: u64,
+}
+
+impl StoreHeader {
+    /// FNV-1a over model_id + embed_dim + text_format_version. Stable across processes.
+    pub fn compute_vector_space_id(model_id: &str, embed_dim: u32, text_format_version: u32) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |b: u8| { h ^= b as u64; h = h.wrapping_mul(0x0000_0100_0000_01b3); };
+        for b in model_id.bytes() { mix(b); }
+        for b in embed_dim.to_le_bytes() { mix(b); }
+        for b in text_format_version.to_le_bytes() { mix(b); }
+        h
+    }
+
+    /// The vector_space_id this binary compiles for.
+    pub fn compiled_vector_space_id() -> u64 {
+        Self::compute_vector_space_id(
+            crate::ops::EMBED_MODEL_ID,
+            crate::ops::EMBED_DIM as u32,
+            crate::ops::TEXT_FORMAT_VERSION,
+        )
+    }
+
+    /// Build a header describing the compiled vector space with the given lineage.
+    pub fn current(lineage_epoch: u64, writer_uuid: u128) -> Self {
+        let model_id = crate::ops::EMBED_MODEL_ID.to_string();
+        let embed_dim = crate::ops::EMBED_DIM as u32;
+        let text_format_version = crate::ops::TEXT_FORMAT_VERSION;
+        StoreHeader {
+            format_version: STORE_FORMAT_VERSION,
+            embed_dim,
+            vector_space_id: Self::compute_vector_space_id(&model_id, embed_dim, text_format_version),
+            model_id,
+            text_format_version,
+            lineage_epoch,
+            writer_uuid,
+        }
+    }
+
+    /// True when this header's vector space matches the binary's compiled constants.
+    pub fn matches_compiled(&self) -> bool {
+        self.embed_dim == crate::ops::EMBED_DIM as u32
+            && self.model_id == crate::ops::EMBED_MODEL_ID
+            && self.vector_space_id == Self::compiled_vector_space_id()
+    }
+
+    /// Persist to `path` (magic + bincode body) via tmp+rename+fsync.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let tmp = path.with_extension("shdr.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&SHDR_MAGIC.to_le_bytes())?;
+            let body = bincode::serialize(self).map_err(|e| FieldError::Serialization(e.to_string()))?;
+            f.write_all(&body)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        if let Some(dir) = path.parent() {
+            if let Ok(d) = std::fs::File::open(dir) { let _ = d.sync_all(); }
+        }
+        Ok(())
+    }
+
+    /// Load from `path`. Returns None if missing/corrupt/wrong-magic (legacy store).
+    pub fn load(path: &Path) -> Option<StoreHeader> {
+        let bytes = std::fs::read(path).ok()?;
+        if bytes.len() < 8 { return None; }
+        let magic = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+        if magic != SHDR_MAGIC { return None; }
+        bincode::deserialize(&bytes[8..]).ok()
+    }
+}
+
 // ── Compile-time guard: MemoryState size must match snapshot magic ────────────
 // If you add/remove fields to MemoryState, this assert will fail.
 // You MUST: (1) bump FULL_SNAPSHOT_MAGIC, (2) add a LegacyMemoryStateVN,

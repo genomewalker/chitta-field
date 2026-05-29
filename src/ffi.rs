@@ -143,6 +143,14 @@ pub extern "C" fn cf_chain_head(h: *const CfHandle, out: *mut u8) -> c_int {
     0
 }
 
+/// Compiled store vector-space identity = hash(model_id, embed_dim, text_format_version).
+/// Handle-less: lets a running daemon probe a replacement binary's vector space (via the
+/// `format-id` subcommand) before execv'ing into it on self-update (PR4 gate).
+#[no_mangle]
+pub extern "C" fn cf_compiled_vector_space_id() -> u64 {
+    crate::snapshot::StoreHeader::compiled_vector_space_id()
+}
+
 /// Free a string returned by cf_* functions (e.g. cf_skill_read, cf_agent_get).
 #[no_mangle]
 pub extern "C" fn cf_free_string(s: *mut c_char) {
