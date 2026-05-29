@@ -96,6 +96,7 @@ fn write_hits(hits: Vec<RecallHit>, buf: *mut CfRecallHit, cap: usize, written: 
 #[no_mangle]
 pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> *mut CfHandle {
     // lock_dir is ignored — the Upanishads model needs no locks.
+    if data_dir.is_null() { return std::ptr::null_mut(); }
     let data_dir = unsafe {
         match CStr::from_ptr(data_dir).to_str() {
             Ok(s) => PathBuf::from(s),
@@ -169,7 +170,7 @@ pub extern "C" fn cf_put_memory(
     authored_at_ms: i64,
     out_memory_id: *mut u64,
 ) -> c_int {
-    if h.is_null() || out_memory_id.is_null() {
+    if h.is_null() || out_memory_id.is_null() || kind.is_null() || realm.is_null() {
         return -1;
     }
     let handle = unsafe { &*h };
@@ -186,7 +187,12 @@ pub extern "C" fn cf_put_memory(
             Err(e) => return handle.err(e),
         }
     };
-    let content = unsafe { std::slice::from_raw_parts(content_ptr, content_len) };
+    // Null/zero-length content → empty slice (from_raw_parts on a null ptr is UB even for len 0).
+    let content: &[u8] = if content_ptr.is_null() || content_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(content_ptr, content_len) }
+    };
     let embedding: &[f32] = if embedding_ptr.is_null() || embedding_len == 0 {
         &[]
     } else {
@@ -274,6 +280,32 @@ pub extern "C" fn cf_forget(h: *mut CfHandle, memory_id: u64) -> c_int {
     }
     let handle = unsafe { &*h };
     match handle.field.forget(memory_id) {
+        Ok(()) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Record a positive ack signal for a memory (raises its recall ack_score).
+#[no_mangle]
+pub extern "C" fn cf_ack_memory(h: *mut CfHandle, memory_id: u64) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    match handle.field.ack_memory(memory_id) {
+        Ok(()) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Record a negative nack signal for a memory (lowers its recall ack_score).
+#[no_mangle]
+pub extern "C" fn cf_nack_memory(h: *mut CfHandle, memory_id: u64) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    match handle.field.nack_memory(memory_id) {
         Ok(()) => handle.ok(),
         Err(e) => handle.err(e),
     }
@@ -1157,6 +1189,17 @@ pub extern "C" fn cf_reconcile_pass(h: *const CfHandle) -> *mut c_char {
     CString::new(json).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
+/// Force a full rebuild of all derived search indices (binary codes, coarse, LSH,
+/// HNSW) from current embeddings. Used after an embedding-dimension migration.
+/// Returns 0 on success, -1 on null handle.
+#[no_mangle]
+pub extern "C" fn cf_force_reindex(h: *const CfHandle) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    handle.field.force_reindex();
+    0
+}
+
 /// Produce a harvest scope document from Turīya anomalies + router misses.
 /// Returns JSON. Caller must free with cf_free_string().
 #[no_mangle]
@@ -1550,7 +1593,7 @@ pub extern "C" fn cf_requeue_all_embeddings(
 ) -> i64 {
     if h.is_null() { return -1; }
     let model_id = if model_id_ptr.is_null() || model_id_len == 0 {
-        "nomic-embed-text:v1.5".to_string()
+        crate::ops::EMBED_MODEL_ID.to_string()
     } else {
         let bytes = unsafe { std::slice::from_raw_parts(model_id_ptr as *const u8, model_id_len) };
         String::from_utf8_lossy(bytes).into_owned()
@@ -1647,9 +1690,13 @@ pub extern "C" fn cf_upsert_symbol(
 
     macro_rules! parse_str {
         ($ptr:expr) => {
-            match unsafe { CStr::from_ptr($ptr).to_str() } {
-                Ok(s) => s,
-                Err(e) => return handle.err(e),
+            if $ptr.is_null() {
+                return -1;
+            } else {
+                match unsafe { CStr::from_ptr($ptr).to_str() } {
+                    Ok(s) => s,
+                    Err(e) => return handle.err(e),
+                }
             }
         };
     }
@@ -1671,7 +1718,11 @@ pub extern "C" fn cf_upsert_symbol(
     } else {
         Some(memory_id)
     };
-    let emb = unsafe { std::slice::from_raw_parts(embedding, embed_len) };
+    let emb: &[f32] = if embedding.is_null() || embed_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(embedding, embed_len) }
+    };
 
     match handle.field.upsert_symbol(
         kind_str, name_str, sig_str, path_str, line_start, line_end, repo_id, emb, desc, mem_id,
@@ -5037,15 +5088,24 @@ pub extern "C" fn cf_update_memory_content(
     if let Err(e) = log_result {
         return handle.err(e);
     }
-    // Apply in-memory
-    if let Some(payload) = handle.field.payloads.write().get_mut(&id) {
-        payload.content = new_content.clone();
-        if !new_embedding.is_empty() {
-            payload.embedding = new_embedding.clone();
+    // Apply in-memory; capture the memory's realm so the semantic-index upsert routes
+    // to the correct per-realm HNSW. Must match apply_op's WAL-replay path (Some(realm)),
+    // otherwise recall realm-filtering diverges for edited memories across a restart.
+    let mem_realm = {
+        let mut payloads = handle.field.payloads.write();
+        match payloads.get_mut(&id) {
+            Some(payload) => {
+                payload.content = new_content.clone();
+                if !new_embedding.is_empty() {
+                    payload.embedding = new_embedding.clone();
+                }
+                payload.realm.clone()
+            }
+            None => String::new(),
         }
-    }
+    };
     if !new_embedding.is_empty() {
-        handle.field.semantic_idx.write().upsert(id, new_embedding, None);
+        handle.field.semantic_idx.write().upsert(id, new_embedding, Some(mem_realm.as_str()));
     }
     let content_str = String::from_utf8_lossy(&new_content).to_string();
     handle.field.keyword_idx.write().index(id, &content_str);
@@ -8252,6 +8312,9 @@ pub extern "C" fn cf_recall_spreading(
     out_json: *mut c_char,
     out_json_len: usize,
 ) -> c_int {
+    if handle.is_null() || query.is_null() || out_json.is_null() || out_json_len == 0 {
+        return -1;
+    }
     let h = unsafe { &*handle };
     let query_str = unsafe { std::ffi::CStr::from_ptr(query).to_string_lossy() };
     let realm_opt: Option<String> = if realm.is_null() {
@@ -8284,8 +8347,8 @@ pub extern "C" fn cf_recall_spreading(
 }
 
 /// Session-level recall hit returned by cf_recall_session.
-/// `session_id` and `best_evidence` are C strings valid until the next cf_recall_session call
-/// on the same handle (stored in thread-local scratch).
+/// Scalar-only struct: session identifiers are NOT carried here — they are returned
+/// separately as a JSON array via the `session_ids_json_out` out-param of cf_recall_session.
 #[repr(C)]
 #[derive(Clone)]
 pub struct CfSessionHit {

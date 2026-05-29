@@ -404,7 +404,52 @@ impl ChittaField {
                 Ok(mut snap) => {
                     full_snapshot_seqno = snap.snapshot_seqno;
                     // v11+: content in .pld sidecar; v10: content already in bincode (no-op).
-                    FullSnapshot::load_payload_sidecar(&candidate.with_extension("pld"), &mut snap.payloads);
+                    let pld_loaded = FullSnapshot::load_payload_sidecar(&candidate.with_extension("pld"), &mut snap.payloads);
+                    if !pld_loaded {
+                        // A missing/torn .pld is harmless only if content is still in the
+                        // bincode body (≤v10). For content-stripped snapshots (v11+) the .pld
+                        // is the ONLY copy of content — reject this candidate and fall back to
+                        // an older snapshot rather than silently serving empty content.
+                        let stripped = !snap.payloads.is_empty()
+                            && snap.payloads.values().all(|p| p.content.is_empty());
+                        if stripped {
+                            eprintln!(
+                                "[chitta-field] REFUSING snapshot {:?}: .pld sidecar missing/corrupt \
+                                 but payload content was stripped — would serve empty content; trying fallback",
+                                candidate
+                            );
+                            continue;
+                        }
+                    }
+                    // Dim-aware fencing: refuse a snapshot whose embedded payloads were
+                    // ALL written at a different EMBED_DIM than this binary compiles for.
+                    // Catches a wholesale 768-d snapshot winning on seqno after a 1536-d
+                    // migration (the contamination that motivated this guard); a partially
+                    // migrated store passes because any payload matching EMBED_DIM lets it
+                    // through, and a fresh store passes because it has no embedded payloads.
+                    {
+                        let mut embedded = 0usize;
+                        let mut matching = 0usize;
+                        let mut foreign_dim = 0u32;
+                        for p in snap.payloads.values() {
+                            if p.embedding_dim > 0 {
+                                embedded += 1;
+                                if p.embedding_dim == crate::ops::EMBED_DIM as u32 {
+                                    matching += 1;
+                                } else {
+                                    foreign_dim = p.embedding_dim;
+                                }
+                            }
+                        }
+                        if embedded > 0 && matching == 0 {
+                            eprintln!(
+                                "[chitta-field] REFUSING snapshot {:?}: {} embedded payloads all at \
+                                 dim={} but this binary compiles EMBED_DIM={}; trying fallback",
+                                candidate, embedded, foreign_dim, crate::ops::EMBED_DIM
+                            );
+                            continue;
+                        }
+                    }
                     snap.triplet_store.load_supersession_sidecar(&candidate.with_extension("sup.json"));
                     payloads = snap.payloads;
                     states = snap.states;
@@ -458,7 +503,7 @@ impl ChittaField {
             // Skip the most recent stale (keep as backup), delete the rest + their sidecars.
             for (_, path) in stale_by_seqno.iter().skip(1) {
                 let _ = std::fs::remove_file(path);
-                for ext in &["emb", "bin", "hnsw", "pld", "snapshot.tmp"] {
+                for ext in &["emb", "bin", "mu", "hnsw", "pld", "snapshot.tmp"] {
                     let _ = std::fs::remove_file(path.with_extension(ext));
                 }
                 // delta.hnsw: with_extension replaces only last component, handle separately
@@ -512,6 +557,10 @@ impl ChittaField {
             }
             // .bin: binary codes sidecar — skip O(N×256) reconstruction in normalize_all.
             let _ = semantic_idx.load_binary_sidecar(&snap_path.with_extension("bin"));
+            // .mu: corpus-mean centroid (anisotropy correction). Must load before
+            // normalize_all() so any rebuilt binary codes are centered, and before any
+            // search so queries are centered. Absent on legacy snapshots → raw cosine.
+            let _ = semantic_idx.load_centroid_sidecar(&snap_path.with_extension("mu"));
             // .emb mmap: serve embeddings from mmap whenever sidecar exists — avoids 1GB+ heap
             // copy regardless of collection size.
             if emb_loaded {
@@ -643,6 +692,32 @@ impl ChittaField {
                 if ssl_count > 0 {
                     eprintln!("[chitta-field] SSL gloss migration: marked {ssl_count} memories for re-embed with gloss");
                 }
+                let _ = std::fs::write(&flag, "done");
+            }
+        }
+
+        // One-time migration: 768→1536 embedding dimension (ssl_distiller_dpo).
+        // The old 768-d .emb/.bin sidecars are skipped via the bumped EMB_MAGIC/BIN_MAGIC,
+        // so on the first start with EMBED_DIM=1536 every memory has no embedding and
+        // purge_wrong_dim() finds nothing to mark. Explicitly mark every content-bearing
+        // memory embed_pending so the background backfill thread re-embeds it at 1536-d.
+        // Guard file makes this run exactly once (after which a 1536-d snapshot is saved).
+        {
+            let flag = data_dir.join("embed_1536_v1.migrated");
+            if !flag.exists() {
+                const MIN_EMBED_CHARS: usize = 20;
+                let mut n = 0usize;
+                for (id, payload) in &payloads {
+                    if payload.content.len() >= MIN_EMBED_CHARS {
+                        if let Some(state) = states.get_mut(id) {
+                            if !state.embed_pending && !state.deleted {
+                                state.embed_pending = true;
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+                eprintln!("[chitta-field] 768→1536 migration: marked {n} memories for re-embed at 1536-d");
                 let _ = std::fs::write(&flag, "done");
             }
         }
