@@ -6,6 +6,11 @@ pub const EMBED_DIM: usize = 1536; // ssl_distiller_dpo full dimension
 /// the in-process embedder. Kept in one place so the Rust core, the C++ daemon's
 /// re_embed command, and the recorded metadata never drift apart again.
 pub const EMBED_MODEL_ID: &str = "ssl_distiller_dpo";
+/// Version of the embedded-document text construction (content + SSL gloss, asymmetric
+/// search_query:/search_document: prefixes). Bumped when that recipe changes so the
+/// store identity (vector_space_id) reflects a query/doc space change even at the same
+/// model + dim. Part of StoreHeader.vector_space_id.
+pub const TEXT_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Op {

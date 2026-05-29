@@ -202,7 +202,7 @@ fn now_ms() -> i64 {
 /// extensions for each stale stem.
 fn prune_old_snapshots(data_dir: &std::path::Path, keep: usize) {
     const SIDECAR_EXTS: &[&str] = &[
-        "snapshot", "hdc", "emb", "bin", "hnsw", "realm_hnsw", "pld", "sup.json",
+        "snapshot", "hdc", "emb", "bin", "mu", "shdr", "hnsw", "realm_hnsw", "pld", "sup.json",
     ];
     let delta_ext = "delta.hnsw";
 
@@ -5230,6 +5230,15 @@ impl ChittaField {
         let realm_hnsw_path = path.with_extension("realm_hnsw");
         let pld_path   = path.with_extension("pld");
         let sup_path   = path.with_extension("sup.json");
+        let shdr_path  = path.with_extension("shdr");
+        // Store-identity sidecar (PR3): records the vector space (model/dim/text-format) +
+        // lineage so snapshot selection and WAL replay can fence foreign-dim/model data.
+        {
+            let hdr = crate::snapshot::StoreHeader::current(self.lineage_epoch, self.writer_uuid);
+            if let Err(e) = hdr.save(&shdr_path) {
+                eprintln!("[chitta-field] WARNING: .shdr sidecar save failed: {e}");
+            }
+        }
         {
             // Merge delta into base if threshold exceeded, then persist both sidecars.
             let mut idx = self.semantic_idx.write();
