@@ -1,7 +1,11 @@
 use crate::ids::{ArtifactId, ChunkHash, MemoryId};
 use serde::{Deserialize, Serialize};
 
-pub const EMBED_DIM: usize = 768; // nomic-embed-text v1.5 full dimension
+pub const EMBED_DIM: usize = 1536; // ssl_distiller_dpo full dimension
+/// Identifier written into MemoryPayload.embedding_model / embedding_model_id by
+/// the in-process embedder. Kept in one place so the Rust core, the C++ daemon's
+/// re_embed command, and the recorded metadata never drift apart again.
+pub const EMBED_MODEL_ID: &str = "ssl_distiller_dpo";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Op {

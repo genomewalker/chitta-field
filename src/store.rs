@@ -2,7 +2,7 @@ use crate::error::{FieldError, Result};
 use crate::field::{AssocEdge, ChittaField};
 use crate::ids::{compute_chunk_hash, ArtifactId, ChunkHash, MemoryId};
 use crate::learner::route::{Route, RouteLearner};
-use crate::ops::EMBED_DIM;
+use crate::ops::{EMBED_DIM, EMBED_MODEL_ID};
 use crate::ops::{
     AddAssocEdgeOp, AddSymCallEdgeOp, AddTripletOp, ArtifactRef, DeleteMemoryOp, DemoteMemoryOp,
     EdgeType, InvalidateTripletOp, Op, PutPayloadOp, RemoveSymbolOp, StateDeltaOp, TrainPQOp,
@@ -477,9 +477,9 @@ impl ChittaField {
             kind: kind.to_string(),
             realm: realm.to_string(),
             content: content.to_vec(),
-            embedding_model: if embed_pending { "none".to_string() } else { "nomic-embed-text:v1.5".to_string() },
-            embedding_model_id: if embed_pending { String::new() } else { "nomic-embed-text:v1.5".to_string() },
-            embedding_dim: if embed_pending { 0 } else { 768 },
+            embedding_model: if embed_pending { "none".to_string() } else { EMBED_MODEL_ID.to_string() },
+            embedding_model_id: if embed_pending { String::new() } else { EMBED_MODEL_ID.to_string() },
+            embedding_dim: if embed_pending { 0 } else { EMBED_DIM as u32 },
             embedding: embedding.to_vec(),
             artifact_refs: artifact_refs.clone(),
             harness: source_tool.as_deref().map(|t| {
@@ -1939,8 +1939,20 @@ impl ChittaField {
         use crate::organ::sequitur::run_sequitur;
         const MIN_SUPPORT: u32 = 5;
 
+        // Operator kill-switch. consolidation_pass is expensive (run_sequitur + FEP
+        // rebuild over the whole tape); when many consolidate_request ops pile up in
+        // the queue it can monopolize the daemon. Setting CHITTA_DISABLE_CONSOLIDATION
+        // makes every trigger (queue, sleep, manual RPC) a no-op.
+        if std::env::var_os("CHITTA_DISABLE_CONSOLIDATION").is_some() {
+            return Ok((0, 0));
+        }
+
         let (rule_data, rules_for_ledger): (Vec<(String, String, String, String, String, String)>, Vec<crate::organ::sequitur::SequiturRule>) = {
-            let tape = self.event_tape.read();
+            // Clone the tape under a brief read, then release the lock before the
+            // expensive run_sequitur (~30s on a large tape). Holding event_tape.read()
+            // across that span starves recall: a queued tape writer (put_memory/log_event)
+            // blocks, and parking_lot task-fairness then blocks every subsequent reader.
+            let tape = self.event_tape.read().clone();
             let rules = run_sequitur(&tape, MIN_SUPPORT);
             let data = rules.iter().map(|r| (
                 r.rule_key(&tape),
@@ -1973,18 +1985,24 @@ impl ChittaField {
         }
         // Phase 12: compress low-surprisal events from the tape.
         {
+            // Lock order MUST match put_memory's tape→cdawg acquisition. Acquiring
+            // cdawg.read() before event_tape.write() here (cdawg→tape) inverts it;
+            // combined with a queued cdawg.write() from log_event — parking_lot is
+            // task-fair, so a waiting writer blocks NEW readers — that closes a
+            // three-thread deadlock cycle. Take the tape write first, then cdawg.
+            let mut tape = self.event_tape.write();
             let cdawg = self.cdawg.read();
-            let removed = self.event_tape.write()
-                .compress_low_surprisal(&cdawg, 0.85);
+            let removed = tape.compress_low_surprisal(&cdawg, 0.85);
             if removed > 0 {
                 self.tape_tombstoned.fetch_add(removed as u64, std::sync::atomic::Ordering::Relaxed);
                 eprintln!("[cec] temporal compression: tombstoned {removed} low-surprisal events");
             }
         }
 
-        // Phase 15: rebuild FEP model from (compressed) tape.
+        // Phase 15: rebuild FEP model from (compressed) tape. Clone under a brief read so
+        // the O(events) rebuild runs off-lock (same starvation reasoning as run_sequitur).
         {
-            let tape = self.event_tape.read();
+            let tape = self.event_tape.read().clone();
             self.fep_prior.write().rebuild_from_tape(&tape);
             eprintln!("[cec] fep rebuilt: {} states modeled, drift={:.3}, shock={:.3}",
                 self.fep_prior.read().state_emission_len(),
@@ -3057,9 +3075,9 @@ impl ChittaField {
             let mut payloads = self.payloads.write();
             if let Some(p) = payloads.get_mut(&memory_id) {
                 p.embedding = embedding.to_vec();
-                p.embedding_model = "nomic-embed-text:v1.5".to_string();
-                p.embedding_model_id = "nomic-embed-text:v1.5".to_string();
-                p.embedding_dim = 768;
+                p.embedding_model = EMBED_MODEL_ID.to_string();
+                p.embedding_model_id = EMBED_MODEL_ID.to_string();
+                p.embedding_dim = EMBED_DIM as u32;
             }
         }
 
@@ -3087,6 +3105,14 @@ impl ChittaField {
             }
         }
         Ok(())
+    }
+
+    /// Force a full rebuild of all derived search structures (binary codes, coarse,
+    /// LSH, HNSW) from the current embeddings. Required after an embedding-dimension
+    /// migration, where re-embedding updates the float vectors but leaves the ANN
+    /// indices built in the old vector space.
+    pub fn force_reindex(&self) {
+        self.semantic_idx.write().force_reindex();
     }
 
     /// Return memory IDs with embed_pending=true, sorted oldest first, up to limit.
@@ -5198,6 +5224,7 @@ impl ChittaField {
         let emb_path   = path.with_extension("emb");
         let hdc_path   = path.with_extension("hdc");
         let bin_path   = path.with_extension("bin");
+        let mu_path    = path.with_extension("mu");
         let hnsw_path       = path.with_extension("hnsw");
         let delta_path      = path.with_extension("delta.hnsw");
         let realm_hnsw_path = path.with_extension("realm_hnsw");
@@ -5211,6 +5238,7 @@ impl ChittaField {
             }
             let _ = idx.save_embeddings_sidecar(&emb_path);
             let _ = idx.save_binary_sidecar(&bin_path);
+            let _ = idx.save_centroid_sidecar(&mu_path);
             let _ = idx.save_hnsw(&hnsw_path);
             let _ = idx.save_delta_hnsw(&delta_path);
             let _ = idx.save_realm_hnsw(&realm_hnsw_path);
@@ -5222,9 +5250,14 @@ impl ChittaField {
                 .unwrap_or_else(|e| format!("err:{e}"));
             eprintln!("[chitta-field] hdc sidecar: {} memories written to {:?}", n, hdc_path);
         }
-        // Save payload content sidecar (.pld) before clearing from bincode.
+        // Save payload content sidecar (.pld) before clearing from bincode. If this
+        // fails we MUST NOT strip content from the bincode body — otherwise the content
+        // would exist in neither place (silent total content loss). Abort the snapshot.
         let mut snap = snap;
-        let _ = FullSnapshot::save_payload_sidecar(&pld_path, &snap.payloads);
+        FullSnapshot::save_payload_sidecar(&pld_path, &snap.payloads)
+            .map_err(|e| FieldError::Manifest(format!(
+                "payload (.pld) sidecar save failed, aborting snapshot to avoid content loss: {e}"
+            )))?;
         // Strip content and embeddings from bincode (live in sidecars now).
         for payload in snap.payloads.values_mut() {
             payload.content.clear();
@@ -5254,7 +5287,9 @@ impl ChittaField {
             eprintln!("[size] artifact_idx:      {}", sz(bincode::serialized_size(&snap.artifact_idx).unwrap_or(0)));
         }
         snap.save(&path)?;
-        // Prune old snapshot families: keep the 2 most recent chitta.*.snapshot files.
+        // Prune old families ONLY after the new snapshot + .pld are durably written
+        // (save() fsyncs the file and parent dir; save_payload_sidecar fsyncs the .pld).
+        // Pruning before durability would delete the fallback the new snapshot replaces.
         prune_old_snapshots(&self.data_dir, 2);
         Ok(())
     }
@@ -5581,14 +5616,19 @@ impl ChittaField {
                 seen.insert(key);
                 let content_a = String::from_utf8_lossy(payloads[id_a].content.as_slice()).into_owned();
                 let content_b = String::from_utf8_lossy(payloads[&id_b].content.as_slice()).into_owned();
+                // char-boundary-safe truncation: byte-slicing (&s[..200]) panics when byte
+                // 200 splits a multibyte codepoint, and this runs under an extern "C" FFI
+                // call (cf_query_cross_harness_conflicts) — an unwind there aborts the daemon.
+                let snippet_a: String = content_a.chars().take(200).collect();
+                let snippet_b: String = content_b.chars().take(200).collect();
                 conflicts.push(serde_json::json!({
                     "harness_a": harness_a,
                     "memory_a_id": id_a,
                     "harness_b": harness_b,
                     "memory_b_id": id_b,
                     "disagreement_score": disagreement,
-                    "snippet_a": &content_a[..content_a.len().min(200)],
-                    "snippet_b": &content_b[..content_b.len().min(200)],
+                    "snippet_a": snippet_a,
+                    "snippet_b": snippet_b,
                 }));
                 if conflicts.len() >= limit { break; }
             }

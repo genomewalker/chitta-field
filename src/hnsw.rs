@@ -439,6 +439,13 @@ pub struct SemanticIndex {
     coarse_members: HashMap<u16, Vec<MemoryId>>,
     #[serde(default)]
     mem_coarse: HashMap<MemoryId, Vec<u16>>,
+    /// Corpus mean of raw unit embeddings — anisotropy correction (mean-centering).
+    /// NOT bincode-serialized: bincode is positional, so adding a field would corrupt
+    /// existing snapshots. Persisted via the `.mu` sidecar instead. Empty = centering
+    /// disabled (legacy). When set, queries, rerank candidates and binary codes are all
+    /// centered against it so cosine becomes discriminative on anisotropic embeddings.
+    #[serde(skip)]
+    centroid: Vec<f32>,
     #[serde(skip)]
     lsh_planes: Vec<Vec<Vec<f32>>>,
     #[serde(skip)]
@@ -460,7 +467,7 @@ pub struct SemanticIndex {
     /// Contiguous flat scan buffer — cache-friendly alternative to HashMap iteration in hamming_candidates.
     /// Kept in sync with binary_codes by upsert/remove/load_binary_sidecar/normalize_all.
     #[serde(skip)]
-    binary_vec: Vec<(MemoryId, [u64; 4])>,
+    binary_vec: Vec<(MemoryId, [u64; BINARY_WORDS])>,
     /// Position index for O(1) swap-remove from binary_vec.
     #[serde(skip)]
     binary_vec_pos: HashMap<MemoryId, usize>,
@@ -495,6 +502,7 @@ impl SemanticIndex {
             coarse_centroids: default_coarse_centroids(),
             coarse_members: HashMap::new(),
             mem_coarse: HashMap::new(),
+            centroid: Vec::new(),
             lsh_planes: default_lsh_planes(),
             lsh_buckets: vec![HashMap::new(); LSH_TABLES],
             mem_lsh: HashMap::new(),
@@ -714,6 +722,70 @@ impl SemanticIndex {
         self.embeddings.get(&id).map(|v| v.as_slice())
     }
 
+    /// Center a vector against the corpus mean and L2-normalize. Falls back to plain
+    /// normalize when centering is disabled (empty/mismatched centroid). The returned
+    /// vector lives in the same centered space as the persisted binary codes.
+    #[inline]
+    fn center_norm(&self, v: &[f32]) -> Option<Vec<f32>> {
+        if self.centroid.len() == v.len() {
+            let mut c = vec![0f32; v.len()];
+            for i in 0..v.len() {
+                c[i] = v[i] - self.centroid[i];
+            }
+            normalize(&c)
+        } else {
+            normalize(v)
+        }
+    }
+
+    /// Recompute the corpus-mean centroid from all live (non-deleted) unit embeddings.
+    /// O(N·dim) over EmbLookup — mmap-safe (read-only). Frozen after computation; only
+    /// re-run via force_reindex. Persisted to the `.mu` sidecar by the snapshot writer.
+    fn compute_centroid(&mut self) {
+        let dim = EMBED_DIM;
+        let ids: Vec<MemoryId> = self
+            .embeddings
+            .keys()
+            .chain(self.emb_offsets.keys())
+            .copied()
+            .collect();
+        let (sum, n) = {
+            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+            let mut sum = vec![0f64; dim];
+            let mut n = 0u64;
+            for id in ids {
+                if self.deleted.contains(&id) {
+                    continue;
+                }
+                let Some(e) = embs.get(id) else { continue };
+                if e.len() != dim {
+                    continue;
+                }
+                let norm: f32 = e.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm < 1e-6 {
+                    continue;
+                }
+                for i in 0..dim {
+                    sum[i] += (e[i] / norm) as f64;
+                }
+                n += 1;
+            }
+            (sum, n)
+        };
+        self.centroid = if n == 0 {
+            Vec::new()
+        } else {
+            sum.iter().map(|&s| (s / n as f64) as f32).collect()
+        };
+        if n > 0 {
+            eprintln!(
+                "[hnsw] compute_centroid: corpus mean over {} unit embeddings (|mu|={:.4})",
+                n,
+                l2_norm(&self.centroid)
+            );
+        }
+    }
+
     /// True if this memory has a usable (non-zero norm) embedding in the index.
     /// Returns false for missing, zero-vector, or NaN embeddings — those score 0.0
     /// against every query and need to be re-embedded.
@@ -783,8 +855,10 @@ impl SemanticIndex {
         // Pending-embed memories arrive with an empty slice and must not trigger binarize.
         let embedding_ready = embedding.len() == EMBED_DIM;
         if embedding_ready {
-            let codes = binarize(&embedding);
-            let arr: [u64; 4] = codes[..BINARY_WORDS].try_into().unwrap_or([0u64; 4]);
+            // Center against the frozen corpus mean (when set) so new writes share the
+            // same binary space as the reindexed corpus; raw binarize otherwise.
+            let codes = binarize_centered(&embedding, &self.centroid);
+            let arr: [u64; BINARY_WORDS] = codes[..BINARY_WORDS].try_into().unwrap_or([0u64; BINARY_WORDS]);
             if let Some(&pos) = self.binary_vec_pos.get(&memory_id) {
                 self.binary_vec[pos].1 = arr;
             } else {
@@ -898,19 +972,24 @@ impl SemanticIndex {
         if query.len() != EMBED_DIM {
             return vec![];
         }
-        let Some(query_unit) = normalize(query) else {
+        let Some(query_unit) = self.center_norm(query) else {
             return vec![];
         };
 
         // Per-realm HNSW fast path: bypass global index + allowed-set filter overhead.
-        if let Some(r) = realm {
-            if let Some(graph) = self.per_realm_hnsw.get(r) {
-                if !graph.is_empty() {
-                    let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
-                    let pairs = graph.search(&query_unit, k, None, &self.deleted, &embs);
-                    return pairs.into_iter()
-                        .map(|(memory_id, cosine_similarity)| SemanticHit { memory_id, cosine_similarity })
-                        .collect();
+        // Skipped when centering is active — the HNSW graph is built in raw cosine space,
+        // so a centered query would mismatch it. The centered binary path below handles
+        // realm scoping via the `allowed` set instead.
+        if self.centroid.is_empty() {
+            if let Some(r) = realm {
+                if let Some(graph) = self.per_realm_hnsw.get(r) {
+                    if !graph.is_empty() {
+                        let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                        let pairs = graph.search(&query_unit, k, None, &self.deleted, &embs);
+                        return pairs.into_iter()
+                            .map(|(memory_id, cosine_similarity)| SemanticHit { memory_id, cosine_similarity })
+                            .collect();
+                    }
                 }
             }
         }
@@ -933,7 +1012,8 @@ impl SemanticIndex {
                 let mut top_k = BinaryHeap::new();
                 for memory_id in candidates {
                     let Some(embedding) = self.get_embedding(memory_id) else { continue; };
-                    let sim = dot(&query_unit, embedding);
+                    let Some(cand) = self.center_norm(embedding) else { continue; };
+                    let sim = dot(&query_unit, &cand);
                     push_top_k(&mut top_k, k, memory_id, sim);
                 }
                 return heap_to_hits(top_k);
@@ -942,7 +1022,8 @@ impl SemanticIndex {
 
         // Fallback: HNSW when active and binary codes are absent/stale.
         // In two-tier mode, search both base and delta graphs, merge by similarity.
-        if self.use_hnsw() && (!self.hnsw.is_empty() || !self.delta_hnsw.is_empty()) {
+        // Only when centering is disabled — the HNSW graph is built in raw cosine space.
+        if self.centroid.is_empty() && self.use_hnsw() && (!self.hnsw.is_empty() || !self.delta_hnsw.is_empty()) {
             let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
             let mut pairs: Vec<(MemoryId, f32)> = if !self.hnsw.is_empty() {
                 self.hnsw.search(&query_unit, k, allowed, &self.deleted, &embs)
@@ -976,7 +1057,8 @@ impl SemanticIndex {
             let Some(embedding) = self.embeddings.get(&memory_id) else {
                 continue;
             };
-            let sim = dot(&query_unit, embedding);
+            let Some(cand) = self.center_norm(embedding) else { continue; };
+            let sim = dot(&query_unit, &cand);
             push_top_k(&mut top_k, k, memory_id, sim);
         }
 
@@ -1005,7 +1087,7 @@ impl SemanticIndex {
         if query.len() != EMBED_DIM {
             return vec![];
         }
-        let Some(query_unit) = normalize(query) else {
+        let Some(query_unit) = self.center_norm(query) else {
             return vec![];
         };
 
@@ -1048,7 +1130,8 @@ impl SemanticIndex {
             let Some(embedding) = self.get_embedding(memory_id) else {
                 continue;
             };
-            let base_sim = dot(&query_unit, embedding);
+            let Some(cand) = self.center_norm(embedding) else { continue; };
+            let base_sim = dot(&query_unit, &cand);
             let boost = if let Some(sig) = signatures.get(&memory_id) {
                 if !sig.is_empty() && !query_ctx_32.is_empty() {
                     beta * dot_n(query_ctx_32, sig, 32).max(0.0)
@@ -1073,7 +1156,7 @@ impl SemanticIndex {
         if query.len() != EMBED_DIM {
             return vec![];
         }
-        let Some(query_unit) = normalize(query) else {
+        let Some(query_unit) = self.center_norm(query) else {
             return vec![];
         };
 
@@ -1085,7 +1168,8 @@ impl SemanticIndex {
             let Some(embedding) = self.get_embedding(memory_id) else {
                 continue;
             };
-            let sim = dot(&query_unit, embedding);
+            let Some(cand) = self.center_norm(embedding) else { continue; };
+            let sim = dot(&query_unit, &cand);
             push_top_k(&mut top_k, k, memory_id, sim);
         }
 
@@ -1134,20 +1218,22 @@ impl SemanticIndex {
             normalize_in_place(embedding);
         }
         if self.binary_codes.len() != self.total_embedding_count() {
+            // Centered binary codes when a centroid is loaded (.mu sidecar); raw otherwise.
+            let centroid = self.centroid.clone();
             let all_ids: Vec<MemoryId> = self.embeddings.keys()
                 .chain(self.emb_offsets.keys())
                 .copied()
                 .collect();
             let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
             self.binary_codes = all_ids.iter()
-                .filter_map(|&id| embs.get(id).map(|e| (id, binarize(e))))
+                .filter_map(|&id| embs.get(id).map(|e| (id, binarize_centered(e, &centroid))))
                 .collect();
         }
         if self.binary_vec.len() != self.binary_codes.len() {
             self.binary_vec.clear();
             self.binary_vec_pos.clear();
             for (id, codes) in &self.binary_codes {
-                let arr: [u64; 4] = codes[..BINARY_WORDS].try_into().unwrap_or([0u64; 4]);
+                let arr: [u64; BINARY_WORDS] = codes[..BINARY_WORDS].try_into().unwrap_or([0u64; BINARY_WORDS]);
                 self.binary_vec_pos.insert(*id, self.binary_vec.len());
                 self.binary_vec.push((*id, arr));
             }
@@ -1186,6 +1272,46 @@ impl SemanticIndex {
                 // binary_covers && hnsw.is_empty(): binary Hamming is the active path, skip rebuild.
             }
         }
+        self.trim_deleted();
+    }
+
+    /// Unconditionally rebuild every derived search structure (binary codes, coarse
+    /// assignments, LSH buckets, HNSW) from the current embeddings. Used after an
+    /// embedding-dimension migration: the on-disk indices were built in a different
+    /// vector space, so normalize_all()'s count-gated refresh cannot detect they are
+    /// geometrically stale. This recomputes them from scratch.
+    pub fn force_reindex(&mut self) {
+        for embedding in self.embeddings.values_mut() {
+            normalize_in_place(embedding);
+        }
+        // Recompute the anisotropy-correction centroid from the (now unit) corpus, then
+        // derive binary codes in the centered space so the Hamming prefilter and cosine
+        // rerank agree. Cloned out to avoid borrowing self while mutating binary_codes.
+        self.compute_centroid();
+        let centroid = self.centroid.clone();
+        let all_ids: Vec<MemoryId> = self.embeddings.keys()
+            .chain(self.emb_offsets.keys())
+            .copied()
+            .collect();
+        {
+            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+            self.binary_codes = all_ids.iter()
+                .filter_map(|&id| embs.get(id).map(|e| (id, binarize_centered(e, &centroid))))
+                .collect();
+        }
+        self.binary_vec.clear();
+        self.binary_vec_pos.clear();
+        for (id, codes) in &self.binary_codes {
+            let arr: [u64; BINARY_WORDS] = codes[..BINARY_WORDS].try_into().unwrap_or([0u64; BINARY_WORDS]);
+            self.binary_vec_pos.insert(*id, self.binary_vec.len());
+            self.binary_vec.push((*id, arr));
+        }
+        // Clear graphs so rebuild_ann's hnsw_valid check fails and forces a full rebuild.
+        self.hnsw = HnswGraph::new();
+        self.delta_hnsw = HnswGraph::new();
+        self.mem_coarse.clear();
+        self.mem_lsh.clear();
+        self.rebuild_ann();
         self.trim_deleted();
     }
 
@@ -1388,7 +1514,7 @@ impl SemanticIndex {
     // Format: [magic:u64][count:u64]([id:u64][f32×EMBED_DIM])×count
     // All values little-endian. Atomic write via .tmp rename.
 
-    const EMB_MAGIC: u64 = 0x454D4244_00000002; // "EMBD\0\0\0\x02" — bumped for EMBED_DIM 256→768
+    const EMB_MAGIC: u64 = 0x454D4244_00000003; // "EMBD\0\0\0\x03" — bumped for EMBED_DIM 768→1536 (ssl_distiller_dpo)
 
     pub fn save_embeddings_sidecar(&self, path: &std::path::Path) -> std::io::Result<()> {
         // When mmap is active the heap holds only the post-activation delta.
@@ -1486,7 +1612,59 @@ impl SemanticIndex {
     // ── Binary codes sidecar (.bin) ──────────────────────────────────────────
     // Format: [magic:u64][count:u64]([id:u64][u64×BINARY_WORDS])×count
 
-    const BIN_MAGIC: u64 = 0x42494E41_00000002; // "BINA\0\0\0\x02" — bumped for EMBED_DIM 256→768
+    const MU_MAGIC: u64 = 0x4D550000_00000001; // "MU\0..\x01" — corpus-mean centroid sidecar
+
+    /// Persist the corpus-mean centroid to the `.mu` sidecar (magic + dim + f32×dim).
+    /// No-op (removes any stale file) when centering is disabled (empty centroid).
+    pub fn save_centroid_sidecar(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if self.centroid.is_empty() {
+            let _ = std::fs::remove_file(path);
+            return Ok(());
+        }
+        let tmp = path.with_extension("mu.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&Self::MU_MAGIC.to_le_bytes())?;
+            f.write_all(&(self.centroid.len() as u64).to_le_bytes())?;
+            for &x in &self.centroid {
+                f.write_all(&x.to_le_bytes())?;
+            }
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load the corpus-mean centroid from the `.mu` sidecar. Returns false if
+    /// missing/corrupt/dim-mismatched (centering then stays disabled).
+    pub fn load_centroid_sidecar(&mut self, path: &std::path::Path) -> bool {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        if bytes.len() < 16 {
+            return false;
+        }
+        let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        if magic != Self::MU_MAGIC {
+            return false;
+        }
+        let dim = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        if dim != EMBED_DIM || bytes.len() < 16 + dim * 4 {
+            return false;
+        }
+        let mut mu = vec![0f32; dim];
+        let mut off = 16usize;
+        for x in mu.iter_mut() {
+            *x = f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            off += 4;
+        }
+        self.centroid = mu;
+        eprintln!("[hnsw] load_mu: centroid loaded (|mu|={:.4}) — centering active", l2_norm(&self.centroid));
+        true
+    }
+
+    const BIN_MAGIC: u64 = 0x42494E41_00000003; // "BINA\0\0\0\x03" — bumped for EMBED_DIM 768→1536 (ssl_distiller_dpo)
 
     pub fn save_binary_sidecar(&self, path: &std::path::Path) -> std::io::Result<()> {
         let tmp = path.with_extension("bin.tmp");
@@ -1541,7 +1719,7 @@ impl SemanticIndex {
         self.binary_vec.clear();
         self.binary_vec_pos.clear();
         for (id, codes) in &self.binary_codes {
-            let arr: [u64; 4] = codes[..BINARY_WORDS].try_into().unwrap_or([0u64; 4]);
+            let arr: [u64; BINARY_WORDS] = codes[..BINARY_WORDS].try_into().unwrap_or([0u64; BINARY_WORDS]);
             self.binary_vec_pos.insert(*id, self.binary_vec.len());
             self.binary_vec.push((*id, arr));
         }
@@ -1806,6 +1984,21 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 fn dot_n(a: &[f32], b: &[f32], n: usize) -> f32 {
     a.iter().zip(b.iter()).take(n).map(|(x, y)| x * y).sum()
+}
+
+/// Sign-bit code of `v - centroid` (mean-centered). Falls back to `binarize(v)` when no
+/// centroid is set. Sign bits are scale-invariant, so the difference is binarized directly
+/// without renormalizing — matching `center_norm`, which only differs by a positive scale.
+fn binarize_centered(v: &[f32], centroid: &[f32]) -> Vec<u64> {
+    if centroid.len() == v.len() {
+        let mut c = vec![0f32; v.len()];
+        for i in 0..v.len() {
+            c[i] = v[i] - centroid[i];
+        }
+        binarize(&c)
+    } else {
+        binarize(v)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -955,8 +955,17 @@ impl FullSnapshot {
             bincode::serialize_into(&mut w, self)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
             w.flush()?;
+            // fsync data+magic to disk before the rename commits the file, so a crash
+            // can't leave a renamed-but-truncated snapshot whose magic still reads valid.
+            w.into_inner()
+                .map_err(|e| FieldError::Manifest(e.to_string()))?
+                .sync_all()?;
         }
         std::fs::rename(&tmp, path)?;
+        // fsync the parent directory so the rename entry itself survives a crash.
+        if let Some(dir) = path.parent() {
+            if let Ok(d) = std::fs::File::open(dir) { let _ = d.sync_all(); }
+        }
         Ok(())
     }
 
