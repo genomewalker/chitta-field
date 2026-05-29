@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 
 pub const SEGMENT_MAGIC: &[u8; 8] = b"CFLOG001";
 pub const SEGMENT_MAGIC_V2: &[u8; 8] = b"CFLOG002";
+/// V3 = V2 record format + an 8-byte vector_space_id lineage stamp in the header.
+/// Lets replay() fence out segments written in a foreign vector space (model/dim/text-format).
+/// NOTE: a pre-V3 binary cannot read V3 segments (rollback hazard — compact_wal before downgrading).
+pub const SEGMENT_MAGIC_V3: &[u8; 8] = b"CFLOG003";
 pub const MAX_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 
 /// SHA256 hash of a record, used for hash-chaining.
@@ -151,6 +155,9 @@ pub struct OpLog {
     /// Hash-chain tip: SHA256 of the most recent V2 record.
     /// Zero for genesis or when only V1 segments exist.
     chain_head: ChainHash,
+    /// Compiled vector-space id stamped into new V3 segments; replay() fences out
+    /// segments carrying a different stamp (foreign lineage).
+    vector_space_id: u64,
 }
 
 impl OpLog {
@@ -169,13 +176,15 @@ impl OpLog {
     ) -> Result<Self> {
         let seg_dir = data_dir.join("segments");
         fs::create_dir_all(&seg_dir)?;
+        let vector_space_id = crate::snapshot::StoreHeader::compiled_vector_space_id();
 
         let existing = collect_instance_segments(&seg_dir, instance_id)?;
 
         if let Some(last_path) = existing.last() {
             let size = last_path.metadata()?.len();
-            // Only continue appending to V2 segments; V1 segments force a new V2 segment
-            if size < MAX_SEGMENT_SIZE && is_v2_segment(last_path) {
+            // Continue appending to a chained (V2/V3) segment; V1 forces a new segment.
+            // The record format is identical, so a V2 tail can continue under a V3 binary.
+            if size < MAX_SEGMENT_SIZE && is_chained_segment(last_path) {
                 let f = OpenOptions::new()
                     .write(true)
                     .append(true)
@@ -189,13 +198,14 @@ impl OpLog {
                     next_seqno,
                     ops_since_sync: 0,
                     chain_head,
+                    vector_space_id,
                 });
             }
         }
 
         let path = segment_path(data_dir, instance_id, next_seqno);
-        let f = create_segment_v2(&path, next_seqno, &chain_head)?;
-        let header_size = V2_HEADER_SIZE as u64;
+        let f = create_segment_v3(&path, next_seqno, &chain_head, vector_space_id)?;
+        let header_size = V3_HEADER_SIZE as u64;
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             instance_id,
@@ -205,6 +215,7 @@ impl OpLog {
             next_seqno,
             ops_since_sync: 0,
             chain_head,
+            vector_space_id,
         })
     }
 
@@ -286,6 +297,18 @@ impl OpLog {
         let own_prefix = format!("{:08x}", self.instance_id);
         let mut own_chain_head = ZERO_HASH;
         for seg_path in &segments {
+            // Lineage fence: skip segments stamped (V3) with a different vector_space_id —
+            // foreign-vector data must not contaminate replay. V1/V2/legacy segments carry
+            // no stamp (None) and are treated as same-lineage (always replayed).
+            if let Some(seg_vsid) = segment_vector_space_id(seg_path) {
+                if seg_vsid != self.vector_space_id {
+                    eprintln!(
+                        "[chitta-field] WAL lineage fence: skipping foreign segment {:?} (vsid={:#018x} != own {:#018x})",
+                        seg_path, seg_vsid, self.vector_space_id
+                    );
+                    continue;
+                }
+            }
             let instance = seg_path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -343,10 +366,10 @@ impl OpLog {
         self.current_segment.flush()?;
         let _ = self.current_segment.get_ref().sync_data(); // ensure old segment is durable before rotation
         let new_path = segment_path(&self.data_dir, self.instance_id, self.next_seqno);
-        let f = create_segment_v2(&new_path, self.next_seqno, &self.chain_head)?;
+        let f = create_segment_v3(&new_path, self.next_seqno, &self.chain_head, self.vector_space_id)?;
         self.current_segment = BufWriter::new(f);
         self.current_segment_path = new_path;
-        self.current_segment_size = V2_HEADER_SIZE as u64;
+        self.current_segment_size = V3_HEADER_SIZE as u64;
         Ok(())
     }
 }
@@ -361,6 +384,8 @@ fn segment_path(data_dir: &Path, instance_id: InstanceId, first_seqno: u64) -> P
 const V1_HEADER_SIZE: usize = 16;
 /// V2 header: magic(8) + first_seqno(8) + chain_head(32) = 48
 const V2_HEADER_SIZE: usize = 48;
+/// V3 header: magic(8) + first_seqno(8) + chain_head(32) + vector_space_id(8) = 56
+const V3_HEADER_SIZE: usize = 56;
 
 #[allow(dead_code)] // Retained for V1 backward compatibility
 fn create_segment(path: &Path, first_seqno: u64) -> Result<File> {
@@ -375,6 +400,7 @@ fn create_segment(path: &Path, first_seqno: u64) -> Result<File> {
     Ok(f)
 }
 
+#[allow(dead_code)] // superseded by create_segment_v3; retained for reference/tooling
 fn create_segment_v2(path: &Path, first_seqno: u64, chain_head: &ChainHash) -> Result<File> {
     let mut f = OpenOptions::new()
         .write(true)
@@ -388,24 +414,49 @@ fn create_segment_v2(path: &Path, first_seqno: u64, chain_head: &ChainHash) -> R
     Ok(f)
 }
 
-/// Check if a segment file uses V2 format by reading the first 8 bytes.
-fn is_v2_segment(path: &Path) -> bool {
-    let mut f = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let mut magic = [0u8; 8];
-    if f.read_exact(&mut magic).is_err() {
-        return false;
-    }
-    &magic == SEGMENT_MAGIC_V2
+fn create_segment_v3(path: &Path, first_seqno: u64, chain_head: &ChainHash, vector_space_id: u64) -> Result<File> {
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    f.write_all(SEGMENT_MAGIC_V3)?;
+    f.write_all(&first_seqno.to_be_bytes())?;
+    f.write_all(chain_head)?;
+    f.write_all(&vector_space_id.to_be_bytes())?;
+    f.sync_all()?;
+    Ok(f)
 }
 
-/// Read the segment magic and return the version (1 or 2).
+/// Read the segment magic and return the version (1, 2, or 3).
 fn segment_version(magic: &[u8; 8]) -> Option<u8> {
     if magic == SEGMENT_MAGIC { Some(1) }
     else if magic == SEGMENT_MAGIC_V2 { Some(2) }
+    else if magic == SEGMENT_MAGIC_V3 { Some(3) }
     else { None }
+}
+
+/// True for V2 or V3 (chained) segments — both safe to continue appending records to
+/// (the record format is identical; only the header differs).
+fn is_chained_segment(path: &Path) -> bool {
+    let mut f = match File::open(path) { Ok(f) => f, Err(_) => return false };
+    let mut magic = [0u8; 8];
+    if f.read_exact(&mut magic).is_err() { return false; }
+    &magic == SEGMENT_MAGIC_V2 || &magic == SEGMENT_MAGIC_V3
+}
+
+/// Read a V3 segment's vector_space_id lineage stamp. None for V1/V2/legacy/unreadable
+/// segments — replay treats those as same-lineage (always replayed).
+fn segment_vector_space_id(path: &Path) -> Option<u64> {
+    let mut f = File::open(path).ok()?;
+    let mut magic = [0u8; 8];
+    f.read_exact(&mut magic).ok()?;
+    if &magic != SEGMENT_MAGIC_V3 { return None; }
+    let mut skip = [0u8; 40]; // first_seqno(8) + chain_head(32)
+    f.read_exact(&mut skip).ok()?;
+    let mut vbuf = [0u8; 8];
+    f.read_exact(&mut vbuf).ok()?;
+    Some(u64::from_be_bytes(vbuf))
 }
 
 fn is_valid_segment_name(name: &str) -> bool {
@@ -502,6 +553,11 @@ where
             let mut _chain = [0u8; 32];
             let _ = file.read_exact(&mut _chain);
             (ver, V2_HEADER_SIZE as u64)
+        } else if ver == 3 {
+            // Skip chain_head(32) + vector_space_id(8) in V3 header
+            let mut _rest = [0u8; 40];
+            let _ = file.read_exact(&mut _rest);
+            (ver, V3_HEADER_SIZE as u64)
         } else {
             (ver, V1_HEADER_SIZE as u64)
         }
@@ -526,7 +582,7 @@ where
             Err(e) => return Err(FieldError::Io(e)),
         }
         let payload_len = u32::from_be_bytes(len_buf) as usize;
-        let prev_hash_size: u64 = if version == 2 { 32 } else { 0 };
+        let prev_hash_size: u64 = if version >= 2 { 32 } else { 0 };
         let entry_size = 4u64 + 8 + 1 + prev_hash_size + payload_len as u64 + 4;
 
         let mut seqno_buf = [0u8; 8];
@@ -540,8 +596,8 @@ where
             break;
         }
 
-        // V2: read prev_hash
-        let prev_hash = if version == 2 {
+        // V2/V3: read prev_hash
+        let prev_hash = if version >= 2 {
             let mut h = [0u8; 32];
             if file.read_exact(&mut h).is_err() { break; }
             h
@@ -563,7 +619,7 @@ where
         let mut hasher = CrcHasher::new();
         hasher.update(&seqno_buf);
         hasher.update(&op_type_buf);
-        if version == 2 {
+        if version >= 2 {
             hasher.update(&prev_hash);
         }
         hasher.update(&payload);
@@ -610,11 +666,18 @@ where
         return Ok(chain_head);
     }
 
-    // V2: read stored chain_head from header and verify continuity
-    if version == 2 {
+    // V2/V3: read stored chain_head from header and verify continuity
+    if version >= 2 {
         let mut stored_head = [0u8; 32];
         if file.read_exact(&mut stored_head).is_err() {
             return Ok(chain_head);
+        }
+        // V3 header carries an 8-byte vector_space_id after chain_head — consume it.
+        if version == 3 {
+            let mut _vsid = [0u8; 8];
+            if file.read_exact(&mut _vsid).is_err() {
+                return Ok(chain_head);
+            }
         }
         // Verify segment continuity: stored head must match incoming chain_head.
         // Skip when chain_head is ZERO (instance boundary reset) — mismatch there is expected.
@@ -650,8 +713,8 @@ where
         }
         let op_type = op_type_buf[0];
 
-        // V2: read prev_hash from record
-        let prev_hash = if version == 2 {
+        // V2/V3: read prev_hash from record
+        let prev_hash = if version >= 2 {
             let mut h = [0u8; 32];
             if file.read_exact(&mut h).is_err() {
                 return Err(FieldError::TruncatedEntry { seqno });
@@ -672,11 +735,11 @@ where
         }
         let stored_crc = u32::from_be_bytes(crc_buf);
 
-        // CRC verification (V2 includes prev_hash in CRC)
+        // CRC verification (V2/V3 include prev_hash in CRC)
         let mut hasher = CrcHasher::new();
         hasher.update(&seqno_buf);
         hasher.update(&op_type_buf);
-        if version == 2 {
+        if version >= 2 {
             hasher.update(&prev_hash);
         }
         hasher.update(&payload);
@@ -694,7 +757,7 @@ where
         // Skip warning when chain_head is ZERO: we're at an instance boundary reset, so any prev_hash
         // mismatch is either correct (genesis) or legacy bad data from a prior bug where replay()
         // propagated a foreign instance's chain tip into the first append of a new instance.
-        if version == 2 {
+        if version >= 2 {
             if prev_hash != chain_head && chain_head != ZERO_HASH {
                 eprintln!(
                     "[chitta-field] chain record warning at seqno {}: expected {}, record has {} — resetting chain",
