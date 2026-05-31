@@ -151,6 +151,14 @@ pub extern "C" fn cf_compiled_vector_space_id() -> u64 {
     crate::snapshot::StoreHeader::compiled_vector_space_id()
 }
 
+/// Compiled embedding model identifier (build.rs-generated EMBED_MODEL_ID) as a
+/// NUL-terminated static C string. The C++ daemon stamps re_embed metadata with this so
+/// the recorded embedding_model never drifts from the Rust store identity / vsid.
+#[no_mangle]
+pub extern "C" fn cf_embed_model_id() -> *const c_char {
+    crate::ops::EMBED_MODEL_ID_CSTR.as_ptr() as *const c_char
+}
+
 /// Free a string returned by cf_* functions (e.g. cf_skill_read, cf_agent_get).
 #[no_mangle]
 pub extern "C" fn cf_free_string(s: *mut c_char) {

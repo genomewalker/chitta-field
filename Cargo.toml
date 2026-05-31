@@ -2,6 +2,7 @@
 name = "chitta-field"
 version = "1.1.0"
 edition = "2021"
+build = "build.rs"
 description = "Organic associative memory substrate for cognitive AI companions"
 license = "MIT"
 
