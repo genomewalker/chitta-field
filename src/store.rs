@@ -206,20 +206,23 @@ fn prune_old_snapshots(data_dir: &std::path::Path, keep: usize) {
     ];
     let delta_ext = "delta.hnsw";
 
-    // Collect (mtime, stem) for all chitta.*.snapshot files.
-    let mut families: Vec<(std::time::SystemTime, String)> = match std::fs::read_dir(data_dir) {
+    // Collect (seqno, stem) for all chitta.*.snapshot files. Keep by SEQNO, not mtime:
+    // the just-written snapshot always has the highest seqno, whereas mtime can be misleading
+    // (sidecar rewrites / NFS resurrection can make an older family appear newer, which would
+    // wrongly prune the snapshot we just saved — fatal for the re-embed migration's output).
+    let mut families: Vec<(u64, String)> = match std::fs::read_dir(data_dir) {
         Ok(rd) => rd.filter_map(|e| {
             let entry = e.ok()?;
             let name = entry.file_name().into_string().ok()?;
             if !name.starts_with("chitta.") || !name.ends_with(".snapshot") { return None; }
             let stem = name.strip_suffix(".snapshot")?.to_string();
-            let mtime = entry.metadata().ok()?.modified().ok()?;
-            Some((mtime, stem))
+            let seqno = crate::snapshot::FullSnapshot::peek_seqno(&entry.path()).unwrap_or(0);
+            Some((seqno, stem))
         }).collect(),
         Err(_) => return,
     };
 
-    families.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    families.sort_by(|a, b| b.0.cmp(&a.0)); // highest seqno first
     let keep_stems: std::collections::HashSet<String> =
         families.iter().take(keep).map(|(_, s)| s.clone()).collect();
 
