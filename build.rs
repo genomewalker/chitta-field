@@ -1,6 +1,6 @@
 // Generates the embedding-identity constants (EMBED_DIM / EMBED_MODEL_ID /
 // EMBED_MODEL_ID_CSTR / TEXT_FORMAT_VERSION) from build-time env so the public release
-// (CI, no env set) matches its bundled nomic-embed-text-v1.5 GGUF (768-dim), while a
+// (CI, no env set) matches its bundled bge-large-en-v1.5 GGUF (1024-dim), while a
 // personal/local build overrides via CHITTA_EMBED_DIM / CHITTA_EMBED_MODEL_ID /
 // CHITTA_TEXT_FORMAT_VERSION. The C++ CMake reads the same env vars, so one environment
 // drives both layers and the on-disk format never drifts between them.
@@ -14,14 +14,14 @@ fn main() {
     let dim: usize = env::var("CHITTA_EMBED_DIM")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(768);
+        .unwrap_or(1024);
     assert!(
         dim % 64 == 0,
         "CHITTA_EMBED_DIM ({dim}) must be a multiple of 64 (binary codes are packed 64/word)"
     );
 
     let model_id =
-        env::var("CHITTA_EMBED_MODEL_ID").unwrap_or_else(|_| "nomic-embed-text-v1.5".to_string());
+        env::var("CHITTA_EMBED_MODEL_ID").unwrap_or_else(|_| "bge-large-en-v1.5".to_string());
     assert!(
         !model_id.contains('"') && !model_id.contains('\\'),
         "CHITTA_EMBED_MODEL_ID must not contain quotes or backslashes"
