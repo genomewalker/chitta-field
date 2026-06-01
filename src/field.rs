@@ -404,6 +404,11 @@ impl ChittaField {
             candidates.push(p);
         }
         let mut loaded_header: Option<crate::snapshot::StoreHeader> = None;
+        // CHITTA_MIGRATE_REEMBED=1: one-shot embedding-space migration. Bypasses the dim/vsid
+        // load fences and skips the foreign-dim embedding sidecars so a new-vsid binary can load
+        // an old-vsid store's content + metadata (embeddings dropped → re_embed refills the
+        // compiled vector space from content). OFF by default; never set in normal daemon operation.
+        let migrate_reembed = std::env::var_os("CHITTA_MIGRATE_REEMBED").is_some();
         for candidate in &candidates {
             match FullSnapshot::load(candidate) {
                 Ok(mut snap) => {
@@ -447,12 +452,19 @@ impl ChittaField {
                             }
                         }
                         if embedded > 0 && matching == 0 {
+                            if !migrate_reembed {
+                                eprintln!(
+                                    "[chitta-field] REFUSING snapshot {:?}: {} embedded payloads all at \
+                                     dim={} but this binary compiles EMBED_DIM={}; trying fallback",
+                                    candidate, embedded, foreign_dim, crate::ops::EMBED_DIM
+                                );
+                                continue;
+                            }
                             eprintln!(
-                                "[chitta-field] REFUSING snapshot {:?}: {} embedded payloads all at \
-                                 dim={} but this binary compiles EMBED_DIM={}; trying fallback",
+                                "[chitta-field] [migrate] accepting foreign-dim snapshot {:?} ({} payloads \
+                                 at dim={}) for re-embed to EMBED_DIM={}",
                                 candidate, embedded, foreign_dim, crate::ops::EMBED_DIM
                             );
-                            continue;
                         }
                     }
                     // Store-identity fencing (PR3): refuse a snapshot whose .shdr records a
@@ -463,17 +475,29 @@ impl ChittaField {
                         let shdr_path = candidate.with_extension("shdr");
                         if let Some(hdr) = crate::snapshot::StoreHeader::load(&shdr_path) {
                             if !hdr.matches_compiled() {
+                                if !migrate_reembed {
+                                    eprintln!(
+                                        "[chitta-field] REFUSING snapshot {:?}: .shdr vector_space \
+                                         (model={} dim={} tfv={}) != compiled (model={} dim={} tfv={}); \
+                                         trying fallback",
+                                        candidate, hdr.model_id, hdr.embed_dim, hdr.text_format_version,
+                                        crate::ops::EMBED_MODEL_ID, crate::ops::EMBED_DIM,
+                                        crate::ops::TEXT_FORMAT_VERSION
+                                    );
+                                    continue;
+                                }
                                 eprintln!(
-                                    "[chitta-field] REFUSING snapshot {:?}: .shdr vector_space \
-                                     (model={} dim={} tfv={}) != compiled (model={} dim={} tfv={}); \
-                                     trying fallback",
+                                    "[chitta-field] [migrate] accepting foreign-vsid snapshot {:?} (.shdr \
+                                     model={} dim={} tfv={}) for re-embed to compiled (model={} dim={} tfv={})",
                                     candidate, hdr.model_id, hdr.embed_dim, hdr.text_format_version,
                                     crate::ops::EMBED_MODEL_ID, crate::ops::EMBED_DIM,
                                     crate::ops::TEXT_FORMAT_VERSION
                                 );
-                                continue;
+                                // Do NOT adopt the foreign header as our identity; the migration
+                                // re-embeds + re-stamps a fresh .shdr at the compiled vector space.
+                            } else {
+                                loaded_header = Some(hdr);
                             }
-                            loaded_header = Some(hdr);
                         }
                     }
                     snap.triplet_store.load_supersession_sidecar(&candidate.with_extension("sup.json"));
@@ -574,7 +598,10 @@ impl ChittaField {
         let mut replay_coactivation_stats = snapshot_coactivation_stats;
         triplet_store.correction_states = snap_correction_states;
         // Load embedding + binary-code sidecars, then HNSW — all before WAL replay.
-        if let Some(ref snap_path) = best_full_path {
+        if let Some(snap_path) = best_full_path.as_ref().filter(|_| !migrate_reembed) {
+            // [migrate] when CHITTA_MIGRATE_REEMBED is set, this whole block is skipped: the
+            // foreign-vector .emb/.bin/.mu/.hnsw sidecars are never loaded, so every memory has
+            // no embedding and re_embed refills the compiled vector space from content (.pld).
             // .emb: flat binary embeddings (v10+). For v9 snapshots the sidecar won't exist
             // yet, so this is a no-op and embeddings remain populated from bincode.
             let emb_loaded = semantic_idx.load_embeddings_sidecar(&snap_path.with_extension("emb"));
