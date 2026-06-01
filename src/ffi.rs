@@ -695,6 +695,7 @@ pub extern "C" fn cf_recall_keyword(
     h: *mut CfHandle,
     query: *const c_char,
     k: usize,
+    realm: *const c_char,
     hits_buf: *mut CfRecallHit,
     hits_cap: usize,
     hits_written: *mut usize,
@@ -709,8 +710,17 @@ pub extern "C" fn cf_recall_keyword(
             Err(e) => return handle.err(e),
         }
     };
+    // Null/empty realm → unscoped; otherwise the BM25 lane is filtered to this realm.
+    let realm_opt = if realm.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(realm) }.to_str() {
+            Ok(s) if !s.is_empty() => Some(s),
+            _ => None,
+        }
+    };
 
-    match handle.field.recall_keyword(query_str, k) {
+    match handle.field.recall_keyword_realm(query_str, k, realm_opt) {
         Ok(hits) => {
             write_hits(hits, hits_buf, hits_cap, hits_written);
             handle.ok()

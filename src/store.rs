@@ -206,20 +206,23 @@ fn prune_old_snapshots(data_dir: &std::path::Path, keep: usize) {
     ];
     let delta_ext = "delta.hnsw";
 
-    // Collect (mtime, stem) for all chitta.*.snapshot files.
-    let mut families: Vec<(std::time::SystemTime, String)> = match std::fs::read_dir(data_dir) {
+    // Collect (seqno, stem) for all chitta.*.snapshot files. Keep by SEQNO, not mtime:
+    // the just-written snapshot always has the highest seqno, whereas mtime can be misleading
+    // (sidecar rewrites / NFS resurrection can make an older family appear newer, which would
+    // wrongly prune the snapshot we just saved — fatal for the re-embed migration's output).
+    let mut families: Vec<(u64, String)> = match std::fs::read_dir(data_dir) {
         Ok(rd) => rd.filter_map(|e| {
             let entry = e.ok()?;
             let name = entry.file_name().into_string().ok()?;
             if !name.starts_with("chitta.") || !name.ends_with(".snapshot") { return None; }
             let stem = name.strip_suffix(".snapshot")?.to_string();
-            let mtime = entry.metadata().ok()?.modified().ok()?;
-            Some((mtime, stem))
+            let seqno = crate::snapshot::FullSnapshot::peek_seqno(&entry.path()).unwrap_or(0);
+            Some((seqno, stem))
         }).collect(),
         Err(_) => return,
     };
 
-    families.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    families.sort_by(|a, b| b.0.cmp(&a.0)); // highest seqno first
     let keep_stems: std::collections::HashSet<String> =
         families.iter().take(keep).map(|(_, s)| s.clone()).collect();
 
@@ -1529,7 +1532,17 @@ impl ChittaField {
 
     /// Keyword (BM25) recall.
     pub fn recall_keyword(&self, query: &str, k: usize) -> Result<Vec<RecallHit>> {
-        self.recall_keyword_ctx(query, k, None, None)
+        self.recall_keyword_ctx(query, k, None, None, None)
+    }
+    /// Realm-scoped keyword recall: drops hits outside `realm` (None = unscoped) so the BM25
+    /// lane honours --realm and never bleeds other projects' memories into a scoped query.
+    pub fn recall_keyword_realm(
+        &self,
+        query: &str,
+        k: usize,
+        realm: Option<&str>,
+    ) -> Result<Vec<RecallHit>> {
+        self.recall_keyword_ctx(query, k, None, None, realm)
     }
 
     /// HDC recall: O(n) Hamming-distance search over binary hypervectors.
@@ -2578,6 +2591,7 @@ impl ChittaField {
         k: usize,
         query_valence: Option<f32>,
         query_arousal: Option<f32>,
+        realm: Option<&str>,
     ) -> Result<Vec<RecallHit>> {
         let max_query_idf = self.keyword_idx.read().query_max_idf(query);
         let keyword_hits = self.keyword_idx.read().search(query, k * 3);
@@ -2603,6 +2617,13 @@ impl ChittaField {
                 }
                 if payload.realm.starts_with("soul:") {
                     return None;
+                }
+                // Realm scoping: the BM25 lane must not leak other projects' memories into a
+                // realm-scoped recall (the cross-realm injection bleed).
+                if let Some(want) = realm {
+                    if payload.realm != want {
+                        return None;
+                    }
                 }
                 let ctx = ScoringContext {
                     relevance_score: hit.bm25_score,
@@ -2691,7 +2712,7 @@ impl ChittaField {
         };
 
         // Merge in keyword hits, deduplicating by memory_id (keep max score)
-        let kw_hits = self.recall_keyword_ctx(query_text, fetch_limit, None, None)?;
+        let kw_hits = self.recall_keyword_ctx(query_text, fetch_limit, None, None, None)?;
         let mut seen: std::collections::HashSet<crate::ids::MemoryId> =
             candidates.iter().map(|h| h.memory_id).collect();
         for h in kw_hits {
