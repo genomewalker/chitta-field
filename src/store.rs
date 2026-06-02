@@ -3214,8 +3214,20 @@ impl ChittaField {
             .filter(|(_, st)| st.embed_pending && !st.deleted)
             .map(|(id, st)| (st.created_at_ms, *id))
             .collect();
-        pending.sort_by_key(|(ts, _)| *ts);
-        pending.into_iter().take(limit).map(|(_, id)| id).collect()
+        pending.sort_by_key(|(ts, _)| *ts); // oldest first
+        if pending.len() <= limit {
+            return pending.into_iter().map(|(_, id)| id).collect();
+        }
+        // Backlog larger than one batch: embed the NEWEST (limit - half) first so a
+        // just-written memory becomes recallable within ONE batch instead of waiting behind
+        // the entire backlog (the write->recall lag), while still draining the OLDEST `half`
+        // each batch so nothing starves. Minimises lag without dropping any pending memory.
+        let half = limit / 2;
+        let newest: Vec<MemoryId> =
+            pending.iter().rev().take(limit - half).map(|(_, id)| *id).collect();
+        let oldest: Vec<MemoryId> =
+            pending.iter().take(half).map(|(_, id)| *id).collect();
+        newest.into_iter().chain(oldest).collect()
     }
 
     /// Clear embed_pending for specific memory IDs, regardless of content.

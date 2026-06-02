@@ -1010,16 +1010,27 @@ impl SemanticIndex {
             }
         }
 
-        // Flat raw-cosine scan for sub-million-vector stores (see FLAT_SCAN_MAX). Bypasses
-        // mean-centering and the binary-Hamming prefilter, which only lose recall at this
-        // size. Uses the raw (un-centered) query so scores are true cosine. Skips non-finite
-        // embeddings so a corrupt vector can never poison the ranking.
+        // Flat-scan for sub-million-vector stores (see FLAT_SCAN_MAX): exact top-k over all
+        // vectors, skipping the binary-Hamming prefilter (no recall loss at this size). Scores
+        // are CENTERED cosine — each vector is centered against the corpus mean (.mu) before
+        // cosine, removing bge's dominant anisotropy direction and ~2.3x'ing the
+        // relevant-vs-noise margin (measured offline: raw margin 0.35 -> centered 0.79; raw
+        // cosine left recall in the most-anisotropic regime). Centering is analytic with NO
+        // per-candidate allocation: stored emb is unit, so |emb-mu|^2 = 1 - 2(emb·mu) + |mu|^2
+        // and the centered numerator is (q_c·emb) - (q_c·mu). Falls back to raw cosine when no
+        // centroid is loaded or CHITTA_FLAT_SCAN_RAW=1 (A/B + rollback escape hatch).
         let flat_max = std::env::var("CHITTA_FLAT_SCAN_MAX")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(FLAT_SCAN_MAX);
         if flat_max > 0 && self.total_embedding_count() <= flat_max {
-            if let Some(q) = normalize(query) {
+            let center = std::env::var_os("CHITTA_FLAT_SCAN_RAW").is_none()
+                && self.centroid.len() == EMBED_DIM;
+            // Centered+normalized query (query_unit) when centering; else raw-normalized.
+            let q_opt = if center { Some(query_unit.clone()) } else { normalize(query) };
+            if let Some(q) = q_opt {
+                let q_dot_mu = if center { dot(&q, &self.centroid) } else { 0.0 };
+                let mu_sq    = if center { dot(&self.centroid, &self.centroid) } else { 0.0 };
                 let mut top_k = BinaryHeap::new();
                 for id in self.all_ids() {
                     if self.deleted.contains(&id) {
@@ -1034,13 +1045,15 @@ impl SemanticIndex {
                     if emb.len() != EMBED_DIM {
                         continue;
                     }
-                    // Stored embeddings are unit vectors (normalize_all on load + upsert), so
-                    // cosine == dot(query, emb) directly. Skipping a per-candidate normalize
-                    // avoids a 4 KB heap allocation for every one of N vectors on every query —
-                    // decisive at flat-scan scale, and it keeps the read lock held briefly so
-                    // background write passes (consolidation) don't starve. is_finite() drops any
-                    // residual corrupt/zero vector.
-                    let sim = dot(&q, emb);
+                    // Centered cosine via the analytic identity above (no per-candidate
+                    // allocation), or raw dot when centering is off. Stored embeddings are unit
+                    // (normalize_all on load + upsert). is_finite() drops any corrupt/zero vector.
+                    let sim = if center {
+                        let denom = (1.0 - 2.0 * dot(emb, &self.centroid) + mu_sq).max(1e-12).sqrt();
+                        (dot(&q, emb) - q_dot_mu) / denom
+                    } else {
+                        dot(&q, emb)
+                    };
                     if !sim.is_finite() {
                         continue;
                     }
