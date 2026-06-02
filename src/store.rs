@@ -495,8 +495,10 @@ impl ChittaField {
 
         let op_enum = Op::PutPayload(op.clone());
         let _seqno = self.log.write().append(&op_enum)?;
-        // Sync after durable write
-        let _ = self.log.write().sync();
+        // Flush the append to the OS (cheap, microseconds) under the lock; the durable
+        // fdatasync runs OFF the C++ rpc_mutex via cf_sync after the caller releases it,
+        // so recall is no longer blocked by the per-write fsync (~200-330ms on NFS /home).
+        let _ = self.log.write().flush_buf();
 
         let payload = MemoryPayload::from(op);
         let mut state = MemoryState::new(memory_id, chunk_hash, ts);

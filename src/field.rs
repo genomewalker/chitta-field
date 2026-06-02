@@ -238,6 +238,14 @@ impl ChittaField {
         self.log.write().flush_buf()
     }
 
+    /// fdatasync the WAL to disk (durable). Separated from flush() (buffer→OS only) so the
+    /// disk sync can run OFF the C++ rpc_mutex: put_memory flush_buf()s the append under the
+    /// lock, the caller calls this after releasing the lock. Recall no longer blocks on the
+    /// per-write fsync.
+    pub fn sync_wal(&self) -> Result<()> {
+        self.log.write().sync()
+    }
+
     /// Return the current chain tip hash (SHA256). Zero if only V1 data.
     pub fn chain_head(&self) -> crate::log::ChainHash {
         self.log.read().chain_head()

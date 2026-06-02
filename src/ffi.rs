@@ -1589,6 +1589,22 @@ pub extern "C" fn cf_flush(h: *mut CfHandle) -> c_int {
     }
 }
 
+/// fdatasync the WAL to disk (durable). Separated from cf_flush so the disk sync can
+/// run OFF the C++ rpc_mutex — put_memory now only flush_buf()s under the lock, and the
+/// caller fdatasyncs after releasing the lock, so recall is no longer blocked by the
+/// per-write fsync (was ~200-330ms on NFS /home).
+#[no_mangle]
+pub extern "C" fn cf_sync(h: *mut CfHandle) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    match handle.field.sync_wal() {
+        Ok(()) => handle.ok(),
+        Err(e) => handle.err(e),
+    }
+}
+
 /// Get stats.
 #[no_mangle]
 pub extern "C" fn cf_memory_count(h: *const CfHandle) -> usize {
