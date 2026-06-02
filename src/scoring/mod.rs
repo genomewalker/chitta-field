@@ -125,17 +125,32 @@ impl ScoringPipeline {
 
     /// Score a candidate memory. Returns None if any factor vetoes it.
     pub fn score(&self, ctx: &ScoringContext) -> Option<(f32, ScoreDecomposition)> {
-        let mut product = 1.0f32;
+        // Bounded-envelope composite (NOT a pure product). Relevance is the anchor; all
+        // secondary factors (recency/ACT-R, confidence, status, epistemic, kind, …) modulate
+        // it within +/-30% via the envelope (0.7 + 0.3*secondary). A pure product let the
+        // secondaries multiply a highly-relevant but old/low-confidence memory down to ~0 —
+        // the "3% inversion" that surfaced once mean-centering compressed the cosine spread
+        // (with raw cosine's larger magnitude masking it). Relevance still caps the product,
+        // so an irrelevant memory cannot be re-inflated. Design room room-f366bf5a (2026-06-02).
+        let mut relevance = 1.0f32;
+        let mut secondary = 1.0f32;
         let mut decomp = ScoreDecomposition::default();
 
         for factor in &self.factors {
             match factor.compute(ctx, &self.config, &mut decomp) {
-                Some(val) => product *= val,
+                Some(val) => {
+                    if factor.name() == "relevance" {
+                        relevance *= val;
+                    } else {
+                        secondary *= val;
+                    }
+                }
                 None => return None,
             }
         }
 
-        Some((product, decomp))
+        let envelope = 0.7 + 0.3 * secondary;
+        Some((relevance * envelope, decomp))
     }
 
     /// Replace the config (hot-reload). Thread-safe when called under write lock.

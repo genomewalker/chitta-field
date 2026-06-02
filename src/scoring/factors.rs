@@ -18,7 +18,16 @@ impl ScoringFactor for RelevanceFactor {
         decomp: &mut ScoreDecomposition,
     ) -> Option<f32> {
         let weight = match ctx.recall_mode {
-            RecallMode::Semantic => ((ctx.relevance_score + 1.0) / 2.0).max(0.0),
+            // Calibrated relevance (Platt on centered cosine): sigma(3.27*cos - 0.85).
+            // Anchored so an unrelated pair (centered cos ~0) maps to 0.30 — honest-low,
+            // not the 0.50 the old (cos+1)/2 gave, which read as false confidence on
+            // uncovered topics — and a strong NN (cos ~0.79) maps to 0.85. Turns the relevance
+            // term into a calibrated probability so "nothing relevant" shows low. Tuned for
+            // the centered flat-scan (default); design room room-f366bf5a (2026-06-02).
+            RecallMode::Semantic => {
+                let s = ctx.relevance_score;
+                (1.0 / (1.0 + (-(3.27 * s - 0.85)).exp())).clamp(0.0, 1.0)
+            }
             RecallMode::Keyword => ctx.relevance_score,
         };
         decomp.semantic_weight = weight;
