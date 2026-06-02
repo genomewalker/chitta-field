@@ -5275,6 +5275,18 @@ impl ChittaField {
         use crate::snapshot::FullSnapshot;
         self.drain_pending_recall_effects()?;
         let seqno = self.log.read().last_seqno();
+        // Compact the delta into the base under a BRIEF write so the snapshot clone below
+        // is canonical (delta empty). Decoupled from the sidecar disk writes, which now run
+        // lock-free off the clone (see the sidecar block further down). Previously the merge
+        // AND all six ~600MB sidecar writes were held under a single semantic_idx.write(),
+        // blocking recall (which needs semantic_idx.read()) for the entire disk-write window
+        // — the sleep-consolidation stall that forced --no-hygiene.
+        {
+            let mut idx = self.semantic_idx.write();
+            if idx.delta_needs_merge() {
+                idx.merge_delta_into_base();
+            }
+        }
         let snap = FullSnapshot {
             snapshot_seqno: seqno,
             payloads: self.payloads.read().clone(),
@@ -5329,11 +5341,12 @@ impl ChittaField {
             }
         }
         {
-            // Merge delta into base if threshold exceeded, then persist both sidecars.
-            let mut idx = self.semantic_idx.write();
-            if idx.delta_needs_merge() {
-                idx.merge_delta_into_base();
-            }
+            // Embedding/code sidecars saved from the cloned index (snap.semantic_idx) with
+            // NO semantic_idx lock held — the six ~600MB disk writes must not block recall,
+            // which needs semantic_idx.read(). The delta was merged into base under a brief
+            // write above, so this clone is canonical (delta empty). clear_embeddings()
+            // below runs after this block, so the clone still carries its vectors here.
+            let idx = &snap.semantic_idx;
             let _ = idx.save_embeddings_sidecar(&emb_path);
             let _ = idx.save_binary_sidecar(&bin_path);
             let _ = idx.save_centroid_sidecar(&mu_path);
