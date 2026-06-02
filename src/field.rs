@@ -431,41 +431,41 @@ impl ChittaField {
                             continue;
                         }
                     }
+                    // Count embedded payloads by dim once — both the dim-fence and the
+                    // stale-.shdr check below need it.
+                    let mut embedded = 0usize;
+                    let mut matching = 0usize;
+                    let mut foreign_dim = 0u32;
+                    for p in snap.payloads.values() {
+                        if p.embedding_dim > 0 {
+                            embedded += 1;
+                            if p.embedding_dim == crate::ops::EMBED_DIM as u32 {
+                                matching += 1;
+                            } else {
+                                foreign_dim = p.embedding_dim;
+                            }
+                        }
+                    }
                     // Dim-aware fencing: refuse a snapshot whose embedded payloads were
                     // ALL written at a different EMBED_DIM than this binary compiles for.
                     // Catches a wholesale 768-d snapshot winning on seqno after a 1536-d
                     // migration (the contamination that motivated this guard); a partially
                     // migrated store passes because any payload matching EMBED_DIM lets it
                     // through, and a fresh store passes because it has no embedded payloads.
-                    {
-                        let mut embedded = 0usize;
-                        let mut matching = 0usize;
-                        let mut foreign_dim = 0u32;
-                        for p in snap.payloads.values() {
-                            if p.embedding_dim > 0 {
-                                embedded += 1;
-                                if p.embedding_dim == crate::ops::EMBED_DIM as u32 {
-                                    matching += 1;
-                                } else {
-                                    foreign_dim = p.embedding_dim;
-                                }
-                            }
-                        }
-                        if embedded > 0 && matching == 0 {
-                            if !migrate_reembed {
-                                eprintln!(
-                                    "[chitta-field] REFUSING snapshot {:?}: {} embedded payloads all at \
-                                     dim={} but this binary compiles EMBED_DIM={}; trying fallback",
-                                    candidate, embedded, foreign_dim, crate::ops::EMBED_DIM
-                                );
-                                continue;
-                            }
+                    if embedded > 0 && matching == 0 {
+                        if !migrate_reembed {
                             eprintln!(
-                                "[chitta-field] [migrate] accepting foreign-dim snapshot {:?} ({} payloads \
-                                 at dim={}) for re-embed to EMBED_DIM={}",
+                                "[chitta-field] REFUSING snapshot {:?}: {} embedded payloads all at \
+                                 dim={} but this binary compiles EMBED_DIM={}; trying fallback",
                                 candidate, embedded, foreign_dim, crate::ops::EMBED_DIM
                             );
+                            continue;
                         }
+                        eprintln!(
+                            "[chitta-field] [migrate] accepting foreign-dim snapshot {:?} ({} payloads \
+                             at dim={}) for re-embed to EMBED_DIM={}",
+                            candidate, embedded, foreign_dim, crate::ops::EMBED_DIM
+                        );
                     }
                     // Store-identity fencing (PR3): refuse a snapshot whose .shdr records a
                     // different vector space (foreign model/dim/text-format) than this binary.
@@ -474,18 +474,35 @@ impl ChittaField {
                     {
                         let shdr_path = candidate.with_extension("shdr");
                         if let Some(hdr) = crate::snapshot::StoreHeader::load(&shdr_path) {
-                            if !hdr.matches_compiled() {
-                                if !migrate_reembed {
-                                    eprintln!(
-                                        "[chitta-field] REFUSING snapshot {:?}: .shdr vector_space \
-                                         (model={} dim={} tfv={}) != compiled (model={} dim={} tfv={}); \
-                                         trying fallback",
-                                        candidate, hdr.model_id, hdr.embed_dim, hdr.text_format_version,
-                                        crate::ops::EMBED_MODEL_ID, crate::ops::EMBED_DIM,
-                                        crate::ops::TEXT_FORMAT_VERSION
-                                    );
-                                    continue;
-                                }
+                            // A .shdr whose recorded dim disagrees with the snapshot's actual
+                            // payload dim (which the dim-fence just validated against the compiled
+                            // space) is a STALE stamp — left behind when a re-embed rewrote the data
+                            // but an older writer's .shdr survived under a reused family id. The
+                            // payload data is ground truth, so disregard the lying stamp and let the
+                            // next save re-stamp it. Without this a correct-data store bricks on load.
+                            let shdr_stale =
+                                hdr.embed_dim != crate::ops::EMBED_DIM as u32 && matching > 0;
+                            if hdr.matches_compiled() {
+                                loaded_header = Some(hdr);
+                            } else if shdr_stale {
+                                eprintln!(
+                                    "[chitta-field] .shdr at {:?} is STALE (records dim={} but {} payloads \
+                                     are at compiled dim={}); disregarding stamp, re-stamping on next save",
+                                    candidate, hdr.embed_dim, matching, crate::ops::EMBED_DIM
+                                );
+                                // accept: leave loaded_header = None → a fresh lineage is minted,
+                                // which also escapes the stale writer's reused family id.
+                            } else if !migrate_reembed {
+                                eprintln!(
+                                    "[chitta-field] REFUSING snapshot {:?}: .shdr vector_space \
+                                     (model={} dim={} tfv={}) != compiled (model={} dim={} tfv={}); \
+                                     trying fallback",
+                                    candidate, hdr.model_id, hdr.embed_dim, hdr.text_format_version,
+                                    crate::ops::EMBED_MODEL_ID, crate::ops::EMBED_DIM,
+                                    crate::ops::TEXT_FORMAT_VERSION
+                                );
+                                continue;
+                            } else {
                                 eprintln!(
                                     "[chitta-field] [migrate] accepting foreign-vsid snapshot {:?} (.shdr \
                                      model={} dim={} tfv={}) for re-embed to compiled (model={} dim={} tfv={})",
@@ -495,8 +512,6 @@ impl ChittaField {
                                 );
                                 // Do NOT adopt the foreign header as our identity; the migration
                                 // re-embeds + re-stamps a fresh .shdr at the compiled vector space.
-                            } else {
-                                loaded_header = Some(hdr);
                             }
                         }
                     }
@@ -614,9 +629,13 @@ impl ChittaField {
             // normalize_all() so any rebuilt binary codes are centered, and before any
             // search so queries are centered. Absent on legacy snapshots → raw cosine.
             let _ = semantic_idx.load_centroid_sidecar(&snap_path.with_extension("mu"));
-            // .emb mmap: serve embeddings from mmap whenever sidecar exists — avoids 1GB+ heap
-            // copy regardless of collection size.
-            if emb_loaded {
+            // .emb mmap: only for large stores (> FLAT_SCAN_MAX). Above that, recall uses the
+            // binary-Hamming prefilter which reads few embeddings, so mmap saves a large heap
+            // copy. Below it, recall is a flat heap scan over every embedding — serving that from
+            // mmap both wastes nothing and courts a SIGBUS: a consolidation prune can unlink the
+            // .emb file out from under the mapping while a scan is faulting its pages. Keeping the
+            // embeddings in the heap removes that race entirely.
+            if emb_loaded && semantic_idx.embeddings_count() > crate::hnsw::FLAT_SCAN_MAX {
                 let _ = semantic_idx.activate_mmap_embeddings(&snap_path.with_extension("emb"));
             }
             // .hnsw + .delta.hnsw: load both tiers; backfill handles WAL-replay additions.

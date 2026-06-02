@@ -40,7 +40,9 @@ const PER_REALM_HNSW_THRESHOLD: usize = 500;
 // lose recall for no benefit (a full scan is sub-millisecond per query). Measured:
 // relevant items move from buried / 3-34% scores up to #1-#10 / 0.70-0.84 raw cosine.
 // Override with CHITTA_FLAT_SCAN_MAX (0 disables the flat path).
-const FLAT_SCAN_MAX: usize = 500_000;
+// Also gates .emb mmap activation in field.rs: below this the embeddings stay in the heap, so
+// the flat scan never faults on a page whose backing file a consolidation prune has unlinked.
+pub(crate) const FLAT_SCAN_MAX: usize = 500_000;
 
 /// Deterministic level assignment seeded by node ID — safe to call from parallel threads.
 fn random_level_from_seed(seed: u64) -> usize {
@@ -1032,8 +1034,13 @@ impl SemanticIndex {
                     if emb.len() != EMBED_DIM {
                         continue;
                     }
-                    let Some(cand) = normalize(emb) else { continue; };
-                    let sim = dot(&q, &cand);
+                    // Stored embeddings are unit vectors (normalize_all on load + upsert), so
+                    // cosine == dot(query, emb) directly. Skipping a per-candidate normalize
+                    // avoids a 4 KB heap allocation for every one of N vectors on every query —
+                    // decisive at flat-scan scale, and it keeps the read lock held briefly so
+                    // background write passes (consolidation) don't starve. is_finite() drops any
+                    // residual corrupt/zero vector.
+                    let sim = dot(&q, emb);
                     if !sim.is_finite() {
                         continue;
                     }
@@ -1560,33 +1567,68 @@ impl SemanticIndex {
     const EMB_MAGIC: u64 = 0x454D4244_00000003; // "EMBD\0\0\0\x03" — bumped for EMBED_DIM 768→1536 (ssl_distiller_dpo)
 
     pub fn save_embeddings_sidecar(&self, path: &std::path::Path) -> std::io::Result<()> {
-        // When mmap is active the heap holds only the post-activation delta.
-        // Write a combined file: mmap entries (bulk) + heap delta, so the next
-        // load sees the full dataset and activate_mmap_embeddings() works correctly.
-        let total = self.embeddings.len() + self.emb_offsets.len();
+        // When mmap is active the heap holds only the post-activation delta. Write a combined
+        // file: heap delta first (freshest values win), then mmap bulk for ids not in the heap.
+        //
+        // Integrity invariants enforced HERE, at the persistence boundary, so no corrupt vector
+        // can ever reach disk (a past migration wrote misaligned/duplicate records that poisoned
+        // recall — see flat-scan path):
+        //   * finite + bounded — every component finite and |v| <= EMB_SANE_BOUND; a normalized
+        //     embedding has |v| <= 1, so anything larger is a misaligned/garbage record. Skipped.
+        //   * de-duplicated — each id written at most once (heap takes precedence over mmap).
+        //   * exact count — the u64 header is back-patched to the number actually written, never
+        //     an upfront guess that a skip could falsify.
+        use std::io::{Seek, SeekFrom};
+        // Normalized vectors live in [-1, 1]; this bound only rejects corruption, never signal.
+        const EMB_SANE_BOUND: f32 = 8.0;
+        let sane = |v: &[f32]| -> bool {
+            v.len() == EMBED_DIM && v.iter().all(|x| x.is_finite() && x.abs() <= EMB_SANE_BOUND)
+        };
         let tmp = path.with_extension("emb.tmp");
+        let mut written: u64 = 0;
+        let mut seen: HashSet<MemoryId> = HashSet::with_capacity(self.total_embedding_count());
         {
-            let mut f = std::fs::File::create(&tmp)?;
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
             f.write_all(&Self::EMB_MAGIC.to_le_bytes())?;
-            f.write_all(&(total as u64).to_le_bytes())?;
-            // Bulk: copy raw f32 bytes straight from mmap (no deserialise/reserialise).
-            if let Some(ref mm) = self.emb_mmap {
-                for (&id, &off) in &self.emb_offsets {
-                    let start = off as usize;
-                    let end = start + EMBED_DIM * 4;
-                    if end <= mm.len() {
-                        f.write_all(&id.to_le_bytes())?;
-                        f.write_all(&mm[start..end])?;
-                    }
-                }
-            }
-            // Delta: heap embeddings written after activation.
+            f.write_all(&0u64.to_le_bytes())?; // count placeholder — back-patched below
+            // Delta: heap embeddings (freshest). Written first so they win on id collision.
             for (&id, emb) in &self.embeddings {
+                if !sane(emb) || !seen.insert(id) {
+                    continue;
+                }
                 f.write_all(&id.to_le_bytes())?;
                 for &v in emb.iter().take(EMBED_DIM) {
                     f.write_all(&v.to_le_bytes())?;
                 }
+                written += 1;
             }
+            // Bulk: raw f32 bytes from mmap, for ids not already written from the heap.
+            if let Some(ref mm) = self.emb_mmap {
+                for (&id, &off) in &self.emb_offsets {
+                    if seen.contains(&id) {
+                        continue;
+                    }
+                    let start = off as usize;
+                    let end = start + EMBED_DIM * 4;
+                    if end > mm.len() {
+                        continue;
+                    }
+                    let vec: Vec<f32> = mm[start..end]
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
+                    if !sane(&vec) {
+                        continue; // drop misaligned/garbage record rather than persist it
+                    }
+                    seen.insert(id);
+                    f.write_all(&id.to_le_bytes())?;
+                    f.write_all(&mm[start..end])?;
+                    written += 1;
+                }
+            }
+            let mut f = f.into_inner()?;
+            f.seek(SeekFrom::Start(8))?;
+            f.write_all(&written.to_le_bytes())?;
             f.sync_all()?;
         }
         std::fs::rename(&tmp, path)?;
