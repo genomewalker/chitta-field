@@ -1999,6 +1999,24 @@ impl ChittaField {
             return Ok((0, 0));
         }
 
+        // Single-flight. A pass can take a long time on a large tape, while the sleep
+        // timer + queued consolidate_request ops fire far more often. Without this guard
+        // the triggers STACK — each acquires the daemon's RPC mutex in turn and they
+        // pile up, turning a slow pass into an unbounded recall outage. Skip any trigger
+        // that arrives while a pass is in flight; the next timer tick picks up the work.
+        static CONSOLIDATING: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if CONSOLIDATING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok((0, 0));
+        }
+        struct InFlightGuard;
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                CONSOLIDATING.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _in_flight = InFlightGuard;
+
         let (rule_data, rules_for_ledger): (Vec<(String, String, String, String, String, String)>, Vec<crate::organ::sequitur::SequiturRule>) = {
             // Clone the tape under a brief read, then release the lock before the
             // expensive run_sequitur (~30s on a large tape). Holding event_tape.read()
@@ -2035,16 +2053,27 @@ impl ChittaField {
             let _ = self.add_triplet(key,         "verbalized_as".into(), verbalized, 1.0, None, None);
             promoted += 1;
         }
-        // Phase 12: compress low-surprisal events from the tape.
+        // Phase 12: compress low-surprisal events from the tape — WITHOUT holding any
+        // lock across the heavy O(n) cdawg.surprisal sweep, which previously stalled
+        // recall for 13-35s (the tape write blocked log_event, and parking_lot's
+        // writer-fairness then starved every new tape reader). Snapshot tape+cdawg under
+        // one brief read (tape→cdawg order, matching put_memory — the clones are cheap:
+        // TurnEvent is 32 bytes), compute the removal mask off-lock, then apply it under a
+        // short write. Events appended during the sweep (indices past the mask) are kept.
         {
-            // Lock order MUST match put_memory's tape→cdawg acquisition. Acquiring
-            // cdawg.read() before event_tape.write() here (cdawg→tape) inverts it;
-            // combined with a queued cdawg.write() from log_event — parking_lot is
-            // task-fair, so a waiting writer blocks NEW readers — that closes a
-            // three-thread deadlock cycle. Take the tape write first, then cdawg.
-            let mut tape = self.event_tape.write();
-            let cdawg = self.cdawg.read();
-            let removed = tape.compress_low_surprisal(&cdawg, 0.85);
+            let (tape_snapshot, cdawg_snapshot) = {
+                let tape = self.event_tape.read();
+                let cdawg = self.cdawg.read();
+                (tape.clone(), cdawg.clone())
+            };
+            let remove = tape_snapshot.compute_low_surprisal_removals(&cdawg_snapshot, 0.85);
+            drop(tape_snapshot);
+            drop(cdawg_snapshot);
+            let removed = if remove.iter().any(|&r| r) {
+                self.event_tape.write().apply_removals(&remove)
+            } else {
+                0
+            };
             if removed > 0 {
                 self.tape_tombstoned.fetch_add(removed as u64, std::sync::atomic::Ordering::Relaxed);
                 eprintln!("[cec] temporal compression: tombstoned {removed} low-surprisal events");

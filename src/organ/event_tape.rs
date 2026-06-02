@@ -167,15 +167,23 @@ impl EventTape {
     /// event of each session, and any event the CDAWG cannot predict (novel).
     ///
     /// Returns the number of events removed.
-    pub fn compress_low_surprisal(
-        &mut self,
+    /// Read-only: compute the low-surprisal removal mask without mutating. This is the
+    /// heavy half (O(n) cdawg.surprisal sweep, ~tens of seconds on a large tape). Run it
+    /// off an immutable clone of the tape + cdawg so NO write lock is held across the
+    /// sweep — holding `event_tape.write()` here was the dominant recall stall (a queued
+    /// tape writer made parking_lot starve every new reader). Returns a per-index mask
+    /// over the events present at call time.
+    pub fn compute_low_surprisal_removals(
+        &self,
         cdawg: &crate::organ::cdawg::CdawgOrgan,
         threshold: f32,
-    ) -> usize {
+    ) -> Vec<bool> {
         const MIN_TAPE: usize = 200;
         const CTX_WINDOW: usize = 4;
 
-        if self.events.len() < MIN_TAPE { return 0; }
+        let n = self.events.len();
+        let mut remove = vec![false; n];
+        if n < MIN_TAPE { return remove; }
 
         // Collect session boundary indices (first and last per session_id).
         let mut session_bounds = std::collections::HashSet::new();
@@ -188,13 +196,8 @@ impl EventTape {
                     last_session = e.session_id;
                 }
             }
-            if !self.events.is_empty() {
-                session_bounds.insert(self.events.len() - 1);
-            }
+            session_bounds.insert(n - 1);
         }
-
-        let mut remove = vec![false; self.events.len()];
-        let n = self.events.len();
 
         for i in CTX_WINDOW..n.saturating_sub(1) {
             // Always keep failure/error events and session boundaries.
@@ -213,16 +216,36 @@ impl EventTape {
                 }
             }
         }
+        remove
+    }
 
+    /// Apply a removal mask from `compute_low_surprisal_removals`. Events appended after
+    /// the mask was computed (index >= mask.len()) are always kept — the tape is
+    /// append-only between compute and apply (consolidation is the sole remover and runs
+    /// single-threaded), so lower indices stay stable. This is the brief half, the only
+    /// mutation, held under a short write lock. Returns count removed.
+    pub fn apply_removals(&mut self, remove: &[bool]) -> usize {
         let removed = remove.iter().filter(|&&r| r).count();
         if removed == 0 { return 0; }
-
-        let mut new_events = Vec::with_capacity(n - removed);
+        let keep_cap = self.events.len().saturating_sub(removed);
+        let mut new_events = Vec::with_capacity(keep_cap);
         for (i, e) in self.events.drain(..).enumerate() {
-            if !remove[i] { new_events.push(e); }
+            if i >= remove.len() || !remove[i] { new_events.push(e); }
         }
         self.events = new_events;
         removed
+    }
+
+    /// Compute + apply in one call. Holds `&mut self` across the heavy sweep, so prefer
+    /// the split (compute off-clone, then apply) on the live daemon path — see
+    /// consolidation_pass Phase 12. Kept for tests and manual/offline callers.
+    pub fn compress_low_surprisal(
+        &mut self,
+        cdawg: &crate::organ::cdawg::CdawgOrgan,
+        threshold: f32,
+    ) -> usize {
+        let remove = self.compute_low_surprisal_removals(cdawg, threshold);
+        self.apply_removals(&remove)
     }
 
     /// Return tape statistics as a JSON string.
