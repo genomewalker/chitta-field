@@ -243,24 +243,17 @@ fn prune_old_snapshots(data_dir: &std::path::Path, keep: usize) {
 
     let mut removed = 0usize;
 
-    // Reclaim-before-unlink: this store can live on an NFS volume that "resurrects"
-    // unlinked files (Isilon SnapshotIQ — observed under .../repl/backup1/...), where a
-    // bare remove_file leaves the file's blocks allocated (the dirent reappears full).
-    // Truncating to zero first frees the space even if the name comes back; on a normal
-    // filesystem the truncate is a harmless no-op precursor to the unlink.
-    let drop_file = |p: &std::path::Path| -> bool {
-        let _ = std::fs::OpenOptions::new().write(true).truncate(true).open(p);
-        std::fs::remove_file(p).is_ok()
-    };
-
-    // Delete stale snapshot families (paired sidecars).
+    // Delete stale snapshot families (paired sidecars). NOTE: use a plain unlink here —
+    // do NOT truncate-before-unlink. On a slow/replicating NFS (Isilon) a multi-GB ftruncate
+    // can block for tens of seconds while this runs under the snapshot-save lock, starving
+    // recall and every other op (observed: 72-deep pool stall). unlink is metadata-only/fast.
     for (_, stem) in families.iter().skip(keep) {
         for ext in SIDECAR_EXTS {
             let p = data_dir.join(format!("{}.{}", stem, ext));
-            if drop_file(&p) { removed += 1; }
+            if std::fs::remove_file(&p).is_ok() { removed += 1; }
         }
         let p = data_dir.join(format!("{}.{}", stem, delta_ext));
-        if drop_file(&p) { removed += 1; }
+        if std::fs::remove_file(&p).is_ok() { removed += 1; }
     }
 
     // Delete orphaned sidecars (chitta.* files with no corresponding .snapshot).
