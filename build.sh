@@ -8,5 +8,5 @@ unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
 if [ -z "${PYO3_PYTHON:-}" ] && [ -x /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/python3 ]; then
     export PYO3_PYTHON=/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/python3
 fi
-export PATH="/usr/bin:$HOME/.rustup/toolchains/1.92.0-x86_64-unknown-linux-gnu/bin:$PATH"
+export PATH="/usr/bin:$HOME/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin:$PATH"
 exec cargo "$@"

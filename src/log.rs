@@ -184,7 +184,13 @@ impl OpLog {
             let size = last_path.metadata()?.len();
             // Continue appending to a chained (V2/V3) segment; V1 forces a new segment.
             // The record format is identical, so a V2 tail can continue under a V3 binary.
-            if size < MAX_SEGMENT_SIZE && is_chained_segment(last_path) {
+            // Lineage guard: never append our (compiled-vsid) ops into a segment stamped with
+            // a DIFFERENT vector_space_id. replay() fences foreign-stamped segments, so any ops
+            // appended here would be silently dropped on the next restart. A V1/V2/legacy
+            // segment carries no stamp (None) and counts as same-lineage (matches replay()).
+            let lineage_ok = segment_vector_space_id(last_path)
+                .map_or(true, |v| v == vector_space_id);
+            if size < MAX_SEGMENT_SIZE && is_chained_segment(last_path) && lineage_ok {
                 let f = OpenOptions::new()
                     .write(true)
                     .append(true)

@@ -223,8 +223,23 @@ fn prune_old_snapshots(data_dir: &std::path::Path, keep: usize) {
     };
 
     families.sort_by(|a, b| b.0.cmp(&a.0)); // highest seqno first
-    let keep_stems: std::collections::HashSet<String> =
+    let mut keep_stems: std::collections::HashSet<String> =
         families.iter().take(keep).map(|(_, s)| s.clone()).collect();
+    // Lineage guard: the seqno ranking above is vsid-blind, so a higher-seqno snapshot from
+    // a FOREIGN vector space (e.g. a stale pre-migration lineage that keeps consolidating)
+    // can outrank — and evict — the only family this binary can actually load, leaving the
+    // store unopenable on the next boot (cf_open fails: no candidate passes the load fence).
+    // Always retain the best (highest-seqno) family whose .shdr matches the compiled vector
+    // space, on top of the keep-N window. `families` is sorted seqno-desc, so the first match
+    // is the best loadable family.
+    if let Some((_, best_compiled)) = families.iter().find(|(_, stem)| {
+        let shdr = data_dir.join(format!("{}.shdr", stem));
+        crate::snapshot::StoreHeader::load(&shdr)
+            .map(|h| h.matches_compiled())
+            .unwrap_or(false)
+    }) {
+        keep_stems.insert(best_compiled.clone());
+    }
 
     let mut removed = 0usize;
 
