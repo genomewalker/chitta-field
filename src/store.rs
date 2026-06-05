@@ -1229,6 +1229,34 @@ impl ChittaField {
             .read()
             .search(query_embedding, result_limit, allowed, realm);
 
+        // Refresh competitive_weight for each candidate using the *current* HNSW neighborhood.
+        // The write-time value is stale for memories ingested when the store was sparse.
+        let dedup_upper = self.scoring_pipeline.read().config.dedup_cosine_upper;
+        {
+            let idx = self.semantic_idx.read();
+            let mut states_w = self.states.write();
+            for hit in &semantic_hits {
+                if let Some(emb) = idx.get_embedding(hit.memory_id) {
+                    let neighbors = idx.search(emb, 9, None, realm);
+                    if neighbors.len() > 1 {
+                        let mut cos_sum = 0.0f32;
+                        let mut n = 0u32;
+                        for nb in &neighbors {
+                            if nb.memory_id == hit.memory_id { continue; }
+                            if nb.cosine_similarity >= dedup_upper { continue; }
+                            cos_sum += nb.cosine_similarity;
+                            n += 1;
+                        }
+                        if n > 0 {
+                            if let Some(st) = states_w.get_mut(&hit.memory_id) {
+                                st.competitive_weight = cos_sum / n as f32;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let states = self.states.read();
         let payloads = self.payloads.read();
         let pipeline = self.scoring_pipeline.read();

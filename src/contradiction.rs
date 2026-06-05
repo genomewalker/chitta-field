@@ -101,6 +101,8 @@ pub enum CandidateStatus {
     Confirmed,
     Rejected,
     Resolved,
+    /// Memory demoted to low-confidence but not deleted; audit trail preserved.
+    SoftRetired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,6 +336,46 @@ impl ContradictionIndex {
         }
     }
 
+    /// Soft-retire the loser rather than hard-demoting to confidence=0.05.
+    /// Sets confidence=0.3, marks SoftRetired, and writes an audit CORRECTION line.
+    /// Use when contradiction confidence < 0.75 (possible false-positive) to preserve
+    /// the memory for human review rather than silently destroying information.
+    pub fn soft_retire(
+        &mut self,
+        candidate_id: u64,
+        loser_id: u64,
+        winner_id: u64,
+        reason: &str,
+    ) -> Option<ResolutionOps> {
+        let candidate = self.candidates.iter_mut().find(|c| c.id == candidate_id)?;
+        candidate.status = CandidateStatus::SoftRetired;
+
+        let winner_content = self.atom_store.get(&winner_id)
+            .and_then(|atoms| atoms.first())
+            .map(|a| a.raw_line.clone())
+            .unwrap_or_default();
+        let loser_content = self.atom_store.get(&loser_id)
+            .and_then(|atoms| atoms.first())
+            .map(|a| a.raw_line.clone())
+            .unwrap_or_default();
+
+        let correction = format!(
+            "[CORRECTION] soft-retired:mem-{}|reason:{}|audit:possible-false-positive F:CORE\nwinner: {}\nsoft-retired: {}",
+            loser_id, reason, winner_content, loser_content
+        );
+
+        Some(ResolutionOps {
+            winner_id,
+            loser_id,
+            add_triplets: vec![
+                (winner_id.to_string(), "soft-supersedes".to_string(), loser_id.to_string()),
+            ],
+            demote_memory_id: loser_id,
+            new_confidence: 0.3, // preserved at low-confidence, not silenced
+            correction_content: correction,
+        })
+    }
+
     /// Background scan: group all atoms in realm by claim_key_hash, score within buckets.
     pub fn scan_realm(
         &mut self,
@@ -413,6 +455,77 @@ impl ContradictionIndex {
                             break 'outer;
                         }
                     }
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Single-hop transitive closure: for each direct contradiction (A↔B), check if any
+    /// third memory C in the same domain makes claims with the same predicate as A or B.
+    /// If score_contradiction(B_atom, C_atom) ≥ 0.65, emit A↔C as a transitive candidate.
+    ///
+    /// This catches the case the direct scan misses: A says "use-ssh", B says "use-telnet",
+    /// and C says "use-ssh-for-login" (same predicate root). B should also contradict C.
+    pub fn scan_transitive(
+        &mut self,
+        direct: &[ContradictionCandidate],
+        realm_atoms: &HashMap<u64, Vec<ClaimAtom>>,
+        limit: usize,
+    ) -> Vec<ContradictionCandidate> {
+        let mut results = Vec::new();
+        let ts = now_ms();
+
+        for cand in direct {
+            if results.len() >= limit { break; }
+            let atoms_a = match realm_atoms.get(&cand.memory_a) { Some(a) => a, None => continue };
+            let atoms_b = match realm_atoms.get(&cand.memory_b) { Some(b) => b, None => continue };
+
+            // Collect predicate roots and domains from both sides
+            let pred_roots_a: Vec<&str> = atoms_a.iter()
+                .map(|a| predicate_root(&a.subject))
+                .collect();
+            let domains_b: Vec<Option<&str>> = atoms_b.iter()
+                .map(|a| a.domain.as_deref())
+                .collect();
+
+            // Check all third memories C ≠ A, B
+            for (mid_c, atoms_c) in realm_atoms {
+                if *mid_c == cand.memory_a || *mid_c == cand.memory_b { continue; }
+                if results.len() >= limit { break; }
+
+                for ac in atoms_c {
+                    let ac_root = predicate_root(&ac.subject);
+                    // C shares a predicate root with A and domain with B → check B vs C
+                    let shares_pred_with_a = pred_roots_a.iter().any(|r| *r == ac_root);
+                    let shares_domain_with_b = domains_b.iter().any(|d| *d == ac.domain.as_deref());
+                    if !shares_pred_with_a || !shares_domain_with_b { continue; }
+
+                    let mut best = 0.0f32;
+                    let mut best_same = 0.0f32;
+                    let mut best_opp = 0.0f32;
+                    let mut best_reason = String::new();
+                    for ab in atoms_b {
+                        let (t, s, o, r) = score_contradiction(ab, ac);
+                        if t > best { best = t; best_same = s; best_opp = o; best_reason = r; }
+                    }
+                    if best >= 0.65 {
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        results.push(ContradictionCandidate {
+                            id,
+                            memory_a: cand.memory_b,
+                            memory_b: *mid_c,
+                            score: best * 0.85, // discount for transitivity
+                            same_score: best_same,
+                            opposition_score: best_opp,
+                            reason: format!("transitive via mem-{}: {}", cand.memory_a, best_reason),
+                            status: CandidateStatus::Open,
+                            created_at_ms: ts,
+                        });
+                    }
+                    break; // one contradiction per (B, C) pair is enough
                 }
             }
         }
