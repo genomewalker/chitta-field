@@ -256,8 +256,11 @@ impl ScoringFactor for InterferenceDensityFactor {
         config: &ScoringConfig,
         decomp: &mut ScoreDecomposition,
     ) -> Option<f32> {
-        let cw = ctx.state.competitive_weight;
-        let factor = 1.0 / (1.0 + config.interference_penalty * cw);
+        let cw = ctx.state.competitive_weight.clamp(0.0, 1.0);
+        // Power-law decay: reaches 0 at cw=1, tunable via interference_penalty as exponent.
+        // Replaces Lorentzian 1/(1+k*cw) which floors at 1/(1+k)≈0.77 and never suppresses
+        // truly redundant memories in dense clusters.
+        let factor = (1.0 - cw).powf(config.interference_penalty);
         decomp.interference_factor = factor;
         Some(factor)
     }

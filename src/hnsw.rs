@@ -20,7 +20,9 @@ const HNSW_THRESHOLD: usize = 2000;
 // Two-tier HNSW: above this count new inserts go to a small delta graph instead
 // of the large base graph. Queries search both and merge. Reduces insert cost from
 // O(log N_total) to O(log N_delta) at 1M+ scale.
-const HNSW_TIER2_THRESHOLD: usize = 100_000;
+// Lowered from 100K: most production deployments never reached 100K memories,
+// so delta-merge never triggered and search latency grew unboundedly.
+const HNSW_TIER2_THRESHOLD: usize = 5_000;
 // Merge delta into base when delta exceeds this fraction of the base size.
 const HNSW_DELTA_MERGE_RATIO: f64 = 0.10;
 // HNSW build/search parameters
