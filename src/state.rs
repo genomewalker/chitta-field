@@ -143,6 +143,10 @@ pub struct MemoryState {
     /// Commit hash or symbol-change ID that deterministically invalidated this memory.
     #[serde(default)]
     pub invalidated_by: Option<String>,
+
+    /// Monotonic ms timestamp of last competitive_weight refresh. Not persisted (runtime-only).
+    #[serde(skip)]
+    pub last_cw_refresh_ms: i64,
 }
 
 fn default_true() -> bool { true }
@@ -177,6 +181,7 @@ impl MemoryState {
             spacing_quality: 0.0,
             staged: true,
             invalidated_by: None,
+            last_cw_refresh_ms: 0,
         }
     }
 

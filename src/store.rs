@@ -1231,30 +1231,66 @@ impl ChittaField {
 
         // Refresh competitive_weight for each candidate using the *current* HNSW neighborhood.
         // The write-time value is stale for memories ingested when the store was sparse.
+        // Two-phase to avoid holding states.write() during HNSW searches.
         let dedup_upper = self.scoring_pipeline.read().config.dedup_cosine_upper;
-        {
+        const CW_REFRESH_INTERVAL_MS: i64 = 60_000;
+        // Phase A — find candidates that need refresh, clone embeddings, reserve them.
+        // Uses states.read() (non-blocking) to check last_cw_refresh_ms, then drops
+        // all locks before the expensive HNSW searches.
+        let candidates: Vec<(MemoryId, Vec<f32>)> = {
             let idx = self.semantic_idx.read();
-            let mut states_w = self.states.write();
-            for hit in &semantic_hits {
-                if let Some(emb) = idx.get_embedding(hit.memory_id) {
-                    let neighbors = idx.search(emb, 9, None, realm);
-                    if neighbors.len() > 1 {
-                        let mut cos_sum = 0.0f32;
-                        let mut n = 0u32;
-                        for nb in &neighbors {
-                            if nb.memory_id == hit.memory_id { continue; }
-                            if nb.cosine_similarity >= dedup_upper { continue; }
-                            cos_sum += nb.cosine_similarity;
-                            n += 1;
-                        }
-                        if n > 0 {
-                            if let Some(st) = states_w.get_mut(&hit.memory_id) {
-                                st.competitive_weight = cos_sum / n as f32;
-                            }
-                        }
-                    }
+            let states_r = self.states.read();
+            let inflight_r = self.cw_refresh_inflight.read();
+            semantic_hits.iter().filter_map(|hit| {
+                // Skip if refreshed recently by this or another session.
+                if let Some(st) = states_r.get(&hit.memory_id) {
+                    if now - st.last_cw_refresh_ms < CW_REFRESH_INTERVAL_MS { return None; }
                 }
+                if let Some(&ts) = inflight_r.get(&hit.memory_id) {
+                    if now - ts < CW_REFRESH_INTERVAL_MS { return None; }
+                }
+                // Clone embedding so we can drop all locks before searching.
+                let emb = idx.get_embedding(hit.memory_id)?.to_vec();
+                Some((hit.memory_id, emb))
+            }).collect()
+        };
+        // Reserve all candidates before releasing the read guards above.
+        if !candidates.is_empty() {
+            let mut inflight_w = self.cw_refresh_inflight.write();
+            for (id, _) in &candidates {
+                inflight_w.insert(*id, now);
             }
+        }
+        // HNSW searches with only semantic_idx.read() — no states lock held.
+        let cw_updates: Vec<(MemoryId, f32)> = {
+            let idx = self.semantic_idx.read();
+            candidates.iter().filter_map(|(memory_id, emb)| {
+                let neighbors = idx.search(emb, 9, None, realm);
+                if neighbors.len() <= 1 { return None; }
+                let mut cos_sum = 0.0f32;
+                let mut n = 0u32;
+                for nb in &neighbors {
+                    if nb.memory_id == *memory_id { continue; }
+                    if nb.cosine_similarity >= dedup_upper { continue; }
+                    cos_sum += nb.cosine_similarity;
+                    n += 1;
+                }
+                if n > 0 { Some((*memory_id, cos_sum / n as f32)) } else { None }
+            }).collect()
+        };
+        // Phase B — apply under brief states.write() + clear reservations.
+        if !cw_updates.is_empty() {
+            let mut states_w = self.states.write();
+            let mut inflight_w = self.cw_refresh_inflight.write();
+            for (memory_id, cw) in &cw_updates {
+                if let Some(st) = states_w.get_mut(memory_id) {
+                    st.competitive_weight = *cw;
+                    st.last_cw_refresh_ms = now;
+                }
+                inflight_w.remove(memory_id);
+            }
+            // Evict stale reservations from sessions that died mid-search.
+            inflight_w.retain(|_, ts| now - *ts < CW_REFRESH_INTERVAL_MS);
         }
 
         let states = self.states.read();

@@ -223,6 +223,9 @@ pub struct ChittaField {
     pub(crate) observer_state:     RwLock<crate::organ::observer::ObserverState>,
     pub(crate) interaction_ledger: RwLock<crate::organ::interaction_ledger::InteractionLedger>,
     pub(crate) predicate_store:    RwLock<crate::organ::predicate_store::PredicateStore>,
+    /// In-flight competitive_weight refresh reservations: memory_id -> reservation_ts_ms.
+    /// Prevents thundering-herd when multiple sessions refresh simultaneously.
+    pub(crate) cw_refresh_inflight: parking_lot::RwLock<std::collections::HashMap<crate::ids::MemoryId, i64>>,
 }
 
 impl Drop for ChittaField {
@@ -1015,6 +1018,7 @@ impl ChittaField {
             observer_state:     RwLock::new(crate::organ::observer::ObserverState::default()),
             interaction_ledger: RwLock::new(snap_interaction_ledger),
             predicate_store:    RwLock::new(snap_predicate_store),
+            cw_refresh_inflight: parking_lot::RwLock::new(std::collections::HashMap::new()),
         })
     }
 }

@@ -289,6 +289,7 @@ impl LegacyMemoryStateV4 {
             spacing_quality: 0.0,
             staged: false,
             invalidated_by: None,
+            last_cw_refresh_ms: 0,
         }
     }
 }
@@ -345,6 +346,7 @@ impl LegacyMemoryStateV5 {
             spacing_quality: 0.0,
             staged: false,
             invalidated_by: None,
+            last_cw_refresh_ms: 0,
         }
     }
 }
@@ -406,6 +408,7 @@ impl LegacyMemoryStateV6 {
             spacing_quality: 0.0,
             staged: false,
             invalidated_by: None,
+            last_cw_refresh_ms: 0,
         }
     }
 }
@@ -468,6 +471,7 @@ impl LegacyMemoryStateV7 {
             spacing_quality: 0.0,
             staged: false,
             invalidated_by: None,
+            last_cw_refresh_ms: 0,
         }
     }
 }
@@ -636,6 +640,7 @@ impl LegacyMemoryStateV11 {
             spacing_quality: self.spacing_quality,
             staged: false,
             invalidated_by: None,
+            last_cw_refresh_ms: 0,
         }
     }
 }
