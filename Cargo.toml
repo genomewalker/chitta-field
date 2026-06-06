@@ -22,6 +22,7 @@ memmap2 = "0.9"
 thiserror = "1"
 log = "0.4"
 parking_lot = "0.12"
+anyhow = "1"
 roaring = { version = "0.10", features = ["serde"] }
 rayon = "1"
 libc = "0.2"
@@ -38,6 +39,15 @@ path = "benches/recall_bench.rs"
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "write_bench"
+harness = false
+
+[[bench]]
+name = "wal_replay_bench"
+harness = false
 
 [profile.release]
 lto = true

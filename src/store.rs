@@ -1396,6 +1396,7 @@ impl ChittaField {
         };
 
         let seed_set: HashSet<MemoryId> = seed_ids.iter().copied().collect();
+        let pipeline_config = self.scoring_pipeline.read().config.clone();
         // activation accumulator: memory_id -> max activation score seen
         let mut activation: std::collections::HashMap<MemoryId, f32> =
             std::collections::HashMap::new();
@@ -1417,9 +1418,13 @@ impl ChittaField {
             };
             for edge in neighbors.iter().take(FANOUT_CAP) {
                 let dst = edge.dst;
-                // Skip deleted memories.
-                if states.get(&dst).map(|s| s.deleted).unwrap_or(true) {
-                    continue;
+                // Skip deleted or status-suppressed memories so assoc expansion
+                // honours the same suppression as semantic recall.
+                match states.get(&dst) {
+                    None => continue,
+                    Some(s) if s.deleted => continue,
+                    Some(s) if crate::scoring::status_multiplier(&s.status, &pipeline_config).is_none() => continue,
+                    Some(_) => {}
                 }
                 let edge_act = act * HOP_DECAY * edge_prior(&edge.edge_type) * edge.weight;
                 let entry = activation.entry(dst).or_insert(0.0);
@@ -1443,9 +1448,13 @@ impl ChittaField {
             .filter(|(id, _)| !seed_set.contains(id))
             .filter_map(|(id, act_score)| {
                 let state = states.get(&id)?;
+                if state.deleted { return None; }
+                // Belt-and-braces: frontier filtered most suppressed memories, but
+                // edges added after a status flip can still land in activation.
+                let status_mul = crate::scoring::status_multiplier(&state.status, &pipeline_config)?;
                 let payload = payloads.get(&id)?;
                 let eff_strength = state.effective_strength(now);
-                let score = act_score * eff_strength;
+                let score = act_score * eff_strength * status_mul;
                 Some(RecallHit {
                     memory_id: id,
                     score,
@@ -1458,7 +1467,7 @@ impl ChittaField {
                     access_count: state.access_count,
                     content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
                     semantic_weight: 0.0,
-                    status_mul: 0.0,
+                    status_mul,
                     epistemic_mul: 0.0,
                     strength_factor: 0.0,
                     affect_valence: 0.0,

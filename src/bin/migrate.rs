@@ -16,6 +16,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::Instant;
 
+use anyhow::{Context, Result};
 use chitta_field::field::ChittaField;
 use chitta_field::ops::EMBED_DIM;
 
@@ -28,7 +29,7 @@ fn expand_home(p: &str) -> PathBuf {
     }
 }
 
-fn main() {
+fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     let mut memories_path: Option<PathBuf> = None;
@@ -78,7 +79,7 @@ fn main() {
     // --- Ingest memories ---
     let t0 = Instant::now();
     let file = File::open(&memories_path)
-        .unwrap_or_else(|e| panic!("Cannot open {}: {}", memories_path.display(), e));
+        .with_context(|| format!("Cannot open {}", memories_path.display()))?;
     let reader = BufReader::new(file);
 
     let mut total = 0usize;
@@ -185,8 +186,8 @@ fn main() {
     // --- Ingest triplets ---
     if let Some(tp) = triplets_path {
         let t1 = Instant::now();
-        let file =
-            File::open(&tp).unwrap_or_else(|e| panic!("Cannot open {}: {}", tp.display(), e));
+        let file = File::open(&tp)
+            .with_context(|| format!("Cannot open {}", tp.display()))?;
         let reader = BufReader::new(file);
 
         let mut trip_total = 0usize;
@@ -260,4 +261,5 @@ fn main() {
 
     println!("\nFinal field state:");
     println!("  Total live memories: {}", field.memory_count());
+    Ok(())
 }

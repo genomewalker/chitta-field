@@ -1745,3 +1745,82 @@ impl FullSnapshot {
         Err(FieldError::Manifest(format!("unknown snapshot magic: {:#x}", magic)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_v4_state() -> LegacyMemoryStateV4 {
+        LegacyMemoryStateV4 {
+            memory_id: 42,
+            current_version: 1,
+            current_chunk_hash: [0u8; 32],
+            deleted: false,
+            strength: 0.8,
+            decay_rate: 0.001,
+            confidence: 0.9,
+            access_count: 3,
+            last_accessed_ms: 1_000_000,
+            last_strengthened_ms: 900_000,
+            created_at_ms: 800_000,
+            pinned: false,
+            tier: 0,
+            last_state_op_ts_ms: 1_000_001,
+        }
+    }
+
+    fn legacy_v5_state() -> LegacyMemoryStateV5 {
+        LegacyMemoryStateV5 {
+            memory_id: 99,
+            current_version: 2,
+            current_chunk_hash: [0u8; 32],
+            deleted: false,
+            strength: 0.7,
+            decay_rate: 0.002,
+            confidence: 0.85,
+            access_count: 5,
+            last_accessed_ms: 2_000_000,
+            last_strengthened_ms: 1_900_000,
+            created_at_ms: 1_800_000,
+            pinned: true,
+            tier: 1,
+            last_state_op_ts_ms: 2_000_001,
+            retrieval_history: RetrievalHistory::default(),
+        }
+    }
+
+    #[test]
+    fn v4_upgrade_sets_surprise_zero() {
+        assert_eq!(legacy_v4_state().upgrade().surprise, 0.0);
+    }
+
+    #[test]
+    fn v5_upgrade_sets_surprise_zero() {
+        assert_eq!(legacy_v5_state().upgrade().surprise, 0.0);
+    }
+
+    /// Bincode positional deserialization of a V4-layout byte stream into the
+    /// current MemoryState via the upgrade path must yield surprise == 0.0.
+    /// `#[serde(default)]` alone does not save bincode (positional); only the
+    /// explicit upgrade path inserting `surprise: 0.0` does.
+    #[test]
+    fn v4_bincode_roundtrip_surprise_zero() {
+        let legacy = legacy_v4_state();
+        let bytes = bincode::serialize(&legacy).expect("serialize");
+        let decoded: LegacyMemoryStateV4 = bincode::deserialize(&bytes).expect("deserialize");
+        let upgraded = decoded.upgrade();
+        assert_eq!(upgraded.surprise, 0.0);
+        assert_eq!(upgraded.strength, 0.8);
+    }
+
+    #[test]
+    fn v5_bincode_roundtrip_surprise_zero() {
+        let legacy = legacy_v5_state();
+        let bytes = bincode::serialize(&legacy).expect("serialize");
+        let decoded: LegacyMemoryStateV5 = bincode::deserialize(&bytes).expect("deserialize");
+        let upgraded = decoded.upgrade();
+        assert_eq!(upgraded.surprise, 0.0);
+        assert_eq!(upgraded.strength, 0.7);
+        assert_eq!(upgraded.tier, 1);
+    }
+}

@@ -619,11 +619,13 @@ pub extern "C" fn cf_get_content(
     match handle.field.get_memory(memory_id) {
         Ok(payload) => {
             let content = &payload.content;
-            if content.len() > buf_cap {
+            // Require room for the trailing NUL the contract promises.
+            if content.len() >= buf_cap {
                 return -2;
             }
             unsafe {
                 std::ptr::copy_nonoverlapping(content.as_ptr(), buf, content.len());
+                *buf.add(content.len()) = 0;
                 *written = content.len();
             }
             handle.ok()
