@@ -64,7 +64,11 @@ const FULL_SNAPSHOT_MAGIC_V19: u64     = 0xF011_5741_7E00_0013;
 /// V20 magic: FullSnapshot gains `interaction_ledger: InteractionLedger`.
 const FULL_SNAPSHOT_MAGIC_V20: u64     = 0xF011_5741_7E00_0014;
 /// V21 magic: FullSnapshot gains `predicate_store: PredicateStore`.
-const FULL_SNAPSHOT_MAGIC: u64         = 0xF011_5741_7E00_0015; // V21
+const FULL_SNAPSHOT_MAGIC_V21: u64     = 0xF011_5741_7E00_0015;
+/// V22 magic: FullSnapshot gains `cw_refresh_ts` — persisted competitive-weight
+/// refresh timestamps, so a daemon restart does not reset every memory to
+/// "never refreshed" (the restart refresh-herd trigger).
+const FULL_SNAPSHOT_MAGIC: u64         = 0xF011_5741_7E00_0016; // V22
 
 /// Magic for the payload content sidecar (.pld).
 const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
@@ -746,6 +750,39 @@ pub struct FullSnapshot {
     pub interaction_ledger: InteractionLedger,
     /// V21: Predicate Store — executable checks attached to memories for falsifiability.
     pub predicate_store: PredicateStore,
+    /// V22: per-memory competitive-weight refresh timestamps. Persisted so a
+    /// restart does not make every memory look never-refreshed (MemoryState's
+    /// `last_cw_refresh_ms` itself stays `#[serde(skip)]` to keep the positional
+    /// bincode layout of all V12+ snapshots stable). Hydrated into states on load.
+    pub cw_refresh_ts: HashMap<MemoryId, i64>,
+}
+
+/// V21 snapshot layout: identical to FullSnapshot minus `cw_refresh_ts`.
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV21 {
+    pub snapshot_seqno: u64,
+    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub states: HashMap<MemoryId, MemoryState>,
+    pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts: HashMap<String, ArtifactId>,
+    pub artifact_paths: HashMap<ArtifactId, String>,
+    pub time_idx: TemporalIndex,
+    pub keyword_idx: KeywordIndex,
+    pub artifact_idx: ArtifactIndex,
+    pub triplet_store: TripletStore,
+    pub symbol_idx: SymbolIndex,
+    pub call_graph: CallGraph,
+    pub code_files: CodeFileIndex,
+    pub semantic_idx: SemanticIndex,
+    pub coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats>,
+    pub ack_scores: HashMap<MemoryId, i32>,
+    pub correction_states: HashMap<u64, CorrectionState>,
+    pub event_tape: EventTape,
+    pub decision_tape: DecisionTape,
+    pub turiya_monitor: TuriyaMonitor,
+    pub observer_state: ObserverState,
+    pub interaction_ledger: InteractionLedger,
+    pub predicate_store: PredicateStore,
 }
 
 /// MemoryPayload as serialized in V16 snapshots (pre-Phase-17).
@@ -1140,7 +1177,8 @@ impl FullSnapshot {
             && magic != FULL_SNAPSHOT_MAGIC_V4
             && magic != FULL_SNAPSHOT_MAGIC_V1
             && magic != FULL_SNAPSHOT_MAGIC_V19
-        && magic != FULL_SNAPSHOT_MAGIC_V20
+            && magic != FULL_SNAPSHOT_MAGIC_V20
+            && magic != FULL_SNAPSHOT_MAGIC_V21
         {
             return Err(FieldError::Manifest("invalid full snapshot magic".to_string()));
         }
@@ -1152,6 +1190,13 @@ impl FullSnapshot {
     pub fn load(path: &Path) -> Result<Self> {
         let mut snap = Self::load_inner(path)?;
         snap.triplet_store.rebuild_indexes();
+        // V22: hydrate per-state refresh timestamps from the persisted map so a
+        // restart does not trigger a full competitive-weight refresh sweep.
+        for (id, ts) in &snap.cw_refresh_ts {
+            if let Some(st) = snap.states.get_mut(id) {
+                st.last_cw_refresh_ms = *ts;
+            }
+        }
         Ok(snap)
     }
 
@@ -1165,11 +1210,46 @@ impl FullSnapshot {
         let magic = u64::from_le_bytes(magic_buf);
 
         if magic == FULL_SNAPSHOT_MAGIC {
-            // V21: current format with predicate_store.
+            // V22: current format with cw_refresh_ts.
             let mut snap: Self = bincode::deserialize_from(&mut r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
+        }
+
+        if magic == FULL_SNAPSHOT_MAGIC_V21 {
+            // V21→V22: add cw_refresh_ts (default empty).
+            eprintln!("[chitta-field] migrating v21 snapshot → v22 (cw refresh timestamps)");
+            let leg: LegacyFullSnapshotV21 = bincode::deserialize_from(&mut r)
+                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            let mut states = leg.states;
+            for state in states.values_mut() { state.sanitize(); }
+            return Ok(FullSnapshot {
+                snapshot_seqno:     leg.snapshot_seqno,
+                payloads:           leg.payloads,
+                states,
+                assoc_edges:        leg.assoc_edges,
+                artifacts:          leg.artifacts,
+                artifact_paths:     leg.artifact_paths,
+                time_idx:           leg.time_idx,
+                keyword_idx:        leg.keyword_idx,
+                artifact_idx:       leg.artifact_idx,
+                triplet_store:      leg.triplet_store,
+                symbol_idx:         leg.symbol_idx,
+                call_graph:         leg.call_graph,
+                code_files:         leg.code_files,
+                semantic_idx:       leg.semantic_idx,
+                coactivation_stats: leg.coactivation_stats,
+                ack_scores:         leg.ack_scores,
+                correction_states:  leg.correction_states,
+                event_tape:         leg.event_tape,
+                decision_tape:      leg.decision_tape,
+                turiya_monitor:     leg.turiya_monitor,
+                observer_state:     leg.observer_state,
+                interaction_ledger: leg.interaction_ledger,
+                predicate_store:    leg.predicate_store,
+                cw_refresh_ts:      HashMap::new(),
+            });
         }
 
         if magic == FULL_SNAPSHOT_MAGIC_V20 {
@@ -1203,6 +1283,7 @@ impl FullSnapshot {
                 observer_state:     leg.observer_state,
                 interaction_ledger: leg.interaction_ledger,
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             });
         }
 
@@ -1237,6 +1318,7 @@ impl FullSnapshot {
                 observer_state:     leg.observer_state,
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             });
         }
 
@@ -1284,6 +1366,7 @@ impl FullSnapshot {
                 observer_state:     leg.observer_state,
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             });
         }
 
@@ -1316,6 +1399,7 @@ impl FullSnapshot {
                 observer_state:     ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1350,6 +1434,7 @@ impl FullSnapshot {
                 observer_state:     ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1384,6 +1469,7 @@ impl FullSnapshot {
                 observer_state:    ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1418,6 +1504,7 @@ impl FullSnapshot {
                 observer_state:    ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1452,6 +1539,7 @@ impl FullSnapshot {
                 observer_state:     ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1487,6 +1575,7 @@ impl FullSnapshot {
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1533,6 +1622,7 @@ impl FullSnapshot {
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             });
         }
 
@@ -1570,6 +1660,7 @@ impl FullSnapshot {
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             });
         }
 
@@ -1604,6 +1695,7 @@ impl FullSnapshot {
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             });
         }
 
@@ -1638,6 +1730,7 @@ impl FullSnapshot {
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             });
         }
 
@@ -1672,6 +1765,7 @@ impl FullSnapshot {
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             });
         }
 
@@ -1706,6 +1800,7 @@ impl FullSnapshot {
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             });
         }
 
@@ -1744,6 +1839,7 @@ impl FullSnapshot {
                 observer_state: ObserverState::default(),
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
+                cw_refresh_ts:      HashMap::new(),
             });
         }
 
