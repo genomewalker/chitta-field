@@ -646,6 +646,25 @@ where
     Ok(cursor)
 }
 
+/// A torn tail (power loss mid-append) leaves the segment's final record
+/// incomplete. Every committed record before it is intact, so bricking the
+/// store would lose nothing and cost everything: truncate at the last good
+/// offset, warn, and continue. Interior corruption (a bad record with valid
+/// records after it) is NOT a torn write and stays fatal.
+fn truncate_torn_tail(path: &Path, good_offset: u64, seqno: u64) -> Result<()> {
+    eprintln!(
+        "[chitta-field] torn WAL tail in {}: record at byte {} (seqno {}) incomplete — \
+         truncating to last good record and continuing",
+        path.display(),
+        good_offset,
+        seqno
+    );
+    let f = OpenOptions::new().write(true).open(path)?;
+    f.set_len(good_offset)?;
+    f.sync_all()?;
+    Ok(())
+}
+
 /// Replay a segment, tracking chain hashes for V2 segments.
 /// Returns the chain_head after replaying all records.
 fn replay_segment_chained<F>(
@@ -657,7 +676,9 @@ fn replay_segment_chained<F>(
 where
     F: FnMut(u64, Op) -> Result<()>,
 {
+    use std::io::Seek;
     let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
 
     let mut magic = [0u8; 8];
     if file.read_exact(&mut magic).is_err() {
@@ -698,6 +719,11 @@ where
     }
 
     loop {
+        // Offset of this record's start — the truncation point if the record
+        // turns out to be torn. An EOF mid-record can only be the file tail,
+        // so every read_exact failure below is a torn-tail condition.
+        let record_start = file.stream_position().map_err(FieldError::Io)?;
+
         let mut len_buf = [0u8; 4];
         match file.read_exact(&mut len_buf) {
             Ok(()) => {}
@@ -709,13 +735,17 @@ where
         let mut seqno_buf = [0u8; 8];
         match file.read_exact(&mut seqno_buf) {
             Ok(()) => {}
-            Err(_) => return Err(FieldError::TruncatedEntry { seqno: 0 }),
+            Err(_) => {
+                truncate_torn_tail(path, record_start, 0)?;
+                break;
+            }
         }
         let seqno = u64::from_be_bytes(seqno_buf);
 
         let mut op_type_buf = [0u8; 1];
         if file.read_exact(&mut op_type_buf).is_err() {
-            return Err(FieldError::TruncatedEntry { seqno });
+            truncate_torn_tail(path, record_start, seqno)?;
+            break;
         }
         let op_type = op_type_buf[0];
 
@@ -723,7 +753,8 @@ where
         let prev_hash = if version >= 2 {
             let mut h = [0u8; 32];
             if file.read_exact(&mut h).is_err() {
-                return Err(FieldError::TruncatedEntry { seqno });
+                truncate_torn_tail(path, record_start, seqno)?;
+                break;
             }
             h
         } else {
@@ -732,12 +763,14 @@ where
 
         let mut payload = vec![0u8; payload_len];
         if file.read_exact(&mut payload).is_err() {
-            return Err(FieldError::TruncatedEntry { seqno });
+            truncate_torn_tail(path, record_start, seqno)?;
+            break;
         }
 
         let mut crc_buf = [0u8; 4];
         if file.read_exact(&mut crc_buf).is_err() {
-            return Err(FieldError::TruncatedEntry { seqno });
+            truncate_torn_tail(path, record_start, seqno)?;
+            break;
         }
         let stored_crc = u32::from_be_bytes(crc_buf);
 
@@ -752,6 +785,13 @@ where
         let computed_crc = hasher.finalize();
 
         if computed_crc != stored_crc {
+            // A CRC failure on the file's FINAL record is a torn write (e.g.
+            // garbage flushed at the tail), not interior corruption — recover.
+            let at_eof = file.stream_position().map_err(FieldError::Io)? >= file_len;
+            if at_eof {
+                truncate_torn_tail(path, record_start, seqno)?;
+                break;
+            }
             return Err(FieldError::CrcMismatch {
                 seqno,
                 expected: stored_crc,
@@ -858,6 +898,92 @@ mod tests {
     //
     // Before the fix, this test produced ~1 warning per appended op on stderr.
     // After the fix, the replay is silent and every op is surfaced exactly once.
+    fn only_segment(data_dir: &Path) -> PathBuf {
+        let seg_dir = data_dir.join("segments");
+        let mut segs: Vec<PathBuf> = fs::read_dir(&seg_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        segs.sort();
+        assert_eq!(segs.len(), 1, "expected exactly one segment");
+        segs.pop().unwrap()
+    }
+
+    // Power loss mid-append leaves an incomplete final record. Replay must
+    // recover every committed op, truncate the torn tail, and keep the store
+    // openable — a torn tail must never brick startup.
+    #[test]
+    fn torn_tail_is_truncated_and_replay_continues() {
+        let tmp = ScratchDir::new("torn-tail");
+        let data_dir = tmp.path();
+
+        {
+            let mut log = OpLog::open(data_dir, 0x3333_3333, 0).unwrap();
+            log.append(&make_op(1)).unwrap();
+            log.append(&make_op(2)).unwrap();
+            log.append(&make_op(3)).unwrap();
+            log.flush_buf().unwrap();
+        }
+
+        // Tear the tail: chop 5 bytes off the last record.
+        let seg = only_segment(data_dir);
+        let len = fs::metadata(&seg).unwrap().len();
+        let f = OpenOptions::new().write(true).open(&seg).unwrap();
+        f.set_len(len - 5).unwrap();
+        f.sync_all().unwrap();
+
+        // Replay recovers ops 1 and 2; the torn record 3 is dropped.
+        let mut seen = Vec::new();
+        let mut log = OpLog::open(data_dir, 0x3333_3333, 0).unwrap();
+        log.replay(0, |_seq, op| {
+            if let Op::UpdateState(d) = op { seen.push(d.memory_id); }
+            Ok(())
+        })
+        .expect("torn tail must not fail replay");
+        assert_eq!(seen, vec![1, 2]);
+
+        // The segment was repaired: a second replay is clean and complete.
+        let mut seen2 = Vec::new();
+        log.replay(0, |_seq, op| {
+            if let Op::UpdateState(d) = op { seen2.push(d.memory_id); }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen2, vec![1, 2]);
+        assert!(fs::metadata(&seg).unwrap().len() < len - 5 + 1);
+    }
+
+    // Interior corruption (bad record with valid records after it) is NOT a
+    // torn write and must remain fatal.
+    #[test]
+    fn interior_corruption_still_fails_replay() {
+        let tmp = ScratchDir::new("interior-corrupt");
+        let data_dir = tmp.path();
+
+        {
+            let mut log = OpLog::open(data_dir, 0x4444_4444, 0).unwrap();
+            log.append(&make_op(1)).unwrap();
+            log.append(&make_op(2)).unwrap();
+            log.append(&make_op(3)).unwrap();
+            log.flush_buf().unwrap();
+        }
+
+        // Flip a byte inside record 1's payload, leaving records 2 and 3
+        // intact after it. V3 header = magic(8)+first_seqno(8)+chain_head(32)
+        // +vsid(8) = 56 bytes; record layout = len(4)+seqno(8)+op_type(1)
+        // +prev_hash(32)+payload+crc(4).
+        let seg = only_segment(data_dir);
+        let mut bytes = fs::read(&seg).unwrap();
+        let len1 = u32::from_be_bytes(bytes[56..60].try_into().unwrap()) as usize;
+        let payload_off = 56 + 4 + 8 + 1 + 32;
+        bytes[payload_off + len1 / 2] ^= 0xFF;
+        fs::write(&seg, &bytes).unwrap();
+
+        let mut log = OpLog::open(data_dir, 0x4444_4444, 0).unwrap();
+        let result = log.replay(0, |_seq, _op| Ok(()));
+        assert!(result.is_err(), "interior corruption must fail replay");
+    }
+
     #[test]
     fn replay_across_independent_instance_chains() {
         let tmp = ScratchDir::new("replay-chains");
