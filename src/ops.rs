@@ -891,3 +891,88 @@ pub struct SymbolEventOp {
     pub timestamp_ms: i64,
     pub notes: Option<String>,
 }
+
+/// Wall-clock timestamp of an op for merge replay (THEORY.md §3), or None
+/// for ops that carry no clock. Zero-valued timestamp fields mean "unset"
+/// and map to None. Clock-less ops inherit the previous ts-bearing op's
+/// time from the same writer during replay (carry-forward), which preserves
+/// per-writer order while still merging across writers by time.
+///
+/// New Op variants MUST be added here; prefer the field that records when
+/// the operation happened (not content attributes like file mtimes).
+pub fn op_timestamp(op: &Op) -> Option<i64> {
+    fn nz(v: i64) -> Option<i64> {
+        if v > 0 { Some(v) } else { None }
+    }
+    match op {
+        Op::PutPayload(o) => nz(o.created_at_ms),
+        Op::UpdateState(o) => nz(o.op_ts_ms),
+        Op::DeleteMemory(o) => nz(o.deleted_at_ms),
+        Op::AddAssocEdge(_) => None,
+        Op::UpsertArtifact(_) => None,
+        Op::AddTriplet(o) => nz(o.valid_from_ms),
+        Op::InvalidateTriplet(o) => nz(o.invalidated_at_ms),
+        Op::UpsertSymbol(_) => None,
+        Op::RemoveSymbol(_) => None,
+        Op::AddSymCallEdge(_) => None,
+        Op::RemoveSymCallEdge(_) => None,
+        // mtime / git_timestamp_ms are content attributes, not op clocks.
+        Op::UpsertCodeFile(_) => None,
+        Op::UpdateSparseCode(o) => nz(o.ts_ms),
+        Op::DemoteMemory(_) => None,
+        Op::TrainPQ(_) => None,
+        Op::UpdateResidualPQ(_) => None,
+        Op::SessionEvent(o) => nz(o.ts_ms),
+        Op::TranscriptEvent(o) => nz(o.ts_ms),
+        Op::TaskEvent(o) => nz(o.ts_ms),
+        Op::UserModelEvent(o) => nz(o.ts_ms),
+        Op::ThemeEvent(o) => nz(o.ts_ms),
+        Op::AnalyticsEvent(o) => nz(o.ts_ms),
+        Op::ClearProject(_) => None,
+        Op::UpdateSymbolDescription(_) => None,
+        Op::UpdateMemoryContent(_) => None,
+        Op::RecordRecallBatch(o) => nz(o.ts_ms),
+        Op::StrengthenAssocEdge(_) => None,
+        Op::MsgEvent(o) => nz(o.ts_ms),
+        Op::SkillUpload(o) => nz(o.ts_ms),
+        Op::SkillDeprecate(_) => None,
+        Op::AgentUpsert(o) => nz(o.ts_ms),
+        Op::AgentDisable(_) => None,
+        Op::AssertConstraint(o) => nz(o.valid_from_ms),
+        Op::RetractConstraint(o) => nz(o.retracted_at_ms),
+        Op::CreateBranch(o) => nz(o.created_ms),
+        Op::ResolveBranch(o) => nz(o.resolved_at_ms),
+        Op::AddTrigger(_) => None,
+        Op::UpdateTrigger(o) => nz(o.fired_ms),
+        Op::FireTrigger(o) => nz(o.fired_ms),
+        Op::RecordSurprise(o) => nz(o.timestamp_ms),
+        Op::RegisterDebt(o) => nz(o.created_ms),
+        Op::UpdateDebt(o) => nz(o.resolved_ms),
+        Op::UpdateSourceWeight(_) => None,
+        Op::RecordFeedback(_) => None,
+        Op::UpdateSurpriseCredit(o) => nz(o.updated_ms),
+        Op::UpsertWisdomCandidate(o) => nz(o.created_ms),
+        Op::UpdateWisdomLifecycle(o) => nz(o.updated_ms),
+        Op::UpdateScorerModel(o) => nz(o.applied_at_ms),
+        Op::AttachDebtEvidence(o) => nz(o.attached_ms),
+        Op::StartIntervention(o) => nz(o.started_ms),
+        Op::AddObservation(o) => nz(o.timestamp_ms),
+        Op::CloseIntervention(o) => nz(o.closed_ms),
+        Op::RecordAttribution(o) => nz(o.timestamp_ms),
+        Op::RegisterTask(o) => nz(o.created_ms),
+        Op::UpdateTask(o) => nz(o.updated_ms),
+        Op::AddDelegation(_) => None,
+        Op::LinkEvidence(o) => nz(o.created_ms),
+        Op::AddProbe(o) => nz(o.created_ms),
+        Op::ResolveProbe(o) => nz(o.resolved_ms),
+        Op::SetCriterion(o) => nz(o.checked_ms),
+        Op::UpsertWisdomLineage(o) => nz(o.updated_ms),
+        Op::AdjudicateLineage(o) => nz(o.adjudicated_ms),
+        Op::TransitionLineage(o) => nz(o.transitioned_ms),
+        Op::RecordChallenger(o) => nz(o.attached_ms),
+        Op::CloseRederive(o) => nz(o.closed_ms),
+        Op::InvalidateTripletsBySourceFile(o) => nz(o.invalidated_at_ms),
+        Op::UpdateMemoryKind(_) => None,
+        Op::SymbolEvent(o) => nz(o.timestamp_ms),
+    }
+}

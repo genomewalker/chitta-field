@@ -75,11 +75,12 @@ lexically-later one — and is silently dropped.
 The system currently converges in practice because of **session affinity**:
 a memory is usually touched only by the node that created it within one WAL
 epoch, and snapshots collapse history before cross-instance writes to the
-same memory accumulate. The characterization tests in `store.rs`
-(`replay_confluent_*` / `replay_drops_*`) pin down both the safe envelope and
-the two loss modes so they cannot drift silently.
+same memory accumulate. Since v2.2.0 the envelope is the full op set: the
+`replay_confluent_*` tests in `store.rs` assert convergence under random
+instance permutations, and `merge_replay_applies_*` / `orphan_delta_*`
+assert that both pre-v2.2 loss modes stay fixed.
 
-## 3. The fix: deterministic merge replay
+## 3. The fix: deterministic merge replay — **implemented in v2.2.0**
 
 Make replay a **k-way merge of segments ordered by `(op_ts_ms, instance_id,
 seqno)`** instead of segment concatenation. Consequences:
@@ -103,7 +104,16 @@ permutation tests — apply a random op set under random instance assignments
 (which permutes replay order) and assert state equality. See
 `replay_confluent_for_disjoint_memories` for the template.
 
-## 4. The manifest should be a version vector
+## 4. The manifest should be a version vector — **implemented in v2.2.0**
+
+> Status: `Manifest.families` is the version vector (joined per-entry across
+> both slots); `CheckpointSet.covered` is the per-writer coverage vector used
+> by both the replay skip and `prune_covered_segments`. The scalar-seqno skip
+> survives only as the fallback for pre-v2.2 snapshots without a family.
+> Known residual: an orphaned delta older than an already-applied delta on
+> the same memory is still rejected by the `apply_delta` guard (idempotency
+> for legacy full-replay); becomes irrelevant once all snapshots carry
+> coverage vectors and replay never re-walks covered ops.
 
 The V23 manifest (`manifest.rs`) is a scalar `generation` counter. With N
 concurrent writers, two daemons can both compute `generation = g+1` and the

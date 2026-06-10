@@ -200,6 +200,51 @@ fn now_ms() -> i64 {
 /// Delete old snapshot families from `data_dir`, keeping the `keep` most recent.
 /// Identifies families by `chitta.*.snapshot` mtime order; removes all sidecar
 /// extensions for each stale stem.
+/// Delete WAL segments fully dominated by the coverage vector (THEORY.md §4).
+/// Segment file names are `{instance:08x}_{first_seqno:012}.seg`. A segment is
+/// prunable iff it is NOT its instance's last segment (its end is then the
+/// next segment's first_seqno - 1) AND covered[instance] >= that end. An
+/// instance's open-ended last segment is never pruned. Returns deleted count.
+fn prune_covered_segments(
+    seg_dir: &std::path::Path,
+    covered: &std::collections::BTreeMap<crate::ids::InstanceId, u64>,
+) -> usize {
+    let mut per_instance: std::collections::BTreeMap<u32, Vec<(u64, std::path::PathBuf)>> =
+        std::collections::BTreeMap::new();
+    if let Ok(entries) = std::fs::read_dir(seg_dir) {
+        for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+            if path.extension().map(|e| e == "seg") != Some(true) {
+                continue;
+            }
+            let stem = path.file_stem().and_then(|f| f.to_str()).unwrap_or("");
+            let (inst, first) = match stem.split_once('_') {
+                Some((i, f)) => (
+                    u32::from_str_radix(i, 16).ok(),
+                    f.parse::<u64>().ok(),
+                ),
+                None => (None, None),
+            };
+            if let (Some(inst), Some(first)) = (inst, first) {
+                per_instance.entry(inst).or_default().push((first, path));
+            }
+        }
+    }
+    let mut deleted = 0usize;
+    for (inst, mut segs) in per_instance {
+        segs.sort();
+        let max_covered = covered.get(&inst).copied().unwrap_or(0);
+        for w in segs.windows(2) {
+            let (_, ref path) = w[0];
+            let (next_first, _) = w[1];
+            let seg_end = next_first.saturating_sub(1);
+            if max_covered >= seg_end && std::fs::remove_file(path).is_ok() {
+                deleted += 1;
+            }
+        }
+    }
+    deleted
+}
+
 fn prune_old_snapshots(data_dir: &std::path::Path, keep: usize) {
     const SIDECAR_EXTS: &[&str] = &[
         "snapshot", "hdc", "emb", "bin", "mu", "shdr", "hnsw", "realm_hnsw", "pld", "sup.json",
@@ -5559,10 +5604,19 @@ impl ChittaField {
                     });
                 manifest.generation += 1;
                 manifest.last_seqno = seqno;
+                // Per-writer coverage vector (THEORY.md §4): everything the
+                // in-memory state contains (open replay ⊔ sync_foreign) plus
+                // our own ops up to this save.
+                let covered: std::collections::BTreeMap<String, u64> = {
+                    let mut cov = self.wal_coverage.read().clone();
+                    let own = cov.entry(self.instance_id).or_insert(0);
+                    if seqno > *own { *own = seqno; }
+                    cov.iter().map(|(i, s)| (format!("{:08x}", i), *s)).collect()
+                };
                 // Only files that actually exist are recorded (e.g. the .sup
                 // sidecar save is best-effort) — validation checks what the
                 // commit promised, nothing more.
-                manifest.checkpoints = Some(CheckpointSet {
+                let family = CheckpointSet {
                     snapshot: snapshot_ref,
                     sidecars: [
                         &emb_path, &hdc_path, &bin_path, &mu_path, &hnsw_path,
@@ -5572,7 +5626,12 @@ impl ChittaField {
                     .filter_map(|p| file_ref(p))
                     .collect(),
                     snapshot_seqno: seqno,
-                });
+                    covered,
+                };
+                manifest
+                    .families
+                    .insert(format!("{:08x}", self.instance_id), family.clone());
+                manifest.checkpoints = Some(family);
                 if let Err(e) = manifest.save(&self.data_dir) {
                     eprintln!(
                         "[chitta-field] WARNING: manifest commit failed (snapshot itself is durable): {e}"
@@ -5589,7 +5648,7 @@ impl ChittaField {
 
 
     /// Compact WAL: save full snapshot then delete WAL segments covered by it.
-    /// After compaction, only segments with seqno >= snapshot_seqno are kept.
+    /// Coverage is per-writer (THEORY.md §4) — see prune_covered_segments.
     /// This bounds WAL growth and speeds up startup replay.
     pub fn compact_wal(&self) -> Result<usize> {
         let count = {
@@ -5602,34 +5661,19 @@ impl ChittaField {
             )));
         }
         self.save_full_snapshot()?;
-        let snapshot_seqno = self.log.read().last_seqno();
-        
+        // Safe pruning rule (THEORY.md §4): a segment of instance i may be
+        // deleted iff our coverage vector dominates it — i.e. every op in it
+        // is provably contained in the snapshot we just committed. The old
+        // scalar rule (first_seqno < snapshot_seqno) compared seqnos across
+        // writers, which can delete a concurrent writer's UNCOVERED ops:
+        // overlapping seqno ranges make a foreign segment look covered.
+        let mut covered = self.wal_coverage.read().clone();
+        let own = covered.entry(self.instance_id).or_insert(0);
+        let last = self.log.read().last_seqno();
+        if last > *own { *own = last; }
+
         let seg_dir = self.data_dir.join("segments");
-        let mut deleted = 0usize;
-        
-        if let Ok(entries) = std::fs::read_dir(&seg_dir) {
-            let mut paths: Vec<std::path::PathBuf> = entries
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().map(|e| e == "seg").unwrap_or(false))
-                .collect();
-            paths.sort();
-            
-            // Keep the last segment (may be partially covered) — delete only fully-covered ones
-            // A segment is covered if its max seqno < snapshot_seqno
-            // Since seqno is in the filename ({instance_id}_{first_seqno}.seg), we can use it
-            for path in &paths[..paths.len().saturating_sub(1)] {
-                // Extract first_seqno from filename
-                let fname = path.file_stem().and_then(|f| f.to_str()).unwrap_or("");
-                let first_seqno: u64 = fname.split('_').nth(1)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(u64::MAX);
-                if first_seqno < snapshot_seqno {
-                    if std::fs::remove_file(path).is_ok() {
-                        deleted += 1;
-                    }
-                }
-            }
-        }
+        let deleted = prune_covered_segments(&seg_dir, &covered);
         Ok(deleted)
     }
 
@@ -6477,15 +6521,12 @@ mod tests {
         );
     }
 
-    /// Characterization of the loss mode in THEORY.md §2.2: apply_delta's
-    /// monotonicity guard (state.rs) wholly discards an op whose op_ts_ms is
-    /// older than one already applied — additive fields included. Segment
-    /// sort order can invert timestamp order across instances, so the ts=2000
-    /// delta below vanishes. Confluent merge replay would yield strength
-    /// 1.0 - 0.2 - 0.4 = 0.4 and access_count 2. When §3's merge replay
-    /// lands, flip these assertions.
+    /// THEORY.md §3: merge replay orders ops by (op_ts, instance, seqno), so
+    /// cross-instance deltas apply in timestamp order even when instance-id
+    /// sort order inverts it. Before merge replay, the ts=2000 delta below was
+    /// wholly discarded by apply_delta's monotonicity guard (loss mode §2.2).
     #[test]
-    fn replay_discards_stale_delta_when_segment_order_inverts_timestamps() {
+    fn merge_replay_applies_cross_instance_deltas_in_timestamp_order() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -6496,32 +6537,149 @@ mod tests {
         let field = ChittaField::open(data_dir).unwrap();
         let (strength, access_count) = state_fingerprint(&field, 33);
         assert!(
-            (strength - 0.8).abs() < 1e-6,
-            "documented loss: stale-by-ts delta is wholly discarded (got strength {strength})"
+            (strength - 0.4).abs() < 1e-6,
+            "both deltas must apply in ts order (got strength {strength})"
         );
-        assert_eq!(access_count, 1, "the discarded delta's touch is lost too");
+        assert_eq!(access_count, 2);
     }
 
-    /// Characterization of the causality gap in THEORY.md §2.3: an UpdateState
-    /// replayed before its memory's PutPayload (possible whenever the updating
-    /// instance sorts before the creating one) is silently dropped. Confluent
-    /// replay (or an orphan-delta buffer) would yield strength 0.6 and
-    /// access_count 1. When §3 lands, flip these assertions.
+    /// THEORY.md §2.3/§3: an UpdateState merge-ordered before its memory's
+    /// PutPayload (possible under cross-writer clock skew) lands in the
+    /// orphan-delta buffer and is applied after the creates. Before merge
+    /// replay + the buffer, it was silently dropped.
     #[test]
-    fn replay_drops_cross_instance_delta_before_create() {
+    fn orphan_delta_before_create_is_buffered_and_applied() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
-        write_instance_segment(&data_dir, 0x1000_0001, &[theory_delta_op(44, -0.4, 2_000)]);
+        // Skewed clock: the delta's ts predates the create's ts, so merge
+        // order applies it first — the orphan buffer must catch it.
+        write_instance_segment(&data_dir, 0x1000_0001, &[theory_delta_op(44, -0.4, 500)]);
         write_instance_segment(&data_dir, 0x2000_0002, &[theory_put_op(44, 1_000, "delta")]);
 
         let field = ChittaField::open(data_dir).unwrap();
         let (strength, access_count) = state_fingerprint(&field, 44);
         assert!(
-            (strength - 1.0).abs() < 1e-6,
-            "documented loss: delta before create is dropped (got strength {strength})"
+            (strength - 0.6).abs() < 1e-6,
+            "orphaned delta must be applied after creates (got strength {strength})"
         );
-        assert_eq!(access_count, 0);
+        assert_eq!(access_count, 1);
+    }
+
+    /// THEORY.md §3: with merge replay, state is a function of the op SET —
+    /// any partition of the ops across writers, under any instance-id
+    /// assignment, converges. Creates carry the earliest timestamps so the
+    /// orphan path stays out of this test (covered separately).
+    #[test]
+    fn replay_confluent_under_random_instance_permutations() {
+        let mut ops: Vec<crate::ops::Op> = Vec::new();
+        for m in 0..4u64 {
+            ops.push(theory_put_op(100 + m, 1_000 + m as i64, "perm"));
+        }
+        for i in 0..8u64 {
+            let mem = 100 + (i % 4);
+            let d = -0.05 * ((i % 3) as f32 + 1.0);
+            ops.push(theory_delta_op(mem, d, 2_000 + 100 * i as i64));
+        }
+        let instances = [0x1000_0001u32, 0x2000_0002, 0x3000_0003];
+
+        let mut seed = 0x9E37_79B9_u64;
+        let mut xorshift = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        let mut fingerprints = Vec::new();
+        for _ in 0..4 {
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path().join("data");
+            std::fs::create_dir_all(&data_dir).unwrap();
+            let mut groups: Vec<Vec<crate::ops::Op>> = vec![Vec::new(), Vec::new(), Vec::new()];
+            for op in &ops {
+                groups[(xorshift() % 3) as usize].push(op.clone());
+            }
+            for (group, inst) in groups.into_iter().zip(instances) {
+                if !group.is_empty() {
+                    write_instance_segment(&data_dir, inst, &group);
+                }
+            }
+            let field = ChittaField::open(data_dir).unwrap();
+            let fp: Vec<(f32, u32)> =
+                (100..104).map(|m| state_fingerprint(&field, m)).collect();
+            fingerprints.push(fp);
+        }
+        for fp in &fingerprints[1..] {
+            assert_eq!(
+                &fingerprints[0], fp,
+                "state must be a function of the op set, not the instance assignment"
+            );
+        }
+    }
+
+    /// THEORY.md §4: seqno ranges overlap across writers, so the scalar
+    /// `seqno <= snapshot_seqno` skip silently dropped foreign ops the
+    /// snapshot never contained. The per-writer coverage vector applies them.
+    #[test]
+    fn reopen_applies_uncovered_foreign_ops_with_overlapping_seqnos() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let emb = vec![0.3f32; crate::ops::EMBED_DIM];
+
+        {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            field
+                .put_memory("wisdom", "test", b"local memory", &emb, 0.9, 0.001, 0, vec![], None, None)
+                .unwrap();
+            field.save_full_snapshot().unwrap();
+        }
+
+        // A foreign writer's ops with LOW seqnos (overlapping the snapshot's
+        // scalar seqno range) that the snapshot does NOT contain.
+        write_instance_segment(
+            &data_dir,
+            0xF000_000F,
+            &[theory_put_op(777, 5_000, "foreign uncovered")],
+        );
+
+        let field = ChittaField::open(data_dir).unwrap();
+        assert!(
+            field.states.read().contains_key(&777),
+            "uncovered foreign op must be applied on reopen (was skipped by the scalar filter)"
+        );
+    }
+
+    /// THEORY.md §4: prune only segments the coverage vector dominates; an
+    /// instance's open-ended last segment is never pruned.
+    #[test]
+    fn prune_covered_segments_respects_coverage_vector() {
+        let tmp = TempDir::new().unwrap();
+        let seg_dir = tmp.path().join("segments");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        for name in [
+            "10000001_000000000001.seg",
+            "10000001_000000000050.seg",
+            "20000002_000000000001.seg",
+        ] {
+            std::fs::write(seg_dir.join(name), b"x").unwrap();
+        }
+
+        // Not covered far enough: nothing prunable.
+        let mut covered = std::collections::BTreeMap::new();
+        covered.insert(0x1000_0001u32, 10u64);
+        assert_eq!(prune_covered_segments(&seg_dir, &covered), 0);
+
+        // Covered through the first segment's end (next_first - 1 = 49):
+        // only instance 1's first segment goes; last segments stay.
+        covered.insert(0x1000_0001, 49);
+        assert_eq!(prune_covered_segments(&seg_dir, &covered), 1);
+        assert!(!seg_dir.join("10000001_000000000001.seg").exists());
+        assert!(seg_dir.join("10000001_000000000050.seg").exists());
+        assert!(
+            seg_dir.join("20000002_000000000001.seg").exists(),
+            "a foreign writer's segment must never be pruned without coverage"
+        );
     }
 
     #[test]

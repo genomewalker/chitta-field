@@ -292,9 +292,25 @@ impl OpLog {
     /// ZERO_HASH — otherwise the next instance's first segment would always
     /// trigger a "chain continuity warning" because its stored_head is zero
     /// while the accumulated head from the prior instance is not.
-    pub fn replay<F>(&mut self, _start_seqno: u64, mut f: F) -> Result<()>
+    /// Replay all segments, applying ops in deterministic MERGE order:
+    /// `(effective_ts, instance_id, seqno)` — THEORY.md §3. Segment walking
+    /// (chain/CRC verification) stays sequential per segment; application is
+    /// deferred until all ops are collected, so cross-instance interleavings
+    /// converge to the same state regardless of instance-id sort order.
+    /// Clock-less ops (op_timestamp == None) inherit the previous ts-bearing
+    /// op's time from the same writer (carry-forward), preserving per-writer
+    /// order. Memory cost is the buffered op set — bounded in practice by
+    /// WAL compaction.
+    ///
+    /// Returns the per-instance max seqno walked (the WAL coverage vector;
+    /// THEORY.md §4).
+    pub fn replay<F>(
+        &mut self,
+        _start_seqno: u64,
+        mut f: F,
+    ) -> Result<std::collections::BTreeMap<InstanceId, u64>>
     where
-        F: FnMut(u64, Op) -> Result<()>,
+        F: FnMut(InstanceId, u64, Op) -> Result<()>,
     {
         let seg_dir = self.data_dir.join("segments");
         let segments = collect_all_segments(&seg_dir)?;
@@ -302,6 +318,9 @@ impl OpLog {
         let mut current_instance: Option<String> = None;
         let own_prefix = format!("{:08x}", self.instance_id);
         let mut own_chain_head = ZERO_HASH;
+        let mut buf: Vec<(i64, InstanceId, u64, Op)> = Vec::new();
+        let mut last_ts: std::collections::BTreeMap<InstanceId, i64> = std::collections::BTreeMap::new();
+        let mut coverage: std::collections::BTreeMap<InstanceId, u64> = std::collections::BTreeMap::new();
         for seg_path in &segments {
             // Lineage fence: skip segments stamped (V3) with a different vector_space_id —
             // foreign-vector data must not contaminate replay. V1/V2/legacy segments carry
@@ -324,7 +343,20 @@ impl OpLog {
                 chain_head = ZERO_HASH;
                 current_instance = instance.clone();
             }
-            chain_head = replay_segment_chained(seg_path, 0, chain_head, &mut f)?;
+            let inst_id: InstanceId = instance
+                .as_deref()
+                .and_then(|p| InstanceId::from_str_radix(p, 16).ok())
+                .unwrap_or(0);
+            chain_head = replay_segment_chained(seg_path, 0, chain_head, &mut |seqno, op| {
+                // Carry-forward effective timestamp: monotone per writer.
+                let prev = last_ts.get(&inst_id).copied().unwrap_or(0);
+                let eff = crate::ops::op_timestamp(&op).unwrap_or(prev).max(prev);
+                last_ts.insert(inst_id, eff);
+                let cov = coverage.entry(inst_id).or_insert(0);
+                if seqno > *cov { *cov = seqno; }
+                buf.push((eff, inst_id, seqno, op));
+                Ok(())
+            })?;
             if current_instance.as_deref() == Some(own_prefix.as_str()) {
                 own_chain_head = chain_head;
             }
@@ -334,7 +366,13 @@ impl OpLog {
         // to write prev_hash = <foreign tip>, triggering a warning on every
         // subsequent restart when the boundary reset sets chain_head back to zero.
         self.chain_head = own_chain_head;
-        Ok(())
+
+        // Apply in merge order.
+        buf.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+        for (_, inst, seqno, op) in buf {
+            f(inst, seqno, op)?;
+        }
+        Ok(coverage)
     }
 
     /// Current chain tip hash. Zero if only V1 data exists.
@@ -935,7 +973,7 @@ mod tests {
         // Replay recovers ops 1 and 2; the torn record 3 is dropped.
         let mut seen = Vec::new();
         let mut log = OpLog::open(data_dir, 0x3333_3333, 0).unwrap();
-        log.replay(0, |_seq, op| {
+        log.replay(0, |_inst, _seq, op| {
             if let Op::UpdateState(d) = op { seen.push(d.memory_id); }
             Ok(())
         })
@@ -944,7 +982,7 @@ mod tests {
 
         // The segment was repaired: a second replay is clean and complete.
         let mut seen2 = Vec::new();
-        log.replay(0, |_seq, op| {
+        log.replay(0, |_inst, _seq, op| {
             if let Op::UpdateState(d) = op { seen2.push(d.memory_id); }
             Ok(())
         })
@@ -980,7 +1018,7 @@ mod tests {
         fs::write(&seg, &bytes).unwrap();
 
         let mut log = OpLog::open(data_dir, 0x4444_4444, 0).unwrap();
-        let result = log.replay(0, |_seq, _op| Ok(()));
+        let result = log.replay(0, |_inst, _seq, _op| Ok(()));
         assert!(result.is_err(), "interior corruption must fail replay");
     }
 
@@ -1009,7 +1047,7 @@ mod tests {
         let mut log_c = OpLog::open(data_dir, 0x3333_3333, 0).unwrap();
         let mut seen: Vec<u64> = Vec::new();
         log_c
-            .replay(0, |_seqno, op| {
+            .replay(0, |_inst, _seqno, op| {
                 if let Op::UpdateState(s) = op {
                     seen.push(s.memory_id);
                 }

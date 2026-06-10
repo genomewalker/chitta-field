@@ -33,6 +33,12 @@ pub struct CheckpointSet {
     pub snapshot: FileRef,
     pub sidecars: Vec<FileRef>,
     pub snapshot_seqno: u64,
+    /// Per-writer WAL coverage: instance-id hex → max seqno of that writer's
+    /// ops included in this snapshot (THEORY.md §4). Replay skips exactly the
+    /// ops this vector dominates; WAL pruning may delete exactly the segments
+    /// it dominates. Empty for pre-v2.2 manifests (scalar-seqno fallback).
+    #[serde(default)]
+    pub covered: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +56,15 @@ pub struct Manifest {
     pub clean_shutdown: bool,
 
     pub segments: Vec<SegmentInfo>,
+    /// Latest committed family of the most recent saver (back-compat; also
+    /// present as an entry in `families`).
     pub checkpoints: Option<CheckpointSet>,
+    /// Version vector of committed families: saver instance hex → its latest
+    /// committed family (THEORY.md §4). Each entry is owned by one writer and
+    /// self-heals on that writer's next save; `load()` joins both slots
+    /// per-entry, so concurrent commits merge instead of shadowing.
+    #[serde(default)]
+    pub families: std::collections::BTreeMap<String, CheckpointSet>,
 }
 
 impl Manifest {
@@ -68,40 +82,41 @@ impl Manifest {
             clean_shutdown: false,
             segments: Vec::new(),
             checkpoints: None,
+            families: std::collections::BTreeMap::new(),
         }
     }
 
-    /// Validate the committed family against the filesystem: the snapshot and
-    /// every recorded sidecar must exist with the recorded size. Returns the
-    /// snapshot path on success; None means the caller should fall back to
+    /// Validate committed families against the filesystem (every file exists
+    /// with the recorded size) and return the snapshot path of the best
+    /// validating one — highest snapshot_seqno across `families` plus the
+    /// legacy `checkpoints` entry. None means the caller should fall back to
     /// fence-based selection.
     pub fn validated_snapshot_path(&self, data_dir: &Path) -> Option<PathBuf> {
-        let cp = self.checkpoints.as_ref()?;
+        let mut candidates: Vec<&CheckpointSet> =
+            self.families.values().chain(self.checkpoints.iter()).collect();
+        candidates.sort_by(|a, b| b.snapshot_seqno.cmp(&a.snapshot_seqno));
+        candidates.dedup_by(|a, b| a.snapshot.name == b.snapshot.name);
         let ok = |fr: &FileRef| -> bool {
             fs::metadata(data_dir.join(&fr.name))
                 .map(|m| m.len() == fr.size_bytes)
                 .unwrap_or(false)
         };
-        if !ok(&cp.snapshot) {
+        for cp in candidates {
+            if ok(&cp.snapshot) && cp.sidecars.iter().all(|fr| ok(fr)) {
+                return Some(data_dir.join(&cp.snapshot.name));
+            }
             eprintln!(
-                "[chitta-field] manifest snapshot {} missing or size-mismatched",
+                "[chitta-field] manifest family {} failed validation — trying next",
                 cp.snapshot.name
             );
-            return None;
         }
-        for fr in &cp.sidecars {
-            if !ok(fr) {
-                eprintln!(
-                    "[chitta-field] manifest sidecar {} missing or size-mismatched",
-                    fr.name
-                );
-                return None;
-            }
-        }
-        Some(data_dir.join(&cp.snapshot.name))
+        None
     }
 
-    /// Load from data_dir — tries both slots, picks the one with the highest valid generation.
+    /// Load from data_dir — joins both slots. The scalar fields come from the
+    /// higher generation; `families` is joined per-entry (the entry with the
+    /// larger snapshot_seqno wins), so a concurrent writer's commit shadowed
+    /// at the slot level is still recovered from the other slot.
     pub fn load(data_dir: &Path) -> Result<Option<Self>> {
         let slot1 = manifest_path(data_dir, 1);
         let slot2 = manifest_path(data_dir, 2);
@@ -114,11 +129,16 @@ impl Manifest {
             (Some(m), None) => Ok(Some(m)),
             (None, Some(m)) => Ok(Some(m)),
             (Some(a), Some(b)) => {
-                if a.generation >= b.generation {
-                    Ok(Some(a))
-                } else {
-                    Ok(Some(b))
+                let (mut newer, older) = if a.generation >= b.generation { (a, b) } else { (b, a) };
+                for (inst, fam) in older.families {
+                    match newer.families.get(&inst) {
+                        Some(existing) if existing.snapshot_seqno >= fam.snapshot_seqno => {}
+                        _ => {
+                            newer.families.insert(inst, fam);
+                        }
+                    }
                 }
+                Ok(Some(newer))
             }
         }
     }

@@ -249,6 +249,11 @@ pub struct ChittaField {
     /// In-flight competitive_weight refresh reservations: memory_id -> reservation_ts_ms.
     /// Prevents thundering-herd when multiple sessions refresh simultaneously.
     pub(crate) cw_refresh_inflight: parking_lot::RwLock<std::collections::HashMap<crate::ids::MemoryId, i64>>,
+    /// Per-writer WAL coverage of the in-memory state: instance → max seqno
+    /// applied (open replay ⊔ sync_foreign ⊔ own appends at save time).
+    /// Written into the manifest family on save; the safe pruning and
+    /// replay-skip vector of THEORY.md §4.
+    pub(crate) wal_coverage: parking_lot::RwLock<std::collections::BTreeMap<crate::ids::InstanceId, u64>>,
 }
 
 impl Drop for ChittaField {
@@ -458,8 +463,10 @@ impl ChittaField {
         }
         // Manifest-committed family takes precedence: a validated commit record
         // beats heuristic seqno-peek selection. Stores without a manifest (or
-        // with a stale/invalid one) fall back to the fence stack below.
-        if let Ok(Some(manifest)) = crate::manifest::Manifest::load(&data_dir) {
+        // with a stale/invalid one) fall back to the fence stack below. Kept
+        // around for the WAL coverage vector of the loaded family (§ replay).
+        let loaded_manifest = crate::manifest::Manifest::load(&data_dir).ok().flatten();
+        if let Some(manifest) = loaded_manifest.as_ref() {
             match manifest.validated_snapshot_path(&data_dir) {
                 Some(committed) => {
                     candidates.retain(|p| p != &committed);
@@ -478,6 +485,7 @@ impl ChittaField {
             }
         }
         let mut loaded_header: Option<crate::snapshot::StoreHeader> = None;
+        let mut loaded_snapshot_name: Option<String> = None;
         // CHITTA_MIGRATE_REEMBED=1: one-shot embedding-space migration. Bypasses the dim/vsid
         // load fences and skips the foreign-dim embedding sidecars so a new-vsid binary can load
         // an old-vsid store's content + metadata (embeddings dropped → re_embed refills the
@@ -614,6 +622,8 @@ impl ChittaField {
                         "[chitta-field] loaded full snapshot seqno={} ({} memories) from {:?}",
                         full_snapshot_seqno, payloads.len(), candidate
                     );
+                    loaded_snapshot_name =
+                        candidate.file_name().map(|n| n.to_string_lossy().into_owned());
                     full_snapshot_loaded = true;
                     break;
                 }
@@ -719,10 +729,43 @@ impl ChittaField {
         // Inhibit HNSW inserts during replay — binary Hamming takes over after normalize_all(),
         // so building the O(N log N) HNSW graph incrementally would waste time and RAM.
         semantic_idx.set_inhibit_hnsw(true);
+        // WAL coverage of the loaded snapshot (THEORY.md §4): per-writer max
+        // seqno the snapshot provably contains, from its manifest family.
+        // Under multi-writer overlap, the scalar `seqno <= full_snapshot_seqno`
+        // filter silently skips foreign ops the snapshot never saw — the
+        // per-writer vector is the correct test. Legacy snapshots without a
+        // family fall back to the scalar (today's approximate behavior).
+        let full_covered: std::collections::BTreeMap<u32, u64> = loaded_manifest
+            .as_ref()
+            .zip(loaded_snapshot_name.as_ref())
+            .and_then(|(m, name)| {
+                m.families
+                    .values()
+                    .chain(m.checkpoints.iter())
+                    .find(|cp| &cp.snapshot.name == name)
+                    .map(|cp| {
+                        cp.covered
+                            .iter()
+                            .filter_map(|(k, v)| u32::from_str_radix(k, 16).ok().map(|i| (i, *v)))
+                            .collect()
+                    })
+            })
+            .unwrap_or_default();
+        let covered_by_full = |inst: u32, seqno: u64| -> bool {
+            match full_covered.get(&inst) {
+                Some(&max) => seqno <= max,
+                None => full_covered.is_empty() && seqno <= full_snapshot_seqno,
+            }
+        };
         let mut max_replayed_seqno = full_snapshot_seqno;
-        log.replay(0, |seqno, op| {
+        // Orphan-delta buffer (THEORY.md §2.3): clock skew across writers can
+        // merge-order an UpdateState before its memory's PutPayload; buffer
+        // and retry once all creates are applied. Merge replay already yields
+        // timestamp order, so collection order is application order.
+        let mut orphan_deltas: Vec<crate::ops::StateDeltaOp> = Vec::new();
+        let replayed_coverage = log.replay(0, |inst, seqno, op| {
             if seqno > max_replayed_seqno { max_replayed_seqno = seqno; }
-            if seqno <= full_snapshot_seqno {
+            if covered_by_full(inst, seqno) {
                 // This op is covered by the full snapshot.
                 // Still apply cortical ops not covered by the cortical snapshot.
                 match &op {
@@ -743,6 +786,12 @@ impl ChittaField {
                     op,
                     Op::UpdateSparseCode(_) | Op::TrainPQ(_) | Op::UpdateResidualPQ(_)
                 ) {
+                    return Ok(());
+                }
+            }
+            if let Op::UpdateState(d) = &op {
+                if !states.contains_key(&d.memory_id) {
+                    orphan_deltas.push(d.clone());
                     return Ok(());
                 }
             }
@@ -790,6 +839,19 @@ impl ChittaField {
             );
             Ok(())
         })?;
+        for d in orphan_deltas {
+            if let Some(state) = states.get_mut(&d.memory_id) {
+                let replay_now = if d.op_ts_ms > 0 { d.op_ts_ms } else { state.created_at_ms };
+                state.apply_delta(&d, replay_now);
+            }
+        }
+        // State coverage = snapshot coverage ⊔ walked WAL maxima (per-writer
+        // max). Carried on the field and written into the next manifest commit.
+        let mut wal_coverage = full_covered;
+        for (inst, max) in replayed_coverage {
+            let e = wal_coverage.entry(inst).or_insert(0);
+            if max > *e { *e = max; }
+        }
         log.set_next_seqno(max_replayed_seqno + 1);
         semantic_idx.set_inhibit_hnsw(false);
         let purged_ids = semantic_idx.purge_wrong_dim();
@@ -1082,6 +1144,7 @@ impl ChittaField {
             interaction_ledger: RwLock::new(snap_interaction_ledger),
             predicate_store:    RwLock::new(snap_predicate_store),
             cw_refresh_inflight: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            wal_coverage: parking_lot::RwLock::new(wal_coverage),
         })
     }
 }
@@ -1115,12 +1178,22 @@ impl ChittaField {
 
         let foreign_segs = collect_foreign_segments(&self.data_dir, self.instance_id)?;
         let mut ops = Vec::new();
+        let mut fresh_coverage: std::collections::BTreeMap<crate::ids::InstanceId, u64> =
+            std::collections::BTreeMap::new();
 
         {
             let mut seen = self.seen_offsets.write();
             for seg_path in &foreign_segs {
+                let inst: crate::ids::InstanceId = seg_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.split_once('_'))
+                    .and_then(|(p, _)| u32::from_str_radix(p, 16).ok())
+                    .unwrap_or(0);
                 let offset = *seen.get(seg_path).unwrap_or(&0);
-                let new_offset = replay_from_offset(seg_path, offset, |_seqno, op| {
+                let new_offset = replay_from_offset(seg_path, offset, |seqno, op| {
+                    let cov = fresh_coverage.entry(inst).or_insert(0);
+                    if seqno > *cov { *cov = seqno; }
                     ops.push(op);
                     Ok(())
                 })?;
@@ -1223,6 +1296,13 @@ impl ChittaField {
 
         if count > 0 {
             self.persist_seen_offsets();
+            // Ingested foreign ops are now part of in-memory state — extend
+            // the coverage vector so the next snapshot commit claims them.
+            let mut cov = self.wal_coverage.write();
+            for (inst, max) in fresh_coverage {
+                let e = cov.entry(inst).or_insert(0);
+                if max > *e { *e = max; }
+            }
         }
 
         Ok(count)

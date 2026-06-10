@@ -2433,13 +2433,13 @@ pub extern "C" fn cf_iterate_log(
         return -1;
     }
     let handle = unsafe { &*h };
-    let result = handle.field.log.write().replay(from_seqno, |seqno, op| {
+    let result = handle.field.log.write().replay(from_seqno, |_inst, seqno, op| {
         let json = serde_json::to_vec(&op).unwrap_or_default();
         callback(json.as_ptr(), json.len(), seqno, ctx);
         Ok(())
     });
     match result {
-        Ok(()) => handle.ok(),
+        Ok(_) => handle.ok(),
         Err(e) => handle.err(e),
     }
 }
