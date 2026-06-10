@@ -49,6 +49,12 @@ harness = false
 name = "wal_replay_bench"
 harness = false
 
+[features]
+# Debug/CI aid: parking_lot deadlock detection. ChittaField::open spawns a
+# checker thread that dumps any deadlock cycle to stderr and aborts.
+# Never enable in production builds (per-lock bookkeeping overhead).
+deadlock-detection = ["parking_lot/deadlock_detection"]
+
 [profile.release]
 lto = true
 codegen-units = 1
