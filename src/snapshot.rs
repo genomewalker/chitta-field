@@ -68,7 +68,18 @@ const FULL_SNAPSHOT_MAGIC_V21: u64     = 0xF011_5741_7E00_0015;
 /// V22 magic: FullSnapshot gains `cw_refresh_ts` — persisted competitive-weight
 /// refresh timestamps, so a daemon restart does not reset every memory to
 /// "never refreshed" (the restart refresh-herd trigger).
-const FULL_SNAPSHOT_MAGIC: u64         = 0xF011_5741_7E00_0016; // V22
+const FULL_SNAPSHOT_MAGIC_V22: u64     = 0xF011_5741_7E00_0016;
+/// V23 magic: sectioned container. Layout after the magic:
+///   [seqno: u64 LE]
+///   then sections until EOF: [name_len: u16 LE][name: utf8]
+///                            [body_len: u64 LE][body: bincode of that field]
+/// One section per FullSnapshot field. Unknown sections are skipped, missing
+/// sections keep their defaults — ADDING a top-level field no longer needs a
+/// magic bump, a Legacy* struct, or a migration arm: write the section in
+/// save(), match it in the V23 loader, done. (Changing the INTERNAL layout of
+/// an existing section still needs versioning — bodies remain positional
+/// bincode of that one type.) The bincode ladder is frozen at V22.
+const FULL_SNAPSHOT_MAGIC: u64         = 0xF011_5741_7E00_0017; // V23
 
 /// Magic for the payload content sidecar (.pld).
 const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
@@ -171,10 +182,17 @@ impl StoreHeader {
     }
 }
 
-// ── Compile-time guard: MemoryState size must match snapshot magic ────────────
-// If you add/remove fields to MemoryState, this assert will fail.
-// You MUST: (1) bump FULL_SNAPSHOT_MAGIC, (2) add a LegacyMemoryStateVN,
-// (3) add migration in FullSnapshot::load(), (4) update this constant.
+// ── Compile-time guard: MemoryState size must match snapshot format ──────────
+// Since V23 the snapshot is a sectioned container (see FULL_SNAPSHOT_MAGIC):
+//   * ADDING a top-level FullSnapshot field = add a write_section line in
+//     save() + a match arm in the V23 loader + a default in empty(). No magic
+//     bump, no Legacy* struct, no migration arm.
+//   * CHANGING the internal layout of a section's type (e.g. MemoryState
+//     inside "states") still breaks positional bincode WITHIN that section.
+//     If you add/remove MemoryState fields you MUST write the new data under a
+//     new section name (e.g. "states_v2") with a fallback reader for the old
+//     one — or persist the new data as its own section keyed by MemoryId,
+//     like cw_refresh_ts does.
 // bincode is positional — #[serde(default)] does NOT work with it.
 // V12: added `staged: bool` + `invalidated_by: Option<String>`. Exact size depends on
 // compiler field-reordering (repr(Rust) may pack bools together). Guard is a range check.
@@ -757,6 +775,68 @@ pub struct FullSnapshot {
     pub cw_refresh_ts: HashMap<MemoryId, i64>,
 }
 
+/// V22 snapshot layout, frozen: the last monolithic-bincode format. Positional
+/// bincode of this exact field list. Do NOT change this struct — V23+ uses the
+/// sectioned container and FullSnapshot itself is free to grow.
+#[derive(Serialize, Deserialize)]
+struct LegacyFullSnapshotV22 {
+    pub snapshot_seqno: u64,
+    pub payloads: HashMap<MemoryId, MemoryPayload>,
+    pub states: HashMap<MemoryId, MemoryState>,
+    pub assoc_edges: HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts: HashMap<String, ArtifactId>,
+    pub artifact_paths: HashMap<ArtifactId, String>,
+    pub time_idx: TemporalIndex,
+    pub keyword_idx: KeywordIndex,
+    pub artifact_idx: ArtifactIndex,
+    pub triplet_store: TripletStore,
+    pub symbol_idx: SymbolIndex,
+    pub call_graph: CallGraph,
+    pub code_files: CodeFileIndex,
+    pub semantic_idx: SemanticIndex,
+    pub coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats>,
+    pub ack_scores: HashMap<MemoryId, i32>,
+    pub correction_states: HashMap<u64, CorrectionState>,
+    pub event_tape: EventTape,
+    pub decision_tape: DecisionTape,
+    pub turiya_monitor: TuriyaMonitor,
+    pub observer_state: ObserverState,
+    pub interaction_ledger: InteractionLedger,
+    pub predicate_store: PredicateStore,
+    pub cw_refresh_ts: HashMap<MemoryId, i64>,
+}
+
+impl LegacyFullSnapshotV22 {
+    fn upgrade(self) -> FullSnapshot {
+        FullSnapshot {
+            snapshot_seqno:     self.snapshot_seqno,
+            payloads:           self.payloads,
+            states:             self.states,
+            assoc_edges:        self.assoc_edges,
+            artifacts:          self.artifacts,
+            artifact_paths:     self.artifact_paths,
+            time_idx:           self.time_idx,
+            keyword_idx:        self.keyword_idx,
+            artifact_idx:       self.artifact_idx,
+            triplet_store:      self.triplet_store,
+            symbol_idx:         self.symbol_idx,
+            call_graph:         self.call_graph,
+            code_files:         self.code_files,
+            semantic_idx:       self.semantic_idx,
+            coactivation_stats: self.coactivation_stats,
+            ack_scores:         self.ack_scores,
+            correction_states:  self.correction_states,
+            event_tape:         self.event_tape,
+            decision_tape:      self.decision_tape,
+            turiya_monitor:     self.turiya_monitor,
+            observer_state:     self.observer_state,
+            interaction_ledger: self.interaction_ledger,
+            predicate_store:    self.predicate_store,
+            cw_refresh_ts:      self.cw_refresh_ts,
+        }
+    }
+}
+
 /// V21 snapshot layout: identical to FullSnapshot minus `cw_refresh_ts`.
 #[derive(Serialize, Deserialize)]
 struct LegacyFullSnapshotV21 {
@@ -1085,15 +1165,87 @@ struct LegacyFullSnapshotV13 {
     pub correction_states: HashMap<u64, CorrectionState>,
 }
 
+/// Write one V23 section: [name_len u16][name][body_len u64][bincode body].
+fn write_section<W: Write, T: serde::Serialize>(w: &mut W, name: &str, value: &T) -> Result<()> {
+    let body = bincode::serialize(value)
+        .map_err(|e| FieldError::Serialization(format!("section '{name}': {e}")))?;
+    w.write_all(&(name.len() as u16).to_le_bytes())?;
+    w.write_all(name.as_bytes())?;
+    w.write_all(&(body.len() as u64).to_le_bytes())?;
+    w.write_all(&body)?;
+    Ok(())
+}
+
+/// Deserialize one V23 section body from a length-capped reader.
+fn read_section<R: Read, T: serde::de::DeserializeOwned>(r: &mut R, name: &str) -> Result<T> {
+    bincode::deserialize_from(r)
+        .map_err(|e| FieldError::Serialization(format!("section '{name}': {e}")))
+}
+
 impl FullSnapshot {
+    /// An empty snapshot at the given seqno — the starting point for the V23
+    /// sectioned loader; sections missing from the file keep these defaults.
+    fn empty(snapshot_seqno: u64) -> Self {
+        FullSnapshot {
+            snapshot_seqno,
+            payloads:           HashMap::new(),
+            states:             HashMap::new(),
+            assoc_edges:        HashMap::new(),
+            artifacts:          HashMap::new(),
+            artifact_paths:     HashMap::new(),
+            time_idx:           TemporalIndex::new(),
+            keyword_idx:        KeywordIndex::new(),
+            artifact_idx:       ArtifactIndex::new(),
+            triplet_store:      TripletStore::new(),
+            symbol_idx:         SymbolIndex::new(),
+            call_graph:         CallGraph::new(),
+            code_files:         CodeFileIndex::new(),
+            semantic_idx:       SemanticIndex::new(),
+            coactivation_stats: HashMap::new(),
+            ack_scores:         HashMap::new(),
+            correction_states:  HashMap::new(),
+            event_tape:         EventTape::new(),
+            decision_tape:      DecisionTape::new(),
+            turiya_monitor:     TuriyaMonitor::new(),
+            observer_state:     ObserverState::default(),
+            interaction_ledger: InteractionLedger::default(),
+            predicate_store:    PredicateStore::default(),
+            cw_refresh_ts:      HashMap::new(),
+        }
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         let tmp = path.with_extension("snapshot.tmp");
         {
             let f = std::fs::File::create(&tmp)?;
             let mut w = BufWriter::new(f);
+            // V23 sectioned container: magic, seqno (fixed offset for
+            // peek_seqno), then one section per field.
             w.write_all(&FULL_SNAPSHOT_MAGIC.to_le_bytes())?;
-            bincode::serialize_into(&mut w, self)
-                .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            w.write_all(&self.snapshot_seqno.to_le_bytes())?;
+            write_section(&mut w, "payloads",           &self.payloads)?;
+            write_section(&mut w, "states",             &self.states)?;
+            write_section(&mut w, "assoc_edges",        &self.assoc_edges)?;
+            write_section(&mut w, "artifacts",          &self.artifacts)?;
+            write_section(&mut w, "artifact_paths",     &self.artifact_paths)?;
+            write_section(&mut w, "time_idx",           &self.time_idx)?;
+            write_section(&mut w, "keyword_idx",        &self.keyword_idx)?;
+            write_section(&mut w, "artifact_idx",       &self.artifact_idx)?;
+            write_section(&mut w, "triplet_store",      &self.triplet_store)?;
+            write_section(&mut w, "symbol_idx",         &self.symbol_idx)?;
+            write_section(&mut w, "call_graph",         &self.call_graph)?;
+            write_section(&mut w, "code_files",         &self.code_files)?;
+            write_section(&mut w, "semantic_idx",       &self.semantic_idx)?;
+            write_section(&mut w, "coactivation_stats", &self.coactivation_stats)?;
+            write_section(&mut w, "ack_scores",         &self.ack_scores)?;
+            write_section(&mut w, "correction_states",  &self.correction_states)?;
+            write_section(&mut w, "event_tape",         &self.event_tape)?;
+            write_section(&mut w, "decision_tape",      &self.decision_tape)?;
+            write_section(&mut w, "turiya_monitor",     &self.turiya_monitor)?;
+            write_section(&mut w, "observer_state",     &self.observer_state)?;
+            write_section(&mut w, "interaction_ledger", &self.interaction_ledger)?;
+            write_section(&mut w, "predicate_store",    &self.predicate_store)?;
+            write_section(&mut w, "cw_refresh_ts",      &self.cw_refresh_ts)?;
             w.flush()?;
             // fsync data+magic to disk before the rename commits the file, so a crash
             // can't leave a renamed-but-truncated snapshot whose magic still reads valid.
@@ -1179,6 +1331,7 @@ impl FullSnapshot {
             && magic != FULL_SNAPSHOT_MAGIC_V19
             && magic != FULL_SNAPSHOT_MAGIC_V20
             && magic != FULL_SNAPSHOT_MAGIC_V21
+            && magic != FULL_SNAPSHOT_MAGIC_V22
         {
             return Err(FieldError::Manifest("invalid full snapshot magic".to_string()));
         }
@@ -1210,9 +1363,74 @@ impl FullSnapshot {
         let magic = u64::from_le_bytes(magic_buf);
 
         if magic == FULL_SNAPSHOT_MAGIC {
-            // V22: current format with cw_refresh_ts.
-            let mut snap: Self = bincode::deserialize_from(&mut r)
+            // V23: sectioned container. Unknown sections are skipped (a newer
+            // writer's file still loads), missing sections keep defaults (an
+            // older file from a leaner writer still loads).
+            let mut seq_buf = [0u8; 8];
+            r.read_exact(&mut seq_buf)
+                .map_err(|_| FieldError::Manifest("v23 snapshot too short".to_string()))?;
+            let mut snap = FullSnapshot::empty(u64::from_le_bytes(seq_buf));
+            loop {
+                let mut nlen_buf = [0u8; 2];
+                match r.read_exact(&mut nlen_buf) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(FieldError::Io(e)),
+                }
+                let nlen = u16::from_le_bytes(nlen_buf) as usize;
+                let mut name_buf = vec![0u8; nlen];
+                r.read_exact(&mut name_buf)?;
+                let name = String::from_utf8_lossy(&name_buf).into_owned();
+                let mut blen_buf = [0u8; 8];
+                r.read_exact(&mut blen_buf)?;
+                let blen = u64::from_le_bytes(blen_buf);
+                let mut body = Read::take(&mut r, blen);
+                let n = name.as_str();
+                match n {
+                    "payloads"           => snap.payloads           = read_section(&mut body, n)?,
+                    "states"             => snap.states             = read_section(&mut body, n)?,
+                    "assoc_edges"        => snap.assoc_edges        = read_section(&mut body, n)?,
+                    "artifacts"          => snap.artifacts          = read_section(&mut body, n)?,
+                    "artifact_paths"     => snap.artifact_paths     = read_section(&mut body, n)?,
+                    "time_idx"           => snap.time_idx           = read_section(&mut body, n)?,
+                    "keyword_idx"        => snap.keyword_idx        = read_section(&mut body, n)?,
+                    "artifact_idx"       => snap.artifact_idx       = read_section(&mut body, n)?,
+                    "triplet_store"      => snap.triplet_store      = read_section(&mut body, n)?,
+                    "symbol_idx"         => snap.symbol_idx         = read_section(&mut body, n)?,
+                    "call_graph"         => snap.call_graph         = read_section(&mut body, n)?,
+                    "code_files"         => snap.code_files         = read_section(&mut body, n)?,
+                    "semantic_idx"       => snap.semantic_idx       = read_section(&mut body, n)?,
+                    "coactivation_stats" => snap.coactivation_stats = read_section(&mut body, n)?,
+                    "ack_scores"         => snap.ack_scores         = read_section(&mut body, n)?,
+                    "correction_states"  => snap.correction_states  = read_section(&mut body, n)?,
+                    "event_tape"         => snap.event_tape         = read_section(&mut body, n)?,
+                    "decision_tape"      => snap.decision_tape      = read_section(&mut body, n)?,
+                    "turiya_monitor"     => snap.turiya_monitor     = read_section(&mut body, n)?,
+                    "observer_state"     => snap.observer_state     = read_section(&mut body, n)?,
+                    "interaction_ledger" => snap.interaction_ledger = read_section(&mut body, n)?,
+                    "predicate_store"    => snap.predicate_store    = read_section(&mut body, n)?,
+                    "cw_refresh_ts"      => snap.cw_refresh_ts      = read_section(&mut body, n)?,
+                    _ => {
+                        eprintln!(
+                            "[chitta-field] skipping unknown snapshot section '{}' ({} bytes)",
+                            name, blen
+                        );
+                    }
+                }
+                // Drain whatever the deserializer left so the next section
+                // header is read from the right offset.
+                std::io::copy(&mut body, &mut std::io::sink()).map_err(FieldError::Io)?;
+            }
+            for state in snap.states.values_mut() { state.sanitize(); }
+            return Ok(snap);
+        }
+
+        if magic == FULL_SNAPSHOT_MAGIC_V22 {
+            // V22: last monolithic-bincode format (frozen layout).
+            eprintln!("[chitta-field] migrating v22 snapshot → v23 (sectioned container)");
+            let leg: LegacyFullSnapshotV22 = bincode::deserialize_from(&mut r)
                 .map_err(|e| FieldError::Serialization(e.to_string()))?;
+            let mut snap = leg.upgrade();
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
         }
@@ -1888,6 +2106,103 @@ mod tests {
             last_state_op_ts_ms: 2_000_001,
             retrieval_history: RetrievalHistory::default(),
         }
+    }
+
+    fn scratch_path(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "chitta-snap-test-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn v23_roundtrip_empty_snapshot() {
+        let path = scratch_path("v23-roundtrip");
+        let snap = FullSnapshot::empty(42);
+        snap.save(&path).unwrap();
+        assert_eq!(FullSnapshot::peek_seqno(&path).unwrap(), 42);
+        let loaded = FullSnapshot::load(&path).unwrap();
+        assert_eq!(loaded.snapshot_seqno, 42);
+        assert!(loaded.states.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v23_unknown_section_is_skipped() {
+        let path = scratch_path("v23-unknown");
+        // Hand-build: magic, seqno, one unknown section, then a real one.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&FULL_SNAPSHOT_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&7u64.to_le_bytes());
+        let name = b"future_organ";
+        bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(name);
+        let body = vec![0xAB; 33];
+        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        let mut ack: HashMap<MemoryId, i32> = HashMap::new();
+        ack.insert(9, 3);
+        let ack_body = bincode::serialize(&ack).unwrap();
+        let ack_name = b"ack_scores";
+        bytes.extend_from_slice(&(ack_name.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(ack_name);
+        bytes.extend_from_slice(&(ack_body.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&ack_body);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let loaded = FullSnapshot::load(&path).unwrap();
+        assert_eq!(loaded.snapshot_seqno, 7);
+        assert_eq!(loaded.ack_scores.get(&9), Some(&3));
+        // Missing sections defaulted.
+        assert!(loaded.states.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v22_bincode_snapshot_migrates_to_v23() {
+        let path = scratch_path("v22-migrate");
+        let mut snap = FullSnapshot::empty(11);
+        snap.cw_refresh_ts.insert(5, 999);
+        // Serialize in the frozen V22 monolithic-bincode layout.
+        let leg = LegacyFullSnapshotV22 {
+            snapshot_seqno:     snap.snapshot_seqno,
+            payloads:           snap.payloads,
+            states:             snap.states,
+            assoc_edges:        snap.assoc_edges,
+            artifacts:          snap.artifacts,
+            artifact_paths:     snap.artifact_paths,
+            time_idx:           snap.time_idx,
+            keyword_idx:        snap.keyword_idx,
+            artifact_idx:       snap.artifact_idx,
+            triplet_store:      snap.triplet_store,
+            symbol_idx:         snap.symbol_idx,
+            call_graph:         snap.call_graph,
+            code_files:         snap.code_files,
+            semantic_idx:       snap.semantic_idx,
+            coactivation_stats: snap.coactivation_stats,
+            ack_scores:         snap.ack_scores,
+            correction_states:  snap.correction_states,
+            event_tape:         snap.event_tape,
+            decision_tape:      snap.decision_tape,
+            turiya_monitor:     snap.turiya_monitor,
+            observer_state:     snap.observer_state,
+            interaction_ledger: snap.interaction_ledger,
+            predicate_store:    snap.predicate_store,
+            cw_refresh_ts:      snap.cw_refresh_ts,
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&FULL_SNAPSHOT_MAGIC_V22.to_le_bytes());
+        bytes.extend_from_slice(&bincode::serialize(&leg).unwrap());
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(FullSnapshot::peek_seqno(&path).unwrap(), 11);
+        let loaded = FullSnapshot::load(&path).unwrap();
+        assert_eq!(loaded.snapshot_seqno, 11);
+        assert_eq!(loaded.cw_refresh_ts.get(&5), Some(&999));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
