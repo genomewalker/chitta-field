@@ -6395,6 +6395,135 @@ mod tests {
         assert_eq!(payload.chunk_hash, hash);
     }
 
+    // ── Replay confluence (THEORY.md §2) ────────────────────────────────────
+    // Multi-node daemons write instance-partitioned WALs; replay applies all
+    // segments in instance-id sort order, not causal order. These tests pin
+    // down the convergence envelope and the two known loss modes so neither
+    // can drift silently.
+
+    fn theory_put_op(memory_id: u64, ts: i64, content: &str) -> crate::ops::Op {
+        let mut emb = vec![0.1f32; crate::ops::EMBED_DIM];
+        emb[0] = (memory_id as f32) / 100.0;
+        crate::ops::Op::PutPayload(crate::ops::PutPayloadOp {
+            memory_id,
+            version: 0,
+            chunk_hash: [memory_id as u8; 32],
+            created_at_ms: ts,
+            authored_at_ms: ts,
+            kind: "wisdom".to_string(),
+            realm: "test".to_string(),
+            content: content.as_bytes().to_vec(),
+            embedding_model: "test".to_string(),
+            embedding: emb,
+            artifact_refs: vec![],
+            source_session: None,
+            source_tool: None,
+            harness: None,
+            embedding_model_id: String::new(),
+            embedding_dim: crate::ops::EMBED_DIM as u32,
+        })
+    }
+
+    fn theory_delta_op(memory_id: u64, strength_delta: f32, ts: i64) -> crate::ops::Op {
+        crate::ops::Op::UpdateState(crate::ops::StateDeltaOp {
+            memory_id,
+            strength_delta: Some(strength_delta),
+            confidence_delta: None,
+            decay_rate: None,
+            touch: true,
+            pin: None,
+            op_ts_ms: ts,
+            status: None,
+            epistemic_status: None,
+            staged: None,
+            invalidated_by: None,
+        })
+    }
+
+    fn write_instance_segment(data_dir: &std::path::Path, instance: u32, ops: &[crate::ops::Op]) {
+        let mut log = crate::log::OpLog::open(data_dir, instance, 1).unwrap();
+        for op in ops {
+            log.append(op).unwrap();
+        }
+        log.flush_buf().unwrap();
+    }
+
+    fn state_fingerprint(field: &ChittaField, id: u64) -> (f32, u32) {
+        let states = field.states.read();
+        let st = states.get(&id).expect("memory state must exist after replay");
+        (st.strength, st.access_count)
+    }
+
+    /// The safe envelope: per-memory single-writer op sets converge no matter
+    /// which instance id (= segment sort position) each writer was assigned.
+    #[test]
+    fn replay_confluent_for_disjoint_memories() {
+        let set_a = vec![theory_put_op(11, 1_000, "alpha"), theory_delta_op(11, -0.2, 2_000)];
+        let set_b = vec![theory_put_op(22, 1_500, "beta"), theory_delta_op(22, -0.4, 2_500)];
+
+        let mut results = Vec::new();
+        for (inst_a, inst_b) in [(0x1000_0001u32, 0x2000_0002u32), (0x2000_0002, 0x1000_0001)] {
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path().join("data");
+            std::fs::create_dir_all(&data_dir).unwrap();
+            write_instance_segment(&data_dir, inst_a, &set_a);
+            write_instance_segment(&data_dir, inst_b, &set_b);
+            let field = ChittaField::open(data_dir).unwrap();
+            results.push((state_fingerprint(&field, 11), state_fingerprint(&field, 22)));
+        }
+        assert_eq!(
+            results[0], results[1],
+            "disjoint-memory replay must be insensitive to instance assignment"
+        );
+    }
+
+    /// Characterization of the loss mode in THEORY.md §2.2: apply_delta's
+    /// monotonicity guard (state.rs) wholly discards an op whose op_ts_ms is
+    /// older than one already applied — additive fields included. Segment
+    /// sort order can invert timestamp order across instances, so the ts=2000
+    /// delta below vanishes. Confluent merge replay would yield strength
+    /// 1.0 - 0.2 - 0.4 = 0.4 and access_count 2. When §3's merge replay
+    /// lands, flip these assertions.
+    #[test]
+    fn replay_discards_stale_delta_when_segment_order_inverts_timestamps() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        write_instance_segment(&data_dir, 0x1000_0001, &[theory_put_op(33, 1_000, "gamma")]);
+        write_instance_segment(&data_dir, 0x2000_0002, &[theory_delta_op(33, -0.2, 3_000)]);
+        write_instance_segment(&data_dir, 0x3000_0003, &[theory_delta_op(33, -0.4, 2_000)]);
+
+        let field = ChittaField::open(data_dir).unwrap();
+        let (strength, access_count) = state_fingerprint(&field, 33);
+        assert!(
+            (strength - 0.8).abs() < 1e-6,
+            "documented loss: stale-by-ts delta is wholly discarded (got strength {strength})"
+        );
+        assert_eq!(access_count, 1, "the discarded delta's touch is lost too");
+    }
+
+    /// Characterization of the causality gap in THEORY.md §2.3: an UpdateState
+    /// replayed before its memory's PutPayload (possible whenever the updating
+    /// instance sorts before the creating one) is silently dropped. Confluent
+    /// replay (or an orphan-delta buffer) would yield strength 0.6 and
+    /// access_count 1. When §3 lands, flip these assertions.
+    #[test]
+    fn replay_drops_cross_instance_delta_before_create() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        write_instance_segment(&data_dir, 0x1000_0001, &[theory_delta_op(44, -0.4, 2_000)]);
+        write_instance_segment(&data_dir, 0x2000_0002, &[theory_put_op(44, 1_000, "delta")]);
+
+        let field = ChittaField::open(data_dir).unwrap();
+        let (strength, access_count) = state_fingerprint(&field, 44);
+        assert!(
+            (strength - 1.0).abs() < 1e-6,
+            "documented loss: delta before create is dropped (got strength {strength})"
+        );
+        assert_eq!(access_count, 0);
+    }
+
     #[test]
     fn test_manifest_commits_snapshot_family() {
         let tmp = TempDir::new().unwrap();
