@@ -5536,6 +5536,50 @@ impl ChittaField {
             eprintln!("[size] artifact_idx:      {}", sz(bincode::serialized_size(&snap.artifact_idx).unwrap_or(0)));
         }
         snap.save(&path)?;
+        // Commit record: the manifest ties the snapshot + sidecars into one
+        // committed family (open() prefers a validated family over fence-based
+        // selection). Written LAST — a crash anywhere above leaves the previous
+        // generation's manifest pointing at the previous intact family.
+        {
+            use crate::manifest::{CheckpointSet, FileRef, Manifest};
+            let file_ref = |p: &std::path::Path| -> Option<FileRef> {
+                let name = p.file_name()?.to_string_lossy().into_owned();
+                let size_bytes = std::fs::metadata(p).ok()?.len();
+                Some(FileRef { name, size_bytes })
+            };
+            if let Some(snapshot_ref) = file_ref(&path) {
+                let mut manifest = Manifest::load(&self.data_dir)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| {
+                        Manifest::new_empty(
+                            crate::ops::EMBED_MODEL_ID,
+                            crate::ops::EMBED_DIM as u16,
+                        )
+                    });
+                manifest.generation += 1;
+                manifest.last_seqno = seqno;
+                // Only files that actually exist are recorded (e.g. the .sup
+                // sidecar save is best-effort) — validation checks what the
+                // commit promised, nothing more.
+                manifest.checkpoints = Some(CheckpointSet {
+                    snapshot: snapshot_ref,
+                    sidecars: [
+                        &emb_path, &hdc_path, &bin_path, &mu_path, &hnsw_path,
+                        &delta_path, &realm_hnsw_path, &pld_path, &sup_path, &shdr_path,
+                    ]
+                    .iter()
+                    .filter_map(|p| file_ref(p))
+                    .collect(),
+                    snapshot_seqno: seqno,
+                });
+                if let Err(e) = manifest.save(&self.data_dir) {
+                    eprintln!(
+                        "[chitta-field] WARNING: manifest commit failed (snapshot itself is durable): {e}"
+                    );
+                }
+            }
+        }
         // Prune old families ONLY after the new snapshot + .pld are durably written
         // (save() fsyncs the file and parent dir; save_payload_sidecar fsyncs the .pld).
         // Pruning before durability would delete the fallback the new snapshot replaces.
@@ -6349,6 +6393,41 @@ mod tests {
         assert_eq!(payload.content, b"hello world");
         assert_eq!(payload.kind, "wisdom");
         assert_eq!(payload.chunk_hash, hash);
+    }
+
+    #[test]
+    fn test_manifest_commits_snapshot_family() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let emb = vec![0.2f32; crate::ops::EMBED_DIM];
+
+        {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            field
+                .put_memory("wisdom", "test", b"manifest commit", &emb, 0.9, 0.001, 0, vec![], None, None)
+                .unwrap();
+            // Bypass the compact_wal 100-memory guard: save directly.
+            field.save_full_snapshot().unwrap();
+        }
+
+        let manifest = crate::manifest::Manifest::load(&data_dir).unwrap().unwrap();
+        assert!(manifest.generation >= 1);
+        let committed = manifest
+            .validated_snapshot_path(&data_dir)
+            .expect("freshly committed family must validate");
+        assert!(committed.exists());
+
+        // Tamper with a recorded sidecar: validation must fail and open must
+        // still succeed via fence-based fallback.
+        let cp = manifest.checkpoints.as_ref().unwrap();
+        let side = data_dir.join(&cp.sidecars[0].name);
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&side).unwrap();
+            f.set_len(cp.sidecars[0].size_bytes + 7).unwrap();
+        }
+        assert!(manifest.validated_snapshot_path(&data_dir).is_none());
+        let field = ChittaField::open(data_dir).unwrap();
+        assert_eq!(field.memory_count(), 1);
     }
 
     #[test]

@@ -126,6 +126,29 @@ pub(crate) struct PendingRecallEffects {
     pub proto_windows: Vec<Vec<MemoryId>>,
 }
 
+// ── Lock-acquisition order ────────────────────────────────────────────────────
+// parking_lot RwLocks are writer-preferring and NOT reentrant: a queued writer
+// blocks all later readers, so acquisition order across fields is what stands
+// between us and both deadlocks and convoys (one already required SIGKILL —
+// see commit a20070a). When holding more than one lock, acquire in ascending
+// tier order and release before acquiring anything from a lower tier:
+//
+//   Tier 0  log, id_alloc                      (append/allocate primitives)
+//   Tier 1  payloads, states, assoc_edges      (core memory data)
+//   Tier 2  semantic_idx, time_idx, keyword_idx, artifact_idx, hdc_idx,
+//           cortical maps, realm_members       (derived indexes)
+//   Tier 3  triplet_store, symbol_idx, call_graph, code_files (knowledge graph)
+//   Tier 4  scoring_pipeline, learners, ack_scores, coactivation_stats,
+//           cw_refresh_inflight                (scoring / stats)
+//   Tier 5  organs: event_tape, decision_tape, turiya_monitor, observer_state,
+//           interaction_ledger, predicate_store, ...  (append-mostly organs)
+//
+// Prefer the two-phase pattern (collect under reads → drop → apply under one
+// brief write; see recall_semantic_ctx's CW refresh) over holding write locks
+// across computation. Long-lived multi-lock holds on the recall path are bugs.
+// Enforcement: build with `--features deadlock-detection` (CI does) to get a
+// checker thread that dumps lock cycles; there is no static ordering check, so
+// keep new multi-lock sites tier-ordered.
 pub struct ChittaField {
     #[allow(dead_code)]
     pub(crate) data_dir: PathBuf,
@@ -255,6 +278,25 @@ impl ChittaField {
     }
 
     pub fn open(data_dir: PathBuf) -> Result<Self> {
+        #[cfg(feature = "deadlock-detection")]
+        {
+            static CHECKER: std::sync::Once = std::sync::Once::new();
+            CHECKER.call_once(|| {
+                std::thread::spawn(|| loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let deadlocks = parking_lot::deadlock::check_deadlock();
+                    if deadlocks.is_empty() { continue; }
+                    eprintln!("[chitta-field] {} DEADLOCK(S) DETECTED", deadlocks.len());
+                    for (i, threads) in deadlocks.iter().enumerate() {
+                        eprintln!("deadlock #{i}");
+                        for t in threads {
+                            eprintln!("thread {:?}\n{:?}", t.thread_id(), t.backtrace());
+                        }
+                    }
+                    std::process::abort();
+                });
+            });
+        }
         std::fs::create_dir_all(&data_dir)?;
         std::fs::create_dir_all(data_dir.join("segments"))?;
 
@@ -413,6 +455,27 @@ impl ChittaField {
         stale_with_seqno.sort_by(|a, b| b.0.cmp(&a.0));
         for (_, p) in stale_with_seqno {
             candidates.push(p);
+        }
+        // Manifest-committed family takes precedence: a validated commit record
+        // beats heuristic seqno-peek selection. Stores without a manifest (or
+        // with a stale/invalid one) fall back to the fence stack below.
+        if let Ok(Some(manifest)) = crate::manifest::Manifest::load(&data_dir) {
+            match manifest.validated_snapshot_path(&data_dir) {
+                Some(committed) => {
+                    candidates.retain(|p| p != &committed);
+                    candidates.insert(0, committed);
+                    eprintln!(
+                        "[chitta-field] manifest generation {}: committed snapshot family preferred",
+                        manifest.generation
+                    );
+                }
+                None if manifest.checkpoints.is_some() => {
+                    eprintln!(
+                        "[chitta-field] manifest family failed validation — using fence-based selection"
+                    );
+                }
+                None => {}
+            }
         }
         let mut loaded_header: Option<crate::snapshot::StoreHeader> = None;
         // CHITTA_MIGRATE_REEMBED=1: one-shot embedding-space migration. Bypasses the dim/vsid

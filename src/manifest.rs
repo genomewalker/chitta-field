@@ -15,34 +15,24 @@ pub struct SegmentInfo {
     pub size_bytes: u64,
 }
 
+/// One file of a committed snapshot family, identified by name (relative to
+/// data_dir) and expected size. Size mismatch ⇒ the family is not trusted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckpointRef {
-    pub path: String,
-    pub max_seqno: u64,
-    pub sha256: [u8; 32],
+pub struct FileRef {
+    pub name: String,
+    pub size_bytes: u64,
 }
 
+/// A committed snapshot family: the `.snapshot` plus every sidecar that
+/// existed when the manifest was written. The manifest write is the single
+/// commit point — a crash anywhere during the multi-file save leaves the
+/// previous generation's manifest intact and the half-written family
+/// unreferenced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointSet {
-    pub payload: Option<CheckpointRef>,
-    pub state: Option<CheckpointRef>,
-    pub time_idx: Option<CheckpointRef>,
-    pub artifact_idx: Option<CheckpointRef>,
-    pub assoc: Option<CheckpointRef>,
-    pub hnsw: Option<CheckpointRef>,
-}
-
-impl CheckpointSet {
-    fn empty() -> Self {
-        Self {
-            payload: None,
-            state: None,
-            time_idx: None,
-            artifact_idx: None,
-            assoc: None,
-            hnsw: None,
-        }
-    }
+    pub snapshot: FileRef,
+    pub sidecars: Vec<FileRef>,
+    pub snapshot_seqno: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +50,7 @@ pub struct Manifest {
     pub clean_shutdown: bool,
 
     pub segments: Vec<SegmentInfo>,
-    pub checkpoints: CheckpointSet,
+    pub checkpoints: Option<CheckpointSet>,
 }
 
 impl Manifest {
@@ -77,8 +67,38 @@ impl Manifest {
             last_seqno: 0,
             clean_shutdown: false,
             segments: Vec::new(),
-            checkpoints: CheckpointSet::empty(),
+            checkpoints: None,
         }
+    }
+
+    /// Validate the committed family against the filesystem: the snapshot and
+    /// every recorded sidecar must exist with the recorded size. Returns the
+    /// snapshot path on success; None means the caller should fall back to
+    /// fence-based selection.
+    pub fn validated_snapshot_path(&self, data_dir: &Path) -> Option<PathBuf> {
+        let cp = self.checkpoints.as_ref()?;
+        let ok = |fr: &FileRef| -> bool {
+            fs::metadata(data_dir.join(&fr.name))
+                .map(|m| m.len() == fr.size_bytes)
+                .unwrap_or(false)
+        };
+        if !ok(&cp.snapshot) {
+            eprintln!(
+                "[chitta-field] manifest snapshot {} missing or size-mismatched",
+                cp.snapshot.name
+            );
+            return None;
+        }
+        for fr in &cp.sidecars {
+            if !ok(fr) {
+                eprintln!(
+                    "[chitta-field] manifest sidecar {} missing or size-mismatched",
+                    fr.name
+                );
+                return None;
+            }
+        }
+        Some(data_dir.join(&cp.snapshot.name))
     }
 
     /// Load from data_dir — tries both slots, picks the one with the highest valid generation.
