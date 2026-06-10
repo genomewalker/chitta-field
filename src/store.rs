@@ -5576,11 +5576,24 @@ impl ChittaField {
             }
         }
         // Save HDC sidecar — avoids tokenize+encode rebuild on next startup.
+        // Dirty-skipped when the store hasn't mutated since the last write
+        // (the sidecar is a lossy cache; a same-content file stays valid).
         {
-            let n = self.hdc_idx.read().save_sidecar(&hdc_path)
-                .map(|n| n.to_string())
-                .unwrap_or_else(|e| format!("err:{e}"));
-            eprintln!("[chitta-field] hdc sidecar: {} memories written to {:?}", n, hdc_path);
+            let hdc = self.hdc_idx.read();
+            let count = hdc.mutation_count();
+            let last = self
+                .hdc_sidecar_saved_at
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if last == count && hdc_path.exists() {
+                eprintln!("[chitta-field] hdc sidecar unchanged since last save — skipping rewrite");
+            } else {
+                let n = hdc.save_sidecar(&hdc_path)
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|e| format!("err:{e}"));
+                self.hdc_sidecar_saved_at
+                    .store(count, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[chitta-field] hdc sidecar: {} memories written to {:?}", n, hdc_path);
+            }
         }
         // Save payload content sidecar (.pld) before clearing from bincode. If this
         // fails we MUST NOT strip content from the bincode body — otherwise the content
@@ -6808,19 +6821,31 @@ mod tests {
             .put_memory("wisdom", "test", b"dirty one", &emb, 0.9, 0.001, 0, vec![], None, None)
             .unwrap();
         field.save_full_snapshot().unwrap();
-        let emb_path = std::fs::read_dir(&data_dir)
-            .unwrap()
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| p.extension().map(|e| e == "emb").unwrap_or(false))
-            .expect(".emb sidecar");
+        let sidecar = |ext: &str| {
+            std::fs::read_dir(&data_dir)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .find(|p| p.extension().map(|e| e == ext).unwrap_or(false))
+                .unwrap_or_else(|| panic!(".{ext} sidecar"))
+        };
+        let emb_path = sidecar("emb");
+        let hdc_path = sidecar("hdc");
         let ino_first = std::fs::metadata(&emb_path).unwrap().ino();
+        let hdc_ino_first = std::fs::metadata(&hdc_path).unwrap().ino();
+        let emb_len_first = std::fs::metadata(&emb_path).unwrap().len();
+        let hdc_len_first = std::fs::metadata(&hdc_path).unwrap().len();
 
-        // No index mutation between saves → same inode (skipped rewrite).
+        // No mutation between saves → same inodes (skipped rewrites).
         field.save_full_snapshot().unwrap();
         assert_eq!(
             std::fs::metadata(&emb_path).unwrap().ino(),
             ino_first,
             "clean index must not rewrite sidecars"
+        );
+        assert_eq!(
+            std::fs::metadata(&hdc_path).unwrap().ino(),
+            hdc_ino_first,
+            "clean hdc store must not rewrite its sidecar"
         );
 
         // A new memory mutates the index → rewrite (fresh inode via rename).
@@ -6833,10 +6858,15 @@ mod tests {
             .put_memory("wisdom", "test", b"dirty two", &emb2, 0.9, 0.001, 0, vec![], None, None)
             .unwrap();
         field.save_full_snapshot().unwrap();
-        assert_ne!(
-            std::fs::metadata(&emb_path).unwrap().ino(),
-            ino_first,
+        // Size, not inode: tmpfs reuses freed inode numbers, so a rename can
+        // land on the same ino. Two embeddings serialize larger than one.
+        assert!(
+            std::fs::metadata(&emb_path).unwrap().len() > emb_len_first,
             "mutated index must rewrite sidecars"
+        );
+        assert!(
+            std::fs::metadata(&hdc_path).unwrap().len() > hdc_len_first,
+            "mutated hdc store must rewrite its sidecar"
         );
     }
 

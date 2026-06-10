@@ -259,6 +259,8 @@ pub struct ChittaField {
     /// Dirty-skip: unchanged index ⇒ the .emb/.bin/.mu/.hnsw/.delta.hnsw/
     /// .realm_hnsw files from the previous save are still current.
     pub(crate) idx_sidecars_saved_at: std::sync::atomic::AtomicU64,
+    /// HdcStore mutation count at the last .hdc sidecar write (same scheme).
+    pub(crate) hdc_sidecar_saved_at: std::sync::atomic::AtomicU64,
 }
 
 impl Drop for ChittaField {
@@ -1180,6 +1182,7 @@ impl ChittaField {
             cw_refresh_inflight: parking_lot::RwLock::new(std::collections::HashMap::new()),
             wal_coverage: parking_lot::RwLock::new(wal_coverage),
             idx_sidecars_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
+            hdc_sidecar_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
         })
     }
 }

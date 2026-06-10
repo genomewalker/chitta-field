@@ -217,6 +217,9 @@ pub struct HdcStore {
     /// token → seeded HdcVec from open-weight geometry harvest
     /// Checked before hash-derived word_hv() — grounded vectors take precedence.
     seeded_codebook: HashMap<String, HdcVec>,
+    /// Monotone mutation counter (runtime-only) for sidecar dirty-skip at
+    /// save (same pattern as SemanticIndex::mutations).
+    mutations: u64,
 }
 
 impl HdcStore {
@@ -224,9 +227,15 @@ impl HdcStore {
         Self::default()
     }
 
+    /// Monotone mutation counter for sidecar dirty-skip at save.
+    pub fn mutation_count(&self) -> u64 {
+        self.mutations
+    }
+
     /// Bulk-load from (id, content, realm) tuples. Used at startup to rebuild
     /// from persisted payloads without snapshot serialisation of large arrays.
     pub fn rebuild<'a>(&mut self, entries: impl Iterator<Item = (MemoryId, &'a str, &'a str)>) {
+        self.mutations += 1;
         self.memories.clear();
         self.realm_bundles.clear();
         self.realm_members.clear();
@@ -258,6 +267,7 @@ impl HdcStore {
 
     /// Encode `text` and register it under `id` in `realm`.
     pub fn insert(&mut self, id: MemoryId, text: &str, realm: &str) {
+        self.mutations += 1;
         let hv = self.encode_with_codebook(text);
         self.realm_bundles
             .entry(realm.to_string())
@@ -272,6 +282,7 @@ impl HdcStore {
 
     /// Remove a memory from the index and update the realm bundle.
     pub fn remove(&mut self, id: MemoryId, realm: &str) {
+        self.mutations += 1;
         if let Some(hv) = self.memories.remove(&id) {
             if let Some(rb) = self.realm_bundles.get_mut(realm) {
                 rb.remove(&hv);
@@ -348,6 +359,7 @@ impl HdcStore {
     /// XOR-rotation mixing. This preserves cosine similarity order in Hamming
     /// space to a first approximation. Returns the number of tokens seeded.
     pub fn seed_from_geometry(&mut self, json_path: &str) -> std::io::Result<usize> {
+        self.mutations += 1;
         let bytes = std::fs::read(json_path)?;
         let val: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
