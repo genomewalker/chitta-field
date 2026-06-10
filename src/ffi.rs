@@ -602,7 +602,9 @@ pub extern "C" fn cf_expand_associations(
 }
 
 /// Get payload content for a memory. Writes UTF-8 content into buf (null-terminated).
-/// Returns 0 on success, -1 if not found/deleted, -2 if buf too small.
+/// Returns 0 on success, -1 if not found/deleted, -2 if buf too small — in that
+/// case *written is set to the required content length (excluding the NUL) so the
+/// caller can retry with a buffer of at least written+1 bytes.
 #[no_mangle]
 pub extern "C" fn cf_get_content(
     h: *mut CfHandle,
@@ -621,6 +623,7 @@ pub extern "C" fn cf_get_content(
             let content = &payload.content;
             // Require room for the trailing NUL the contract promises.
             if content.len() >= buf_cap {
+                unsafe { *written = content.len(); }
                 return -2;
             }
             unsafe {
@@ -5593,6 +5596,49 @@ mod tests {
             0 => Ok(Some(String::from_utf8(buf[..written].to_vec()).unwrap())),
             1 => Ok(None),
             other => Err(other),
+        }
+    }
+
+    #[test]
+    fn test_ffi_get_content_too_small_reports_required_size() {
+        unsafe {
+            let (h, _tmp) = open_tmp();
+            let kind = CString::new("wisdom").unwrap();
+            let realm = CString::new("test").unwrap();
+            let content = vec![b'x'; 100];
+            let embedding = vec![0.1f32; crate::ops::EMBED_DIM];
+            let mut id: u64 = 0;
+            let r = cf_put_memory(
+                h,
+                kind.as_ptr(),
+                realm.as_ptr(),
+                content.as_ptr(),
+                content.len(),
+                embedding.as_ptr(),
+                embedding.len(),
+                0.9,
+                0.001,
+                0,
+                &mut id,
+            );
+            assert_eq!(r, 0);
+
+            // Exact-fit buffer (no room for the NUL) → -2, *written = required size.
+            let mut buf = vec![0u8; 100];
+            let mut written = 0usize;
+            let r = cf_get_content(h, id, buf.as_mut_ptr(), buf.len(), &mut written);
+            assert_eq!(r, -2);
+            assert_eq!(written, 100);
+
+            // Retry with written+1 succeeds and NUL-terminates.
+            let mut buf = vec![0u8; written + 1];
+            let r = cf_get_content(h, id, buf.as_mut_ptr(), buf.len(), &mut written);
+            assert_eq!(r, 0);
+            assert_eq!(written, 100);
+            assert_eq!(&buf[..100], &content[..]);
+            assert_eq!(buf[100], 0);
+
+            cf_close(h);
         }
     }
 

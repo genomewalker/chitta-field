@@ -83,6 +83,10 @@ pub struct ScoringConfig {
     /// Cosine similarity upper bound (above = exact duplicate, handled by chunk hash).
     pub dedup_cosine_upper: f32,
 
+    // ── Competitive-weight refresh ──────────────────────────────────────
+    /// Minimum interval (ms) between competitive_weight refreshes per memory.
+    pub cw_refresh_interval_ms: i64,
+
     // ── Association spreading ───────────────────────────────────────────
     /// Per-hop decay factor for spreading activation.
     pub assoc_hop_decay: f32,
@@ -181,6 +185,9 @@ impl Default for ScoringConfig {
             // Dedup
             dedup_cosine_threshold: 0.88,
             dedup_cosine_upper: 0.9999,
+
+            // Competitive-weight refresh
+            cw_refresh_interval_ms: 60_000,
 
             // Association
             assoc_hop_decay: 0.55,

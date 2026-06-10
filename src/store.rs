@@ -1232,11 +1232,16 @@ impl ChittaField {
         // Refresh competitive_weight for each candidate using the *current* HNSW neighborhood.
         // The write-time value is stale for memories ingested when the store was sparse.
         // Two-phase to avoid holding states.write() during HNSW searches.
-        let dedup_upper = self.scoring_pipeline.read().config.dedup_cosine_upper;
-        const CW_REFRESH_INTERVAL_MS: i64 = 60_000;
-        // Phase A — find candidates that need refresh, clone embeddings, reserve them.
-        // Uses states.read() (non-blocking) to check last_cw_refresh_ms, then drops
-        // all locks before the expensive HNSW searches.
+        let (dedup_upper, cw_refresh_interval_ms) = {
+            let pipeline = self.scoring_pipeline.read();
+            (
+                pipeline.config.dedup_cosine_upper,
+                pipeline.config.cw_refresh_interval_ms,
+            )
+        };
+        // Phase A — find candidates that need refresh, clone embeddings.
+        // Uses read locks only; the inflight check here is a cheap pre-filter,
+        // the authoritative check-and-reserve happens under the write guard below.
         let candidates: Vec<(MemoryId, Vec<f32>)> = {
             let idx = self.semantic_idx.read();
             let states_r = self.states.read();
@@ -1244,23 +1249,35 @@ impl ChittaField {
             semantic_hits.iter().filter_map(|hit| {
                 // Skip if refreshed recently by this or another session.
                 if let Some(st) = states_r.get(&hit.memory_id) {
-                    if now - st.last_cw_refresh_ms < CW_REFRESH_INTERVAL_MS { return None; }
+                    if now - st.last_cw_refresh_ms < cw_refresh_interval_ms { return None; }
                 }
                 if let Some(&ts) = inflight_r.get(&hit.memory_id) {
-                    if now - ts < CW_REFRESH_INTERVAL_MS { return None; }
+                    if now - ts < cw_refresh_interval_ms { return None; }
                 }
                 // Clone embedding so we can drop all locks before searching.
                 let emb = idx.get_embedding(hit.memory_id)?.to_vec();
                 Some((hit.memory_id, emb))
             }).collect()
         };
-        // Reserve all candidates before releasing the read guards above.
-        if !candidates.is_empty() {
+        // Atomically re-check and reserve under a single write guard: concurrent
+        // sessions can all pass the read-lock pre-filter above, but only one wins
+        // each slot here.
+        let candidates: Vec<(MemoryId, Vec<f32>)> = if candidates.is_empty() {
+            candidates
+        } else {
             let mut inflight_w = self.cw_refresh_inflight.write();
-            for (id, _) in &candidates {
-                inflight_w.insert(*id, now);
-            }
-        }
+            // Evict expired reservations (sessions that died mid-search) on every
+            // pass, not only on rounds that produce updates.
+            inflight_w.retain(|_, ts| now - *ts < cw_refresh_interval_ms);
+            candidates
+                .into_iter()
+                .filter(|(id, _)| {
+                    if inflight_w.contains_key(id) { return false; }
+                    inflight_w.insert(*id, now);
+                    true
+                })
+                .collect()
+        };
         // HNSW searches with only semantic_idx.read() — no states lock held.
         let cw_updates: Vec<(MemoryId, f32)> = {
             let idx = self.semantic_idx.read();
@@ -1278,19 +1295,28 @@ impl ChittaField {
                 if n > 0 { Some((*memory_id, cos_sum / n as f32)) } else { None }
             }).collect()
         };
-        // Phase B — apply under brief states.write() + clear reservations.
-        if !cw_updates.is_empty() {
-            let mut states_w = self.states.write();
-            let mut inflight_w = self.cw_refresh_inflight.write();
-            for (memory_id, cw) in &cw_updates {
-                if let Some(st) = states_w.get_mut(memory_id) {
-                    st.competitive_weight = *cw;
-                    st.last_cw_refresh_ms = now;
+        // Phase B — apply under brief states.write(), then release reservations.
+        // Every searched candidate is marked refreshed even when its neighborhood
+        // produced no update, so isolated memories aren't re-searched on every
+        // recall; reservations are always released so empty rounds don't leak.
+        if !candidates.is_empty() {
+            let cw_by_id: std::collections::HashMap<MemoryId, f32> =
+                cw_updates.into_iter().collect();
+            {
+                let mut states_w = self.states.write();
+                for (memory_id, _) in &candidates {
+                    if let Some(st) = states_w.get_mut(memory_id) {
+                        if let Some(&cw) = cw_by_id.get(memory_id) {
+                            st.competitive_weight = cw;
+                        }
+                        st.last_cw_refresh_ms = now;
+                    }
                 }
-                inflight_w.remove(memory_id);
             }
-            // Evict stale reservations from sessions that died mid-search.
-            inflight_w.retain(|_, ts| now - *ts < CW_REFRESH_INTERVAL_MS);
+            let mut inflight_w = self.cw_refresh_inflight.write();
+            for (id, _) in &candidates {
+                inflight_w.remove(id);
+            }
         }
 
         let states = self.states.read();
@@ -5422,6 +5448,13 @@ impl ChittaField {
             observer_state: self.observer_state.read().clone(),
             interaction_ledger: self.interaction_ledger.read().clone(),
             predicate_store:    self.predicate_store.read().clone(),
+            cw_refresh_ts: self
+                .states
+                .read()
+                .iter()
+                .filter(|(_, st)| st.last_cw_refresh_ms > 0)
+                .map(|(&id, st)| (id, st.last_cw_refresh_ms))
+                .collect(),
         };
         let path = self
             .data_dir
@@ -6316,6 +6349,64 @@ mod tests {
         assert_eq!(payload.content, b"hello world");
         assert_eq!(payload.kind, "wisdom");
         assert_eq!(payload.chunk_hash, hash);
+    }
+
+    #[test]
+    fn test_cw_refresh_ts_survives_snapshot_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let emb = vec![0.4f32; crate::ops::EMBED_DIM];
+
+        let id = {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            let (id, _) = field
+                .put_memory("wisdom", "test", b"cw persist", &emb, 0.9, 0.001, 0, vec![], None, None)
+                .unwrap();
+            field.states.write().get_mut(&id).unwrap().last_cw_refresh_ms = 1_234_567;
+            field.save_full_snapshot().unwrap();
+            id
+        };
+
+        let field = ChittaField::open(data_dir).unwrap();
+        assert_eq!(
+            field.states.read().get(&id).unwrap().last_cw_refresh_ms,
+            1_234_567,
+            "last_cw_refresh_ms must survive a snapshot save/reopen cycle"
+        );
+    }
+
+    #[test]
+    fn test_cw_refresh_releases_inflight_reservations() {
+        // Neighborhood with a real update: reservations must be released.
+        let (field, _tmp) = open_test_field();
+        let mut emb_a = vec![0.0f32; crate::ops::EMBED_DIM];
+        emb_a[0] = 1.0;
+        let mut emb_b = vec![0.0f32; crate::ops::EMBED_DIM];
+        emb_b[0] = 1.0;
+        emb_b[1] = 1.0;
+        field
+            .put_memory("wisdom", "test", b"cw refresh a", &emb_a, 0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+        field
+            .put_memory("wisdom", "test", b"cw refresh b", &emb_b, 0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+        field.recall_semantic(&emb_a, 5, Some("test")).unwrap();
+        assert!(
+            field.cw_refresh_inflight.read().is_empty(),
+            "reservations must be released after a refresh round"
+        );
+
+        // Isolated memory: the round produces no cw update — reservations must
+        // still be released (empty rounds must not leak entries).
+        let (field2, _tmp2) = open_test_field();
+        field2
+            .put_memory("wisdom", "test", b"isolated", &emb_a, 0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+        field2.recall_semantic(&emb_a, 5, Some("test")).unwrap();
+        assert!(
+            field2.cw_refresh_inflight.read().is_empty(),
+            "empty update rounds must not leak reservations"
+        );
     }
 
     #[test]

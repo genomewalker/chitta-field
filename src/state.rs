@@ -144,7 +144,9 @@ pub struct MemoryState {
     #[serde(default)]
     pub invalidated_by: Option<String>,
 
-    /// Monotonic ms timestamp of last competitive_weight refresh. Not persisted (runtime-only).
+    /// Wall-clock ms timestamp of last competitive_weight refresh. Skipped here
+    /// to keep the positional bincode layout of V12+ snapshots stable; persisted
+    /// via `FullSnapshot::cw_refresh_ts` (V22) and hydrated on load.
     #[serde(skip)]
     pub last_cw_refresh_ms: i64,
 }
