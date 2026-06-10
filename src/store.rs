@@ -190,7 +190,7 @@ fn extract_signatures_with_docs(content: &str) -> String {
     result.join("\n")
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -3320,6 +3320,7 @@ impl ChittaField {
             memory_id,
             content: existing_content.clone(),
             embedding: embedding.to_vec(),
+            op_ts_ms: now_ms(),
         });
         self.log.write().append(&op)?;
 
@@ -5465,7 +5466,26 @@ impl ChittaField {
         }
         let snap = FullSnapshot {
             snapshot_seqno: seqno,
-            payloads: self.payloads.read().clone(),
+            // Clone payloads WITHOUT embeddings the index carries — the .emb
+            // sidecar is their on-disk home and open() rehydrates them. This
+            // alone removes ~630MB from both the clone (RSS) and the body
+            // (disk). Payloads the index lacks (deleted/unindexed) keep their
+            // embedding in the body.
+            payloads: {
+                // Tier order: payloads (1) before semantic_idx (2).
+                let payloads_r = self.payloads.read();
+                let idx = self.semantic_idx.read();
+                payloads_r
+                    .iter()
+                    .map(|(id, p)| {
+                        let mut q = p.clone();
+                        if idx.get_embedding(*id).is_some() {
+                            q.embedding = Vec::new();
+                        }
+                        (*id, q)
+                    })
+                    .collect()
+            },
             states: self.states.read().clone(),
             assoc_edges: self.assoc_edges.read().clone(),
             artifacts: self.artifacts.read().clone(),
@@ -5529,13 +5549,31 @@ impl ChittaField {
             // which needs semantic_idx.read(). The delta was merged into base under a brief
             // write above, so this clone is canonical (delta empty). clear_embeddings()
             // below runs after this block, so the clone still carries its vectors here.
+            //
+            // Dirty-skip: if the index hasn't mutated since this instance's
+            // last successful sidecar write, the files on disk are already
+            // current — skip the ~800MB of rewrites (THEORY.md §8 Phase 2).
             let idx = &snap.semantic_idx;
-            let _ = idx.save_embeddings_sidecar(&emb_path);
-            let _ = idx.save_binary_sidecar(&bin_path);
-            let _ = idx.save_centroid_sidecar(&mu_path);
-            let _ = idx.save_hnsw(&hnsw_path);
-            let _ = idx.save_delta_hnsw(&delta_path);
-            let _ = idx.save_realm_hnsw(&realm_hnsw_path);
+            let idx_mutations = idx.mutation_count();
+            let last = self
+                .idx_sidecars_saved_at
+                .load(std::sync::atomic::Ordering::Relaxed);
+            // Existence guard on .emb only: the other sidecars are written
+            // conditionally (empty HNSW/centroid produce no file), so their
+            // absence matches the previous save rather than invalidating it.
+            let clean = last == idx_mutations && emb_path.exists();
+            if clean {
+                eprintln!("[chitta-field] index sidecars unchanged since last save — skipping rewrite");
+            } else {
+                let _ = idx.save_embeddings_sidecar(&emb_path);
+                let _ = idx.save_binary_sidecar(&bin_path);
+                let _ = idx.save_centroid_sidecar(&mu_path);
+                let _ = idx.save_hnsw(&hnsw_path);
+                let _ = idx.save_delta_hnsw(&delta_path);
+                let _ = idx.save_realm_hnsw(&realm_hnsw_path);
+                self.idx_sidecars_saved_at
+                    .store(idx_mutations, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         // Save HDC sidecar — avoids tokenize+encode rebuild on next startup.
         {
@@ -6679,6 +6717,126 @@ mod tests {
         assert!(
             seg_dir.join("20000002_000000000001.seg").exists(),
             "a foreign writer's segment must never be pruned without coverage"
+        );
+    }
+
+    fn theory_content_op(memory_id: u64, content: &str, ts: i64) -> crate::ops::Op {
+        crate::ops::Op::UpdateMemoryContent(crate::ops::UpdateMemoryContentOp {
+            memory_id,
+            content: content.as_bytes().to_vec(),
+            embedding: Vec::new(),
+            op_ts_ms: ts,
+        })
+    }
+
+    /// THEORY.md §2.1 class (c): absolute writes are LWW registers under
+    /// merge replay — newest op_ts_ms wins regardless of instance assignment.
+    #[test]
+    fn content_updates_are_lww_by_timestamp() {
+        for (inst_b, inst_c) in [(0x2000_0002u32, 0x3000_0003u32), (0x3000_0003, 0x2000_0002)] {
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path().join("data");
+            std::fs::create_dir_all(&data_dir).unwrap();
+            write_instance_segment(&data_dir, 0x1000_0001, &[theory_put_op(55, 1_000, "orig")]);
+            write_instance_segment(&data_dir, inst_b, &[theory_content_op(55, "newest", 3_000)]);
+            write_instance_segment(&data_dir, inst_c, &[theory_content_op(55, "middle", 2_000)]);
+
+            let field = ChittaField::open(data_dir).unwrap();
+            let payloads = field.payloads.read();
+            assert_eq!(
+                payloads.get(&55).unwrap().content,
+                b"newest".to_vec(),
+                "newest op_ts_ms must win under any instance assignment"
+            );
+        }
+    }
+
+    /// Phase 2 (THEORY.md §8): payload embeddings the index carries are
+    /// stripped from the snapshot body (the .emb sidecar owns them) and
+    /// rehydrated on open.
+    #[test]
+    fn payload_embeddings_stripped_from_body_and_rehydrated() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let emb = vec![0.7f32; crate::ops::EMBED_DIM];
+
+        let id = {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            let (id, _) = field
+                .put_memory("wisdom", "test", b"strip me", &emb, 0.9, 0.001, 0, vec![], None, None)
+                .unwrap();
+            field.save_full_snapshot().unwrap();
+            id
+        };
+
+        // Raw body: embedding stripped.
+        let snap_path = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                let n = p.file_name().unwrap().to_string_lossy().into_owned();
+                n.starts_with("chitta.") && n.ends_with(".snapshot")
+            })
+            .expect("snapshot file");
+        let raw = crate::snapshot::FullSnapshot::load(&snap_path).unwrap();
+        assert!(
+            raw.payloads.get(&id).unwrap().embedding.is_empty(),
+            "body must not carry an embedding the .emb sidecar owns"
+        );
+
+        // Full open: rehydrated from the sidecar.
+        let field = ChittaField::open(data_dir).unwrap();
+        let payloads = field.payloads.read();
+        assert_eq!(
+            payloads.get(&id).unwrap().embedding.len(),
+            crate::ops::EMBED_DIM,
+            "open() must rehydrate payload embeddings from .emb"
+        );
+    }
+
+    /// Phase 2 (THEORY.md §8): index sidecars are not rewritten when the
+    /// index hasn't mutated since the last save (dirty-skip).
+    #[test]
+    fn index_sidecars_skipped_when_clean() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let emb = vec![0.5f32; crate::ops::EMBED_DIM];
+
+        let field = ChittaField::open(data_dir.clone()).unwrap();
+        field
+            .put_memory("wisdom", "test", b"dirty one", &emb, 0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+        field.save_full_snapshot().unwrap();
+        let emb_path = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().map(|e| e == "emb").unwrap_or(false))
+            .expect(".emb sidecar");
+        let ino_first = std::fs::metadata(&emb_path).unwrap().ino();
+
+        // No index mutation between saves → same inode (skipped rewrite).
+        field.save_full_snapshot().unwrap();
+        assert_eq!(
+            std::fs::metadata(&emb_path).unwrap().ino(),
+            ino_first,
+            "clean index must not rewrite sidecars"
+        );
+
+        // A new memory mutates the index → rewrite (fresh inode via rename).
+        // Orthogonal-ish embedding so the write-path dedup doesn't merge it.
+        let mut emb2 = emb.clone();
+        for v in emb2.iter_mut().take(crate::ops::EMBED_DIM / 2) {
+            *v = -0.5;
+        }
+        field
+            .put_memory("wisdom", "test", b"dirty two", &emb2, 0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+        field.save_full_snapshot().unwrap();
+        assert_ne!(
+            std::fs::metadata(&emb_path).unwrap().ino(),
+            ino_first,
+            "mutated index must rewrite sidecars"
         );
     }
 

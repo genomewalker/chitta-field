@@ -254,6 +254,11 @@ pub struct ChittaField {
     /// Written into the manifest family on save; the safe pruning and
     /// replay-skip vector of THEORY.md §4.
     pub(crate) wal_coverage: parking_lot::RwLock<std::collections::BTreeMap<crate::ids::InstanceId, u64>>,
+    /// SemanticIndex mutation count at the last successful sidecar write by
+    /// this instance. u64::MAX = never written (first save must write).
+    /// Dirty-skip: unchanged index ⇒ the .emb/.bin/.mu/.hnsw/.delta.hnsw/
+    /// .realm_hnsw files from the previous save are still current.
+    pub(crate) idx_sidecars_saved_at: std::sync::atomic::AtomicU64,
 }
 
 impl Drop for ChittaField {
@@ -707,6 +712,35 @@ impl ChittaField {
             if !emb_loaded && semantic_idx.embeddings_count() == 0 {
                 eprintln!("[chitta-field] WARNING: v10 snapshot but .emb sidecar missing — embeddings will be empty until backfill");
             }
+            // Rehydrate payload embeddings stripped from the snapshot body —
+            // the .emb sidecar is their on-disk home (save_full_snapshot
+            // strips any payload embedding the index carries; ~630MB of the
+            // body). Payloads whose embedding the sidecar can't supply are
+            // marked embed_pending so backfill self-heals them from content.
+            {
+                let mut rehydrated = 0usize;
+                let mut requeued = 0usize;
+                for (id, p) in payloads.iter_mut() {
+                    if !p.embedding.is_empty() || p.embedding_dim == 0 {
+                        continue;
+                    }
+                    if let Some(e) = semantic_idx.get_embedding(*id) {
+                        p.embedding = e.to_vec();
+                        rehydrated += 1;
+                    } else if let Some(st) = states.get_mut(id) {
+                        if !st.deleted && !p.content.is_empty() {
+                            st.embed_pending = true;
+                            requeued += 1;
+                        }
+                    }
+                }
+                if rehydrated > 0 || requeued > 0 {
+                    eprintln!(
+                        "[chitta-field] payload embeddings: {} rehydrated from .emb, {} requeued for re-embed",
+                        rehydrated, requeued
+                    );
+                }
+            }
             // .bin: binary codes sidecar — skip O(N×256) reconstruction in normalize_all.
             let _ = semantic_idx.load_binary_sidecar(&snap_path.with_extension("bin"));
             // .mu: corpus-mean centroid (anisotropy correction). Must load before
@@ -1145,6 +1179,7 @@ impl ChittaField {
             predicate_store:    RwLock::new(snap_predicate_store),
             cw_refresh_inflight: parking_lot::RwLock::new(std::collections::HashMap::new()),
             wal_coverage: parking_lot::RwLock::new(wal_coverage),
+            idx_sidecars_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
         })
     }
 }

@@ -196,6 +196,15 @@ the V23 snapshot get dirty-tracking so unchanged organs are not re-cloned or
 re-written (kills the 2× RSS spike and most of the save cost); single FFI
 error envelope.
 
+> Status (v2.3.0): the two heaviest save costs are gone — payload embeddings
+> (632MB of the body, duplicating the .emb sidecar) are stripped at save and
+> rehydrated at open (missing ones self-heal via embed_pending), and the six
+> index sidecars (~800MB) are dirty-skipped via a SemanticIndex mutation
+> counter when the index hasn't changed since the last save. Class-(c) ops
+> (`UpdateMemoryContent`/`UpdateMemoryKind`/`UpdateSymbolDescription`) now
+> carry `op_ts_ms` — honest LWW registers under merge replay. Remaining:
+> organ trait, per-organ dirty-tracking beyond SemanticIndex, FFI envelope.
+
 Phase 3 — *cognition*: explicit consolidation operator (the merge function,
 run as sleep-phase compaction rather than implicit replay); cross-node
 episodic→semantic promotion; LOCOMO-driven evaluation loop as CI for memory

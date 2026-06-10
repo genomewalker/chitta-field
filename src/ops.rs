@@ -406,6 +406,9 @@ pub struct ClearProjectOp {
 pub struct UpdateSymbolDescriptionOp {
     pub symbol_id: u64,
     pub description: String,
+    /// LWW clock for merge replay (THEORY.md §3). 0 = legacy record.
+    #[serde(default)]
+    pub op_ts_ms: i64,
 }
 
 /// Update the content and/or embedding for an existing memory.
@@ -414,6 +417,9 @@ pub struct UpdateMemoryContentOp {
     pub memory_id: MemoryId,
     pub content: Vec<u8>,
     pub embedding: Vec<f32>, // empty = no embedding change
+    /// LWW clock for merge replay (THEORY.md §3). 0 = legacy record.
+    #[serde(default)]
+    pub op_ts_ms: i64,
 }
 
 /// Update the semantic kind (e.g. wisdom -> belief) for an existing memory.
@@ -421,6 +427,9 @@ pub struct UpdateMemoryContentOp {
 pub struct UpdateMemoryKindOp {
     pub memory_id: MemoryId,
     pub new_kind: String,
+    /// LWW clock for merge replay (THEORY.md §3). 0 = legacy record.
+    #[serde(default)]
+    pub op_ts_ms: i64,
 }
 
 /// Domain event envelope for analytics events.
@@ -929,8 +938,8 @@ pub fn op_timestamp(op: &Op) -> Option<i64> {
         Op::ThemeEvent(o) => nz(o.ts_ms),
         Op::AnalyticsEvent(o) => nz(o.ts_ms),
         Op::ClearProject(_) => None,
-        Op::UpdateSymbolDescription(_) => None,
-        Op::UpdateMemoryContent(_) => None,
+        Op::UpdateSymbolDescription(o) => nz(o.op_ts_ms),
+        Op::UpdateMemoryContent(o) => nz(o.op_ts_ms),
         Op::RecordRecallBatch(o) => nz(o.ts_ms),
         Op::StrengthenAssocEdge(_) => None,
         Op::MsgEvent(o) => nz(o.ts_ms),
@@ -972,7 +981,7 @@ pub fn op_timestamp(op: &Op) -> Option<i64> {
         Op::RecordChallenger(o) => nz(o.attached_ms),
         Op::CloseRederive(o) => nz(o.closed_ms),
         Op::InvalidateTripletsBySourceFile(o) => nz(o.invalidated_at_ms),
-        Op::UpdateMemoryKind(_) => None,
+        Op::UpdateMemoryKind(o) => nz(o.op_ts_ms),
         Op::SymbolEvent(o) => nz(o.timestamp_ms),
     }
 }

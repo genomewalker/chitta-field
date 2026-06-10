@@ -458,6 +458,12 @@ pub struct SemanticIndex {
     /// centered against it so cosine becomes discriminative on anisotropic embeddings.
     #[serde(skip)]
     centroid: Vec<f32>,
+    /// Monotone mutation counter (runtime-only). Bumped by every content
+    /// mutation; save_full_snapshot skips rewriting the index sidecars when
+    /// unchanged since the last save (dirty-skip; THEORY.md §8 Phase 2).
+    /// Over-bumping is safe (loses the skip, never correctness).
+    #[serde(skip)]
+    mutations: u64,
     #[serde(skip)]
     lsh_planes: Vec<Vec<Vec<f32>>>,
     #[serde(skip)]
@@ -515,6 +521,7 @@ impl SemanticIndex {
             coarse_members: HashMap::new(),
             mem_coarse: HashMap::new(),
             centroid: Vec::new(),
+            mutations: 0,
             lsh_planes: default_lsh_planes(),
             lsh_buckets: vec![HashMap::new(); LSH_TABLES],
             mem_lsh: HashMap::new(),
@@ -558,6 +565,7 @@ impl SemanticIndex {
     /// O(K log N) where K = delta count. Called after WAL replay when binary_covers=true
     /// prevents a full O(N log N) rebuild but HNSW is partially stale.
     pub fn backfill_hnsw_delta(&mut self) {
+        self.mutations += 1;
         if !self.use_hnsw() { return; }
         if self.hnsw.is_empty() && self.delta_hnsw.is_empty() { return; }
         let delta: Vec<MemoryId> = self.embeddings.keys()
@@ -594,6 +602,7 @@ impl SemanticIndex {
     /// Phase 2 (serial): apply the pre-computed plans into the live graph.
     /// Falls back to serial for small deltas (< 512 nodes) where overhead dominates.
     pub fn backfill_hnsw_delta_parallel(&mut self) {
+        self.mutations += 1;
         if !self.use_hnsw() { return; }
         if self.hnsw.is_empty() && self.delta_hnsw.is_empty() { return; }
 
@@ -693,6 +702,7 @@ impl SemanticIndex {
     /// Merge delta tier into base HNSW. O(delta × log N_base).
     /// Clears delta after merge. Called when delta_needs_merge() is true.
     pub fn merge_delta_into_base(&mut self) {
+        self.mutations += 1;
         if self.delta_hnsw.is_empty() { return; }
         let ids = self.delta_hnsw.ids();
         eprintln!("[hnsw] merge_delta_into_base: merging {} nodes into base", ids.len());
@@ -712,6 +722,11 @@ impl SemanticIndex {
 
     /// Inhibit HNSW inserts during WAL replay when binary Hamming will be the active path.
     /// Call with `true` before replay and `false` after `normalize_all()` completes.
+    /// Monotone mutation counter for dirty-skip at save (see field doc).
+    pub fn mutation_count(&self) -> u64 {
+        self.mutations
+    }
+
     pub fn set_inhibit_hnsw(&mut self, v: bool) {
         self.inhibit_hnsw = v;
     }
@@ -844,6 +859,7 @@ impl SemanticIndex {
 
     /// Add or update an embedding. Un-deletes the entry if it was soft-deleted.
     pub fn upsert(&mut self, memory_id: MemoryId, mut embedding: Vec<f32>, realm: Option<&str>) {
+        self.mutations += 1;
         self.remove(memory_id);
         normalize_in_place(&mut embedding);
         self.deleted.remove(&memory_id);
@@ -916,6 +932,7 @@ impl SemanticIndex {
 
     /// Mark a memory as deleted — excluded from future search results.
     pub fn remove(&mut self, memory_id: MemoryId) {
+        self.mutations += 1;
         if let Some(realm) = self.per_id_realm.remove(&memory_id) {
             if let Some(graph) = self.per_realm_hnsw.get_mut(&realm) {
                 graph.remove(memory_id);
@@ -1252,6 +1269,7 @@ impl SemanticIndex {
     /// Drop all embeddings whose length doesn't match EMBED_DIM (model-swap migration).
     /// Returns the IDs that were purged so the caller can mark them embed_pending.
     pub fn purge_wrong_dim(&mut self) -> Vec<MemoryId> {
+        self.mutations += 1;
         let bad: Vec<MemoryId> = self.embeddings.iter()
             .filter(|(_, v)| v.len() != EMBED_DIM)
             .map(|(&id, _)| id)
@@ -1279,6 +1297,7 @@ impl SemanticIndex {
 
     /// Normalize embeddings loaded from older snapshots that stored raw vectors.
     pub fn normalize_all(&mut self) {
+        self.mutations += 1;
         for embedding in self.embeddings.values_mut() {
             normalize_in_place(embedding);
         }
@@ -1346,6 +1365,7 @@ impl SemanticIndex {
     /// vector space, so normalize_all()'s count-gated refresh cannot detect they are
     /// geometrically stale. This recomputes them from scratch.
     pub fn force_reindex(&mut self) {
+        self.mutations += 1;
         for embedding in self.embeddings.values_mut() {
             normalize_in_place(embedding);
         }
@@ -1383,6 +1403,7 @@ impl SemanticIndex {
     /// Remove IDs from `deleted` that are no longer reachable via either HNSW graph.
     /// Safe to call any time; called at the end of normalize_all() so it runs once per WAL replay.
     pub fn trim_deleted(&mut self) {
+        self.mutations += 1;
         self.deleted.retain(|id| {
             self.hnsw.contains(*id) || self.delta_hnsw.contains(*id)
         });

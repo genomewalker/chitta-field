@@ -4942,6 +4942,7 @@ pub extern "C" fn cf_update_memory_kind(
     let op = crate::ops::Op::UpdateMemoryKind(crate::ops::UpdateMemoryKindOp {
         memory_id,
         new_kind: kind_str.to_string(),
+        op_ts_ms: crate::store::now_ms(),
     });
     let log_result = handle.field.log.write().append(&op);
     if let Err(e) = log_result {
@@ -5114,6 +5115,7 @@ pub extern "C" fn cf_set_symbol_description(
     let op = Op::UpdateSymbolDescription(UpdateSymbolDescriptionOp {
         symbol_id,
         description: desc.clone(),
+        op_ts_ms: crate::store::now_ms(),
     });
     let log_result = handle.field.log.write().append(&op);
     if let Err(e) = log_result {
@@ -5162,6 +5164,7 @@ pub extern "C" fn cf_update_memory_content(
         memory_id: id,
         content: new_content.clone(),
         embedding: new_embedding.clone(),
+        op_ts_ms: crate::store::now_ms(),
     });
     let log_result = handle.field.log.write().append(&op);
     if let Err(e) = log_result {
