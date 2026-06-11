@@ -97,6 +97,12 @@ pub struct ScoringConfig {
     pub cross_context_weight: f32,
     pub cross_context_max: f32,
 
+    /// Max competitive-weight refreshes per recall. Each refresh costs one
+    /// ANN/flat search; unbounded refresh after a restart with stale
+    /// timestamps turned k-large recalls into minutes-long scan convoys
+    /// (production 2026-06-11). Refresh is amortized across queries instead.
+    pub cw_refresh_max_per_query: usize,
+
     // ── Interference density (Price of Meaning) ────────────────────────
     /// Penalty weight for local competitor crowding.
     /// Factor = 1 / (1 + interference_penalty * competitive_weight).
@@ -201,6 +207,9 @@ impl Default for ScoringConfig {
             // Cross-context generality
             cross_context_weight: 0.05,
             cross_context_max: 3.0,
+
+            // Competitive-weight refresh budget
+            cw_refresh_max_per_query: 16,
 
             // Interference (Price of Meaning)
             interference_penalty: 0.3,

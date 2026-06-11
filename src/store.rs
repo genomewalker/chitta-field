@@ -1281,11 +1281,12 @@ impl ChittaField {
         // Refresh competitive_weight for each candidate using the *current* HNSW neighborhood.
         // The write-time value is stale for memories ingested when the store was sparse.
         // Two-phase to avoid holding states.write() during HNSW searches.
-        let (dedup_upper, cw_refresh_interval_ms) = {
+        let (dedup_upper, cw_refresh_interval_ms, cw_refresh_budget) = {
             let pipeline = self.scoring_pipeline.read();
             (
                 pipeline.config.dedup_cosine_upper,
                 pipeline.config.cw_refresh_interval_ms,
+                pipeline.config.cw_refresh_max_per_query,
             )
         };
         // Phase A — find candidates that need refresh, clone embeddings.
@@ -1308,7 +1309,11 @@ impl ChittaField {
                 // Clone embedding so we can drop all locks before searching.
                 let emb = idx.get_embedding(hit.memory_id)?.to_vec();
                 Some((hit.memory_id, emb))
-            }).collect()
+            })
+            // Budget: each refresh is a full ANN/flat search; the rest are
+            // picked up by later queries (amortized refresh).
+            .take(cw_refresh_budget)
+            .collect()
         };
         // Atomically re-check and reserve under a single write guard: concurrent
         // sessions can all pass the read-lock pre-filter above, but only one wins
