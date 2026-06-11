@@ -86,3 +86,27 @@ impl MsgRegistry {
             .unwrap_or(false)
     }
 }
+
+impl crate::organ::OrganApply for MsgRegistry {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::MsgEvent(ev) => {
+                use crate::organ::msg::MsgEvent;
+                let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
+                self.insert(MsgEvent {
+                    event_id: ev.event_id,
+                    domain: ev.domain,
+                    kind: ev.kind,
+                    target: ev.target,
+                    payload_json: payload_str,
+                    realm: ev.realm,
+                    ts_ms: ev.ts_ms,
+                });
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

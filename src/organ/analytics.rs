@@ -46,3 +46,18 @@ impl AnalyticsRegistry {
         self.entries.len()
     }
 }
+
+impl crate::organ::OrganApply for AnalyticsRegistry {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::AnalyticsEvent(ev) => {
+                let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
+                self.append(ev.kind, ev.session_id, payload_str, ev.ts_ms);
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

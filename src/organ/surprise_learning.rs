@@ -219,3 +219,26 @@ impl SurpriseLearningStore {
         }
     }
 }
+
+impl crate::organ::OrganApply for SurpriseLearningStore {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::UpdateSurpriseCredit(c) => {
+                self.replay_credit(
+                    crate::organ::surprise_learning::SurpriseLearningState {
+                        memory_id: c.memory_id,
+                        credit: c.credit,
+                        last_dir: c.last_dir,
+                        same_dir_streak: c.same_dir_streak,
+                        last_surprise_id: c.last_surprise_id,
+                        updated_ms: c.updated_ms,
+                    },
+                );
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

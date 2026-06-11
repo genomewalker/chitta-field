@@ -210,3 +210,32 @@ mod tests {
         assert!(!r.transition("no-such-task", "running", 1000, 1));
     }
 }
+
+impl crate::organ::OrganApply for TaskRegistry {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::TaskEvent(ev) => {
+                let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
+                match ev.kind.as_str() {
+                    "create" => {
+                        self.create(
+                            ev.task_id,
+                            ev.task_type,
+                            payload_str,
+                            ev.ts_ms,
+                            ev.fencing_token,
+                        );
+                    }
+                    "start" | "pause" | "resume" | "complete" | "fail" => {
+                        self.transition(&ev.task_id, &ev.kind, ev.ts_ms, ev.fencing_token);
+                    }
+                    _ => {}
+                }
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

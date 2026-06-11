@@ -91,3 +91,88 @@ impl TranscriptRegistry {
         self.transcripts.values().collect()
     }
 }
+
+impl crate::organ::OrganApply for TranscriptRegistry {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::TranscriptEvent(ev) => {
+                // Always store the raw payload for cf_get_latest_event("transcript", kind, session_id)
+                let payload_str = String::from_utf8(ev.payload_json.clone()).unwrap_or_default();
+                self.set_session_event(&ev.session_id, &ev.kind, payload_str);
+
+                match ev.kind.as_str() {
+                    "register" => {
+                        let payload =
+                            serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
+                        let transcript_id = payload
+                            .as_ref()
+                            .and_then(|v| {
+                                v.get("transcript_id")
+                                    .and_then(|k| k.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_default();
+                        if !transcript_id.is_empty() {
+                            self.register(transcript_id, ev.session_id);
+                        }
+                    }
+                    "update_progress" => {
+                        let payload =
+                            serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
+                        let transcript_id = payload
+                            .as_ref()
+                            .and_then(|v| {
+                                v.get("transcript_id")
+                                    .and_then(|k| k.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_default();
+                        let pct = payload
+                            .as_ref()
+                            .and_then(|v| v.get("progress_pct").and_then(|k| k.as_f64()))
+                            .unwrap_or(0.0) as f32;
+                        if !transcript_id.is_empty() {
+                            self.update_progress(&transcript_id, pct);
+                        }
+                    }
+                    "add_turn" => {
+                        let payload =
+                            serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
+                        let transcript_id = payload
+                            .as_ref()
+                            .and_then(|v| {
+                                v.get("transcript_id")
+                                    .and_then(|k| k.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_default();
+                        let role = payload
+                            .as_ref()
+                            .and_then(|v| {
+                                v.get("role")
+                                    .and_then(|k| k.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_default();
+                        let content = payload
+                            .as_ref()
+                            .and_then(|v| {
+                                v.get("content")
+                                    .and_then(|k| k.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_default();
+                        if !transcript_id.is_empty() {
+                            self.add_turn(&transcript_id, role, content, ev.ts_ms);
+                        }
+                    }
+                    _ => {}
+                }
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

@@ -543,3 +543,39 @@ mod tests {
         assert_eq!(matches[0].object, "red");
     }
 }
+
+impl crate::organ::OrganApply for ConstraintStore {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::AssertConstraint(c) => {
+                use crate::organ::constraint::Provenance;
+                self.replay_assert(
+                    c.fact_id, c.subject, c.predicate, c.object, c.confidence,
+                    c.scope, c.branch_id,
+                    Provenance {
+                        source: c.provenance_source,
+                        session_id: c.provenance_session,
+                        confidence_basis: c.provenance_basis,
+                    },
+                    c.valid_from_ms, c.source_memory_id,
+                );
+                    None
+                }
+            Op::RetractConstraint(r) => {
+                self.replay_retract(r.fact_id, r.retracted_at_ms);
+                    None
+                }
+            Op::CreateBranch(b) => {
+                self.replay_create_branch(b.branch_id, b.parent_id, b.scope, b.created_ms);
+                    None
+                }
+            Op::ResolveBranch(r) => {
+                self.replay_resolve_branch(r.winner_id, r.loser_id, r.resolved_at_ms);
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

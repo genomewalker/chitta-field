@@ -139,3 +139,28 @@ impl SymbolEventLog {
     pub fn len(&self) -> usize { self.events.len() }
     pub fn is_empty(&self) -> bool { self.events.is_empty() }
 }
+
+impl crate::organ::OrganApply for SymbolEventLog {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::SymbolEvent(e) => {
+                self.replay(SymbolEvent {
+                    id: e.id,
+                    symbol_name: e.symbol_name,
+                    file_path: e.file_path,
+                    symbol_id: e.symbol_id,
+                    kind: SymbolEventKind::from_u8(e.kind),
+                    session_id: e.session_id,
+                    harness: e.harness,
+                    memory_id: e.memory_id,
+                    timestamp_ms: e.timestamp_ms,
+                    notes: e.notes,
+                });
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

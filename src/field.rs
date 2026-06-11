@@ -1626,6 +1626,30 @@ pub(crate) fn apply_op(op: Op, ctx: ApplyCtx) {
         kind_members,
         coactivation_stats,
     } = ctx;
+    // Organ-owned ops first (OrganApply, THEORY.md §8 Phase 2); the central
+    // match below keeps only multi-structure ops. Migration is incremental —
+    // move an organ's arms into its `impl OrganApply` and add a line here.
+    use crate::organ::OrganApply;
+    let op = match intervention_store.apply(op) { None => return, Some(op) => op };
+    let op = match agent_protocol_store.apply(op) { None => return, Some(op) => op };
+    let op = match wisdom_lineage_store.apply(op) { None => return, Some(op) => op };
+    let op = match surprise_store.apply(op) { None => return, Some(op) => op };
+    let op = match epistemic_debt_store.apply(op) { None => return, Some(op) => op };
+    let op = match integration_kernel.apply(op) { None => return, Some(op) => op };
+    let op = match surprise_learning.apply(op) { None => return, Some(op) => op };
+    let op = match wisdom_promotion.apply(op) { None => return, Some(op) => op };
+    let op = match learned_scorer.apply(op) { None => return, Some(op) => op };
+    let op = match msg_registry.apply(op) { None => return, Some(op) => op };
+    let op = match skill_registry.apply(op) { None => return, Some(op) => op };
+    let op = match agent_registry.apply(op) { None => return, Some(op) => op };
+    let op = match analytics_registry.apply(op) { None => return, Some(op) => op };
+    let op = match trigger_store.apply(op) { None => return, Some(op) => op };
+    let op = match constraint_store.apply(op) { None => return, Some(op) => op };
+    let op = match transcript_registry.apply(op) { None => return, Some(op) => op };
+    let op = match task_registry.apply(op) { None => return, Some(op) => op };
+    let op = match user_model_registry.apply(op) { None => return, Some(op) => op };
+    let op = match theme_organ.apply(op) { None => return, Some(op) => op };
+    let op = match symbol_event_log.apply(op) { None => return, Some(op) => op };
     match op {
         Op::PutPayload(put) => {
             let memory_id = put.memory_id;
@@ -1854,160 +1878,6 @@ pub(crate) fn apply_op(op: Op, ctx: ApplyCtx) {
                 ts_ms: ev.ts_ms,
             });
         }
-        Op::TranscriptEvent(ev) => {
-            // Always store the raw payload for cf_get_latest_event("transcript", kind, session_id)
-            let payload_str = String::from_utf8(ev.payload_json.clone()).unwrap_or_default();
-            transcript_registry.set_session_event(&ev.session_id, &ev.kind, payload_str);
-
-            match ev.kind.as_str() {
-                "register" => {
-                    let payload =
-                        serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
-                    let transcript_id = payload
-                        .as_ref()
-                        .and_then(|v| {
-                            v.get("transcript_id")
-                                .and_then(|k| k.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .unwrap_or_default();
-                    if !transcript_id.is_empty() {
-                        transcript_registry.register(transcript_id, ev.session_id);
-                    }
-                }
-                "update_progress" => {
-                    let payload =
-                        serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
-                    let transcript_id = payload
-                        .as_ref()
-                        .and_then(|v| {
-                            v.get("transcript_id")
-                                .and_then(|k| k.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .unwrap_or_default();
-                    let pct = payload
-                        .as_ref()
-                        .and_then(|v| v.get("progress_pct").and_then(|k| k.as_f64()))
-                        .unwrap_or(0.0) as f32;
-                    if !transcript_id.is_empty() {
-                        transcript_registry.update_progress(&transcript_id, pct);
-                    }
-                }
-                "add_turn" => {
-                    let payload =
-                        serde_json::from_slice::<serde_json::Value>(&ev.payload_json).ok();
-                    let transcript_id = payload
-                        .as_ref()
-                        .and_then(|v| {
-                            v.get("transcript_id")
-                                .and_then(|k| k.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .unwrap_or_default();
-                    let role = payload
-                        .as_ref()
-                        .and_then(|v| {
-                            v.get("role")
-                                .and_then(|k| k.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .unwrap_or_default();
-                    let content = payload
-                        .as_ref()
-                        .and_then(|v| {
-                            v.get("content")
-                                .and_then(|k| k.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .unwrap_or_default();
-                    if !transcript_id.is_empty() {
-                        transcript_registry.add_turn(&transcript_id, role, content, ev.ts_ms);
-                    }
-                }
-                _ => {}
-            }
-        }
-        Op::TaskEvent(ev) => {
-            let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
-            match ev.kind.as_str() {
-                "create" => {
-                    task_registry.create(
-                        ev.task_id,
-                        ev.task_type,
-                        payload_str,
-                        ev.ts_ms,
-                        ev.fencing_token,
-                    );
-                }
-                "start" | "pause" | "resume" | "complete" | "fail" => {
-                    task_registry.transition(&ev.task_id, &ev.kind, ev.ts_ms, ev.fencing_token);
-                }
-                _ => {}
-            }
-        }
-        Op::UserModelEvent(ev) => {
-            let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
-            match ev.kind.as_str() {
-                "upsert" => {
-                    user_model_registry.upsert(ev.entity_id, ev.entity_type, payload_str, ev.ts_ms);
-                }
-                "observe" | "progress" | "complete" => {
-                    user_model_registry.observe(&ev.entity_id, ev.ts_ms);
-                }
-                _ => {}
-            }
-        }
-        Op::ThemeEvent(ev) => {
-            let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
-            match ev.kind.as_str() {
-                "create" => {
-                    let name = serde_json::from_str::<serde_json::Value>(&payload_str)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("name")
-                                .and_then(|n| n.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .unwrap_or_default();
-                    theme_organ.create(ev.theme_id, name);
-                }
-                "update_centroid" => {
-                    let centroid = serde_json::from_str::<serde_json::Value>(&payload_str)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("centroid_json")
-                                .and_then(|c| c.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .unwrap_or(payload_str);
-                    theme_organ.update_centroid(ev.theme_id, centroid);
-                }
-                "assign_member" => {
-                    let memory_id = serde_json::from_str::<serde_json::Value>(&payload_str)
-                        .ok()
-                        .and_then(|v| v.get("memory_id").and_then(|m| m.as_u64()))
-                        .unwrap_or(0);
-                    if memory_id > 0 {
-                        theme_organ.assign_member(ev.theme_id, memory_id);
-                    }
-                }
-                "remove_member" => {
-                    let memory_id = serde_json::from_str::<serde_json::Value>(&payload_str)
-                        .ok()
-                        .and_then(|v| v.get("memory_id").and_then(|m| m.as_u64()))
-                        .unwrap_or(0);
-                    if memory_id > 0 {
-                        theme_organ.remove_member(ev.theme_id, memory_id);
-                    }
-                }
-                _ => {}
-            }
-        }
-        Op::AnalyticsEvent(ev) => {
-            let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
-            analytics_registry.append(ev.kind, ev.session_id, payload_str, ev.ts_ms);
-        }
         Op::ClearProject(cp) => {
             let removed_paths = code_files.remove_by_project(&cp.project);
             let removed_ids = symbol_idx.remove_by_file_paths(&removed_paths);
@@ -2075,418 +1945,27 @@ pub(crate) fn apply_op(op: Op, ctx: ApplyCtx) {
         Op::StrengthenAssocEdge(op) => {
             strengthen_assoc_edge_map(assoc_edges, op.src, op.dst, op.edge_type, op.delta);
         }
-        Op::MsgEvent(ev) => {
-            use crate::organ::msg::MsgEvent;
-            let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
-            msg_registry.insert(MsgEvent {
-                event_id: ev.event_id,
-                domain: ev.domain,
-                kind: ev.kind,
-                target: ev.target,
-                payload_json: payload_str,
-                realm: ev.realm,
-                ts_ms: ev.ts_ms,
-            });
-        }
-        Op::SkillUpload(s) => {
-            skill_registry.upload(&s.skill_id, &s.content, &s.uploaded_by, &s.tags, s.ts_ms);
-        }
-        Op::SkillDeprecate(s) => {
-            skill_registry.deprecate(&s.skill_id);
-        }
-        Op::AgentUpsert(a) => {
-            agent_registry.upsert(&a.agent_id, &a.display_name, &a.description, a.ts_ms);
-        }
-        Op::AgentDisable(a) => {
-            agent_registry.disable(&a.agent_id);
-        }
-        Op::AssertConstraint(c) => {
-            use crate::organ::constraint::Provenance;
-            constraint_store.replay_assert(
-                c.fact_id, c.subject, c.predicate, c.object, c.confidence,
-                c.scope, c.branch_id,
-                Provenance {
-                    source: c.provenance_source,
-                    session_id: c.provenance_session,
-                    confidence_basis: c.provenance_basis,
-                },
-                c.valid_from_ms, c.source_memory_id,
-            );
-        }
-        Op::RetractConstraint(r) => {
-            constraint_store.replay_retract(r.fact_id, r.retracted_at_ms);
-        }
-        Op::CreateBranch(b) => {
-            constraint_store.replay_create_branch(b.branch_id, b.parent_id, b.scope, b.created_ms);
-        }
-        Op::ResolveBranch(r) => {
-            constraint_store.replay_resolve_branch(r.winner_id, r.loser_id, r.resolved_at_ms);
-        }
-        Op::AddTrigger(t) => {
-            if let Ok(trigger) = serde_json::from_slice(&t.trigger_json) {
-                trigger_store.replay_add(trigger);
-            }
-        }
-        Op::UpdateTrigger(u) => {
-            let status = match u.status {
-                0 => crate::organ::trigger::TriggerStatus::Armed,
-                1 => crate::organ::trigger::TriggerStatus::Fired,
-                2 => crate::organ::trigger::TriggerStatus::Expired,
-                _ => crate::organ::trigger::TriggerStatus::Inhibited,
-            };
-            trigger_store.replay_update_status(u.trigger_id, status, u.fired_ms);
-        }
-        Op::FireTrigger(f) => {
-            trigger_store.replay_update_status(
-                f.trigger_id,
-                crate::organ::trigger::TriggerStatus::Fired,
-                f.fired_ms,
-            );
-        }
-        Op::RecordSurprise(s) => {
-            surprise_store.replay_record(crate::organ::surprise::SurpriseEvent {
-                id: s.event_id,
-                context_sketch: s.context_sketch,
-                action: s.action,
-                expected: s.expected,
-                actual: s.actual,
-                surprise_magnitude: s.surprise_magnitude,
-                domain: s.domain,
-                timestamp_ms: s.timestamp_ms,
-                realm: s.realm,
-                session_id: s.session_id,
-                source_memory_id: s.source_memory_id,
-            });
-        }
-        Op::RegisterDebt(d) => {
-            epistemic_debt_store.replay_register(crate::organ::epistemic_debt::EpistemicDebt {
-                id: d.debt_id,
-                pattern: d.pattern,
-                competing_hypotheses: d.competing_hypotheses,
-                discriminating_test: d.discriminating_test,
-                fragility_score: d.fragility_score,
-                domain: d.domain,
-                status: crate::organ::epistemic_debt::DebtStatus::Open,
-                created_ms: d.created_ms,
-                resolved_ms: 0,
-                resolution: None,
-                realm: d.realm,
-                source_session: d.source_session,
-                evidence: Vec::new(),
-                auto_resolved: false,
-            });
-        }
-        Op::UpdateDebt(u) => {
-            let status = crate::organ::epistemic_debt::DebtStatus::from_u8(u.status);
-            epistemic_debt_store.replay_update(u.debt_id, status, u.resolved_ms, u.resolution);
-        }
-        Op::UpdateSourceWeight(w) => {
-            integration_kernel.replay_update_weight(w.source, w.query_domain, w.weight);
-        }
-        Op::RecordFeedback(f) => {
-            integration_kernel.replay_feedback(
-                f.source,
-                f.query_domain,
-                f.new_weight,
-                f.success_count,
-                f.total_count,
-            );
-        }
-        Op::UpdateSurpriseCredit(c) => {
-            surprise_learning.replay_credit(
-                crate::organ::surprise_learning::SurpriseLearningState {
-                    memory_id: c.memory_id,
-                    credit: c.credit,
-                    last_dir: c.last_dir,
-                    same_dir_streak: c.same_dir_streak,
-                    last_surprise_id: c.last_surprise_id,
-                    updated_ms: c.updated_ms,
-                },
-            );
-        }
-        Op::UpsertWisdomCandidate(w) => {
-            wisdom_promotion.replay_upsert(
-                crate::organ::wisdom_promotion::WisdomCandidate {
-                    id: w.candidate_id,
-                    cluster_key: w.cluster_key,
-                    domain: w.domain,
-                    action: w.action,
-                    summary: w.summary,
-                    episode_ids: w.episode_ids,
-                    debt_ids: w.debt_ids,
-                    support_count: w.support_count,
-                    cross_session_count: w.cross_session_count,
-                    mean_surprise: w.mean_surprise,
-                    promotion_score: w.promotion_score,
-                    contradiction_count: 0,
-                    lifecycle: crate::organ::wisdom_promotion::WisdomLifecycle::Candidate,
-                    memory_id: None,
-                    created_ms: w.created_ms,
-                    updated_ms: w.created_ms,
-                },
-            );
-        }
-        Op::UpdateWisdomLifecycle(l) => {
-            wisdom_promotion.replay_lifecycle(
-                l.candidate_id,
-                l.new_state,
-                l.memory_id,
-                l.contradiction_count,
-                l.updated_ms,
-            );
-        }
-        Op::UpdateScorerModel(m) => {
-            learned_scorer.apply_update(
-                &m.weights_json,
-                m.model_version,
-                m.mean_loss,
-                m.outcome_count,
-                m.applied_at_ms,
-            );
-        }
-        Op::AttachDebtEvidence(e) => {
-            epistemic_debt_store.replay_attach_evidence(
-                e.debt_id,
-                e.evidence_memory_ids,
-                e.confidence,
-                e.note,
-                e.attached_ms,
-            );
-        }
-        Op::StartIntervention(s) => {
-            use crate::organ::intervention::{ActionType, InterventionRecord, InterventionStatus, ReversalCost};
-            intervention_store.replay_start(InterventionRecord {
-                id: s.id,
-                realm: s.realm,
-                session_id: s.session_id,
-                task_id: s.task_id,
-                agent_id: s.agent_id,
-                domain: s.domain,
-                intent: s.intent,
-                action_type: ActionType::from_u8(s.action_type),
-                action_ref: s.action_ref,
-                preconditions: s.preconditions,
-                expected_observables: s.expected_observables,
-                reversal_cost: ReversalCost::from_u8(s.reversal_cost),
-                started_ms: s.started_ms,
-                closed_ms: None,
-                status: InterventionStatus::Open,
-            });
-        }
-        Op::AddObservation(o) => {
-            use crate::organ::intervention::{ObservationKind, ObservationRecord};
-            intervention_store.replay_observation(ObservationRecord {
-                id: o.id,
-                intervention_id: o.intervention_id,
-                kind: ObservationKind::from_u8(o.kind),
-                evidence_refs: o.evidence_refs,
-                summary: o.summary,
-                confidence: o.confidence,
-                timestamp_ms: o.timestamp_ms,
-            });
-        }
-        Op::CloseIntervention(c) => {
-            use crate::organ::intervention::InterventionStatus;
-            intervention_store.replay_close(
-                c.intervention_id,
-                InterventionStatus::from_u8(c.status),
-                c.closed_ms,
-            );
-        }
-        Op::RecordAttribution(a) => {
-            use crate::organ::intervention::{AttributionClass, AttributionRecord};
-            intervention_store.replay_attribution(AttributionRecord {
-                intervention_id: a.intervention_id,
-                primary_class: AttributionClass::from_u8(a.primary_class),
-                secondary_class: a.secondary_class.map(AttributionClass::from_u8),
-                confidence_delta: a.confidence_delta,
-                surprise_id: a.surprise_id,
-                debt_ids: a.debt_ids,
-                source_memory_ids: a.source_memory_ids,
-                skill_memory_ids: a.skill_memory_ids,
-                note: a.note,
-                timestamp_ms: a.timestamp_ms,
-            });
-        }
         // ── Layer 8: Agent Protocol Memory ──────────────────────────────────
-        Op::RegisterTask(t) => {
-            use crate::organ::agent_protocol::TaskContract;
-            use crate::organ::agent_protocol::TaskStatus;
-            agent_protocol_store.replay_register_task(TaskContract {
-                id: t.id,
-                session_id: t.session_id,
-                realm: t.realm,
-                goal: t.goal,
-                constraints: t.constraints,
-                acceptance_criteria: t.acceptance_criteria,
-                priority: t.priority,
-                status: TaskStatus::Active,
-                parent_task_id: t.parent_task_id,
-                intervention_ids: Vec::new(),
-                tags: t.tags,
-                created_ms: t.created_ms,
-                updated_ms: t.created_ms,
-                deadline_ms: t.deadline_ms,
-            });
-        }
-        Op::UpdateTask(u) => {
-            agent_protocol_store.replay_update_task(
-                u.task_id,
-                u.status,
-                u.add_intervention_id,
-                u.add_tag,
-                u.updated_ms,
-            );
-        }
-        Op::AddDelegation(d) => {
-            use crate::organ::agent_protocol::{DelegationEdge, DelegationStatus};
-            agent_protocol_store.replay_delegation(DelegationEdge {
-                id: d.id,
-                task_id: d.task_id,
-                from_agent: d.from_agent,
-                to_agent: d.to_agent,
-                delegated_at: d.delegated_at,
-                handoff_note: d.handoff_note,
-                status: DelegationStatus::Active,
-            });
-        }
-        Op::LinkEvidence(e) => {
-            use crate::organ::agent_protocol::{EvidenceKind, EvidenceLink};
-            agent_protocol_store.replay_evidence(EvidenceLink {
-                id: e.id,
-                task_id: e.task_id,
-                memory_id: e.memory_id,
-                produced_by: e.produced_by,
-                evidence_kind: EvidenceKind::from_u8(e.evidence_kind),
-                relevance: e.relevance,
-                created_ms: e.created_ms,
-            });
-        }
-        Op::AddProbe(p) => {
-            use crate::organ::agent_protocol::{PendingProbe, ProbeStatus};
-            agent_protocol_store.replay_probe(PendingProbe {
-                id: p.id,
-                task_id: p.task_id,
-                question: p.question,
-                expected_answerer: p.expected_answerer,
-                priority: p.priority,
-                status: ProbeStatus::Open,
-                created_ms: p.created_ms,
-                resolved_ms: None,
-                answer: None,
-            });
-        }
-        Op::ResolveProbe(r) => {
-            agent_protocol_store.replay_resolve_probe(
-                r.probe_id,
-                r.status,
-                r.answer,
-                r.resolved_ms,
-            );
-        }
-        Op::SetCriterion(c) => {
-            use crate::organ::agent_protocol::CompletionCriterion;
-            agent_protocol_store.replay_criterion(CompletionCriterion {
-                id: c.id,
-                task_id: c.task_id,
-                criterion: c.criterion,
-                is_met: c.is_met,
-                checked_ms: Some(c.checked_ms),
-                evidence_note: c.evidence_note,
-            });
-        }
         // Layer 9: Wisdom Homeostasis
-        Op::UpsertWisdomLineage(l) => {
-            use crate::organ::wisdom_lineage::{ApplicabilityEnvelope, WisdomLineage, LineageState};
-            let envelope: ApplicabilityEnvelope =
-                serde_json::from_str(&l.envelope_json).unwrap_or_default();
-            wisdom_lineage_store.replay_upsert(WisdomLineage {
-                id: l.lineage_id,
-                wisdom_candidate_id: l.wisdom_candidate_id,
-                claim: l.claim,
-                envelope,
-                seed_episode_ids: l.seed_episode_ids,
-                seed_surprise_ids: l.seed_surprise_ids,
-                seed_intervention_ids: l.seed_intervention_ids,
-                seed_debt_ids: l.seed_debt_ids,
-                ancestor_lineage_id: l.ancestor_lineage_id,
-                derivation_version: l.derivation_version,
-                derivation_relation: l.derivation_relation,
-                support_mass: 0.0,
-                contradiction_mass: 0.0,
-                staleness_mass: 0.0,
-                last_supported_ms: l.created_ms,
-                last_challenged_ms: 0,
-                state: LineageState::Trusted,
-                challengers: Vec::new(),
-                rederive_task_id: None,
-                rederive_opened_ms: None,
-                rederive_ttl_ms: l.rederive_ttl_ms,
-                created_ms: l.created_ms,
-                updated_ms: l.updated_ms,
-            });
-        }
-        Op::AdjudicateLineage(a) => {
-            wisdom_lineage_store.replay_adjudicate(
-                a.lineage_id,
-                a.support_mass,
-                a.contradiction_mass,
-                a.staleness_mass,
-                a.last_supported_ms,
-                a.last_challenged_ms,
-                a.adjudicated_ms,
-            );
-        }
-        Op::TransitionLineage(t) => {
-            use crate::organ::wisdom_lineage::LineageState;
-            wisdom_lineage_store.transition_state(
-                t.lineage_id,
-                LineageState::from_u8(t.new_state),
-                "",
-                t.rederive_task_id,
-                t.transitioned_ms,
-            );
-        }
-        Op::RecordChallenger(c) => {
-            use crate::organ::wisdom_lineage::ChallengerEvidence;
-            wisdom_lineage_store.record_challenger(
-                c.lineage_id,
-                ChallengerEvidence {
-                    intervention_id: c.intervention_id,
-                    surprise_id: c.surprise_id,
-                    outcome_summary: c.outcome_summary,
-                    attached_ms: c.attached_ms,
-                },
-                c.attached_ms,
-            );
-        }
-        Op::CloseRederive(r) => {
-            use crate::organ::wisdom_lineage::{RederiveAction, ApplicabilityEnvelope};
-            let new_envelope = r.new_envelope_json.as_deref()
-                .and_then(|j| serde_json::from_str::<ApplicabilityEnvelope>(j).ok());
-            wisdom_lineage_store.close_rederive(
-                r.lineage_id,
-                RederiveAction::from_u8(r.action),
-                new_envelope,
-                r.fork_claim,
-                r.fork_lineage_id,
-                r.closed_ms,
-            );
-        }
 
-        Op::SymbolEvent(e) => {
-            symbol_event_log.replay(SymbolEvent {
-                id: e.id,
-                symbol_name: e.symbol_name,
-                file_path: e.file_path,
-                symbol_id: e.symbol_id,
-                kind: SymbolEventKind::from_u8(e.kind),
-                session_id: e.session_id,
-                harness: e.harness,
-                memory_id: e.memory_id,
-                timestamp_ms: e.timestamp_ms,
-                notes: e.notes,
-            });
+        // Consumed by the OrganApply dispatch above — unreachable by
+        // construction. Listed explicitly (not `_`) so adding a new Op
+        // variant still breaks this match at compile time until it gets a
+        // handler or an organ.
+        Op::StartIntervention(_) | Op::AddObservation(_) | Op::CloseIntervention(_)
+        | Op::RecordAttribution(_) | Op::RegisterTask(_) | Op::UpdateTask(_)
+        | Op::AddDelegation(_) | Op::LinkEvidence(_) | Op::AddProbe(_)
+        | Op::ResolveProbe(_) | Op::SetCriterion(_) | Op::UpsertWisdomLineage(_)
+        | Op::AdjudicateLineage(_) | Op::TransitionLineage(_)
+        | Op::RecordChallenger(_) | Op::CloseRederive(_)
+        | Op::RecordSurprise(_) | Op::RegisterDebt(_) | Op::UpdateDebt(_) | Op::AttachDebtEvidence(_) | Op::UpdateSourceWeight(_) | Op::RecordFeedback(_)
+        | Op::UpdateSurpriseCredit(_) | Op::UpsertWisdomCandidate(_) | Op::UpdateWisdomLifecycle(_) | Op::UpdateScorerModel(_) | Op::MsgEvent(_) | Op::SkillUpload(_)
+        | Op::SkillDeprecate(_) | Op::AgentUpsert(_) | Op::AgentDisable(_) | Op::AnalyticsEvent(_) | Op::AddTrigger(_) | Op::UpdateTrigger(_)
+        | Op::FireTrigger(_) | Op::AssertConstraint(_) | Op::RetractConstraint(_) | Op::CreateBranch(_) | Op::ResolveBranch(_)
+        | Op::TranscriptEvent(_) | Op::TaskEvent(_) | Op::UserModelEvent(_)
+        | Op::ThemeEvent(_) | Op::SymbolEvent(_) => {
+            debug_assert!(false, "organ-owned op leaked past OrganApply dispatch");
+            eprintln!("[chitta-field] BUG: organ-owned op reached the central match");
         }
     }
 }

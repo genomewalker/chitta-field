@@ -340,3 +340,47 @@ impl EpistemicDebtStore {
             .collect()
     }
 }
+
+impl crate::organ::OrganApply for EpistemicDebtStore {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::RegisterDebt(d) => {
+                self.replay_register(crate::organ::epistemic_debt::EpistemicDebt {
+                    id: d.debt_id,
+                    pattern: d.pattern,
+                    competing_hypotheses: d.competing_hypotheses,
+                    discriminating_test: d.discriminating_test,
+                    fragility_score: d.fragility_score,
+                    domain: d.domain,
+                    status: crate::organ::epistemic_debt::DebtStatus::Open,
+                    created_ms: d.created_ms,
+                    resolved_ms: 0,
+                    resolution: None,
+                    realm: d.realm,
+                    source_session: d.source_session,
+                    evidence: Vec::new(),
+                    auto_resolved: false,
+                });
+                    None
+                }
+            Op::UpdateDebt(u) => {
+                let status = crate::organ::epistemic_debt::DebtStatus::from_u8(u.status);
+                self.replay_update(u.debt_id, status, u.resolved_ms, u.resolution);
+                    None
+                }
+            Op::AttachDebtEvidence(e) => {
+                self.replay_attach_evidence(
+                    e.debt_id,
+                    e.evidence_memory_ids,
+                    e.confidence,
+                    e.note,
+                    e.attached_ms,
+                );
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

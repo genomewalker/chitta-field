@@ -575,3 +575,97 @@ impl WisdomLineageStore {
         }
     }
 }
+
+impl crate::organ::OrganApply for WisdomLineageStore {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2). Consumes this organ's
+    /// op variants; everything else passes through to the next organ or the
+    /// central multi-structure match in apply_op.
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::UpsertWisdomLineage(l) => {
+                use crate::organ::wisdom_lineage::{ApplicabilityEnvelope, WisdomLineage, LineageState};
+                let envelope: ApplicabilityEnvelope =
+                    serde_json::from_str(&l.envelope_json).unwrap_or_default();
+                self.replay_upsert(WisdomLineage {
+                    id: l.lineage_id,
+                    wisdom_candidate_id: l.wisdom_candidate_id,
+                    claim: l.claim,
+                    envelope,
+                    seed_episode_ids: l.seed_episode_ids,
+                    seed_surprise_ids: l.seed_surprise_ids,
+                    seed_intervention_ids: l.seed_intervention_ids,
+                    seed_debt_ids: l.seed_debt_ids,
+                    ancestor_lineage_id: l.ancestor_lineage_id,
+                    derivation_version: l.derivation_version,
+                    derivation_relation: l.derivation_relation,
+                    support_mass: 0.0,
+                    contradiction_mass: 0.0,
+                    staleness_mass: 0.0,
+                    last_supported_ms: l.created_ms,
+                    last_challenged_ms: 0,
+                    state: LineageState::Trusted,
+                    challengers: Vec::new(),
+                    rederive_task_id: None,
+                    rederive_opened_ms: None,
+                    rederive_ttl_ms: l.rederive_ttl_ms,
+                    created_ms: l.created_ms,
+                    updated_ms: l.updated_ms,
+                });
+                    None
+                }
+            Op::AdjudicateLineage(a) => {
+                self.replay_adjudicate(
+                    a.lineage_id,
+                    a.support_mass,
+                    a.contradiction_mass,
+                    a.staleness_mass,
+                    a.last_supported_ms,
+                    a.last_challenged_ms,
+                    a.adjudicated_ms,
+                );
+                    None
+                }
+            Op::TransitionLineage(t) => {
+                use crate::organ::wisdom_lineage::LineageState;
+                self.transition_state(
+                    t.lineage_id,
+                    LineageState::from_u8(t.new_state),
+                    "",
+                    t.rederive_task_id,
+                    t.transitioned_ms,
+                );
+                    None
+                }
+            Op::RecordChallenger(c) => {
+                use crate::organ::wisdom_lineage::ChallengerEvidence;
+                self.record_challenger(
+                    c.lineage_id,
+                    ChallengerEvidence {
+                        intervention_id: c.intervention_id,
+                        surprise_id: c.surprise_id,
+                        outcome_summary: c.outcome_summary,
+                        attached_ms: c.attached_ms,
+                    },
+                    c.attached_ms,
+                );
+                    None
+                }
+            Op::CloseRederive(r) => {
+                use crate::organ::wisdom_lineage::{RederiveAction, ApplicabilityEnvelope};
+                let new_envelope = r.new_envelope_json.as_deref()
+                    .and_then(|j| serde_json::from_str::<ApplicabilityEnvelope>(j).ok());
+                self.close_rederive(
+                    r.lineage_id,
+                    RederiveAction::from_u8(r.action),
+                    new_envelope,
+                    r.fork_claim,
+                    r.fork_lineage_id,
+                    r.closed_ms,
+                );
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

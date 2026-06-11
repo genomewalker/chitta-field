@@ -530,3 +530,74 @@ impl InterventionStore {
         }
     }
 }
+
+impl crate::organ::OrganApply for InterventionStore {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2). Consumes this organ's
+    /// op variants; everything else passes through to the next organ or the
+    /// central multi-structure match in apply_op.
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::StartIntervention(s) => {
+                use crate::organ::intervention::{ActionType, InterventionRecord, InterventionStatus, ReversalCost};
+                self.replay_start(InterventionRecord {
+                    id: s.id,
+                    realm: s.realm,
+                    session_id: s.session_id,
+                    task_id: s.task_id,
+                    agent_id: s.agent_id,
+                    domain: s.domain,
+                    intent: s.intent,
+                    action_type: ActionType::from_u8(s.action_type),
+                    action_ref: s.action_ref,
+                    preconditions: s.preconditions,
+                    expected_observables: s.expected_observables,
+                    reversal_cost: ReversalCost::from_u8(s.reversal_cost),
+                    started_ms: s.started_ms,
+                    closed_ms: None,
+                    status: InterventionStatus::Open,
+                });
+                    None
+                }
+            Op::AddObservation(o) => {
+                use crate::organ::intervention::{ObservationKind, ObservationRecord};
+                self.replay_observation(ObservationRecord {
+                    id: o.id,
+                    intervention_id: o.intervention_id,
+                    kind: ObservationKind::from_u8(o.kind),
+                    evidence_refs: o.evidence_refs,
+                    summary: o.summary,
+                    confidence: o.confidence,
+                    timestamp_ms: o.timestamp_ms,
+                });
+                    None
+                }
+            Op::CloseIntervention(c) => {
+                use crate::organ::intervention::InterventionStatus;
+                self.replay_close(
+                    c.intervention_id,
+                    InterventionStatus::from_u8(c.status),
+                    c.closed_ms,
+                );
+                    None
+                }
+            Op::RecordAttribution(a) => {
+                use crate::organ::intervention::{AttributionClass, AttributionRecord};
+                self.replay_attribution(AttributionRecord {
+                    intervention_id: a.intervention_id,
+                    primary_class: AttributionClass::from_u8(a.primary_class),
+                    secondary_class: a.secondary_class.map(AttributionClass::from_u8),
+                    confidence_delta: a.confidence_delta,
+                    surprise_id: a.surprise_id,
+                    debt_ids: a.debt_ids,
+                    source_memory_ids: a.source_memory_ids,
+                    skill_memory_ids: a.skill_memory_ids,
+                    note: a.note,
+                    timestamp_ms: a.timestamp_ms,
+                });
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

@@ -110,3 +110,23 @@ impl LearnedScoringModel {
         }
     }
 }
+
+impl crate::organ::OrganApply for LearnedScoringModel {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::UpdateScorerModel(m) => {
+                self.apply_update(
+                    &m.weights_json,
+                    m.model_version,
+                    m.mean_loss,
+                    m.outcome_count,
+                    m.applied_at_ms,
+                );
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

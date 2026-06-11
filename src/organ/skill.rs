@@ -111,3 +111,21 @@ impl SkillRegistry {
         self.skills.len()
     }
 }
+
+impl crate::organ::OrganApply for SkillRegistry {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::SkillUpload(s) => {
+                self.upload(&s.skill_id, &s.content, &s.uploaded_by, &s.tags, s.ts_ms);
+                    None
+                }
+            Op::SkillDeprecate(s) => {
+                self.deprecate(&s.skill_id);
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

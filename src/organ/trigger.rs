@@ -304,3 +304,37 @@ mod tests {
         assert_eq!(store.get(id).unwrap().status, TriggerStatus::Expired);
     }
 }
+
+impl crate::organ::OrganApply for TriggerStore {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::AddTrigger(t) => {
+                if let Ok(trigger) = serde_json::from_slice(&t.trigger_json) {
+                    self.replay_add(trigger);
+                }
+                    None
+                }
+            Op::UpdateTrigger(u) => {
+                let status = match u.status {
+                    0 => crate::organ::trigger::TriggerStatus::Armed,
+                    1 => crate::organ::trigger::TriggerStatus::Fired,
+                    2 => crate::organ::trigger::TriggerStatus::Expired,
+                    _ => crate::organ::trigger::TriggerStatus::Inhibited,
+                };
+                self.replay_update_status(u.trigger_id, status, u.fired_ms);
+                    None
+                }
+            Op::FireTrigger(f) => {
+                self.replay_update_status(
+                    f.trigger_id,
+                    crate::organ::trigger::TriggerStatus::Fired,
+                    f.fired_ms,
+                );
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

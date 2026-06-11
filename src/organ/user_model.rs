@@ -60,3 +60,26 @@ impl UserModelRegistry {
         self.entries.values().collect()
     }
 }
+
+impl crate::organ::OrganApply for UserModelRegistry {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::UserModelEvent(ev) => {
+                let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
+                match ev.kind.as_str() {
+                    "upsert" => {
+                        self.upsert(ev.entity_id, ev.entity_type, payload_str, ev.ts_ms);
+                    }
+                    "observe" | "progress" | "complete" => {
+                        self.observe(&ev.entity_id, ev.ts_ms);
+                    }
+                    _ => {}
+                }
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

@@ -114,3 +114,21 @@ impl AgentRegistry {
         self.agents.len()
     }
 }
+
+impl crate::organ::OrganApply for AgentRegistry {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::AgentUpsert(a) => {
+                self.upsert(&a.agent_id, &a.display_name, &a.description, a.ts_ms);
+                    None
+                }
+            Op::AgentDisable(a) => {
+                self.disable(&a.agent_id);
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

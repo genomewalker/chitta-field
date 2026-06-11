@@ -728,3 +728,108 @@ impl AgentProtocolStore {
 impl Default for AgentProtocolStore {
     fn default() -> Self { Self::new() }
 }
+
+impl crate::organ::OrganApply for AgentProtocolStore {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2). Consumes this organ's
+    /// op variants; everything else passes through to the next organ or the
+    /// central multi-structure match in apply_op.
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::RegisterTask(t) => {
+                use crate::organ::agent_protocol::TaskContract;
+                use crate::organ::agent_protocol::TaskStatus;
+                self.replay_register_task(TaskContract {
+                    id: t.id,
+                    session_id: t.session_id,
+                    realm: t.realm,
+                    goal: t.goal,
+                    constraints: t.constraints,
+                    acceptance_criteria: t.acceptance_criteria,
+                    priority: t.priority,
+                    status: TaskStatus::Active,
+                    parent_task_id: t.parent_task_id,
+                    intervention_ids: Vec::new(),
+                    tags: t.tags,
+                    created_ms: t.created_ms,
+                    updated_ms: t.created_ms,
+                    deadline_ms: t.deadline_ms,
+                });
+                    None
+                }
+            Op::UpdateTask(u) => {
+                self.replay_update_task(
+                    u.task_id,
+                    u.status,
+                    u.add_intervention_id,
+                    u.add_tag,
+                    u.updated_ms,
+                );
+                    None
+                }
+            Op::AddDelegation(d) => {
+                use crate::organ::agent_protocol::{DelegationEdge, DelegationStatus};
+                self.replay_delegation(DelegationEdge {
+                    id: d.id,
+                    task_id: d.task_id,
+                    from_agent: d.from_agent,
+                    to_agent: d.to_agent,
+                    delegated_at: d.delegated_at,
+                    handoff_note: d.handoff_note,
+                    status: DelegationStatus::Active,
+                });
+                    None
+                }
+            Op::LinkEvidence(e) => {
+                use crate::organ::agent_protocol::{EvidenceKind, EvidenceLink};
+                self.replay_evidence(EvidenceLink {
+                    id: e.id,
+                    task_id: e.task_id,
+                    memory_id: e.memory_id,
+                    produced_by: e.produced_by,
+                    evidence_kind: EvidenceKind::from_u8(e.evidence_kind),
+                    relevance: e.relevance,
+                    created_ms: e.created_ms,
+                });
+                    None
+                }
+            Op::AddProbe(p) => {
+                use crate::organ::agent_protocol::{PendingProbe, ProbeStatus};
+                self.replay_probe(PendingProbe {
+                    id: p.id,
+                    task_id: p.task_id,
+                    question: p.question,
+                    expected_answerer: p.expected_answerer,
+                    priority: p.priority,
+                    status: ProbeStatus::Open,
+                    created_ms: p.created_ms,
+                    resolved_ms: None,
+                    answer: None,
+                });
+                    None
+                }
+            Op::ResolveProbe(r) => {
+                self.replay_resolve_probe(
+                    r.probe_id,
+                    r.status,
+                    r.answer,
+                    r.resolved_ms,
+                );
+                    None
+                }
+            Op::SetCriterion(c) => {
+                use crate::organ::agent_protocol::CompletionCriterion;
+                self.replay_criterion(CompletionCriterion {
+                    id: c.id,
+                    task_id: c.task_id,
+                    criterion: c.criterion,
+                    is_met: c.is_met,
+                    checked_ms: Some(c.checked_ms),
+                    evidence_note: c.evidence_note,
+                });
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

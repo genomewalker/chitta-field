@@ -303,3 +303,46 @@ impl WisdomPromotionStore {
         }
     }
 }
+
+impl crate::organ::OrganApply for WisdomPromotionStore {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::UpsertWisdomCandidate(w) => {
+                self.replay_upsert(
+                    crate::organ::wisdom_promotion::WisdomCandidate {
+                        id: w.candidate_id,
+                        cluster_key: w.cluster_key,
+                        domain: w.domain,
+                        action: w.action,
+                        summary: w.summary,
+                        episode_ids: w.episode_ids,
+                        debt_ids: w.debt_ids,
+                        support_count: w.support_count,
+                        cross_session_count: w.cross_session_count,
+                        mean_surprise: w.mean_surprise,
+                        promotion_score: w.promotion_score,
+                        contradiction_count: 0,
+                        lifecycle: crate::organ::wisdom_promotion::WisdomLifecycle::Candidate,
+                        memory_id: None,
+                        created_ms: w.created_ms,
+                        updated_ms: w.created_ms,
+                    },
+                );
+                    None
+                }
+            Op::UpdateWisdomLifecycle(l) => {
+                self.replay_lifecycle(
+                    l.candidate_id,
+                    l.new_state,
+                    l.memory_id,
+                    l.contradiction_count,
+                    l.updated_ms,
+                );
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

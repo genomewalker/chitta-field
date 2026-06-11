@@ -223,3 +223,29 @@ impl SurpriseStore {
         self.events.len()
     }
 }
+
+impl crate::organ::OrganApply for SurpriseStore {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::RecordSurprise(s) => {
+                self.replay_record(crate::organ::surprise::SurpriseEvent {
+                    id: s.event_id,
+                    context_sketch: s.context_sketch,
+                    action: s.action,
+                    expected: s.expected,
+                    actual: s.actual,
+                    surprise_magnitude: s.surprise_magnitude,
+                    domain: s.domain,
+                    timestamp_ms: s.timestamp_ms,
+                    realm: s.realm,
+                    session_id: s.session_id,
+                    source_memory_id: s.source_memory_id,
+                });
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

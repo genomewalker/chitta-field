@@ -479,3 +479,60 @@ fn mean_embedding(ids: &[u64], embeddings: &HashMap<u64, Vec<f32>>) -> Vec<f32> 
     }
     result
 }
+
+impl crate::organ::OrganApply for ThemeOrgan {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::ThemeEvent(ev) => {
+                let payload_str = String::from_utf8(ev.payload_json).unwrap_or_default();
+                match ev.kind.as_str() {
+                    "create" => {
+                        let name = serde_json::from_str::<serde_json::Value>(&payload_str)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("name")
+                                    .and_then(|n| n.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_default();
+                        self.create(ev.theme_id, name);
+                    }
+                    "update_centroid" => {
+                        let centroid = serde_json::from_str::<serde_json::Value>(&payload_str)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("centroid_json")
+                                    .and_then(|c| c.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or(payload_str);
+                        self.update_centroid(ev.theme_id, centroid);
+                    }
+                    "assign_member" => {
+                        let memory_id = serde_json::from_str::<serde_json::Value>(&payload_str)
+                            .ok()
+                            .and_then(|v| v.get("memory_id").and_then(|m| m.as_u64()))
+                            .unwrap_or(0);
+                        if memory_id > 0 {
+                            self.assign_member(ev.theme_id, memory_id);
+                        }
+                    }
+                    "remove_member" => {
+                        let memory_id = serde_json::from_str::<serde_json::Value>(&payload_str)
+                            .ok()
+                            .and_then(|v| v.get("memory_id").and_then(|m| m.as_u64()))
+                            .unwrap_or(0);
+                        if memory_id > 0 {
+                            self.remove_member(ev.theme_id, memory_id);
+                        }
+                    }
+                    _ => {}
+                }
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

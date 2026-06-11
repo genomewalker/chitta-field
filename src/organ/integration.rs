@@ -200,3 +200,27 @@ impl IntegrationKernel {
         self.total_queries
     }
 }
+
+impl crate::organ::OrganApply for IntegrationKernel {
+    /// Organ-owned WAL replay (THEORY.md §8 Phase 2).
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op> {
+        use crate::ops::Op;
+        match op {
+            Op::UpdateSourceWeight(w) => {
+                self.replay_update_weight(w.source, w.query_domain, w.weight);
+                    None
+                }
+            Op::RecordFeedback(f) => {
+                self.replay_feedback(
+                    f.source,
+                    f.query_domain,
+                    f.new_weight,
+                    f.success_count,
+                    f.total_count,
+                );
+                    None
+                }
+            other => Some(other),
+        }
+    }
+}

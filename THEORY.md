@@ -196,7 +196,12 @@ the V23 snapshot get dirty-tracking so unchanged organs are not re-cloned or
 re-written (kills the 2× RSS spike and most of the save cost); single FFI
 error envelope.
 
-> Status (v2.3.0): the two heaviest save costs are gone — payload embeddings
+> Status (v2.5.5): the OrganApply trait landed — 44 op variants across 20
+> organs apply themselves in their own modules; apply_op dispatches organs
+> first and its central match keeps only multi-structure ops, with the
+> consumed variants listed explicitly so a new Op variant still breaks the
+> build until it gets a handler or an organ. Earlier (v2.3.0): the two
+> heaviest save costs are gone — payload embeddings
 > (632MB of the body, duplicating the .emb sidecar) are stripped at save and
 > rehydrated at open (missing ones self-heal via embed_pending), and the six
 > index sidecars (~800MB) are dirty-skipped via a SemanticIndex mutation

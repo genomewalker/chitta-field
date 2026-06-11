@@ -49,3 +49,12 @@ pub mod reconciler;
 pub mod observer;
 pub mod interaction_ledger;
 pub mod predicate_store;
+
+/// Organ-owned WAL replay (THEORY.md §8 Phase 2): an organ applies the op
+/// variants it owns and consumes them (returns None); everything else passes
+/// through (Some(op)) to the next organ or the central multi-structure match
+/// in apply_op. Taking `Op` by value preserves the replay path's move
+/// semantics — no clones.
+pub(crate) trait OrganApply {
+    fn apply(&mut self, op: crate::ops::Op) -> Option<crate::ops::Op>;
+}
