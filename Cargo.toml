@@ -1,6 +1,6 @@
 [package]
 name = "chitta-field"
-version = "2.4.0"
+version = "2.5.0"
 edition = "2021"
 build = "build.rs"
 description = "Organic associative memory substrate for cognitive AI companions"
