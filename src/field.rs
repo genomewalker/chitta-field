@@ -764,13 +764,13 @@ impl ChittaField {
             // normalize_all() so any rebuilt binary codes are centered, and before any
             // search so queries are centered. Absent on legacy snapshots → raw cosine.
             let _ = semantic_idx.load_centroid_sidecar(&snap_path.with_extension("mu"));
-            // .emb mmap: only for large stores (> FLAT_SCAN_MAX). Above that, recall uses the
+            // .emb mmap: only for large stores (> EMB_MMAP_MIN). Above that, recall uses the
             // binary-Hamming prefilter which reads few embeddings, so mmap saves a large heap
             // copy. Below it, recall is a flat heap scan over every embedding — serving that from
             // mmap both wastes nothing and courts a SIGBUS: a consolidation prune can unlink the
             // .emb file out from under the mapping while a scan is faulting its pages. Keeping the
             // embeddings in the heap removes that race entirely.
-            if emb_loaded && semantic_idx.embeddings_count() > crate::hnsw::FLAT_SCAN_MAX {
+            if emb_loaded && semantic_idx.embeddings_count() > crate::hnsw::EMB_MMAP_MIN {
                 let _ = semantic_idx.activate_mmap_embeddings(&snap_path.with_extension("emb"));
             }
             // .hnsw + .delta.hnsw: load both tiers; backfill handles WAL-replay additions.

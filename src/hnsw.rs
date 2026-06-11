@@ -36,15 +36,22 @@ const HNSW_ML: f64 = 0.36067; // 1/ln(16)
 // Below this, binary Hamming + linear scan (search_candidates) handles it.
 const PER_REALM_HNSW_THRESHOLD: usize = 500;
 
-// At or below this corpus size, recall does a flat raw-cosine scan over every
-// embedding instead of the binary-Hamming prefilter + mean-centering. Both of those
-// exist only to bound query cost at million-vector scale; below this threshold they
-// lose recall for no benefit (a full scan is sub-millisecond per query). Measured:
-// relevant items move from buried / 3-34% scores up to #1-#10 / 0.70-0.84 raw cosine.
-// Override with CHITTA_FLAT_SCAN_MAX (0 disables the flat path).
-// Also gates .emb mmap activation in field.rs: below this the embeddings stay in the heap, so
-// the flat scan never faults on a page whose backing file a consolidation prune has unlinked.
-pub(crate) const FLAT_SCAN_MAX: usize = 500_000;
+// Flat scan disabled by default since 2026-06-11: the ANN path was validated
+// against flat at 154k memories — 20-40x faster (12.5s → 0.3-0.6s per recall;
+// CW-refresh searches drop from ~150ms to ~1ms, retiring the scan-convoy
+// class) with bit-identical LOCOMO retrieval F1 on every question and top-5
+// ranking parity on live probes. The historical regression this constant
+// guarded against ("relevant items buried at 3-34%") did not reproduce on
+// the matured graph + centering. Re-enable flat per-process with
+// CHITTA_FLAT_SCAN_MAX=<n> (stores ≤ n scan exhaustively) for A/B or rollback.
+pub(crate) const FLAT_SCAN_MAX: usize = 0;
+
+// .emb mmap activation threshold (field.rs): below this the embeddings stay
+// in the heap, so scans never fault on a page whose backing file a
+// consolidation prune (or, multi-node, a peer's sidecar rewrite over NFS)
+// has unlinked. Deliberately DECOUPLED from FLAT_SCAN_MAX — flipping the
+// search path must not silently arm the mmap hazard at small scale.
+pub(crate) const EMB_MMAP_MIN: usize = 500_000;
 
 /// Deterministic level assignment seeded by node ID — safe to call from parallel threads.
 fn random_level_from_seed(seed: u64) -> usize {
