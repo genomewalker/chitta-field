@@ -5260,9 +5260,11 @@ pub extern "C" fn cf_recall_by_kind(
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
-    let kind_members = handle.field.kind_members.read();
-    let states = handle.field.states.read();
+    // Lock order: payloads → states → kind_members (struct order; matches
+    // sync_foreign's write-guard acquisition).
     let payloads = handle.field.payloads.read();
+    let states = handle.field.states.read();
+    let kind_members = handle.field.kind_members.read();
 
     let empty_set;
     let members: &std::collections::HashSet<u64> = match kind_members.get(&kind_str) {

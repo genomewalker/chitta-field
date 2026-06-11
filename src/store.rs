@@ -1365,8 +1365,8 @@ impl ChittaField {
             }
         }
 
-        let states = self.states.read();
         let payloads = self.payloads.read();
+        let states = self.states.read();
         let pipeline = self.scoring_pipeline.read();
         let learners = self.learners.read();
         let ack_scores = self.ack_scores.read();
@@ -1533,8 +1533,12 @@ impl ChittaField {
         let mut frontier: Vec<(MemoryId, f32, usize)> =
             seed_ids.iter().map(|&id| (id, 1.0, max_hops)).collect();
 
-        let assoc_edges = self.assoc_edges.read();
+        // Lock order: payloads → states → assoc_edges (struct order; matches
+        // sync_foreign's write-guard acquisition). payloads is needed only
+        // after the walk but must be acquired first to keep the global order.
+        let payloads = self.payloads.read();
         let states = self.states.read();
+        let assoc_edges = self.assoc_edges.read();
 
         while let Some((node, act, hops_left)) = frontier.pop() {
             if hops_left == 0 {
@@ -1568,7 +1572,6 @@ impl ChittaField {
 
         drop(assoc_edges);
 
-        let payloads = self.payloads.read();
         let now = now_ms();
 
         let mut hits: Vec<RecallHit> = activation
@@ -1669,8 +1672,8 @@ impl ChittaField {
             .read()
             .range_query(start_ms, end_ms, realm, limit);
         let now = now_ms();
-        let states = self.states.read();
         let payloads = self.payloads.read();
+        let states = self.states.read();
 
         let hits = entries
             .into_iter()
@@ -2811,8 +2814,8 @@ impl ChittaField {
         let keyword_hits = self.keyword_idx.read().search(query, k * 3);
 
         let now = now_ms();
-        let states = self.states.read();
         let payloads = self.payloads.read();
+        let states = self.states.read();
         let pipeline = self.scoring_pipeline.read();
         let learners = self.learners.read();
         let ack_scores = self.ack_scores.read();
@@ -3029,8 +3032,8 @@ impl ChittaField {
     pub fn recall_artifact(&self, path: &str, limit: usize) -> Result<Vec<RecallHit>> {
         let entries = self.artifact_idx.read().query_path(path, limit);
         let now = now_ms();
-        let states = self.states.read();
         let payloads = self.payloads.read();
+        let states = self.states.read();
 
         let hits = entries
             .into_iter()
@@ -3324,12 +3327,14 @@ impl ChittaField {
             return Err(FieldError::InvalidEmbedDim { expected: EMBED_DIM, actual: embedding.len() });
         }
         let existing_content = {
+            // Lock order: payloads before states (matches sync_foreign).
+            let payloads = self.payloads.read();
             let states = self.states.read();
             match states.get(&memory_id) {
                 None => return Err(FieldError::NotFound(memory_id)),
                 Some(st) if !st.embed_pending => return Ok(()),
                 Some(_) => {
-                    self.payloads.read().get(&memory_id)
+                    payloads.get(&memory_id)
                         .map(|p| p.content.clone())
                         .unwrap_or_default()
                 }
@@ -3473,8 +3478,8 @@ impl ChittaField {
 
         // Pass 1: collect candidates — states+payloads locked briefly, then released.
         let candidates: Vec<MemoryId> = {
-            let states   = self.states.read();
             let payloads = self.payloads.read();
+            let states   = self.states.read();
             states.iter()
                 .filter(|(id, st)| {
                     !st.deleted && !st.embed_pending &&
@@ -3517,8 +3522,8 @@ impl ChittaField {
 
         // Pass 1: collect candidates — brief shared lock on both maps.
         let candidates: Vec<MemoryId> = {
-            let states   = self.states.read();
             let payloads = self.payloads.read();
+            let states   = self.states.read();
             states.iter()
                 .filter(|(id, st)| {
                     !st.deleted &&
@@ -5988,8 +5993,8 @@ impl ChittaField {
     }
 
     pub fn memory_claim_info_json(&self, id: crate::ids::MemoryId, now_ms: i64) -> String {
-        let states = self.states.read();
         let payloads = self.payloads.read();
+        let states = self.states.read();
         let state = match states.get(&id) { Some(s) => s, None => return "{}".to_string() };
         let payload = match payloads.get(&id) { Some(p) => p, None => return "{}".to_string() };
         let age_days = (now_ms - state.created_at_ms).max(0) as f64 / 86_400_000.0;
