@@ -40,6 +40,9 @@ jobs:
           export PATH="/usr/bin:$HOME/.rustup/toolchains/1.92.0-x86_64-unknown-linux-gnu/bin:$PATH"
           cargo test --release --features deadlock-detection
 
+      - name: Lock-order audit
+        run: python3.11 tools/lock_order_audit.py
+
       - name: Build release artifacts
         env:
           PYO3_PYTHON: /usr/bin/python3.11

@@ -1266,14 +1266,17 @@ impl ChittaField {
         }
 
         let now = now_ms();
-        let realm_members = self.realm_members.read();
-        let allowed = realm.and_then(|r| realm_members.get(r));
-
         let result_limit = k.saturating_mul(3).max(k);
-        let semantic_hits = self
-            .semantic_idx
-            .read()
-            .search(query_embedding, result_limit, allowed, realm);
+        // realm_members guard scoped to the search: holding it (a late-order
+        // lock) across the states/idx acquisitions below deadlocks against
+        // put_memory, which holds states.write while taking realm_members.write.
+        let semantic_hits = {
+            let realm_members = self.realm_members.read();
+            let allowed = realm.and_then(|r| realm_members.get(r));
+            self.semantic_idx
+                .read()
+                .search(query_embedding, result_limit, allowed, realm)
+        };
 
         // Refresh competitive_weight for each candidate using the *current* HNSW neighborhood.
         // The write-time value is stale for memories ingested when the store was sparse.
@@ -1289,8 +1292,10 @@ impl ChittaField {
         // Uses read locks only; the inflight check here is a cheap pre-filter,
         // the authoritative check-and-reserve happens under the write guard below.
         let candidates: Vec<(MemoryId, Vec<f32>)> = {
-            let idx = self.semantic_idx.read();
+            // Lock order: states before semantic_idx (struct order) — the
+            // inverse deadlocked against sync_foreign in production.
             let states_r = self.states.read();
+            let idx = self.semantic_idx.read();
             let inflight_r = self.cw_refresh_inflight.read();
             semantic_hits.iter().filter_map(|hit| {
                 // Skip if refreshed recently by this or another session.
@@ -1367,8 +1372,8 @@ impl ChittaField {
 
         let payloads = self.payloads.read();
         let states = self.states.read();
-        let pipeline = self.scoring_pipeline.read();
         let learners = self.learners.read();
+        let pipeline = self.scoring_pipeline.read();
         let ack_scores = self.ack_scores.read();
         let recall_prov = self.recall_provenance.read();
 
@@ -1903,8 +1908,8 @@ impl ChittaField {
             let mut tape = self.event_tape.write();
             tape.symbol_of(tool, entity, 0) // outcome=0 as probe; CDAWG walk ignores outcome bits via partial match
         };
-        let cdawg = self.cdawg.read();
         let tape  = self.event_tape.read();
+        let cdawg = self.cdawg.read();
 
         // Try exact match first, then fall back to tool-only by zeroing entity_key bits.
         let turns = if let Some(state) = cdawg.walk(&[sym]) {
@@ -1957,8 +1962,8 @@ impl ChittaField {
 
     /// Return top-k failure patterns from the CDAWG as RecallHit stubs.
     pub fn recall_failure_pattern(&self, k: usize) -> Result<Vec<RecallHit>> {
-        let cdawg = self.cdawg.read();
         let tape  = self.event_tape.read();
+        let cdawg = self.cdawg.read();
         let patterns = cdawg.failure_patterns(3, k);
         let hits = patterns.into_iter().filter_map(|(state_id, fail_count, ratio)| {
             let turns = cdawg.collect_endpos(state_id);
@@ -2006,8 +2011,8 @@ impl ChittaField {
             let mut tape = self.event_tape.write();
             tape.symbol_of(tool, entity, 0)
         };
-        let cdawg = self.cdawg.read();
         let tape  = self.event_tape.read();
+        let cdawg = self.cdawg.read();
         let antecedents = cdawg.causal_antecedents(&[sym], k, &tape);
         let hits = antecedents
             .into_iter()
@@ -2121,8 +2126,8 @@ impl ChittaField {
         use crate::organ::cdawg::CounterfactualHit;
         let taken_sym = self.event_tape.write().symbol_of(tool, entity, outcome);
         let context   = self.event_tape.read().last_n_syms(4);
-        let cdawg     = self.cdawg.read();
         let tape      = self.event_tape.read();
+        let cdawg     = self.cdawg.read();
         let hits: Vec<CounterfactualHit> = cdawg.counterfactual_alternatives(&context, taken_sym, 5, k);
         let result = hits.into_iter().enumerate().map(|(i, h)| {
             let tool_id   = (h.symbol >> 40) as u16;
@@ -2282,8 +2287,8 @@ impl ChittaField {
         // Phase 11: take a Turīya health sample after each consolidation_pass.
         let diagnosis = {
             let ts = now_ms();
-            let cdawg   = self.cdawg.read();
             let tape    = self.event_tape.read();
+            let cdawg   = self.cdawg.read();
             let ledger  = self.refutation_ledger.read();
             let market  = self.hypothesis_market.read();
             let fep     = self.fep_prior.read();
@@ -2628,8 +2633,8 @@ impl ChittaField {
             let mut tape = self.event_tape.write();
             tape.symbol_of(tool, entity, 0)
         };
-        let cdawg = self.cdawg.read();
         let tape  = self.event_tape.read();
+        let cdawg = self.cdawg.read();
         let rows = cdawg.top_q_states(&[sym], k.max(1));
         let hits = rows.into_iter().map(|(state_id, q_val, support)| {
             let next_syms: Vec<String> = cdawg.states.get(state_id as usize)
@@ -2674,8 +2679,8 @@ impl ChittaField {
 
     /// Return top-k rules by refute_ratio as a plain-text summary.
     pub fn refutation_stats(&self, k: usize) -> String {
-        let ledger = self.refutation_ledger.read();
         let tape   = self.event_tape.read();
+        let ledger = self.refutation_ledger.read();
         ledger.stats_json(&tape, k)
     }
 
@@ -2750,6 +2755,7 @@ impl ChittaField {
         &self, tool: &str, entity: &str, outcome: u8, k: usize,
     ) -> Result<Vec<RecallHit>> {
         let sym = self.event_tape.read().symbol_of_ro(tool, entity, outcome);
+        let etape = self.event_tape.read();
         let tape = self.decision_tape.read();
         let hits = tape.rejected_alternatives(sym, k)
             .into_iter()
@@ -2758,7 +2764,6 @@ impl ChittaField {
                 let reason = crate::organ::decision_tape::RejectionReason::from_u8(reason_u8);
                 let chosen_tool_id  = (dp.chosen_sym >> 40) as u16;
                 let chosen_entity_k = (dp.chosen_sym & 0xffff_ffff) as u32;
-                let etape = self.event_tape.read();
                 let chosen_tool_name   = etape.tool_name(chosen_tool_id);
                 let chosen_entity_name = etape.entity_name(chosen_entity_k);
                 let content = format!(
@@ -2816,8 +2821,8 @@ impl ChittaField {
         let now = now_ms();
         let payloads = self.payloads.read();
         let states = self.states.read();
-        let pipeline = self.scoring_pipeline.read();
         let learners = self.learners.read();
+        let pipeline = self.scoring_pipeline.read();
         let ack_scores = self.ack_scores.read();
 
         let mut hits: Vec<RecallHit> = keyword_hits
@@ -6222,8 +6227,8 @@ impl ChittaField {
         // Collect residuals: for each memory with a sparse code, decode and subtract
         let residuals: Vec<Vec<f32>> = {
             let payloads = self.payloads.read();
-            let cortical = self.cortical_idx.read();
             let encoder = self.sparse_encoder.read();
+            let cortical = self.cortical_idx.read();
 
             cortical
                 .mem_codes
@@ -6272,12 +6277,13 @@ impl ChittaField {
         }
 
         let decoded = {
+            let encoder = self.sparse_encoder.read();
             let cortical = self.cortical_idx.read();
             let code = match cortical.mem_codes.get(&memory_id) {
                 Some(c) => c.clone(),
                 None => return Ok(()),
             };
-            self.sparse_encoder.read().decode(&code)
+            encoder.decode(&code)
         };
 
         let residual: Vec<f32> = embedding

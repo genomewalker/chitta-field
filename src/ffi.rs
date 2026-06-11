@@ -5346,8 +5346,8 @@ pub extern "C" fn cf_purge_corrupt(h: *mut CfHandle, out_purged: *mut usize) -> 
 
     // Also remove orphaned semantic index entries (embedding exists but no payload)
     let orphaned: Vec<u64> = {
-        let idx = handle.field.semantic_idx.read();
         let payloads = handle.field.payloads.read();
+        let idx = handle.field.semantic_idx.read();
         idx.all_ids()
             .filter(|id| !payloads.contains_key(id))
             .collect()
@@ -5461,8 +5461,8 @@ pub unsafe extern "C" fn cf_record_recall_batch(
                 }
             }
             {
-                let mut coact = h.field.coactivation_stats.write();
                 let mut assoc = h.field.assoc_edges.write();
+                let mut coact = h.field.coactivation_stats.write();
                 for i in 0..id_slice.len() {
                     for j in (i + 1)..id_slice.len() {
                         let key = (
