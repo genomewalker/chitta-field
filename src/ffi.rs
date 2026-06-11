@@ -5178,6 +5178,10 @@ pub extern "C" fn cf_update_memory_content(
         match payloads.get_mut(&id) {
             Some(payload) => {
                 payload.content = new_content.clone();
+                handle
+                    .field
+                    .pld_mutations
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if !new_embedding.is_empty() {
                     payload.embedding = new_embedding.clone();
                 }

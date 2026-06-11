@@ -573,6 +573,7 @@ impl ChittaField {
             self.pending_embed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.payloads.write().insert(memory_id, payload);
+        self.pld_mutations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.memory_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.states.write().insert(memory_id, state);
         self.chunk_hash_idx
@@ -5464,6 +5465,12 @@ impl ChittaField {
                 idx.merge_delta_into_base();
             }
         }
+        // Read BEFORE the payloads clone: any content mutation racing this
+        // save then differs from the stored value and forces the next .pld
+        // rewrite (see the field doc on pld_mutations).
+        let pld_mutations_at_clone = self
+            .pld_mutations
+            .load(std::sync::atomic::Ordering::Relaxed);
         let snap = FullSnapshot {
             snapshot_seqno: seqno,
             // Clone payloads WITHOUT embeddings the index carries — the .emb
@@ -5599,10 +5606,24 @@ impl ChittaField {
         // fails we MUST NOT strip content from the bincode body — otherwise the content
         // would exist in neither place (silent total content loss). Abort the snapshot.
         let mut snap = snap;
-        FullSnapshot::save_payload_sidecar(&pld_path, &snap.payloads)
-            .map_err(|e| FieldError::Manifest(format!(
-                "payload (.pld) sidecar save failed, aborting snapshot to avoid content loss: {e}"
-            )))?;
+        // .pld dirty-skip: content is the ONE thing with no fallback copy, so
+        // skip only when no content mutation happened since the last write by
+        // this instance AND the existing file is plausibly intact.
+        let pld_clean = self
+            .pld_saved_at
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == pld_mutations_at_clone
+            && std::fs::metadata(&pld_path).map(|m| m.len() >= 16).unwrap_or(false);
+        if pld_clean {
+            eprintln!("[chitta-field] .pld sidecar unchanged since last save — skipping rewrite");
+        } else {
+            FullSnapshot::save_payload_sidecar(&pld_path, &snap.payloads)
+                .map_err(|e| FieldError::Manifest(format!(
+                    "payload (.pld) sidecar save failed, aborting snapshot to avoid content loss: {e}"
+                )))?;
+            self.pld_saved_at
+                .store(pld_mutations_at_clone, std::sync::atomic::Ordering::Relaxed);
+        }
         // Strip content and embeddings from bincode (live in sidecars now).
         for payload in snap.payloads.values_mut() {
             payload.content.clear();
@@ -6830,10 +6851,13 @@ mod tests {
         };
         let emb_path = sidecar("emb");
         let hdc_path = sidecar("hdc");
+        let pld_path = sidecar("pld");
         let ino_first = std::fs::metadata(&emb_path).unwrap().ino();
         let hdc_ino_first = std::fs::metadata(&hdc_path).unwrap().ino();
+        let pld_ino_first = std::fs::metadata(&pld_path).unwrap().ino();
         let emb_len_first = std::fs::metadata(&emb_path).unwrap().len();
         let hdc_len_first = std::fs::metadata(&hdc_path).unwrap().len();
+        let pld_len_first = std::fs::metadata(&pld_path).unwrap().len();
 
         // No mutation between saves → same inodes (skipped rewrites).
         field.save_full_snapshot().unwrap();
@@ -6846,6 +6870,11 @@ mod tests {
             std::fs::metadata(&hdc_path).unwrap().ino(),
             hdc_ino_first,
             "clean hdc store must not rewrite its sidecar"
+        );
+        assert_eq!(
+            std::fs::metadata(&pld_path).unwrap().ino(),
+            pld_ino_first,
+            "unchanged content must not rewrite the .pld sidecar"
         );
 
         // A new memory mutates the index → rewrite (fresh inode via rename).
@@ -6867,6 +6896,10 @@ mod tests {
         assert!(
             std::fs::metadata(&hdc_path).unwrap().len() > hdc_len_first,
             "mutated hdc store must rewrite its sidecar"
+        );
+        assert!(
+            std::fs::metadata(&pld_path).unwrap().len() > pld_len_first,
+            "new content must rewrite the .pld sidecar"
         );
     }
 
