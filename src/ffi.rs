@@ -9115,3 +9115,14 @@ pub extern "C" fn cf_predicate_list(h: *const CfHandle, memory_id: u64) -> *mut 
 fn handle_from(h: *const CfHandle) -> &'static CfHandle {
     unsafe { &*h }
 }
+
+/// Budgeted background competitive-weight refresh (consolidation sweep).
+/// Returns the number refreshed, or -1 on null handle.
+#[no_mangle]
+pub extern "C" fn cf_cw_refresh_sweep(h: *mut CfHandle, budget: usize) -> i64 {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    handle.field.cw_refresh_sweep(budget) as i64
+}

@@ -5484,6 +5484,109 @@ impl ChittaField {
 
     /// Save full in-memory state to a binary snapshot (chitta.snapshot).
     /// After this, on next open only ops after snapshot_seqno need to be replayed.
+    /// Budgeted background competitive-weight refresh (THEORY.md §8 Phase 3:
+    /// consolidation as deliberate merge). Refreshes up to `budget` memories
+    /// whose last refresh is older than the configured interval, using the
+    /// same reservation discipline as the recall-path refresh — so recalls
+    /// (whose own budget is small) almost never pay refresh cost themselves.
+    /// Called from the subconscious sleep-consolidation cycle. Returns the
+    /// number refreshed.
+    pub fn cw_refresh_sweep(&self, budget: usize) -> usize {
+        if budget == 0 {
+            return 0;
+        }
+        let now = now_ms();
+        let (dedup_upper, interval_ms) = {
+            let pipeline = self.scoring_pipeline.read();
+            (
+                pipeline.config.dedup_cosine_upper,
+                pipeline.config.cw_refresh_interval_ms,
+            )
+        };
+        // Collect stale candidates + embeddings under read locks (struct order).
+        let candidates: Vec<(MemoryId, Vec<f32>)> = {
+            let states_r = self.states.read();
+            let idx = self.semantic_idx.read();
+            let inflight_r = self.cw_refresh_inflight.read();
+            states_r
+                .iter()
+                .filter(|(_, st)| !st.deleted && now - st.last_cw_refresh_ms >= interval_ms)
+                .filter(|(id, _)| {
+                    inflight_r
+                        .get(id)
+                        .map(|&ts| now - ts >= interval_ms)
+                        .unwrap_or(true)
+                })
+                .filter_map(|(id, _)| idx.get_embedding(*id).map(|e| (*id, e.to_vec())))
+                .take(budget)
+                .collect()
+        };
+        // Atomic re-check + reserve (same as the recall path).
+        let candidates: Vec<(MemoryId, Vec<f32>)> = if candidates.is_empty() {
+            return 0;
+        } else {
+            let mut inflight_w = self.cw_refresh_inflight.write();
+            inflight_w.retain(|_, ts| now - *ts < interval_ms);
+            candidates
+                .into_iter()
+                .filter(|(id, _)| {
+                    if inflight_w.contains_key(id) {
+                        return false;
+                    }
+                    inflight_w.insert(*id, now);
+                    true
+                })
+                .collect()
+        };
+        let cw_updates: Vec<(MemoryId, f32)> = {
+            let idx = self.semantic_idx.read();
+            candidates
+                .iter()
+                .filter_map(|(memory_id, emb)| {
+                    let neighbors = idx.search(emb, 9, None, None);
+                    if neighbors.len() <= 1 {
+                        return None;
+                    }
+                    let mut cos_sum = 0.0f32;
+                    let mut n = 0u32;
+                    for nb in &neighbors {
+                        if nb.memory_id == *memory_id {
+                            continue;
+                        }
+                        if nb.cosine_similarity >= dedup_upper {
+                            continue;
+                        }
+                        cos_sum += nb.cosine_similarity;
+                        n += 1;
+                    }
+                    if n > 0 {
+                        Some((*memory_id, cos_sum / n as f32))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let refreshed = candidates.len();
+        let cw_by_id: std::collections::HashMap<MemoryId, f32> = cw_updates.into_iter().collect();
+        {
+            let mut states_w = self.states.write();
+            for (memory_id, _) in &candidates {
+                if let Some(st) = states_w.get_mut(memory_id) {
+                    if let Some(&cw) = cw_by_id.get(memory_id) {
+                        st.competitive_weight = cw;
+                    }
+                    st.last_cw_refresh_ms = now;
+                }
+            }
+        }
+        let mut inflight_w = self.cw_refresh_inflight.write();
+        for (id, _) in &candidates {
+            inflight_w.remove(id);
+        }
+        refreshed
+    }
+
     pub fn save_full_snapshot(&self) -> Result<()> {
         use crate::snapshot::FullSnapshot;
         self.drain_pending_recall_effects()?;
@@ -7048,6 +7151,47 @@ mod tests {
             rankings[0], rankings[1],
             "recall ranking must be writer-assignment invariant"
         );
+    }
+
+    /// THEORY.md §6/§8: the consolidation sweep refreshes stale competitive
+    /// weights up to its budget and stamps them, so recall-path budgets
+    /// rarely trigger.
+    #[test]
+    fn cw_refresh_sweep_respects_budget_and_stamps() {
+        let (field, _tmp) = open_test_field();
+        // Orthogonal square waves (different frequencies) — pairwise cosine 0,
+        // so the write-path dedup can't merge them.
+        let mut embs = Vec::new();
+        for m in 0..4usize {
+            let e: Vec<f32> = (0..crate::ops::EMBED_DIM)
+                .map(|i| if (i / (64 << m)) % 2 == 0 { 0.5 } else { -0.5 })
+                .collect();
+            embs.push(e);
+        }
+        let mut ids = Vec::new();
+        for (m, e) in embs.iter().enumerate() {
+            let (id, _) = field
+                .put_memory("wisdom", "test", format!("sweep {m}").as_bytes(), e, 0.9, 0.001, 0, vec![], None, None)
+                .unwrap();
+            ids.push(id);
+        }
+        // Force staleness.
+        {
+            let mut states = field.states.write();
+            for id in &ids {
+                states.get_mut(id).unwrap().last_cw_refresh_ms = 0;
+            }
+        }
+        assert_eq!(field.cw_refresh_sweep(2), 2, "budget must cap the sweep");
+        let stamped = field
+            .states
+            .read()
+            .values()
+            .filter(|st| st.last_cw_refresh_ms > 0)
+            .count();
+        assert_eq!(stamped, 2);
+        assert_eq!(field.cw_refresh_sweep(10), 2, "remaining stale memories swept");
+        assert_eq!(field.cw_refresh_sweep(10), 0, "nothing stale left");
     }
 
     #[test]
