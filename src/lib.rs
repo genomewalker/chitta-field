@@ -59,3 +59,6 @@ pub use recall::RecallHit;
 pub use state::MemoryState;
 pub use log::{ChainHash, ZERO_HASH};
 pub use store::FilterLevel;
+
+#[cfg(all(test, feature = "turbovec-bench"))]
+mod turbovec_bench;

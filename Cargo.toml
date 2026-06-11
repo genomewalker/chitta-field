@@ -22,6 +22,7 @@ memmap2 = "0.9"
 thiserror = "1"
 log = "0.4"
 parking_lot = "0.12"
+turbovec = { version = "0.9", optional = true }
 anyhow = "1"
 roaring = { version = "0.10", features = ["serde"] }
 rayon = "1"
@@ -50,6 +51,9 @@ name = "wal_replay_bench"
 harness = false
 
 [features]
+# Offline A/B bench for TurboQuant vs the current engine (no production use).
+# Run: cargo test --release --features turbovec-bench turbovec_ab -- --ignored --nocapture
+turbovec-bench = ["dep:turbovec"]
 # Debug/CI aid: parking_lot deadlock detection. ChittaField::open spawns a
 # checker thread that dumps any deadlock cycle to stderr and aborts.
 # Never enable in production builds (per-lock bookkeeping overhead).
