@@ -270,6 +270,10 @@ pub struct ChittaField {
     /// the NEXT save instead of leaving a skippable stale file.
     pub(crate) pld_mutations: std::sync::atomic::AtomicU64,
     pub(crate) pld_saved_at: std::sync::atomic::AtomicU64,
+    /// Memories whose sparse encode produced an empty code (runtime-only;
+    /// retried after restart). Keeps encode_all_unindexed from re-encoding
+    /// the same unencodable ids every consolidation cycle.
+    pub(crate) encode_skip: parking_lot::RwLock<HashSet<MemoryId>>,
     /// memory → distinct instances that recalled it (cross-context
     /// generality evidence; THEORY.md §6). Capped at 8 per memory.
     /// Persisted as the V23 "recall_provenance" section.
@@ -1208,6 +1212,7 @@ impl ChittaField {
             hdc_sidecar_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
             pld_mutations: std::sync::atomic::AtomicU64::new(0),
             pld_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
+            encode_skip: parking_lot::RwLock::new(HashSet::new()),
             recall_provenance: parking_lot::RwLock::new(recall_provenance),
         })
     }

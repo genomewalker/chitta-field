@@ -4169,6 +4169,8 @@ impl ChittaField {
         let encoder = self.sparse_encoder.read();
         let code = encoder.encode(&embedding);
         if code.is_empty() {
+            drop(encoder);
+            self.encode_skip.write().insert(memory_id);
             return Ok(());
         }
 
@@ -6340,13 +6342,26 @@ impl ChittaField {
 
     /// Encode all memories that don't yet have a sparse code.
     pub fn encode_all_unindexed(&self) -> Result<usize> {
+        // Collect only memories that CAN encode: skip deleted (payloads
+        // outlive soft-delete), empty/foreign-dim embeddings (the stripped-
+        // snapshot rehydrator deliberately leaves deleted ones empty), and
+        // ids whose sparse code came back empty before (runtime skip-set —
+        // retried after restart). Without these filters the same ~7.6k
+        // unencodable memories re-encoded on every consolidation cycle.
         let ids: Vec<MemoryId> = {
             let payloads = self.payloads.read();
+            let states = self.states.read();
             let cortical = self.cortical_idx.read();
+            let skip = self.encode_skip.read();
             payloads
-                .keys()
-                .filter(|id| !cortical.mem_codes.contains_key(id))
-                .copied()
+                .iter()
+                .filter(|(id, p)| {
+                    !cortical.mem_codes.contains_key(*id)
+                        && !skip.contains(*id)
+                        && p.embedding.len() == EMBED_DIM
+                        && states.get(*id).map(|s| !s.deleted).unwrap_or(false)
+                })
+                .map(|(id, _)| *id)
                 .collect()
         };
         let count = ids.len();
@@ -7219,6 +7234,36 @@ mod tests {
         assert_eq!(stamped, 2);
         assert_eq!(field.cw_refresh_sweep(10), 2, "remaining stale memories swept");
         assert_eq!(field.cw_refresh_sweep(10), 0, "nothing stale left");
+    }
+
+    /// Regression for the consolidation re-encode loop: unencodable memories
+    /// (deleted, empty-code) must not be re-collected on every pass.
+    #[test]
+    fn encode_all_unindexed_converges_to_zero() {
+        let (field, _tmp) = open_test_field();
+        let emb_a = vec![0.5f32; crate::ops::EMBED_DIM];
+        let mut emb_b = emb_a.clone();
+        for v in emb_b.iter_mut().take(crate::ops::EMBED_DIM / 2) {
+            *v = -0.5;
+        }
+        let (id_a, _) = field
+            .put_memory("wisdom", "test", b"encodable", &emb_a, 0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+        field
+            .put_memory("wisdom", "test", b"to be deleted", &emb_b, 0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+
+        // Soft-delete one: it must never be collected for encoding.
+        let _ = field.forget(id_a);
+
+        let first = field.encode_all_unindexed().unwrap();
+        assert!(first <= 1, "deleted memory must not be collected (got {first})");
+        // Whatever was attempted is now coded or skip-set: the pass converges.
+        assert_eq!(
+            field.encode_all_unindexed().unwrap(),
+            0,
+            "second pass must collect nothing — the re-encode loop"
+        );
     }
 
     #[test]
