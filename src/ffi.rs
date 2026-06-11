@@ -5449,6 +5449,16 @@ pub unsafe extern "C" fn cf_record_recall_batch(
                 }
             }
             {
+                // Cross-context generality evidence (THEORY.md §6).
+                let mut prov = h.field.recall_provenance.write();
+                for &mid in id_slice {
+                    let set = prov.entry(mid).or_default();
+                    if set.len() < 8 {
+                        set.insert(h.field.instance_id);
+                    }
+                }
+            }
+            {
                 let mut coact = h.field.coactivation_stats.write();
                 let mut assoc = h.field.assoc_edges.write();
                 for i in 0..id_slice.len() {

@@ -270,6 +270,10 @@ pub struct ChittaField {
     /// the NEXT save instead of leaving a skippable stale file.
     pub(crate) pld_mutations: std::sync::atomic::AtomicU64,
     pub(crate) pld_saved_at: std::sync::atomic::AtomicU64,
+    /// memory → distinct instances that recalled it (cross-context
+    /// generality evidence; THEORY.md §6). Capped at 8 per memory.
+    /// Persisted as the V23 "recall_provenance" section.
+    pub(crate) recall_provenance: parking_lot::RwLock<HashMap<MemoryId, std::collections::BTreeSet<crate::ids::InstanceId>>>,
 }
 
 impl Drop for ChittaField {
@@ -332,6 +336,7 @@ impl ChittaField {
         let artifact_id_alloc = Arc::new(ArtifactIdAllocator::with_instance(instance_id));
 
         let mut payloads: HashMap<MemoryId, MemoryPayload> = HashMap::new();
+        let mut recall_provenance: HashMap<MemoryId, std::collections::BTreeSet<crate::ids::InstanceId>> = HashMap::new();
         let mut states: HashMap<MemoryId, MemoryState> = HashMap::new();
         let mut assoc_edges: HashMap<MemoryId, Vec<AssocEdge>> = HashMap::new();
         let mut artifacts: HashMap<String, ArtifactId> = HashMap::new();
@@ -615,6 +620,7 @@ impl ChittaField {
                     }
                     snap.triplet_store.load_supersession_sidecar(&candidate.with_extension("sup.json"));
                     payloads = snap.payloads;
+                    recall_provenance = snap.recall_provenance;
                     states = snap.states;
                     assoc_edges = snap.assoc_edges;
                     artifacts = snap.artifacts;
@@ -873,6 +879,14 @@ impl ChittaField {
                     Op::UpdateSparseCode(_) | Op::TrainPQ(_) | Op::UpdateResidualPQ(_)
                 ) {
                     return Ok(());
+                }
+            }
+            if let Op::RecordRecallBatch(b) = &op {
+                for mid in &b.memory_ids {
+                    let set = recall_provenance.entry(*mid).or_default();
+                    if set.len() < 8 {
+                        set.insert(inst);
+                    }
                 }
             }
             if let Op::UpdateState(d) = &op {
@@ -1194,6 +1208,7 @@ impl ChittaField {
             hdc_sidecar_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
             pld_mutations: std::sync::atomic::AtomicU64::new(0),
             pld_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
+            recall_provenance: parking_lot::RwLock::new(recall_provenance),
         })
     }
 }
@@ -1226,7 +1241,7 @@ impl ChittaField {
         use crate::log::{collect_foreign_segments, replay_from_offset};
 
         let foreign_segs = collect_foreign_segments(&self.data_dir, self.instance_id)?;
-        let mut ops = Vec::new();
+        let mut ops: Vec<(crate::ids::InstanceId, Op)> = Vec::new();
         let mut fresh_coverage: std::collections::BTreeMap<crate::ids::InstanceId, u64> =
             std::collections::BTreeMap::new();
 
@@ -1243,7 +1258,7 @@ impl ChittaField {
                 let new_offset = replay_from_offset(seg_path, offset, |seqno, op| {
                     let cov = fresh_coverage.entry(inst).or_insert(0);
                     if seqno > *cov { *cov = seqno; }
-                    ops.push(op);
+                    ops.push((inst, op));
                     Ok(())
                 })?;
                 seen.insert(seg_path.clone(), new_offset);
@@ -1297,6 +1312,7 @@ impl ChittaField {
         let mut realm_members = self.realm_members.write();
         let mut kind_members  = self.kind_members.write();
         let mut coactivation_stats = self.coactivation_stats.write();
+        let mut recall_prov = self.recall_provenance.write();
 
         let mut ctx = ApplyCtx {
             payloads: &mut *payloads,
@@ -1339,7 +1355,15 @@ impl ChittaField {
             kind_members: &mut *kind_members,
             coactivation_stats: &mut *coactivation_stats,
         };
-        for op in ops {
+        for (inst, op) in ops {
+            if let Op::RecordRecallBatch(b) = &op {
+                for mid in &b.memory_ids {
+                    let set = recall_prov.entry(*mid).or_default();
+                    if set.len() < 8 {
+                        set.insert(inst);
+                    }
+                }
+            }
             apply_op(op, ctx.reborrow());
         }
 

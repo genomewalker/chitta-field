@@ -773,6 +773,10 @@ pub struct FullSnapshot {
     /// `last_cw_refresh_ms` itself stays `#[serde(skip)]` to keep the positional
     /// bincode layout of all V12+ snapshots stable). Hydrated into states on load.
     pub cw_refresh_ts: HashMap<MemoryId, i64>,
+    /// V23 section "recall_provenance": memory → distinct recalling instance
+    /// ids (cross-context generality evidence; THEORY.md §6). Added with NO
+    /// format migration — the sectioned container defaults missing sections.
+    pub recall_provenance: HashMap<MemoryId, std::collections::BTreeSet<u32>>,
 }
 
 /// V22 snapshot layout, frozen: the last monolithic-bincode format. Positional
@@ -833,6 +837,7 @@ impl LegacyFullSnapshotV22 {
             interaction_ledger: self.interaction_ledger,
             predicate_store:    self.predicate_store,
             cw_refresh_ts:      self.cw_refresh_ts,
+            recall_provenance:  HashMap::new(),
         }
     }
 }
@@ -1211,6 +1216,7 @@ impl FullSnapshot {
             interaction_ledger: InteractionLedger::default(),
             predicate_store:    PredicateStore::default(),
             cw_refresh_ts:      HashMap::new(),
+            recall_provenance:  HashMap::new(),
         }
     }
 
@@ -1246,6 +1252,7 @@ impl FullSnapshot {
             write_section(&mut w, "interaction_ledger", &self.interaction_ledger)?;
             write_section(&mut w, "predicate_store",    &self.predicate_store)?;
             write_section(&mut w, "cw_refresh_ts",      &self.cw_refresh_ts)?;
+            write_section(&mut w, "recall_provenance",  &self.recall_provenance)?;
             w.flush()?;
             // fsync data+magic to disk before the rename commits the file, so a crash
             // can't leave a renamed-but-truncated snapshot whose magic still reads valid.
@@ -1410,6 +1417,7 @@ impl FullSnapshot {
                     "interaction_ledger" => snap.interaction_ledger = read_section(&mut body, n)?,
                     "predicate_store"    => snap.predicate_store    = read_section(&mut body, n)?,
                     "cw_refresh_ts"      => snap.cw_refresh_ts      = read_section(&mut body, n)?,
+                    "recall_provenance"  => snap.recall_provenance  = read_section(&mut body, n)?,
                     _ => {
                         eprintln!(
                             "[chitta-field] skipping unknown snapshot section '{}' ({} bytes)",
@@ -1467,6 +1475,7 @@ impl FullSnapshot {
                 interaction_ledger: leg.interaction_ledger,
                 predicate_store:    leg.predicate_store,
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             });
         }
 
@@ -1502,6 +1511,7 @@ impl FullSnapshot {
                 interaction_ledger: leg.interaction_ledger,
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             });
         }
 
@@ -1537,6 +1547,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             });
         }
 
@@ -1585,6 +1596,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             });
         }
 
@@ -1618,6 +1630,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1653,6 +1666,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1688,6 +1702,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1723,6 +1738,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1758,6 +1774,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1794,6 +1811,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1841,6 +1859,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             });
         }
 
@@ -1879,6 +1898,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             });
         }
 
@@ -1914,6 +1934,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             });
         }
 
@@ -1949,6 +1970,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             });
         }
 
@@ -1984,6 +2006,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             });
         }
 
@@ -2019,6 +2042,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             });
         }
 
@@ -2058,6 +2082,7 @@ impl FullSnapshot {
                 interaction_ledger: InteractionLedger::default(),
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
+                recall_provenance:  HashMap::new(),
             });
         }
 

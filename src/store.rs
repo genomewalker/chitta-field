@@ -1370,6 +1370,7 @@ impl ChittaField {
         let pipeline = self.scoring_pipeline.read();
         let learners = self.learners.read();
         let ack_scores = self.ack_scores.read();
+        let recall_prov = self.recall_provenance.read();
 
         let mut hits: Vec<RecallHit> = semantic_hits
             .into_iter()
@@ -1406,6 +1407,25 @@ impl ChittaField {
                     max_query_idf: 0.0,
                 };
                 let (score, decomp) = pipeline.score(&ctx)?;
+                // Cross-context generality (THEORY.md §6): recall from N
+                // distinct daemons is evidence the memory generalizes beyond
+                // one session/node. Multiplicative, config-gated boost.
+                let score = {
+                    let w = pipeline.config.cross_context_weight;
+                    if w > 0.0 {
+                        let distinct = recall_prov
+                            .get(&memory_id)
+                            .map(|s| s.len())
+                            .unwrap_or(0) as f32;
+                        score
+                            * (1.0
+                                + w * (distinct - 1.0)
+                                    .max(0.0)
+                                    .min(pipeline.config.cross_context_max))
+                    } else {
+                        score
+                    }
+                };
                 let eff_strength = state.effective_strength(now);
                 Some(RecallHit {
                     memory_id,
@@ -5520,6 +5540,7 @@ impl ChittaField {
             observer_state: self.observer_state.read().clone(),
             interaction_ledger: self.interaction_ledger.read().clone(),
             predicate_store:    self.predicate_store.read().clone(),
+            recall_provenance: self.recall_provenance.read().clone(),
             cw_refresh_ts: self
                 .states
                 .read()
@@ -6900,6 +6921,116 @@ mod tests {
         assert!(
             std::fs::metadata(&pld_path).unwrap().len() > pld_len_first,
             "new content must rewrite the .pld sidecar"
+        );
+    }
+
+    fn theory_recall_op(memory_ids: &[u64], ts: i64) -> crate::ops::Op {
+        crate::ops::Op::RecordRecallBatch(crate::ops::RecordRecallBatchOp {
+            memory_ids: memory_ids.to_vec(),
+            centroid_q: Vec::new(),
+            centroid_scale: 0.0,
+            context_hash: ts as u64,
+            ts_ms: ts,
+            base_assoc_delta: 0.0,
+        })
+    }
+
+    /// THEORY.md §6: recalls from distinct daemons accrue as cross-context
+    /// provenance, and the evidence survives a snapshot save/reopen cycle
+    /// via the V23 "recall_provenance" section (added with zero migration).
+    #[test]
+    fn recall_provenance_accrues_across_instances_and_persists() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        write_instance_segment(&data_dir, 0x1000_0001, &[theory_put_op(66, 1_000, "general")]);
+        write_instance_segment(&data_dir, 0x2000_0002, &[theory_recall_op(&[66], 2_000)]);
+        write_instance_segment(&data_dir, 0x3000_0003, &[theory_recall_op(&[66], 3_000)]);
+        write_instance_segment(&data_dir, 0x4000_0004, &[theory_recall_op(&[66], 4_000)]);
+
+        let distinct = {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            let n = field.recall_provenance.read().get(&66).map(|s| s.len());
+            field.save_full_snapshot().unwrap();
+            n
+        };
+        assert_eq!(distinct, Some(3), "three distinct recalling instances");
+
+        let field = ChittaField::open(data_dir).unwrap();
+        assert_eq!(
+            field.recall_provenance.read().get(&66).map(|s| s.len()),
+            Some(3),
+            "provenance must survive snapshot save/reopen"
+        );
+    }
+
+    /// THEORY.md §6: cross-context evidence raises recall score
+    /// (multiplicative, config-gated).
+    #[test]
+    fn cross_context_provenance_boosts_recall_score() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.6f32; crate::ops::EMBED_DIM];
+        let (id, _) = field
+            .put_memory("wisdom", "test", b"generalizes", &emb, 0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+
+        let s1 = field.recall_semantic(&emb, 3, Some("test")).unwrap()[0].score;
+        {
+            let mut prov = field.recall_provenance.write();
+            let set = prov.entry(id).or_default();
+            for inst in [0x1u32, 0x2, 0x3, 0x4] {
+                set.insert(inst);
+            }
+        }
+        let s2 = field.recall_semantic(&emb, 3, Some("test")).unwrap()[0].score;
+        assert!(
+            s2 > s1,
+            "4 distinct recalling instances must boost score ({s1} → {s2})"
+        );
+    }
+
+    /// THEORY.md §6, the falsifiable claim at the recall level: the ranked
+    /// result of a query must not depend on which writer wrote what.
+    #[test]
+    fn recall_ranking_invariant_under_writer_permutation() {
+        let mut emb_q = vec![0.1f32; crate::ops::EMBED_DIM];
+        emb_q[0] = 1.0;
+        let mut ops: Vec<crate::ops::Op> = Vec::new();
+        for m in 0..5u64 {
+            let mut e = vec![0.1f32; crate::ops::EMBED_DIM];
+            e[0] = 1.0;
+            e[1 + m as usize] = 0.3 + 0.1 * m as f32;
+            ops.push(crate::ops::Op::PutPayload(match theory_put_op(200 + m, 1_000 + m as i64, "rank") {
+                crate::ops::Op::PutPayload(mut p) => {
+                    p.embedding = e;
+                    p
+                }
+                _ => unreachable!(),
+            }));
+            ops.push(theory_delta_op(200 + m, -0.05 * (m as f32 + 1.0), 2_000 + m as i64));
+        }
+
+        let mut rankings = Vec::new();
+        for (a, b) in [(0x1000_0001u32, 0x2000_0002u32), (0x2000_0002, 0x1000_0001)] {
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path().join("data");
+            std::fs::create_dir_all(&data_dir).unwrap();
+            let (left, right): (Vec<_>, Vec<_>) =
+                ops.iter().cloned().enumerate().partition(|(i, _)| i % 2 == 0);
+            write_instance_segment(&data_dir, a, &left.into_iter().map(|(_, o)| o).collect::<Vec<_>>());
+            write_instance_segment(&data_dir, b, &right.into_iter().map(|(_, o)| o).collect::<Vec<_>>());
+            let field = ChittaField::open(data_dir).unwrap();
+            let ids: Vec<u64> = field
+                .recall_semantic(&emb_q, 5, Some("test"))
+                .unwrap()
+                .iter()
+                .map(|h| h.memory_id)
+                .collect();
+            rankings.push(ids);
+        }
+        assert_eq!(
+            rankings[0], rankings[1],
+            "recall ranking must be writer-assignment invariant"
         );
     }
 

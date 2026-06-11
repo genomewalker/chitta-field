@@ -91,6 +91,12 @@ pub struct ScoringConfig {
     /// Per-hop decay factor for spreading activation.
     pub assoc_hop_decay: f32,
 
+    // ── Cross-context generality (THEORY.md §6) ─────────────────────────
+    /// Boost per additional distinct recalling instance:
+    /// factor = 1 + weight * min(distinct − 1, cross_context_max). 0 disables.
+    pub cross_context_weight: f32,
+    pub cross_context_max: f32,
+
     // ── Interference density (Price of Meaning) ────────────────────────
     /// Penalty weight for local competitor crowding.
     /// Factor = 1 / (1 + interference_penalty * competitive_weight).
@@ -191,6 +197,10 @@ impl Default for ScoringConfig {
 
             // Association
             assoc_hop_decay: 0.55,
+
+            // Cross-context generality
+            cross_context_weight: 0.05,
+            cross_context_max: 3.0,
 
             // Interference (Price of Meaning)
             interference_penalty: 0.3,

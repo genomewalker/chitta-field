@@ -210,6 +210,15 @@ run as sleep-phase compaction rather than implicit replay); cross-node
 episodic→semantic promotion; LOCOMO-driven evaluation loop as CI for memory
 quality; online learned-scorer updates with the SEC-safe merge.
 
+> Status (v2.5.0): cross-context provenance landed — RecordRecallBatch ops
+> accrue the set of distinct recalling instances per memory (live, replay,
+> and sync_foreign paths; capped at 8), persisted as the V23
+> "recall_provenance" section (the first field added with zero migration
+> code, as designed), and feeding a config-gated generality boost
+> (`cross_context_weight`, default 0.05). The recall-level SEC experiment is
+> now a unit test: `recall_ranking_invariant_under_writer_permutation`.
+> Remaining: explicit consolidation pass, LOCOMO-in-CI, online scorer merge.
+
 Phase 4 — *scale*: realm-sharded stores with per-shard manifests; L2/L3
 tiers on object storage; replication beyond a single NFS volume using the
 same version-vector machinery (it is already a replication protocol — it
