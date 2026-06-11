@@ -182,6 +182,14 @@ design resource, not a metaphor:
    New `Op` variants must state their class from §2.1 in a doc comment.
 4. **No cross-language lock interleaving** — FFI is one-directional; C++
    locks strictly outermost (documented at both boundaries in cc-soul).
+5. **One guard per statement** — a guard created as a TEMPORARY inside a
+   larger expression (e.g. a struct-literal initializer's
+   `self.x.read().clone()`) lives until the end of the whole statement, so
+   multi-initializer literals silently multi-hold and can re-acquire the
+   same lock — a same-thread self-deadlock under writer preference
+   (production, 2026-06-11: save_full_snapshot read `states` twice in one
+   statement). The lock-order audit cannot see expression temporaries; bind
+   every guard with its own `let` and let it drop at statement end.
 
 ## 8. Roadmap (theory → practice)
 
