@@ -3985,9 +3985,16 @@ pub extern "C" fn cf_theme_maintain(
 
     let embeddings: std::collections::HashMap<u64, Vec<f32>> = {
         let payloads = handle.field.payloads.read();
+        let idx = handle.field.semantic_idx.read();
         payloads
             .iter()
-            .map(|(id, p)| (*id, p.embedding.clone()))
+            .map(|(id, p)| {
+                let e = idx
+                    .get_embedding(*id)
+                    .map(|e| e.to_vec())
+                    .unwrap_or_else(|| p.embedding.clone());
+                (*id, e)
+            })
             .collect()
     };
 
@@ -4041,10 +4048,17 @@ pub extern "C" fn cf_theme_assign_orphans(
 
     let (all_memory_ids, embeddings): (Vec<u64>, std::collections::HashMap<u64, Vec<f32>>) = {
         let payloads = handle.field.payloads.read();
+        let idx = handle.field.semantic_idx.read();
         let ids: Vec<u64> = payloads.keys().copied().collect();
         let embs: std::collections::HashMap<u64, Vec<f32>> = payloads
             .iter()
-            .map(|(id, p)| (*id, p.embedding.clone()))
+            .map(|(id, p)| {
+                let e = idx
+                    .get_embedding(*id)
+                    .map(|e| e.to_vec())
+                    .unwrap_or_else(|| p.embedding.clone());
+                (*id, e)
+            })
             .collect();
         (ids, embs)
     };
@@ -5191,7 +5205,9 @@ pub extern "C" fn cf_update_memory_content(
                     .pld_mutations
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if !new_embedding.is_empty() {
-                    payload.embedding = new_embedding.clone();
+                    // semantic_idx (upserted below) is the embedding's single
+                    // in-RAM home; drop any stale payload copy.
+                    payload.embedding = Vec::new();
                 }
                 payload.realm.clone()
             }
@@ -5387,10 +5403,13 @@ pub unsafe extern "C" fn cf_get_memory_embeddings_batch(
     let field = &(*handle).field;
     let id_slice = std::slice::from_raw_parts(ids, ids_len);
     let payloads = field.payloads.read();
+    let idx = field.semantic_idx.read();
     let mut result: std::collections::HashMap<String, Vec<f32>> =
         std::collections::HashMap::new();
     for &id in id_slice {
-        if let Some(payload) = payloads.get(&id) {
+        if let Some(e) = idx.get_embedding(id) {
+            result.insert(id.to_string(), e.to_vec());
+        } else if let Some(payload) = payloads.get(&id) {
             result.insert(id.to_string(), payload.embedding.clone());
         }
     }
@@ -6722,12 +6741,9 @@ pub extern "C" fn cf_save_scoring_config(h: *const CfHandle) -> c_int {
 pub extern "C" fn cf_reconstruction_error(h: *const CfHandle, memory_id: u64) -> f32 {
     if h.is_null() { return -1.0; }
     let handle = unsafe { &*h };
-    let embedding = {
-        let payloads = handle.field.payloads.read();
-        match payloads.get(&memory_id) {
-            Some(p) if p.embedding.len() == crate::ops::EMBED_DIM => p.embedding.clone(),
-            _ => return -1.0,
-        }
+    let embedding = match handle.field.embedding_of(memory_id) {
+        Some(e) if e.len() == crate::ops::EMBED_DIM => e,
+        _ => return -1.0,
     };
     let encoder = handle.field.sparse_encoder.read();
     let code = encoder.encode(&embedding);

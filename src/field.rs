@@ -733,32 +733,31 @@ impl ChittaField {
             if !emb_loaded && semantic_idx.embeddings_count() == 0 {
                 eprintln!("[chitta-field] WARNING: v10 snapshot but .emb sidecar missing — embeddings will be empty until backfill");
             }
-            // Rehydrate payload embeddings stripped from the snapshot body —
-            // the .emb sidecar is their on-disk home (save_full_snapshot
-            // strips any payload embedding the index carries; ~630MB of the
-            // body). Payloads whose embedding the sidecar can't supply are
-            // marked embed_pending so backfill self-heals them from content.
+            // Payload embeddings stay OUT of the heap — the semantic index is
+            // their single in-RAM home (the rehydration this block used to do
+            // duplicated ~600MB of RSS; readers go through embedding_of).
+            // Payloads whose embedding exists in neither place self-heal via
+            // embed_pending backfill from content.
             {
-                let mut rehydrated = 0usize;
                 let mut requeued = 0usize;
-                for (id, p) in payloads.iter_mut() {
+                for (id, p) in payloads.iter() {
                     if !p.embedding.is_empty() || p.embedding_dim == 0 {
                         continue;
                     }
-                    if let Some(e) = semantic_idx.get_embedding(*id) {
-                        p.embedding = e.to_vec();
-                        rehydrated += 1;
-                    } else if let Some(st) = states.get_mut(id) {
+                    if semantic_idx.get_embedding(*id).is_some() {
+                        continue;
+                    }
+                    if let Some(st) = states.get_mut(id) {
                         if !st.deleted && !p.content.is_empty() {
                             st.embed_pending = true;
                             requeued += 1;
                         }
                     }
                 }
-                if rehydrated > 0 || requeued > 0 {
+                if requeued > 0 {
                     eprintln!(
-                        "[chitta-field] payload embeddings: {} rehydrated from .emb, {} requeued for re-embed",
-                        rehydrated, requeued
+                        "[chitta-field] payload embeddings: {} requeued for re-embed (index holds the rest)",
+                        requeued
                     );
                 }
             }
@@ -1679,7 +1678,13 @@ pub(crate) fn apply_op(op: Op, ctx: ApplyCtx) {
             state.current_chunk_hash = chunk_hash;
             let strength = state.strength;
 
-            payloads.insert(memory_id, MemoryPayload::from(put));
+            let mut pl = MemoryPayload::from(put);
+            if !pl.embedding.is_empty() {
+                // semantic_idx (upserted below) is the embedding's single
+                // in-RAM home — see ChittaField::embedding_of.
+                pl.embedding = Vec::new();
+            }
+            payloads.insert(memory_id, pl);
             chunk_hash_idx.entry(chunk_hash).or_insert(memory_id);
             semantic_idx.upsert(memory_id, embedding, Some(realm.as_str()));
             keyword_idx.index(memory_id, &content_str);
@@ -1900,7 +1905,9 @@ pub(crate) fn apply_op(op: Op, ctx: ApplyCtx) {
             if let Some(payload) = payloads.get_mut(&umc.memory_id) {
                 payload.content = umc.content;
                 if !umc.embedding.is_empty() {
-                    payload.embedding = umc.embedding.clone();
+                    // semantic_idx (upserted below) is the embedding's single
+                    // in-RAM home; drop any stale payload copy.
+                    payload.embedding = Vec::new();
                 }
             }
             if !umc.embedding.is_empty() {

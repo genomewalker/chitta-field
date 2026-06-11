@@ -563,7 +563,13 @@ impl ChittaField {
         // so recall is no longer blocked by the per-write fsync (~200-330ms on NFS /home).
         let _ = self.log.write().flush_buf();
 
-        let payload = MemoryPayload::from(op);
+        let mut payload = MemoryPayload::from(op);
+        if !embed_pending {
+            // The semantic index (upserted below) is the embedding's single
+            // in-RAM home; a payload copy would duplicate ~600MB across the
+            // store. The WAL op above keeps the full vector for replay.
+            payload.embedding = Vec::new();
+        }
         let mut state = MemoryState::new(memory_id, chunk_hash, ts);
         state.confidence = confidence;
         state.decay_rate = decay_rate;
@@ -3360,11 +3366,12 @@ impl ChittaField {
         });
         self.log.write().append(&op)?;
 
-        // Update payload embedding in memory
+        // Update payload embedding metadata; the vector itself lives only in
+        // the semantic index (upserted below) — see ChittaField::embedding_of.
         {
             let mut payloads = self.payloads.write();
             if let Some(p) = payloads.get_mut(&memory_id) {
-                p.embedding = embedding.to_vec();
+                p.embedding = Vec::new();
                 p.embedding_model = EMBED_MODEL_ID.to_string();
                 p.embedding_model_id = EMBED_MODEL_ID.to_string();
                 p.embedding_dim = EMBED_DIM as u32;
@@ -4154,11 +4161,30 @@ impl ChittaField {
 
     /// Encode a memory's embedding into sparse codes and index into the cortical index.
     /// Persists via UpdateSparseCode op.
+    /// Embedding for a memory. The semantic index is the single in-RAM home
+    /// (payload copies are cleared at write/replay since v2.7.0 — keeping
+    /// them duplicated ~600MB of RSS); the payload copy survives only for
+    /// memories the index does not hold (unindexed / foreign-dim).
+    pub(crate) fn embedding_of(&self, memory_id: MemoryId) -> Option<Vec<f32>> {
+        // Lock order: payloads before semantic_idx.
+        let payloads = self.payloads.read();
+        let idx = self.semantic_idx.read();
+        if let Some(e) = idx.get_embedding(memory_id) {
+            if !e.is_empty() {
+                return Some(e.to_vec());
+            }
+        }
+        payloads.get(&memory_id).and_then(|p| {
+            if p.embedding.is_empty() {
+                None
+            } else {
+                Some(p.embedding.clone())
+            }
+        })
+    }
+
     pub fn encode_memory(&self, memory_id: MemoryId) -> Result<()> {
-        let embedding = {
-            let payloads = self.payloads.read();
-            payloads.get(&memory_id).map(|p| p.embedding.clone())
-        };
+        let embedding = self.embedding_of(memory_id);
         let Some(embedding) = embedding else {
             return Ok(());
         };
@@ -6166,8 +6192,10 @@ impl ChittaField {
                 if s.deleted || s.staged { return None; }
                 if !realm.is_empty() && p.realm != realm { return None; }
                 let harness = p.harness.as_deref()?;
-                if p.embedding.is_empty() { return None; }
-                Some((*id, p.embedding.as_slice(), harness))
+                let emb = idx
+                    .get_embedding(*id)
+                    .or_else(|| (!p.embedding.is_empty()).then(|| p.embedding.as_slice()))?;
+                Some((*id, emb, harness))
             })
             .collect();
 
@@ -6351,6 +6379,7 @@ impl ChittaField {
         let ids: Vec<MemoryId> = {
             let payloads = self.payloads.read();
             let states = self.states.read();
+            let idx = self.semantic_idx.read();
             let cortical = self.cortical_idx.read();
             let skip = self.encode_skip.read();
             payloads
@@ -6358,7 +6387,8 @@ impl ChittaField {
                 .filter(|(id, p)| {
                     !cortical.mem_codes.contains_key(*id)
                         && !skip.contains(*id)
-                        && p.embedding.len() == EMBED_DIM
+                        && (idx.get_embedding(**id).is_some()
+                            || p.embedding.len() == EMBED_DIM)
                         && states.get(*id).map(|s| !s.deleted).unwrap_or(false)
                 })
                 .map(|(id, _)| *id)
@@ -6377,6 +6407,7 @@ impl ChittaField {
         // Collect residuals: for each memory with a sparse code, decode and subtract
         let residuals: Vec<Vec<f32>> = {
             let payloads = self.payloads.read();
+            let idx = self.semantic_idx.read();
             let encoder = self.sparse_encoder.read();
             let cortical = self.cortical_idx.read();
 
@@ -6384,7 +6415,10 @@ impl ChittaField {
                 .mem_codes
                 .iter()
                 .filter_map(|(&memory_id, code)| {
-                    let embedding = payloads.get(&memory_id).map(|p| p.embedding.clone())?;
+                    let embedding = idx
+                        .get_embedding(memory_id)
+                        .map(|e| e.to_vec())
+                        .or_else(|| payloads.get(&memory_id).map(|p| p.embedding.clone()))?;
                     if embedding.len() != crate::ops::EMBED_DIM {
                         return None;
                     }
@@ -6415,10 +6449,7 @@ impl ChittaField {
 
     /// Encode PQ residual for a single memory. The PQ must already be trained.
     pub fn encode_pq_memory(&self, memory_id: MemoryId) -> Result<()> {
-        let embedding = {
-            let payloads = self.payloads.read();
-            payloads.get(&memory_id).map(|p| p.embedding.clone())
-        };
+        let embedding = self.embedding_of(memory_id);
         let Some(embedding) = embedding else {
             return Ok(());
         };
@@ -6967,9 +6998,9 @@ mod tests {
         }
     }
 
-    /// Phase 2 (THEORY.md §8): payload embeddings the index carries are
-    /// stripped from the snapshot body (the .emb sidecar owns them) and
-    /// rehydrated on open.
+    /// The semantic index is the embedding's single in-RAM home: the payload
+    /// copy is cleared at write, stripped from the snapshot body, NOT
+    /// rehydrated at open — and embedding_of() serves every reader.
     #[test]
     fn payload_embeddings_stripped_from_body_and_rehydrated() {
         let tmp = TempDir::new().unwrap();
@@ -7000,13 +7031,25 @@ mod tests {
             "body must not carry an embedding the .emb sidecar owns"
         );
 
-        // Full open: rehydrated from the sidecar.
+        // Full open: the payload copy STAYS empty (no ~600MB duplicate);
+        // embedding_of serves the vector from the index.
         let field = ChittaField::open(data_dir).unwrap();
-        let payloads = field.payloads.read();
+        {
+            let payloads = field.payloads.read();
+            assert!(
+                payloads.get(&id).unwrap().embedding.is_empty(),
+                "payload embedding must NOT be rehydrated into the heap"
+            );
+        }
         assert_eq!(
-            payloads.get(&id).unwrap().embedding.len(),
-            crate::ops::EMBED_DIM,
-            "open() must rehydrate payload embeddings from .emb"
+            field.embedding_of(id).map(|e| e.len()),
+            Some(crate::ops::EMBED_DIM),
+            "embedding_of must serve the vector from the index"
+        );
+        assert_eq!(
+            field.states.read().get(&id).map(|s| s.embed_pending),
+            Some(false),
+            "index-held embeddings must not be requeued for re-embed"
         );
     }
 
