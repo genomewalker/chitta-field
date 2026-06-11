@@ -5609,63 +5609,90 @@ impl ChittaField {
         let pld_mutations_at_clone = self
             .pld_mutations
             .load(std::sync::atomic::Ordering::Relaxed);
-        let snap = FullSnapshot {
-            snapshot_seqno: seqno,
-            // Clone payloads WITHOUT embeddings the index carries — the .emb
-            // sidecar is their on-disk home and open() rehydrates them. This
-            // alone removes ~630MB from both the clone (RSS) and the body
-            // (disk). Payloads the index lacks (deleted/unindexed) keep their
-            // embedding in the body.
-            payloads: {
-                // Tier order: payloads (1) before semantic_idx (2).
-                let payloads_r = self.payloads.read();
-                let idx = self.semantic_idx.read();
-                payloads_r
-                    .iter()
-                    .map(|(id, p)| {
-                        let mut q = p.clone();
-                        if idx.get_embedding(*id).is_some() {
-                            q.embedding = Vec::new();
-                        }
-                        (*id, q)
-                    })
-                    .collect()
-            },
-            states: self.states.read().clone(),
-            assoc_edges: self.assoc_edges.read().clone(),
-            artifacts: self.artifacts.read().clone(),
-            artifact_paths: self.artifact_paths.read().clone(),
-            time_idx: self.time_idx.read().clone(),
-            keyword_idx: self.keyword_idx.read().clone(),
-            artifact_idx: self.artifact_idx.read().clone(),
-            triplet_store: self.triplet_store.read().clone(),
-            symbol_idx: self.symbol_idx.read().clone(),
-            call_graph: self.call_graph.read().clone(),
-            code_files: self.code_files.read().clone(),
-            semantic_idx: self.semantic_idx.read().clone(),
-            coactivation_stats: {
-                let mut cs = self.coactivation_stats.read().clone();
-                let before = cs.len();
-                let removed = crate::field::prune_coactivation_stats(&mut cs, 20);
-                eprintln!("[chitta-field] coactivation_stats: {} pairs before prune, {} removed (cap=20/memory)", before, removed);
-                cs
-            },
-            ack_scores: self.ack_scores.read().clone(),
-            correction_states: self.triplet_store.read().correction_states.clone(),
-            event_tape:     self.event_tape.read().clone(),
-            decision_tape:  self.decision_tape.read().clone(),
-            turiya_monitor: self.turiya_monitor.read().clone(),
-            observer_state: self.observer_state.read().clone(),
-            interaction_ledger: self.interaction_ledger.read().clone(),
-            predicate_store:    self.predicate_store.read().clone(),
-            recall_provenance: self.recall_provenance.read().clone(),
-            cw_refresh_ts: self
-                .states
-                .read()
+        // Each clone in its OWN statement: a struct-literal initializer's
+        // temporary guard lives until the end of the whole statement, so the
+        // previous form held ~20 read guards at once — and read `states`
+        // TWICE in one statement (cw_refresh_ts), which self-deadlocks when a
+        // writer queues between the two acquisitions (parking_lot writer
+        // preference blocks same-thread reacquisition). Production deadlock
+        // 2026-06-11, caught by the deadlock-detection build.
+        let payloads = {
+            // Tier order: payloads (1) before semantic_idx (2).
+            let payloads_r = self.payloads.read();
+            let idx = self.semantic_idx.read();
+            payloads_r
+                .iter()
+                .map(|(id, p)| {
+                    let mut q = p.clone();
+                    if idx.get_embedding(*id).is_some() {
+                        q.embedding = Vec::new();
+                    }
+                    (*id, q)
+                })
+                .collect()
+        };
+        let (states, cw_refresh_ts) = {
+            let states_r = self.states.read();
+            let cw: std::collections::HashMap<MemoryId, i64> = states_r
                 .iter()
                 .filter(|(_, st)| st.last_cw_refresh_ms > 0)
                 .map(|(&id, st)| (id, st.last_cw_refresh_ms))
-                .collect(),
+                .collect();
+            (states_r.clone(), cw)
+        };
+        let assoc_edges = self.assoc_edges.read().clone();
+        let artifacts = self.artifacts.read().clone();
+        let artifact_paths = self.artifact_paths.read().clone();
+        let time_idx = self.time_idx.read().clone();
+        let keyword_idx = self.keyword_idx.read().clone();
+        let artifact_idx = self.artifact_idx.read().clone();
+        let triplet_store = self.triplet_store.read().clone();
+        let symbol_idx = self.symbol_idx.read().clone();
+        let call_graph = self.call_graph.read().clone();
+        let code_files = self.code_files.read().clone();
+        let semantic_idx = self.semantic_idx.read().clone();
+        let coactivation_stats = {
+            let mut cs = self.coactivation_stats.read().clone();
+            let before = cs.len();
+            let removed = crate::field::prune_coactivation_stats(&mut cs, 20);
+            eprintln!("[chitta-field] coactivation_stats: {} pairs before prune, {} removed (cap=20/memory)", before, removed);
+            cs
+        };
+        let ack_scores = self.ack_scores.read().clone();
+        let correction_states = self.triplet_store.read().correction_states.clone();
+        let event_tape = self.event_tape.read().clone();
+        let decision_tape = self.decision_tape.read().clone();
+        let turiya_monitor = self.turiya_monitor.read().clone();
+        let observer_state = self.observer_state.read().clone();
+        let interaction_ledger = self.interaction_ledger.read().clone();
+        let predicate_store = self.predicate_store.read().clone();
+        let recall_provenance = self.recall_provenance.read().clone();
+        let snap = FullSnapshot {
+            snapshot_seqno: seqno,
+            payloads,
+            states,
+            assoc_edges,
+            artifacts,
+            artifact_paths,
+            time_idx,
+            keyword_idx,
+            artifact_idx,
+            triplet_store,
+            symbol_idx,
+            call_graph,
+            code_files,
+            semantic_idx,
+            coactivation_stats,
+            ack_scores,
+            correction_states,
+            event_tape,
+            decision_tape,
+            turiya_monitor,
+            observer_state,
+            interaction_ledger,
+            predicate_store,
+            recall_provenance,
+            cw_refresh_ts,
         };
         let path = self
             .data_dir
