@@ -45,6 +45,14 @@ impl CfHandle {
     }
 }
 
+/// Error return for JSON-returning FFI fns: NULL + LAST_ERROR set, so C++
+/// can always distinguish (and log) failure via cf_last_error instead of
+/// treating NULL as ambiguous "empty". One envelope for all 90+ JSON fns.
+fn json_null(e: impl std::fmt::Display) -> *mut c_char {
+    LAST_ERROR.with(|le| *le.borrow_mut() = CString::new(e.to_string()).ok());
+    std::ptr::null_mut()
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn edge_type_from_u8(v: u8) -> EdgeType {
@@ -817,7 +825,7 @@ pub extern "C" fn cf_recall_failure_pattern(
     h: *mut CfHandle,
     k: usize,
 ) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_recall_failure_pattern: null argument"); }
     let handle = unsafe { &*h };
     match handle.field.recall_failure_pattern(k) {
         Ok(hits) => {
@@ -829,10 +837,10 @@ pub extern "C" fn cf_recall_failure_pattern(
             })).collect();
             match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
                 Ok(s) => s.into_raw(),
-                Err(_) => std::ptr::null_mut(),
+                Err(e) => json_null(format!("cf_recall_failure_pattern: {e}")),
             }
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_recall_failure_pattern: {e}")),
     }
 }
 
@@ -848,7 +856,7 @@ pub extern "C" fn cf_prune_memories(
     apply: c_int,
     action: c_int,
 ) -> *mut c_char {
-    if h.is_null() || patterns_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || patterns_json.is_null() { return json_null("cf_prune_memories: null argument"); }
     let handle = unsafe { &*h };
     let pj = unsafe { std::ffi::CStr::from_ptr(patterns_json) }.to_string_lossy().into_owned();
     let patterns: Vec<String> = serde_json::from_str(&pj).unwrap_or_default();
@@ -861,10 +869,10 @@ pub extern "C" fn cf_prune_memories(
             })).collect();
             match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
                 Ok(s) => s.into_raw(),
-                Err(_) => std::ptr::null_mut(),
+                Err(e) => json_null(format!("cf_prune_memories: {e}")),
             }
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_prune_memories: {e}")),
     }
 }
 
@@ -878,11 +886,11 @@ pub extern "C" fn cf_recall_causal_antecedent(
     k: usize,
 ) -> *mut c_char {
     if h.is_null() || tool.is_null() || entity.is_null() {
-        return std::ptr::null_mut();
+        return json_null("cf_recall_causal_antecedent: null argument");
     }
     let handle = unsafe { &*h };
-    let tool_str   = unsafe { match CStr::from_ptr(tool).to_str()   { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
-    let entity_str = unsafe { match CStr::from_ptr(entity).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let tool_str   = unsafe { match CStr::from_ptr(tool).to_str()   { Ok(s) => s, Err(_) => return json_null("cf_recall_causal_antecedent: no data") } };
+    let entity_str = unsafe { match CStr::from_ptr(entity).to_str() { Ok(s) => s, Err(_) => return json_null("cf_recall_causal_antecedent: no data") } };
     match handle.field.recall_causal_antecedent(tool_str, entity_str, k) {
         Ok(hits) => {
             let arr: Vec<serde_json::Value> = hits.iter().map(|h| serde_json::json!({
@@ -893,10 +901,10 @@ pub extern "C" fn cf_recall_causal_antecedent(
             })).collect();
             match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
                 Ok(s) => s.into_raw(),
-                Err(_) => std::ptr::null_mut(),
+                Err(e) => json_null(format!("cf_recall_causal_antecedent: {e}")),
             }
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_recall_causal_antecedent: {e}")),
     }
 }
 
@@ -909,12 +917,12 @@ pub extern "C" fn cf_recall_hdcbind(
     k: usize,
 ) -> *mut c_char {
     if h.is_null() || known_role.is_null() || known_val.is_null() || query_role.is_null() {
-        return std::ptr::null_mut();
+        return json_null("cf_recall_hdcbind: null argument");
     }
     let handle = unsafe { &*h };
-    let kr = unsafe { match CStr::from_ptr(known_role).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
-    let kv = unsafe { match CStr::from_ptr(known_val).to_str()  { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
-    let qr = unsafe { match CStr::from_ptr(query_role).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let kr = unsafe { match CStr::from_ptr(known_role).to_str() { Ok(s) => s, Err(_) => return json_null("cf_recall_hdcbind: no data") } };
+    let kv = unsafe { match CStr::from_ptr(known_val).to_str()  { Ok(s) => s, Err(_) => return json_null("cf_recall_hdcbind: no data") } };
+    let qr = unsafe { match CStr::from_ptr(query_role).to_str() { Ok(s) => s, Err(_) => return json_null("cf_recall_hdcbind: no data") } };
     match handle.field.recall_hdcbind(kr, kv, qr, k) {
         Ok(hits) => {
             let arr: Vec<serde_json::Value> = hits.iter().map(|h| {
@@ -933,10 +941,10 @@ pub extern "C" fn cf_recall_hdcbind(
             }).collect();
             match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
                 Ok(s) => s.into_raw(),
-                Err(_) => std::ptr::null_mut(),
+                Err(e) => json_null(format!("cf_recall_hdcbind: {e}")),
             }
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_recall_hdcbind: {e}")),
     }
 }
 
@@ -948,10 +956,10 @@ pub extern "C" fn cf_recall_counterfactual(
     outcome: u8,
     k: usize,
 ) -> *mut c_char {
-    if h.is_null() || tool.is_null() || entity.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || tool.is_null() || entity.is_null() { return json_null("cf_recall_counterfactual: null argument"); }
     let handle = unsafe { &*h };
-    let tool_s   = unsafe { match CStr::from_ptr(tool).to_str()   { Ok(s)=>s, Err(_)=>return std::ptr::null_mut() } };
-    let entity_s = unsafe { match CStr::from_ptr(entity).to_str() { Ok(s)=>s, Err(_)=>return std::ptr::null_mut() } };
+    let tool_s   = unsafe { match CStr::from_ptr(tool).to_str()   { Ok(s)=>s, Err(_)=>return json_null("cf_recall_counterfactual: no data") } };
+    let entity_s = unsafe { match CStr::from_ptr(entity).to_str() { Ok(s)=>s, Err(_)=>return json_null("cf_recall_counterfactual: no data") } };
     match handle.field.recall_counterfactual(tool_s, entity_s, outcome, k) {
         Ok(hits) => {
             let arr: Vec<serde_json::Value> = hits.iter().map(|h| serde_json::json!({
@@ -963,16 +971,16 @@ pub extern "C" fn cf_recall_counterfactual(
             })).collect();
             match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
                 Ok(s) => s.into_raw(),
-                Err(_) => std::ptr::null_mut(),
+                Err(e) => json_null(format!("cf_recall_counterfactual: {e}")),
             }
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_recall_counterfactual: {e}")),
     }
 }
 
 #[no_mangle]
 pub extern "C" fn cf_consolidation_preview(h: *mut CfHandle, k: usize) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_consolidation_preview: null argument"); }
     let handle = unsafe { &*h };
     let items = handle.field.consolidation_preview(k);
     let arr: Vec<serde_json::Value> = items.iter().map(|(key, support)| {
@@ -980,23 +988,23 @@ pub extern "C" fn cf_consolidation_preview(h: *mut CfHandle, k: usize) -> *mut c
     }).collect();
     match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
         Ok(s) => s.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_consolidation_preview: {e}")),
     }
 }
 
 #[no_mangle]
 pub extern "C" fn cf_consolidation_pass(h: *mut CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_consolidation_pass: null argument"); }
     let handle = unsafe { &*h };
     match handle.field.consolidation_pass() {
         Ok((total, promoted)) => {
             let s = format!("{{\"rules_found\":{total},\"rules_promoted\":{promoted}}}");
             match CString::new(s) {
                 Ok(cs) => cs.into_raw(),
-                Err(_) => std::ptr::null_mut(),
+                Err(e) => json_null(format!("cf_consolidation_pass: {e}")),
             }
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_consolidation_pass: {e}")),
     }
 }
 
@@ -1008,10 +1016,10 @@ pub extern "C" fn cf_recall_motif_value(
     entity: *const c_char,
     k: usize,
 ) -> *mut c_char {
-    if h.is_null() || tool.is_null() || entity.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || tool.is_null() || entity.is_null() { return json_null("cf_recall_motif_value: null argument"); }
     let handle = unsafe { &*h };
-    let tool_s   = unsafe { match CStr::from_ptr(tool).to_str()   { Ok(s)=>s, Err(_)=>return std::ptr::null_mut() } };
-    let entity_s = unsafe { match CStr::from_ptr(entity).to_str() { Ok(s)=>s, Err(_)=>return std::ptr::null_mut() } };
+    let tool_s   = unsafe { match CStr::from_ptr(tool).to_str()   { Ok(s)=>s, Err(_)=>return json_null("cf_recall_motif_value: no data") } };
+    let entity_s = unsafe { match CStr::from_ptr(entity).to_str() { Ok(s)=>s, Err(_)=>return json_null("cf_recall_motif_value: no data") } };
     match handle.field.recall_motif_value(tool_s, entity_s, if k == 0 { 5 } else { k }) {
         Ok(hits) => {
             let arr: Vec<serde_json::Value> = hits.iter().map(|h| serde_json::json!({
@@ -1022,22 +1030,22 @@ pub extern "C" fn cf_recall_motif_value(
             })).collect();
             match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
                 Ok(s) => s.into_raw(),
-                Err(_) => std::ptr::null_mut(),
+                Err(e) => json_null(format!("cf_recall_motif_value: {e}")),
             }
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_recall_motif_value: {e}")),
     }
 }
 
 /// Return top-k refuted/live Sequitur rules as a plain-text stats string.
 #[no_mangle]
 pub extern "C" fn cf_refutation_stats(h: *mut CfHandle, k: usize) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_refutation_stats: null argument"); }
     let handle = unsafe { &*h };
     let s = handle.field.refutation_stats(if k == 0 { 10 } else { k });
     match CString::new(s) {
         Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_refutation_stats: {e}")),
     }
 }
 
@@ -1086,13 +1094,13 @@ pub extern "C" fn cf_recall_true_counterfactual(
     h: *mut CfHandle,
     tool: *const c_char, entity: *const c_char, outcome: u8, k: usize,
 ) -> *mut c_char {
-    if h.is_null() || tool.is_null() || entity.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || tool.is_null() || entity.is_null() { return json_null("cf_recall_true_counterfactual: null argument"); }
     let handle = unsafe { &*h };
     let t = unsafe { CStr::from_ptr(tool).to_string_lossy() };
     let e = unsafe { CStr::from_ptr(entity).to_string_lossy() };
     let hits = match handle.field.recall_true_counterfactual(&t, &e, outcome, if k == 0 { 5 } else { k }) {
         Ok(h) => h,
-        Err(_) => return std::ptr::null_mut(),
+        Err(_) => return json_null("cf_recall_true_counterfactual: no data"),
     };
     let json = serde_json::to_string(&hits.iter().map(|h| serde_json::json!({
         "turn_id": h.memory_id,
@@ -1103,53 +1111,53 @@ pub extern "C" fn cf_recall_true_counterfactual(
     })).collect::<Vec<_>>()).unwrap_or_else(|_| "[]".to_string());
     match CString::new(json) {
         Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_recall_true_counterfactual: {e}")),
     }
 }
 
 /// Return top-k hypothesis probes as JSON (rules with highest expected info gain).
 #[no_mangle]
 pub extern "C" fn cf_hypothesis_probes(h: *mut CfHandle, k: usize) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_hypothesis_probes: null argument"); }
     let handle = unsafe { &*h };
     let s = handle.field.hypothesis_probes(if k == 0 { 10 } else { k });
     match CString::new(s) {
         Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_hypothesis_probes: {e}")),
     }
 }
 
 #[no_mangle]
 pub extern "C" fn cf_executor_flush(h: *mut CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_executor_flush: null argument"); }
     let handle = unsafe { &*h };
     let s = handle.field.executor_flush();
     match CString::new(s) {
         Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_executor_flush: {e}")),
     }
 }
 
 #[no_mangle]
 pub extern "C" fn cf_list_policies(h: *mut CfHandle, active_only: bool) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_list_policies: null argument"); }
     let handle = unsafe { &*h };
     let s = handle.field.list_policies(active_only);
     match CString::new(s) {
         Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_list_policies: {e}")),
     }
 }
 
 /// CEC Phase 11: Turīya Monitor status. Caller must free with cf_free_string.
 #[no_mangle]
 pub extern "C" fn cf_turiya_status(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_turiya_status: null argument"); }
     let handle = unsafe { &*h };
     let s = handle.field.turiya_status();
     match CString::new(s) {
         Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_turiya_status: {e}")),
     }
 }
 
@@ -1157,48 +1165,48 @@ pub extern "C" fn cf_turiya_status(h: *const CfHandle) -> *mut c_char {
 /// Returns JSON: {"queued":N,"skipped_refuted":M,"skipped_certain":L}. Caller must free with cf_free_string.
 #[no_mangle]
 pub extern "C" fn cf_queue_experiments(h: *mut CfHandle, k: usize) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_queue_experiments: null argument"); }
     let handle = unsafe { &*h };
     let s = handle.field.queue_experiments(if k == 0 { 5 } else { k });
     match CString::new(s) {
         Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_queue_experiments: {e}")),
     }
 }
 
 /// CEC Phase 13: top-k verbalized Sequitur rules. Caller must free with cf_free_string.
 #[no_mangle]
 pub extern "C" fn cf_verbalize_rules(h: *const CfHandle, k: usize) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_verbalize_rules: null argument"); }
     let handle = unsafe { &*h };
     let s = handle.field.verbalize_rules(if k == 0 { 10 } else { k });
     match CString::new(s) {
         Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_verbalize_rules: {e}")),
     }
 }
 
 /// CEC Phase 12: EventTape statistics + compression totals. Caller must free with cf_free_string.
 #[no_mangle]
 pub extern "C" fn cf_tape_stats(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_tape_stats: null argument"); }
     let handle = unsafe { &*h };
     let s = handle.field.tape_stats();
     match CString::new(s) {
         Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_tape_stats: {e}")),
     }
 }
 
 /// Return FEP prior organ status as a JSON string (caller must cf_free_string).
 #[no_mangle]
 pub extern "C" fn cf_fep_status(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_fep_status: null argument"); }
     let handle = unsafe { &*h };
     let s = handle.field.fep_status();
     match CString::new(s) {
         Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_fep_status: {e}")),
     }
 }
 
@@ -1210,7 +1218,7 @@ pub extern "C" fn cf_routed_recall(
     h: *const CfHandle,
     request_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || request_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || request_json.is_null() { return json_null("cf_routed_recall: null argument"); }
     let handle = unsafe { &*h };
     let req_str = unsafe { std::ffi::CStr::from_ptr(request_json) }.to_string_lossy();
     let req: crate::organ::query_router::RecallRequest =
@@ -1218,11 +1226,11 @@ pub extern "C" fn cf_routed_recall(
             Ok(r) => r,
             Err(e) => {
                 let s = format!(r#"{{"error":"bad request: {}"}}"#, e);
-                return CString::new(s).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut());
+                return CString::new(s).map(|cs| cs.into_raw()).unwrap_or(json_null("cf_routed_recall: no data"));
             }
         };
     let result = handle.field.routed_recall(req);
-    CString::new(result).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(result).map(|cs| cs.into_raw()).unwrap_or(json_null("cf_routed_recall: no data"))
 }
 
 // ── Phase 17 exports ─────────────────────────────────────────────────────────
@@ -1235,21 +1243,21 @@ pub extern "C" fn cf_witness_memory(
     memory_id: u64,
     witness_kind: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || witness_kind.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || witness_kind.is_null() { return json_null("cf_witness_memory: null argument"); }
     let handle = unsafe { &*h };
     let wk = unsafe { std::ffi::CStr::from_ptr(witness_kind) }.to_string_lossy();
     let json = handle.field.witness_memory(memory_id, &wk);
-    CString::new(json).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|cs| cs.into_raw()).unwrap_or(json_null("cf_witness_memory: no data"))
 }
 
 /// R0 reconcile pass: scan assoc_edges for legality violations + detect contradictions.
 /// Returns JSON summary. Caller must free with cf_free_string().
 #[no_mangle]
 pub extern "C" fn cf_reconcile_pass(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_reconcile_pass: null argument"); }
     let handle = unsafe { &*h };
     let json = handle.field.reconcile_pass();
-    CString::new(json).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|cs| cs.into_raw()).unwrap_or(json_null("cf_reconcile_pass: no data"))
 }
 
 /// Force a full rebuild of all derived search indices (binary codes, coarse, LSH,
@@ -1267,10 +1275,10 @@ pub extern "C" fn cf_force_reindex(h: *const CfHandle) -> c_int {
 /// Returns JSON. Caller must free with cf_free_string().
 #[no_mangle]
 pub extern "C" fn cf_harvest_scope(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_harvest_scope: null argument"); }
     let handle = unsafe { &*h };
     let json = handle.field.harvest_scope();
-    CString::new(json).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|cs| cs.into_raw()).unwrap_or(json_null("cf_harvest_scope: no data"))
 }
 
 /// Seed HDC codebook from a vocab_geometry harvest JSON (Phase 17 Part D).
@@ -1281,11 +1289,11 @@ pub extern "C" fn cf_seed_hdc_geometry(
     h: *const CfHandle,
     json_path: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || json_path.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || json_path.is_null() { return json_null("cf_seed_hdc_geometry: null argument"); }
     let handle = unsafe { &*h };
     let path = unsafe { std::ffi::CStr::from_ptr(json_path) }.to_string_lossy();
     let json = handle.field.seed_hdc_geometry(&path);
-    CString::new(json).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|cs| cs.into_raw()).unwrap_or(json_null("cf_seed_hdc_geometry: no data"))
 }
 
 // ── Triplet operations ────────────────────────────────────────────────────────
@@ -6640,7 +6648,7 @@ pub extern "C" fn cf_prune_episodes(h: *mut CfHandle, max_age_days: u64, max_cou
 /// Return JSON: {"staged_count": N, "oldest_staged_age_days": F}.
 #[no_mangle]
 pub extern "C" fn cf_write_gate_stats(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_write_gate_stats: null argument"); }
     let handle = unsafe { &*h };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -6664,7 +6672,7 @@ pub extern "C" fn cf_write_gate_stats(h: *const CfHandle) -> *mut c_char {
     let j = format!(r#"{{"staged_count":{},"oldest_staged_age_days":{:.2}}}"#, count, oldest_days);
     match std::ffi::CString::new(j) {
         Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_write_gate_stats: {e}")),
     }
 }
 
@@ -6816,7 +6824,7 @@ pub extern "C" fn cf_hopfield_co_retrieval(
 /// Get Hopfield network statistics as JSON string.
 #[no_mangle]
 pub extern "C" fn cf_hopfield_stats(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_hopfield_stats: null argument"); }
     let handle = unsafe { &*h };
     let net = handle.field.hopfield.read();
     let json = format!(
@@ -6824,7 +6832,7 @@ pub extern "C" fn cf_hopfield_stats(h: *const CfHandle) -> *mut c_char {
         net.coupling_count(),
         net.settle_count()
     );
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_hopfield_stats: no data"))
 }
 
 /// Adapt cortical vigilance based on aggregate reconstruction error.
@@ -6886,30 +6894,30 @@ pub extern "C" fn cf_skill_read(
     skill_id: *const c_char,
     version: u32,
 ) -> *mut c_char {
-    if h.is_null() || skill_id.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || skill_id.is_null() { return json_null("cf_skill_read: null argument"); }
     let handle = unsafe { &*h };
-    let skill_id_str = unsafe { match CStr::from_ptr(skill_id).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let skill_id_str = unsafe { match CStr::from_ptr(skill_id).to_str() { Ok(s) => s, Err(_) => return json_null("cf_skill_read: no data") } };
     let reg = handle.field.skill_registry.read();
     match reg.read(skill_id_str, version) {
         Some(sv) => {
             let json = serde_json::to_string(sv).unwrap_or_default();
-            CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_skill_read: no data"))
         }
-        None => std::ptr::null_mut(),
+        None => json_null("cf_skill_read: no data"),
     }
 }
 
 /// List all skills as JSON array of {skill_id, latest_version}.
 #[no_mangle]
 pub extern "C" fn cf_skill_list(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_skill_list: null argument"); }
     let handle = unsafe { &*h };
     let reg = handle.field.skill_registry.read();
     let list: Vec<serde_json::Value> = reg.list().iter().map(|(id, ver)| {
         serde_json::json!({"skill_id": id, "latest_version": ver})
     }).collect();
     let json = serde_json::to_string(&list).unwrap_or_default();
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_skill_list: no data"))
 }
 
 /// Search skills by query. Returns JSON array.
@@ -6919,13 +6927,13 @@ pub extern "C" fn cf_skill_search(
     query: *const c_char,
     limit: usize,
 ) -> *mut c_char {
-    if h.is_null() || query.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || query.is_null() { return json_null("cf_skill_search: null argument"); }
     let handle = unsafe { &*h };
-    let query_str = unsafe { match CStr::from_ptr(query).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let query_str = unsafe { match CStr::from_ptr(query).to_str() { Ok(s) => s, Err(_) => return json_null("cf_skill_search: no data") } };
     let reg = handle.field.skill_registry.read();
     let results = reg.search(query_str, if limit == 0 { 20 } else { limit });
     let json = serde_json::to_string(&results).unwrap_or_default();
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_skill_search: no data"))
 }
 
 /// Deprecate a skill.
@@ -7014,28 +7022,28 @@ pub extern "C" fn cf_agent_get(
     h: *const CfHandle,
     agent_id: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || agent_id.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || agent_id.is_null() { return json_null("cf_agent_get: null argument"); }
     let handle = unsafe { &*h };
-    let agent_id_str = unsafe { match CStr::from_ptr(agent_id).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let agent_id_str = unsafe { match CStr::from_ptr(agent_id).to_str() { Ok(s) => s, Err(_) => return json_null("cf_agent_get: no data") } };
     let reg = handle.field.agent_registry.read();
     match reg.get(agent_id_str) {
         Some(rec) => {
             let json = serde_json::to_string(rec).unwrap_or_default();
-            CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_agent_get: no data"))
         }
-        None => std::ptr::null_mut(),
+        None => json_null("cf_agent_get: no data"),
     }
 }
 
 /// List all agents as JSON array.
 #[no_mangle]
 pub extern "C" fn cf_agent_list(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_agent_list: null argument"); }
     let handle = unsafe { &*h };
     let reg = handle.field.agent_registry.read();
     let list = reg.list();
     let json = serde_json::to_string(&list).unwrap_or_default();
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_agent_list: no data"))
 }
 
 /// Disable (revoke) an agent.
@@ -7062,10 +7070,10 @@ pub extern "C" fn cf_assert_constraint(
     h: *mut CfHandle,
     params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_assert_constraint: null argument"); }
     let handle = unsafe { &*h };
-    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
-    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return json_null("cf_assert_constraint: no data") } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return json_null("cf_assert_constraint: no data") };
 
     let subject = params["subject"].as_str().unwrap_or("").to_string();
     let predicate = params["predicate"].as_str().unwrap_or("").to_string();
@@ -7090,9 +7098,9 @@ pub extern "C" fn cf_assert_constraint(
                     "new_branch_id": c.new_branch_id,
                 })),
             });
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_assert_constraint: no data"))
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_assert_constraint: {e}")),
     }
 }
 
@@ -7112,10 +7120,10 @@ pub extern "C" fn cf_query_constraints(
     h: *const CfHandle,
     params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_query_constraints: null argument"); }
     let handle = unsafe { &*h };
-    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
-    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return json_null("cf_query_constraints: no data") } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return json_null("cf_query_constraints: no data") };
 
     let subject = params["subject"].as_str();
     let predicate = params["predicate"].as_str();
@@ -7124,12 +7132,12 @@ pub extern "C" fn cf_query_constraints(
 
     let results = handle.field.query_constraints(subject, predicate, object, scope);
     let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_query_constraints: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_explain_constraint(h: *const CfHandle, fact_id: u64) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_explain_constraint: null argument"); }
     let handle = unsafe { &*h };
     match handle.field.explain_constraint(fact_id) {
         Some(explanation) => {
@@ -7155,9 +7163,9 @@ pub extern "C" fn cf_explain_constraint(h: *const CfHandle, fact_id: u64) -> *mu
                     "status": format!("{:?}", b.status),
                 })),
             });
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_explain_constraint: no data"))
         }
-        None => std::ptr::null_mut(),
+        None => json_null("cf_explain_constraint: no data"),
     }
 }
 
@@ -7219,7 +7227,7 @@ pub extern "C" fn cf_add_trigger(
 
 #[no_mangle]
 pub extern "C" fn cf_fire_trigger(h: *mut CfHandle, trigger_id: u64) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_fire_trigger: null argument"); }
     let handle = unsafe { &*h };
     match handle.field.fire_trigger(trigger_id) {
         Ok(Some(result)) => {
@@ -7227,9 +7235,9 @@ pub extern "C" fn cf_fire_trigger(h: *mut CfHandle, trigger_id: u64) -> *mut c_c
                 "trigger_id": result.trigger_id,
                 "action": result.action,
             });
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_fire_trigger: no data"))
         }
-        _ => std::ptr::null_mut(),
+        _ => json_null("cf_fire_trigger: no data"),
     }
 }
 
@@ -7246,25 +7254,25 @@ pub extern "C" fn cf_dismiss_trigger(h: *mut CfHandle, trigger_id: u64) -> c_int
 
 #[no_mangle]
 pub extern "C" fn cf_list_triggers(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_list_triggers: null argument"); }
     let handle = unsafe { &*h };
     let triggers = handle.field.list_triggers();
     let json = serde_json::to_string(&triggers).unwrap_or_else(|_| "[]".to_string());
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_list_triggers: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_evaluate_triggers(h: *mut CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_evaluate_triggers: null argument"); }
     let handle = unsafe { &*h };
     match handle.field.evaluate_triggers() {
         Ok(results) => {
             let json = serde_json::json!(results.iter().map(|r| serde_json::json!({
                 "trigger_id": r.trigger_id,
             })).collect::<Vec<_>>());
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_evaluate_triggers: no data"))
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_evaluate_triggers: {e}")),
     }
 }
 
@@ -7272,13 +7280,13 @@ pub extern "C" fn cf_evaluate_triggers(h: *mut CfHandle) -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn cf_predict_needed(h: *const CfHandle, k: usize) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_predict_needed: null argument"); }
     let handle = unsafe { &*h };
     let predictions = handle.field.predict_needed(k);
     let json = serde_json::json!(predictions.iter().map(|(id, prob)| {
         serde_json::json!({"memory_id": id, "probability": prob})
     }).collect::<Vec<_>>());
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_predict_needed: no data"))
 }
 
 #[no_mangle]
@@ -7291,7 +7299,7 @@ pub extern "C" fn cf_retrain_predictor(h: *mut CfHandle) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cf_constraint_stats(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_constraint_stats: null argument"); }
     let handle = unsafe { &*h };
     let (facts, branches) = handle.field.constraint_stats();
     let armed = handle.field.trigger_stats();
@@ -7307,7 +7315,7 @@ pub extern "C" fn cf_constraint_stats(h: *const CfHandle) -> *mut c_char {
         "epistemic_debt": {"total": debt.total, "open": debt.open, "resolved": debt.resolved, "deferred": debt.deferred, "avg_fragility_open": debt.avg_fragility_open},
         "integration": {"total_queries": integration.total_queries, "sources": integration.source_rates.len()},
     });
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_constraint_stats: no data"))
 }
 
 // ── Layer 4: Surprise Memory ──────────────────────────────────────────────
@@ -7316,10 +7324,10 @@ pub extern "C" fn cf_constraint_stats(h: *const CfHandle) -> *mut c_char {
 pub extern "C" fn cf_record_surprise(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_record_surprise: null argument"); }
     let handle = unsafe { &*h };
-    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
-    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return json_null("cf_record_surprise: no data") } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return json_null("cf_record_surprise: no data") };
 
     let context_sketch = params["context_sketch"].as_str().unwrap_or("").to_string();
     let action = params["action"].as_str().unwrap_or("").to_string();
@@ -7337,9 +7345,9 @@ pub extern "C" fn cf_record_surprise(
     ) {
         Ok(event_id) => {
             let json = serde_json::json!({"event_id": event_id});
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_record_surprise: no data"))
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_record_surprise: {e}")),
     }
 }
 
@@ -7347,10 +7355,10 @@ pub extern "C" fn cf_record_surprise(
 pub extern "C" fn cf_query_surprises(
     h: *const CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_query_surprises: null argument"); }
     let handle = unsafe { &*h };
-    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
-    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return json_null("cf_query_surprises: no data") } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return json_null("cf_query_surprises: no data") };
 
     let domain = params["domain"].as_str();
     let realm = params["realm"].as_str();
@@ -7360,29 +7368,29 @@ pub extern "C" fn cf_query_surprises(
 
     let events = handle.field.query_surprises(domain, realm, min_magnitude, since_ms, limit);
     let json = serde_json::to_string(&events).unwrap_or_else(|_| "[]".to_string());
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_query_surprises: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_get_blind_spots(
     h: *const CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_get_blind_spots: null argument"); }
     let handle = unsafe { &*h };
-    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
-    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return json_null("cf_get_blind_spots: no data") } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return json_null("cf_get_blind_spots: no data") };
 
     let realm = params["realm"].as_str();
     let limit = params["limit"].as_u64().unwrap_or(10) as usize;
 
     let spots = handle.field.get_blind_spots(realm, limit);
     let json = serde_json::to_string(&spots).unwrap_or_else(|_| "[]".to_string());
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_get_blind_spots: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_surprise_stats(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_surprise_stats: null argument"); }
     let handle = unsafe { &*h };
     let stats = handle.field.surprise_stats();
     let json = serde_json::json!({
@@ -7390,7 +7398,7 @@ pub extern "C" fn cf_surprise_stats(h: *const CfHandle) -> *mut c_char {
         "avg_magnitude": stats.avg_magnitude,
         "by_domain": stats.by_domain,
     });
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_surprise_stats: no data"))
 }
 
 // ── Layer 5: Epistemic Debt ───────────────────────────────────────────────
@@ -7399,10 +7407,10 @@ pub extern "C" fn cf_surprise_stats(h: *const CfHandle) -> *mut c_char {
 pub extern "C" fn cf_register_debt(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_register_debt: null argument"); }
     let handle = unsafe { &*h };
-    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
-    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return json_null("cf_register_debt: no data") } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return json_null("cf_register_debt: no data") };
 
     let pattern = params["pattern"].as_str().unwrap_or("").to_string();
     let competing_hypotheses: Vec<String> = params["competing_hypotheses"]
@@ -7421,9 +7429,9 @@ pub extern "C" fn cf_register_debt(
     ) {
         Ok(debt_id) => {
             let json = serde_json::json!({"debt_id": debt_id});
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_register_debt: no data"))
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_register_debt: {e}")),
     }
 }
 
@@ -7456,10 +7464,10 @@ pub extern "C" fn cf_defer_debt(h: *mut CfHandle, debt_id: u64) -> c_int {
 pub extern "C" fn cf_query_debts(
     h: *const CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_query_debts: null argument"); }
     let handle = unsafe { &*h };
-    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
-    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return json_null("cf_query_debts: no data") } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return json_null("cf_query_debts: no data") };
 
     let status = params["status"].as_str().map(|s| match s {
         "open" | "Open" => crate::organ::epistemic_debt::DebtStatus::Open,
@@ -7473,29 +7481,29 @@ pub extern "C" fn cf_query_debts(
 
     let debts = handle.field.query_debts(status, domain, realm, min_fragility, limit);
     let json = serde_json::to_string(&debts).unwrap_or_else(|_| "[]".to_string());
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_query_debts: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_get_fragile_decisions(
     h: *const CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_get_fragile_decisions: null argument"); }
     let handle = unsafe { &*h };
-    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
-    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return json_null("cf_get_fragile_decisions: no data") } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return json_null("cf_get_fragile_decisions: no data") };
 
     let threshold = params["threshold"].as_f64().unwrap_or(0.5) as f32;
     let limit = params["limit"].as_u64().unwrap_or(20) as usize;
 
     let debts = handle.field.get_fragile_decisions(threshold, limit);
     let json = serde_json::to_string(&debts).unwrap_or_else(|_| "[]".to_string());
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_get_fragile_decisions: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_debt_stats(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_debt_stats: null argument"); }
     let handle = unsafe { &*h };
     let stats = handle.field.debt_stats();
     let json = serde_json::json!({
@@ -7505,7 +7513,7 @@ pub extern "C" fn cf_debt_stats(h: *const CfHandle) -> *mut c_char {
         "deferred": stats.deferred,
         "avg_fragility_open": stats.avg_fragility_open,
     });
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_debt_stats: no data"))
 }
 
 // ── Layer 6: Integration Kernel ───────────────────────────────────────────
@@ -7514,10 +7522,10 @@ pub extern "C" fn cf_debt_stats(h: *const CfHandle) -> *mut c_char {
 pub extern "C" fn cf_record_feedback(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_record_feedback: null argument"); }
     let handle = unsafe { &*h };
-    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
-    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return json_null("cf_record_feedback: no data") } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return json_null("cf_record_feedback: no data") };
 
     let query_domain = params["query_domain"].as_str().unwrap_or("general");
     let source = params["source"].as_str().unwrap_or("");
@@ -7532,9 +7540,9 @@ pub extern "C" fn cf_record_feedback(
                 "success_count": sw.success_count,
                 "total_count": sw.total_count,
             });
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_record_feedback: no data"))
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_record_feedback: {e}")),
     }
 }
 
@@ -7542,15 +7550,15 @@ pub extern "C" fn cf_record_feedback(
 pub extern "C" fn cf_get_source_weights(
     h: *const CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_get_source_weights: null argument"); }
     let handle = unsafe { &*h };
-    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
-    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return std::ptr::null_mut() };
+    let json_str = unsafe { match CStr::from_ptr(params_json).to_str() { Ok(s) => s, Err(_) => return json_null("cf_get_source_weights: no data") } };
+    let params: serde_json::Value = match serde_json::from_str(json_str) { Ok(v) => v, Err(_) => return json_null("cf_get_source_weights: no data") };
 
     let domain = params["domain"].as_str();
     let weights = handle.field.get_source_weights(domain);
     let json = serde_json::to_string(&weights).unwrap_or_else(|_| "[]".to_string());
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_get_source_weights: no data"))
 }
 
 #[no_mangle]
@@ -7574,7 +7582,7 @@ pub extern "C" fn cf_update_source_weight(
 
 #[no_mangle]
 pub extern "C" fn cf_integration_stats(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_integration_stats: null argument"); }
     let handle = unsafe { &*h };
     let stats = handle.field.integration_stats();
     let json = serde_json::json!({
@@ -7583,14 +7591,14 @@ pub extern "C" fn cf_integration_stats(h: *const CfHandle) -> *mut c_char {
             serde_json::json!({"source": source, "domain": domain, "success_rate": rate, "total_count": count})
         }).collect::<Vec<_>>(),
     });
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_integration_stats: no data"))
 }
 
 // ── Autonomous Learning FFI ───────────────────────────────────────────────
 
 #[no_mangle]
 pub extern "C" fn cf_surprise_learning_stats(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_surprise_learning_stats: null argument"); }
     let handle = unsafe { &*h };
     let stats = handle.field.surprise_learning_stats();
     let json = serde_json::json!({
@@ -7599,20 +7607,20 @@ pub extern "C" fn cf_surprise_learning_stats(h: *const CfHandle) -> *mut c_char 
         "total_gates_passed": stats.total_gates_passed,
         "total_credits_updated": stats.total_credits_updated,
     });
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_surprise_learning_stats: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_upsert_wisdom_candidate(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_upsert_wisdom_candidate: null argument"); }
     let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
-        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+        Ok(s) => s, Err(_) => return json_null("cf_upsert_wisdom_candidate: no data")
     }};
     let params: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+        Ok(v) => v, Err(_) => return json_null("cf_upsert_wisdom_candidate: no data")
     };
     let cluster_key = params["cluster_key"].as_str().unwrap_or("").to_string();
     let domain = params["domain"].as_str().unwrap_or("").to_string();
@@ -7635,9 +7643,9 @@ pub extern "C" fn cf_upsert_wisdom_candidate(
     ) {
         Ok(candidate_id) => {
             let json = serde_json::json!({"candidate_id": candidate_id});
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_upsert_wisdom_candidate: no data"))
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_upsert_wisdom_candidate: {e}")),
     }
 }
 
@@ -7658,13 +7666,13 @@ pub extern "C" fn cf_update_wisdom_lifecycle(
 pub extern "C" fn cf_query_wisdom_candidates(
     h: *const CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_query_wisdom_candidates: null argument"); }
     let handle = unsafe { &*h };
     let params: serde_json::Value = if params_json.is_null() {
         serde_json::Value::Object(serde_json::Map::new())
     } else {
         let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
-            Ok(s) => s, Err(_) => return std::ptr::null_mut()
+            Ok(s) => s, Err(_) => return json_null("cf_query_wisdom_candidates: no data")
         }};
         serde_json::from_str(json_str).unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
     };
@@ -7674,16 +7682,16 @@ pub extern "C" fn cf_query_wisdom_candidates(
     let limit = params["limit"].as_u64().unwrap_or(50) as usize;
     let results = handle.field.query_wisdom_candidates(lifecycle, domain, limit);
     let json = serde_json::to_value(&results).unwrap_or(serde_json::Value::Array(vec![]));
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_query_wisdom_candidates: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_wisdom_promotion_stats(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_wisdom_promotion_stats: null argument"); }
     let handle = unsafe { &*h };
     let stats = handle.field.wisdom_promotion_stats();
     let json = serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null);
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_wisdom_promotion_stats: no data"))
 }
 
 #[no_mangle]
@@ -7733,16 +7741,16 @@ pub extern "C" fn cf_update_scorer_model(
 
 #[no_mangle]
 pub extern "C" fn cf_learned_scorer_stats(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_learned_scorer_stats: null argument"); }
     let handle = unsafe { &*h };
     let stats = handle.field.learned_scorer_stats();
     let json = serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null);
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_learned_scorer_stats: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_effective_scorer_weights(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_effective_scorer_weights: null argument"); }
     let handle = unsafe { &*h };
     let stats = handle.field.learned_scorer_stats();
     let mut weights = serde_json::Map::new();
@@ -7758,7 +7766,7 @@ pub extern "C" fn cf_effective_scorer_weights(h: *const CfHandle) -> *mut c_char
         "baseline_version": stats.baseline_version,
         "factors": weights,
     });
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_effective_scorer_weights: no data"))
 }
 
 // ── Layer 7: Intervention Ledger ─────────────────────────────────────────
@@ -7767,13 +7775,13 @@ pub extern "C" fn cf_effective_scorer_weights(h: *const CfHandle) -> *mut c_char
 pub extern "C" fn cf_start_intervention(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_start_intervention: null argument"); }
     let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
-        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+        Ok(s) => s, Err(_) => return json_null("cf_start_intervention: no data")
     }};
     let p: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+        Ok(v) => v, Err(_) => return json_null("cf_start_intervention: no data")
     };
     use crate::organ::intervention::{ActionType, ReversalCost};
     let realm = p["realm"].as_str().unwrap_or("coding").to_string();
@@ -7797,9 +7805,9 @@ pub extern "C" fn cf_start_intervention(
     ) {
         Ok(id) => {
             let json = serde_json::json!({ "intervention_id": id });
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_start_intervention: no data"))
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_start_intervention: {e}")),
     }
 }
 
@@ -7807,17 +7815,17 @@ pub extern "C" fn cf_start_intervention(
 pub extern "C" fn cf_add_observation(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_add_observation: null argument"); }
     let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
-        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+        Ok(s) => s, Err(_) => return json_null("cf_add_observation: no data")
     }};
     let p: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+        Ok(v) => v, Err(_) => return json_null("cf_add_observation: no data")
     };
     use crate::organ::intervention::ObservationKind;
     let intervention_id = match p["intervention_id"].as_u64() {
-        Some(id) => id, None => return std::ptr::null_mut()
+        Some(id) => id, None => return json_null("cf_add_observation: no data")
     };
     let kind = ObservationKind::from_u8(p["kind"].as_u64().unwrap_or(0) as u8);
     let evidence_refs = p["evidence_refs"].as_array()
@@ -7827,9 +7835,9 @@ pub extern "C" fn cf_add_observation(
     match handle.field.add_observation(intervention_id, kind, evidence_refs, summary, confidence) {
         Ok(Some(oid)) => {
             let json = serde_json::json!({ "observation_id": oid });
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_add_observation: no data"))
         }
-        _ => std::ptr::null_mut(),
+        _ => json_null("cf_add_observation: no data"),
     }
 }
 
@@ -7886,13 +7894,13 @@ pub extern "C" fn cf_record_attribution(
 pub extern "C" fn cf_query_interventions(
     h: *const CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_query_interventions: null argument"); }
     let handle = unsafe { &*h };
     let p: serde_json::Value = if params_json.is_null() {
         serde_json::Value::Null
     } else {
         let s = unsafe { match CStr::from_ptr(params_json).to_str() {
-            Ok(s) => s, Err(_) => return std::ptr::null_mut()
+            Ok(s) => s, Err(_) => return json_null("cf_query_interventions: no data")
         }};
         serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
     };
@@ -7903,40 +7911,40 @@ pub extern "C" fn cf_query_interventions(
     let limit = p["limit"].as_u64().unwrap_or(50) as usize;
     let results = handle.field.query_interventions(realm, session_id, status, limit);
     let json = serde_json::to_value(&results).unwrap_or(serde_json::Value::Array(vec![]));
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_query_interventions: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_get_intervention(
     h: *const CfHandle, intervention_id: u64,
 ) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_get_intervention: null argument"); }
     let handle = unsafe { &*h };
     match handle.field.get_intervention(intervention_id) {
         Some(rec) => {
             let json = serde_json::to_value(&rec).unwrap_or(serde_json::Value::Null);
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_get_intervention: no data"))
         }
-        None => std::ptr::null_mut(),
+        None => json_null("cf_get_intervention: no data"),
     }
 }
 
 #[no_mangle]
 pub extern "C" fn cf_intervention_stats(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_intervention_stats: null argument"); }
     let handle = unsafe { &*h };
     let stats = handle.field.intervention_stats();
     let json = serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null);
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_intervention_stats: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_list_open_interventions(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_list_open_interventions: null argument"); }
     let handle = unsafe { &*h };
     let results = handle.field.list_open_interventions();
     let json = serde_json::to_value(&results).unwrap_or(serde_json::Value::Array(vec![]));
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_list_open_interventions: no data"))
 }
 
 #[no_mangle]
@@ -7953,11 +7961,11 @@ pub extern "C" fn cf_close_stale_interventions(
 
 #[no_mangle]
 pub extern "C" fn cf_auto_resolve_debts(h: *mut CfHandle, threshold: f32) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_auto_resolve_debts: null argument"); }
     let handle = unsafe { &*h };
     let resolved = handle.field.auto_resolve_debts(threshold).unwrap_or(0);
     let json = serde_json::json!({ "resolved_count": resolved });
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_auto_resolve_debts: no data"))
 }
 
 // ── Agent Protocol Memory (Layer 8) ──────────────────────────────────────────
@@ -7966,13 +7974,13 @@ pub extern "C" fn cf_auto_resolve_debts(h: *mut CfHandle, threshold: f32) -> *mu
 pub extern "C" fn cf_register_task(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_register_task: null argument"); }
     let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
-        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+        Ok(s) => s, Err(_) => return json_null("cf_register_task: no data")
     }};
     let p: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+        Ok(v) => v, Err(_) => return json_null("cf_register_task: no data")
     };
     let goal = p["goal"].as_str().unwrap_or("").to_string();
     let constraints: Vec<String> = p["constraints"].as_array()
@@ -7995,9 +8003,9 @@ pub extern "C" fn cf_register_task(
     ) {
         Ok(id) => {
             let json = serde_json::json!({ "task_id": id });
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_register_task: no data"))
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_register_task: {e}")),
     }
 }
 
@@ -8028,24 +8036,24 @@ pub extern "C" fn cf_update_task(
 pub extern "C" fn cf_add_delegation(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_add_delegation: null argument"); }
     let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
-        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+        Ok(s) => s, Err(_) => return json_null("cf_add_delegation: no data")
     }};
     let p: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+        Ok(v) => v, Err(_) => return json_null("cf_add_delegation: no data")
     };
-    let task_id = match p["task_id"].as_u64() { Some(id) => id, None => return std::ptr::null_mut() };
+    let task_id = match p["task_id"].as_u64() { Some(id) => id, None => return json_null("cf_add_delegation: no data") };
     let from_agent = p["from_agent"].as_str().unwrap_or("").to_string();
     let to_agent = p["to_agent"].as_str().unwrap_or("").to_string();
     let handoff_note = p["handoff_note"].as_str().map(|s| s.to_string());
     match handle.field.add_delegation(task_id, from_agent, to_agent, handoff_note) {
         Ok(Some(id)) => {
             let json = serde_json::json!({ "delegation_id": id });
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_add_delegation: no data"))
         }
-        _ => std::ptr::null_mut(),
+        _ => json_null("cf_add_delegation: no data"),
     }
 }
 
@@ -8053,25 +8061,25 @@ pub extern "C" fn cf_add_delegation(
 pub extern "C" fn cf_link_evidence(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_link_evidence: null argument"); }
     let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
-        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+        Ok(s) => s, Err(_) => return json_null("cf_link_evidence: no data")
     }};
     let p: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+        Ok(v) => v, Err(_) => return json_null("cf_link_evidence: no data")
     };
-    let task_id = match p["task_id"].as_u64() { Some(id) => id, None => return std::ptr::null_mut() };
-    let memory_id = match p["memory_id"].as_u64() { Some(id) => id, None => return std::ptr::null_mut() };
+    let task_id = match p["task_id"].as_u64() { Some(id) => id, None => return json_null("cf_link_evidence: no data") };
+    let memory_id = match p["memory_id"].as_u64() { Some(id) => id, None => return json_null("cf_link_evidence: no data") };
     let produced_by = p["produced_by"].as_str().unwrap_or("").to_string();
     let evidence_kind = p["evidence_kind"].as_u64().unwrap_or(0) as u8;
     let relevance = p["relevance"].as_f64().unwrap_or(1.0) as f32;
     match handle.field.link_evidence(task_id, memory_id, produced_by, evidence_kind, relevance) {
         Ok(Some(id)) => {
             let json = serde_json::json!({ "evidence_id": id });
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_link_evidence: no data"))
         }
-        _ => std::ptr::null_mut(),
+        _ => json_null("cf_link_evidence: no data"),
     }
 }
 
@@ -8079,24 +8087,24 @@ pub extern "C" fn cf_link_evidence(
 pub extern "C" fn cf_add_probe(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_add_probe: null argument"); }
     let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
-        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+        Ok(s) => s, Err(_) => return json_null("cf_add_probe: no data")
     }};
     let p: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+        Ok(v) => v, Err(_) => return json_null("cf_add_probe: no data")
     };
-    let task_id = match p["task_id"].as_u64() { Some(id) => id, None => return std::ptr::null_mut() };
+    let task_id = match p["task_id"].as_u64() { Some(id) => id, None => return json_null("cf_add_probe: no data") };
     let question = p["question"].as_str().unwrap_or("").to_string();
     let expected_answerer = p["expected_answerer"].as_str().map(|s| s.to_string());
     let priority = p["priority"].as_u64().unwrap_or(5) as u8;
     match handle.field.add_probe(task_id, question, expected_answerer, priority) {
         Ok(Some(id)) => {
             let json = serde_json::json!({ "probe_id": id });
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_add_probe: no data"))
         }
-        _ => std::ptr::null_mut(),
+        _ => json_null("cf_add_probe: no data"),
     }
 }
 
@@ -8126,24 +8134,24 @@ pub extern "C" fn cf_resolve_probe(
 pub extern "C" fn cf_set_criterion(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_set_criterion: null argument"); }
     let handle = unsafe { &*h };
     let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
-        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+        Ok(s) => s, Err(_) => return json_null("cf_set_criterion: no data")
     }};
     let p: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v, Err(_) => return std::ptr::null_mut()
+        Ok(v) => v, Err(_) => return json_null("cf_set_criterion: no data")
     };
-    let task_id = match p["task_id"].as_u64() { Some(id) => id, None => return std::ptr::null_mut() };
+    let task_id = match p["task_id"].as_u64() { Some(id) => id, None => return json_null("cf_set_criterion: no data") };
     let criterion = p["criterion"].as_str().unwrap_or("").to_string();
     let is_met = p["is_met"].as_bool().unwrap_or(false);
     let evidence_note = p["evidence_note"].as_str().map(|s| s.to_string());
     match handle.field.set_criterion(task_id, criterion, is_met, evidence_note) {
         Ok(Some(id)) => {
             let json = serde_json::json!({ "criterion_id": id });
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_set_criterion: no data"))
         }
-        _ => std::ptr::null_mut(),
+        _ => json_null("cf_set_criterion: no data"),
     }
 }
 
@@ -8151,14 +8159,14 @@ pub extern "C" fn cf_set_criterion(
 pub extern "C" fn cf_get_task(
     h: *const CfHandle, task_id: u64,
 ) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_get_task: null argument"); }
     let handle = unsafe { &*h };
     match handle.field.get_task_full(task_id) {
         Some(view) => {
             let json = serde_json::to_value(&view).unwrap_or(serde_json::Value::Null);
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_get_task: no data"))
         }
-        None => std::ptr::null_mut(),
+        None => json_null("cf_get_task: no data"),
     }
 }
 
@@ -8166,13 +8174,13 @@ pub extern "C" fn cf_get_task(
 pub extern "C" fn cf_query_tasks(
     h: *const CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_query_tasks: null argument"); }
     let handle = unsafe { &*h };
     let p: serde_json::Value = if params_json.is_null() {
         serde_json::Value::Null
     } else {
         let s = unsafe { match CStr::from_ptr(params_json).to_str() {
-            Ok(s) => s, Err(_) => return std::ptr::null_mut()
+            Ok(s) => s, Err(_) => return json_null("cf_query_tasks: no data")
         }};
         serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
     };
@@ -8183,25 +8191,25 @@ pub extern "C" fn cf_query_tasks(
     let limit = p["limit"].as_u64().unwrap_or(50) as usize;
     let results = handle.field.query_tasks(realm, session_id, status, priority, limit);
     let json = serde_json::to_value(&results).unwrap_or(serde_json::Value::Array(vec![]));
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_query_tasks: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_agent_protocol_stats(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_agent_protocol_stats: null argument"); }
     let handle = unsafe { &*h };
     let stats = handle.field.agent_protocol_stats();
     let json = serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null);
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_agent_protocol_stats: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_auto_complete_tasks(h: *mut CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_auto_complete_tasks: null argument"); }
     let handle = unsafe { &*h };
     let completed = handle.field.auto_complete_tasks().unwrap_or(0);
     let json = serde_json::json!({ "completed_count": completed });
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_auto_complete_tasks: no data"))
 }
 
 // ── Layer 9: Wisdom Homeostasis ───────────────────────────────────────────────
@@ -8210,14 +8218,14 @@ pub extern "C" fn cf_auto_complete_tasks(h: *mut CfHandle) -> *mut c_char {
 pub extern "C" fn cf_enroll_wisdom_lineage(
     h: *mut CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || params_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || params_json.is_null() { return json_null("cf_enroll_wisdom_lineage: null argument"); }
     let handle = unsafe { &*h };
     let s = unsafe { match CStr::from_ptr(params_json).to_str() {
-        Ok(s) => s, Err(_) => return std::ptr::null_mut()
+        Ok(s) => s, Err(_) => return json_null("cf_enroll_wisdom_lineage: no data")
     }};
     let p: serde_json::Value = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
     let candidate_id = match p["wisdom_candidate_id"].as_u64() {
-        Some(v) => v, None => return std::ptr::null_mut()
+        Some(v) => v, None => return json_null("cf_enroll_wisdom_lineage: no data")
     };
     let claim = p["claim"].as_str().unwrap_or("").to_string();
     let envelope_json = p["envelope"].to_string();
@@ -8235,9 +8243,9 @@ pub extern "C" fn cf_enroll_wisdom_lineage(
     ) {
         Ok(id) => {
             let json = serde_json::json!({ "lineage_id": id });
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_enroll_wisdom_lineage: no data"))
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_enroll_wisdom_lineage: {e}")),
     }
 }
 
@@ -8286,13 +8294,13 @@ pub extern "C" fn cf_close_rederive(
 pub extern "C" fn cf_query_wisdom_lineages(
     h: *const CfHandle, params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_query_wisdom_lineages: null argument"); }
     let handle = unsafe { &*h };
     let p: serde_json::Value = if params_json.is_null() {
         serde_json::Value::Null
     } else {
         let s = unsafe { match CStr::from_ptr(params_json).to_str() {
-            Ok(s) => s, Err(_) => return std::ptr::null_mut()
+            Ok(s) => s, Err(_) => return json_null("cf_query_wisdom_lineages: no data")
         }};
         serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
     };
@@ -8301,51 +8309,51 @@ pub extern "C" fn cf_query_wisdom_lineages(
     let limit = p["limit"].as_u64().unwrap_or(50) as usize;
     let results = handle.field.query_wisdom_lineages(state_str, domain, limit);
     let json = serde_json::to_value(&results).unwrap_or(serde_json::Value::Array(vec![]));
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_query_wisdom_lineages: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_get_wisdom_lineage(
     h: *const CfHandle, lineage_id: u64,
 ) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_get_wisdom_lineage: null argument"); }
     let handle = unsafe { &*h };
     match handle.field.get_wisdom_lineage(lineage_id) {
         Some(l) => {
             let json = serde_json::to_value(&l).unwrap_or(serde_json::Value::Null);
-            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_get_wisdom_lineage: no data"))
         }
-        None => std::ptr::null_mut(),
+        None => json_null("cf_get_wisdom_lineage: no data"),
     }
 }
 
 #[no_mangle]
 pub extern "C" fn cf_wisdom_lineage_stats(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_wisdom_lineage_stats: null argument"); }
     let handle = unsafe { &*h };
     let stats = handle.field.wisdom_lineage_stats();
     let json = serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null);
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_wisdom_lineage_stats: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_tick_lineage_staleness(h: *mut CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_tick_lineage_staleness: null argument"); }
     let handle = unsafe { &*h };
     let ids = handle.field.tick_lineage_staleness().unwrap_or_default();
     let count = ids.len();
     let json = serde_json::json!({ "transitioned_ids": ids, "count": count });
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_tick_lineage_staleness: no data"))
 }
 
 #[no_mangle]
 pub extern "C" fn cf_lineage_expiry_check(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_lineage_expiry_check: null argument"); }
     let handle = unsafe { &*h };
     let ids = handle.field.lineage_expiry_check();
     let count = ids.len();
     let json = serde_json::json!({ "expired_ids": ids, "count": count });
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_lineage_expiry_check: no data"))
 }
 
 // ── Soul REPL Session Store FFI ─────────────────────────────────────────────
@@ -8357,12 +8365,12 @@ pub extern "C" fn cf_repl_session_get(
     h: *const CfHandle,
     session_id: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || session_id.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || session_id.is_null() { return json_null("cf_repl_session_get: null argument"); }
     let handle = unsafe { &*h };
-    let id_str = unsafe { match CStr::from_ptr(session_id).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let id_str = unsafe { match CStr::from_ptr(session_id).to_str() { Ok(s) => s, Err(_) => return json_null("cf_repl_session_get: no data") } };
     match handle.field.repl_session_get(id_str) {
-        Some(ns) => CString::new(ns).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
-        None => std::ptr::null_mut(),
+        Some(ns) => CString::new(ns).map(|s| s.into_raw()).unwrap_or(json_null("cf_repl_session_get: no data")),
+        None => json_null("cf_repl_session_get: no data"),
     }
 }
 
@@ -8407,16 +8415,16 @@ pub extern "C" fn cf_repl_execute(
     socket_path: *const c_char,
     max_output: c_int,
 ) -> *mut c_char {
-    if h.is_null() || session_id.is_null() || code.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || session_id.is_null() || code.is_null() { return json_null("cf_repl_execute: null argument"); }
     let handle = unsafe { &*h };
-    let sid  = unsafe { match CStr::from_ptr(session_id).to_str() { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
-    let code = unsafe { match CStr::from_ptr(code).to_str()       { Ok(s) => s, Err(_) => return std::ptr::null_mut() } };
+    let sid  = unsafe { match CStr::from_ptr(session_id).to_str() { Ok(s) => s, Err(_) => return json_null("cf_repl_execute: no data") } };
+    let code = unsafe { match CStr::from_ptr(code).to_str()       { Ok(s) => s, Err(_) => return json_null("cf_repl_execute: no data") } };
     let sp   = if socket_path.is_null() { "" } else {
         unsafe { CStr::from_ptr(socket_path).to_str().unwrap_or("") }
     };
     let max = if max_output > 0 { max_output as usize } else { 10_000 };
     let json = handle.field.repl_execute(sid, code, reset != 0, sp, max);
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_repl_execute: no data"))
 }
 
 /// Set source_session on an existing memory (in-memory; persisted at next snapshot).
@@ -8571,10 +8579,10 @@ pub extern "C" fn cf_recall_session(
 /// List all REPL sessions as JSON array. Caller must free with cf_free_string.
 #[no_mangle]
 pub extern "C" fn cf_repl_session_list(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_repl_session_list: null argument"); }
     let handle = unsafe { &*h };
     let json = handle.field.repl_session_list();
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_repl_session_list: no data"))
 }
 
 // ── Contradiction detection FFI ───────────────────────────────────────────────
@@ -8590,12 +8598,12 @@ pub extern "C" fn cf_detect_contradictions(
     realm_ptr: *const c_char,
 ) -> *mut c_char {
     if h.is_null() || realm_ptr.is_null() {
-        return std::ptr::null_mut();
+        return json_null("cf_detect_contradictions: null argument");
     }
     let handle = unsafe { &*h };
     let realm = match unsafe { CStr::from_ptr(realm_ptr) }.to_str() {
         Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
+        Err(_) => return json_null("cf_detect_contradictions: no data"),
     };
 
     // Gather peers and target content in a single lock window
@@ -8612,7 +8620,7 @@ pub extern "C" fn cf_detect_contradictions(
             .collect();
         let target = match payloads.get(&memory_id) {
             Some(p) => p.content.clone(),
-            None => return CString::new("[]").map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
+            None => return CString::new("[]").map(|s| s.into_raw()).unwrap_or(json_null("cf_detect_contradictions: no data")),
         };
         (peers, target)
     };
@@ -8630,7 +8638,7 @@ pub extern "C" fn cf_detect_contradictions(
 
     let candidates = index.detect_for_new_memory(memory_id, &target_content, realm);
     let json = serde_json::to_string(&candidates).unwrap_or_else(|_| "[]".into());
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_detect_contradictions: no data"))
 }
 
 /// Background scan: detect contradictions across all memories in a realm.
@@ -8643,12 +8651,12 @@ pub extern "C" fn cf_scan_contradictions(
     limit: u32,
 ) -> *mut c_char {
     if h.is_null() || realm_ptr.is_null() {
-        return std::ptr::null_mut();
+        return json_null("cf_scan_contradictions: null argument");
     }
     let handle = unsafe { &*h };
     let realm = match unsafe { CStr::from_ptr(realm_ptr) }.to_str() {
         Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
+        Err(_) => return json_null("cf_scan_contradictions: no data"),
     };
 
     let pairs: Vec<(u64, Vec<u8>)> = {
@@ -8667,7 +8675,7 @@ pub extern "C" fn cf_scan_contradictions(
     let mut index = ContradictionIndex::new();
     let candidates = index.scan_realm(realm, &pairs, limit as usize);
     let json = serde_json::to_string(&candidates).unwrap_or_else(|_| "[]".into());
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_scan_contradictions: no data"))
 }
 
 /// Resolve a contradiction pair by declaring a winner and loser.
@@ -8681,7 +8689,7 @@ pub extern "C" fn cf_resolve_contradiction(
     reason_ptr: *const c_char,
 ) -> *mut c_char {
     if h.is_null() {
-        return std::ptr::null_mut();
+        return json_null("cf_resolve_contradiction: null argument");
     }
     let reason = if reason_ptr.is_null() {
         "manual"
@@ -8730,9 +8738,9 @@ pub extern "C" fn cf_resolve_contradiction(
     match index.resolve(candidate_id, winner_id, loser_id, reason) {
         Some(ops) => {
             let json = serde_json::to_string(&ops).unwrap_or_else(|_| "{}".into());
-            CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_resolve_contradiction: no data"))
         }
-        None => CString::new("{}").map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
+        None => CString::new("{}").map(|s| s.into_raw()).unwrap_or(json_null("cf_resolve_contradiction: no data")),
     }
 }
 
@@ -8743,14 +8751,14 @@ pub extern "C" fn cf_symbol_stale_for_memory(
     h: *const CfHandle,
     memory_id: u64,
 ) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_symbol_stale_for_memory: null argument"); }
     let handle = unsafe { &*h };
     let reason = handle.field.symbol_stale_for_memory(memory_id);
     let json = serde_json::json!({
         "stale": reason.is_some(),
         "reason": reason,
     });
-    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json.to_string()).map(|s| s.into_raw()).unwrap_or(json_null("cf_symbol_stale_for_memory: no data"))
 }
 
 #[no_mangle]
@@ -8759,10 +8767,10 @@ pub extern "C" fn cf_memory_claim_info(
     memory_id: u64,
     now_ms: i64,
 ) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_memory_claim_info: null argument"); }
     let handle = unsafe { &*h };
     let json = handle.field.memory_claim_info_json(memory_id, now_ms);
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_memory_claim_info: no data"))
 }
 
 // ── Symbol event log FFI ─────────────────────────────────────────────────────
@@ -8806,13 +8814,13 @@ pub extern "C" fn cf_query_symbol_events(
     h: *const CfHandle,
     params_json: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_query_symbol_events: null argument"); }
     let handle = unsafe { &*h };
     let (symbol_name, file_path, limit) = if params_json.is_null() {
         (None, None, 50usize)
     } else {
         let json_str = unsafe { match CStr::from_ptr(params_json).to_str() {
-            Ok(s) => s, Err(_) => return std::ptr::null_mut(),
+            Ok(s) => s, Err(_) => return json_null("cf_query_symbol_events: no data"),
         }};
         let p: serde_json::Value = serde_json::from_str(json_str).unwrap_or_default();
         let sn = p["symbol_name"].as_str().map(|s| s.to_string());
@@ -8825,7 +8833,7 @@ pub extern "C" fn cf_query_symbol_events(
         file_path.as_deref(),
         limit,
     );
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_query_symbol_events: no data"))
 }
 
 #[no_mangle]
@@ -8849,7 +8857,7 @@ pub extern "C" fn cf_query_cross_harness_conflicts(
     limit: u32,
     min_score: f32,
 ) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_query_cross_harness_conflicts: null argument"); }
     let handle = unsafe { &*h };
     let realm_str = if realm.is_null() { "".to_string() } else {
         unsafe { CStr::from_ptr(realm).to_str().unwrap_or("").to_string() }
@@ -8858,7 +8866,7 @@ pub extern "C" fn cf_query_cross_harness_conflicts(
     let json = handle.field.query_cross_harness_conflicts(&realm_str, lim, min_score);
     match CString::new(json) {
         Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_query_cross_harness_conflicts: {e}")),
     }
 }
 
@@ -8871,22 +8879,22 @@ pub extern "C" fn cf_triplet_query_as_of(
     subject: *const c_char,
     world_ms: i64,
 ) -> *mut c_char {
-    if h.is_null() || subject.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || subject.is_null() { return json_null("cf_triplet_query_as_of: null argument"); }
     let handle = unsafe { &*h };
     let subject_str = unsafe {
         match CStr::from_ptr(subject).to_str() {
             Ok(s) => s,
-            Err(_) => return std::ptr::null_mut(),
+            Err(_) => return json_null("cf_triplet_query_as_of: no data"),
         }
     };
     let entries = match handle.field.query_subject_as_of(subject_str, world_ms) {
         Ok(e) => e,
-        Err(_) => return std::ptr::null_mut(),
+        Err(_) => return json_null("cf_triplet_query_as_of: no data"),
     };
     let json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
     match CString::new(json) {
         Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => json_null(format!("cf_triplet_query_as_of: {e}")),
     }
 }
 
@@ -8917,12 +8925,12 @@ pub extern "C" fn cf_graph_traverse(
     max_results: usize,
     direction: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() || start.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || start.is_null() { return json_null("cf_graph_traverse: null argument"); }
     let handle = unsafe { &*h };
     let start_str = unsafe {
         match CStr::from_ptr(start).to_str() {
             Ok(s) => s,
-            Err(_) => return std::ptr::null_mut(),
+            Err(_) => return json_null("cf_graph_traverse: no data"),
         }
     };
     let edge_types_str: Vec<String> = if edge_types_json.is_null() {
@@ -8946,7 +8954,7 @@ pub extern "C" fn cf_graph_traverse(
     };
     let hits = handle.field.graph_traverse(start_str, &edge_refs, max_hops, max_results, dir);
     let json = serde_json::to_string(&hits).unwrap_or_else(|_| "[]".to_string());
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_graph_traverse: no data"))
 }
 
 /// Personalized PageRank over the triplet graph. Returns JSON array of [node, score] pairs.
@@ -8960,7 +8968,7 @@ pub extern "C" fn cf_graph_pagerank(
     iterations: u8,
     top_k: usize,
 ) -> *mut c_char {
-    if h.is_null() || seeds_json.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() || seeds_json.is_null() { return json_null("cf_graph_pagerank: null argument"); }
     let handle = unsafe { &*h };
     let seeds_str: Vec<String> = unsafe {
         CStr::from_ptr(seeds_json).to_str().ok()
@@ -8980,7 +8988,7 @@ pub extern "C" fn cf_graph_pagerank(
     let edge_refs: Vec<&str> = edge_types_str.iter().map(|s| s.as_str()).collect();
     let results = handle.field.graph_pagerank(&seed_refs, &edge_refs, damping, iterations, top_k);
     let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_graph_pagerank: no data"))
 }
 
 // ── Interaction Ledger FFI ─────────────────────────────────────────────────────
@@ -9017,7 +9025,7 @@ pub extern "C" fn cf_ledger_query(
     h: *const CfHandle,
     json_in: *const c_char,
 ) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_ledger_query: null argument"); }
     let handle = unsafe { &*h };
     let args: serde_json::Value = if json_in.is_null() {
         serde_json::Value::Object(Default::default())
@@ -9025,7 +9033,7 @@ pub extern "C" fn cf_ledger_query(
         match unsafe { CStr::from_ptr(json_in) }.to_str().ok()
             .and_then(|s| serde_json::from_str(s).ok()) {
             Some(v) => v,
-            None => return std::ptr::null_mut(),
+            None => return json_null("cf_ledger_query: no data"),
         }
     };
     use crate::organ::interaction_ledger::EventKind;
@@ -9041,10 +9049,10 @@ pub extern "C" fn cf_ledger_query(
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
     let results = match handle.field.ledger_query(kind, session_id_owned.as_deref(), since_ms, limit) {
         Ok(r) => r,
-        Err(_) => return std::ptr::null_mut(),
+        Err(_) => return json_null("cf_ledger_query: no data"),
     };
     let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_ledger_query: no data"))
 }
 
 /// Compile Override events into versioned assertions. Returns number of new assertions via `out_count`.
@@ -9062,14 +9070,14 @@ pub extern "C" fn cf_ledger_compile(h: *const CfHandle, out_count: *mut u32) -> 
 /// Caller must free with cf_free_string.
 #[no_mangle]
 pub extern "C" fn cf_ledger_contradictions(h: *const CfHandle) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_ledger_contradictions: null argument"); }
     let handle = unsafe { &*h };
     let results = match handle.field.ledger_contradictions() {
         Ok(r) => r,
-        Err(_) => return std::ptr::null_mut(),
+        Err(_) => return json_null("cf_ledger_contradictions: no data"),
     };
     let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
-    CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_ledger_contradictions: no data"))
 }
 
 
@@ -9093,21 +9101,21 @@ pub extern "C" fn cf_predicate_attach(
 
 #[no_mangle]
 pub extern "C" fn cf_predicate_run(h: *const CfHandle, memory_id: u64) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_predicate_run: null argument"); }
     let handle = unsafe { &*h };
     match handle.field.predicate_run(memory_id) {
-        Ok(json) => CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
-        Err(_) => std::ptr::null_mut(),
+        Ok(json) => CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_predicate_run: no data")),
+        Err(e) => json_null(format!("cf_predicate_run: {e}")),
     }
 }
 
 #[no_mangle]
 pub extern "C" fn cf_predicate_list(h: *const CfHandle, memory_id: u64) -> *mut c_char {
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() { return json_null("cf_predicate_list: null argument"); }
     let handle = unsafe { &*h };
     match handle.field.predicate_list(memory_id) {
-        Ok(json) => CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
-        Err(_) => std::ptr::null_mut(),
+        Ok(json) => CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_predicate_list: no data")),
+        Err(e) => json_null(format!("cf_predicate_list: {e}")),
     }
 }
 
