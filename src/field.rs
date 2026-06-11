@@ -261,6 +261,15 @@ pub struct ChittaField {
     pub(crate) idx_sidecars_saved_at: std::sync::atomic::AtomicU64,
     /// HdcStore mutation count at the last .hdc sidecar write (same scheme).
     pub(crate) hdc_sidecar_saved_at: std::sync::atomic::AtomicU64,
+    /// Payload CONTENT mutation counter + the value at the last .pld write.
+    /// Audited bump sites: put_memory insert, cf_update_memory_content, and
+    /// sync_foreign (wholesale). Removals never need a bump: the loader fills
+    /// only ids present in the snapshot body, so stale extras are ignored.
+    /// The counter MUST be read before the payloads clone in
+    /// save_full_snapshot — a put racing the save then forces a rewrite on
+    /// the NEXT save instead of leaving a skippable stale file.
+    pub(crate) pld_mutations: std::sync::atomic::AtomicU64,
+    pub(crate) pld_saved_at: std::sync::atomic::AtomicU64,
 }
 
 impl Drop for ChittaField {
@@ -799,6 +808,47 @@ impl ChittaField {
         // and retry once all creates are applied. Merge replay already yields
         // timestamp order, so collection order is application order.
         let mut orphan_deltas: Vec<crate::ops::StateDeltaOp> = Vec::new();
+        let mut ctx = ApplyCtx {
+            payloads: &mut payloads,
+            states: &mut states,
+            assoc_edges: &mut assoc_edges,
+            artifacts: &mut artifacts,
+            artifact_paths: &mut artifact_paths,
+            semantic_idx: &mut semantic_idx,
+            time_idx: &mut time_idx,
+            artifact_idx: &mut artifact_idx,
+            keyword_idx: &mut keyword_idx,
+            triplet_store: &mut triplet_store,
+            symbol_idx: &mut symbol_idx,
+            call_graph: &mut call_graph,
+            code_files: &mut code_files,
+            cortical_idx: &mut cortical_idx,
+            session_registry: &mut session_registry,
+            transcript_registry: &mut transcript_registry,
+            task_registry: &mut task_registry,
+            user_model_registry: &mut user_model_registry,
+            theme_organ: &mut theme_organ,
+            analytics_registry: &mut analytics_registry,
+            msg_registry: &mut msg_registry,
+            skill_registry: &mut skill_registry,
+            agent_registry: &mut agent_registry,
+            constraint_store: &mut constraint_store,
+            trigger_store: &mut trigger_store,
+            surprise_store: &mut surprise_store,
+            epistemic_debt_store: &mut epistemic_debt_store,
+            integration_kernel: &mut integration_kernel,
+            surprise_learning: &mut surprise_learning,
+            wisdom_promotion: &mut wisdom_promotion,
+            learned_scorer: &mut learned_scorer,
+            intervention_store: &mut intervention_store,
+            agent_protocol_store: &mut agent_protocol_store,
+            wisdom_lineage_store: &mut wisdom_lineage_store,
+            symbol_event_log: &mut symbol_event_log,
+            chunk_hash_idx: &mut chunk_hash_idx,
+            realm_members: &mut replay_realm_members,
+            kind_members: &mut replay_kind_members,
+            coactivation_stats: &mut replay_coactivation_stats,
+        };
         let replayed_coverage = log.replay(0, |inst, seqno, op| {
             if seqno > max_replayed_seqno { max_replayed_seqno = seqno; }
             if covered_by_full(inst, seqno) {
@@ -826,53 +876,12 @@ impl ChittaField {
                 }
             }
             if let Op::UpdateState(d) = &op {
-                if !states.contains_key(&d.memory_id) {
+                if !ctx.states.contains_key(&d.memory_id) {
                     orphan_deltas.push(d.clone());
                     return Ok(());
                 }
             }
-            apply_op(
-                op,
-                &mut payloads,
-                &mut states,
-                &mut assoc_edges,
-                &mut artifacts,
-                &mut artifact_paths,
-                &mut semantic_idx,
-                &mut time_idx,
-                &mut artifact_idx,
-                &mut keyword_idx,
-                &mut triplet_store,
-                &mut symbol_idx,
-                &mut call_graph,
-                &mut code_files,
-                &mut cortical_idx,
-                &mut session_registry,
-                &mut transcript_registry,
-                &mut task_registry,
-                &mut user_model_registry,
-                &mut theme_organ,
-                &mut analytics_registry,
-                &mut msg_registry,
-                &mut skill_registry,
-                &mut agent_registry,
-                &mut constraint_store,
-                &mut trigger_store,
-                &mut surprise_store,
-                &mut epistemic_debt_store,
-                &mut integration_kernel,
-                &mut surprise_learning,
-                &mut wisdom_promotion,
-                &mut learned_scorer,
-                &mut intervention_store,
-                &mut agent_protocol_store,
-                &mut wisdom_lineage_store,
-                &mut symbol_event_log,
-                &mut chunk_hash_idx,
-                &mut replay_realm_members,
-                &mut replay_kind_members,
-                &mut replay_coactivation_stats,
-            );
+            apply_op(op, ctx.reborrow());
             Ok(())
         })?;
         for d in orphan_deltas {
@@ -1183,6 +1192,8 @@ impl ChittaField {
             wal_coverage: parking_lot::RwLock::new(wal_coverage),
             idx_sidecars_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
             hdc_sidecar_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
+            pld_mutations: std::sync::atomic::AtomicU64::new(0),
+            pld_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
         })
     }
 }
@@ -1287,53 +1298,55 @@ impl ChittaField {
         let mut kind_members  = self.kind_members.write();
         let mut coactivation_stats = self.coactivation_stats.write();
 
+        let mut ctx = ApplyCtx {
+            payloads: &mut *payloads,
+            states: &mut *states,
+            assoc_edges: &mut *assoc_edges,
+            artifacts: &mut *artifacts,
+            artifact_paths: &mut *artifact_paths,
+            semantic_idx: &mut *semantic_idx,
+            time_idx: &mut *time_idx,
+            artifact_idx: &mut *artifact_idx,
+            keyword_idx: &mut *keyword_idx,
+            triplet_store: &mut *triplet_store,
+            symbol_idx: &mut *symbol_idx,
+            call_graph: &mut *call_graph,
+            code_files: &mut *code_files,
+            cortical_idx: &mut *cortical_idx,
+            session_registry: &mut *session_reg,
+            transcript_registry: &mut *transcript_reg,
+            task_registry: &mut *task_reg,
+            user_model_registry: &mut *user_model_reg,
+            theme_organ: &mut *theme_organ,
+            analytics_registry: &mut *analytics_reg,
+            msg_registry: &mut *msg_reg,
+            skill_registry: &mut *skill_reg,
+            agent_registry: &mut *agent_reg,
+            constraint_store: &mut *constraint_reg,
+            trigger_store: &mut *trigger_reg,
+            surprise_store: &mut *surprise_reg,
+            epistemic_debt_store: &mut *epistemic_debt_reg,
+            integration_kernel: &mut *integration_reg,
+            surprise_learning: &mut *surprise_learning_reg,
+            wisdom_promotion: &mut *wisdom_promotion_reg,
+            learned_scorer: &mut *learned_scorer_reg,
+            intervention_store: &mut *intervention_store_reg,
+            agent_protocol_store: &mut *agent_protocol_store_reg,
+            wisdom_lineage_store: &mut *wisdom_lineage_store_reg,
+            symbol_event_log: &mut *symbol_event_log_reg,
+            chunk_hash_idx: &mut *chunk_hash_idx,
+            realm_members: &mut *realm_members,
+            kind_members: &mut *kind_members,
+            coactivation_stats: &mut *coactivation_stats,
+        };
         for op in ops {
-            apply_op(
-                op,
-                &mut *payloads,
-                &mut *states,
-                &mut *assoc_edges,
-                &mut *artifacts,
-                &mut *artifact_paths,
-                &mut *semantic_idx,
-                &mut *time_idx,
-                &mut *artifact_idx,
-                &mut *keyword_idx,
-                &mut *triplet_store,
-                &mut *symbol_idx,
-                &mut *call_graph,
-                &mut *code_files,
-                &mut *cortical_idx,
-                &mut *session_reg,
-                &mut *transcript_reg,
-                &mut *task_reg,
-                &mut *user_model_reg,
-                &mut *theme_organ,
-                &mut *analytics_reg,
-                &mut *msg_reg,
-                &mut *skill_reg,
-                &mut *agent_reg,
-                &mut *constraint_reg,
-                &mut *trigger_reg,
-                &mut *surprise_reg,
-                &mut *epistemic_debt_reg,
-                &mut *integration_reg,
-                &mut *surprise_learning_reg,
-                &mut *wisdom_promotion_reg,
-                &mut *learned_scorer_reg,
-                &mut *intervention_store_reg,
-                &mut *agent_protocol_store_reg,
-                &mut *wisdom_lineage_store_reg,
-                &mut *symbol_event_log_reg,
-                &mut *chunk_hash_idx,
-                &mut *realm_members,
-                &mut *kind_members,
-                &mut *coactivation_stats,
-            );
+            apply_op(op, ctx.reborrow());
         }
 
         if count > 0 {
             self.persist_seen_offsets();
+            self.pld_mutations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Ingested foreign ops are now part of in-memory state — extend
             // the coverage vector so the next snapshot commit claims them.
             let mut cov = self.wal_coverage.write();
@@ -1455,48 +1468,140 @@ impl ChittaField {
 }
 
 /// Apply a single Op to the in-memory projections, including all indexes.
-pub(crate) fn apply_op(
-    op: Op,
-    payloads: &mut HashMap<MemoryId, MemoryPayload>,
-    states: &mut HashMap<MemoryId, MemoryState>,
-    assoc_edges: &mut HashMap<MemoryId, Vec<AssocEdge>>,
-    artifacts: &mut HashMap<String, ArtifactId>,
-    artifact_paths: &mut HashMap<ArtifactId, String>,
-    semantic_idx: &mut SemanticIndex,
-    time_idx: &mut TemporalIndex,
-    artifact_idx: &mut ArtifactIndex,
-    keyword_idx: &mut KeywordIndex,
-    triplet_store: &mut TripletStore,
-    symbol_idx: &mut SymbolIndex,
-    call_graph: &mut CallGraph,
-    code_files: &mut CodeFileIndex,
-    cortical_idx: &mut CorticalIndex,
-    session_registry: &mut SessionRegistry,
-    transcript_registry: &mut TranscriptRegistry,
-    task_registry: &mut TaskRegistry,
-    user_model_registry: &mut UserModelRegistry,
-    theme_organ: &mut ThemeOrgan,
-    analytics_registry: &mut AnalyticsRegistry,
-    msg_registry: &mut MsgRegistry,
-    skill_registry: &mut SkillRegistry,
-    agent_registry: &mut AgentRegistry,
-    constraint_store: &mut ConstraintStore,
-    trigger_store: &mut TriggerStore,
-    surprise_store: &mut SurpriseStore,
-    epistemic_debt_store: &mut EpistemicDebtStore,
-    integration_kernel: &mut IntegrationKernel,
-    surprise_learning: &mut SurpriseLearningStore,
-    wisdom_promotion: &mut WisdomPromotionStore,
-    learned_scorer: &mut LearnedScoringModel,
-    intervention_store: &mut InterventionStore,
-    agent_protocol_store: &mut AgentProtocolStore,
-    wisdom_lineage_store: &mut WisdomLineageStore,
-    symbol_event_log: &mut SymbolEventLog,
-    chunk_hash_idx: &mut HashMap<crate::ids::ChunkHash, MemoryId>,
-    realm_members: &mut HashMap<String, HashSet<MemoryId>>,
-    kind_members:  &mut HashMap<String, HashSet<MemoryId>>,
-    coactivation_stats: &mut HashMap<(MemoryId, MemoryId), CoActivationStats>,
-) {
+/// Borrow bundle for op application — every mutable structure an op can
+/// touch. Built once per replay/sync batch; pass `ctx.reborrow()` per op.
+/// Adding an organ = one field here, one line in reborrow(), one arm in
+/// apply_op — the seam for the organ-trait migration (THEORY.md §8 Phase 2).
+pub(crate) struct ApplyCtx<'a> {
+    pub payloads: &'a mut HashMap<MemoryId, MemoryPayload>,
+    pub states: &'a mut HashMap<MemoryId, MemoryState>,
+    pub assoc_edges: &'a mut HashMap<MemoryId, Vec<AssocEdge>>,
+    pub artifacts: &'a mut HashMap<String, ArtifactId>,
+    pub artifact_paths: &'a mut HashMap<ArtifactId, String>,
+    pub semantic_idx: &'a mut SemanticIndex,
+    pub time_idx: &'a mut TemporalIndex,
+    pub artifact_idx: &'a mut ArtifactIndex,
+    pub keyword_idx: &'a mut KeywordIndex,
+    pub triplet_store: &'a mut TripletStore,
+    pub symbol_idx: &'a mut SymbolIndex,
+    pub call_graph: &'a mut CallGraph,
+    pub code_files: &'a mut CodeFileIndex,
+    pub cortical_idx: &'a mut CorticalIndex,
+    pub session_registry: &'a mut SessionRegistry,
+    pub transcript_registry: &'a mut TranscriptRegistry,
+    pub task_registry: &'a mut TaskRegistry,
+    pub user_model_registry: &'a mut UserModelRegistry,
+    pub theme_organ: &'a mut ThemeOrgan,
+    pub analytics_registry: &'a mut AnalyticsRegistry,
+    pub msg_registry: &'a mut MsgRegistry,
+    pub skill_registry: &'a mut SkillRegistry,
+    pub agent_registry: &'a mut AgentRegistry,
+    pub constraint_store: &'a mut ConstraintStore,
+    pub trigger_store: &'a mut TriggerStore,
+    pub surprise_store: &'a mut SurpriseStore,
+    pub epistemic_debt_store: &'a mut EpistemicDebtStore,
+    pub integration_kernel: &'a mut IntegrationKernel,
+    pub surprise_learning: &'a mut SurpriseLearningStore,
+    pub wisdom_promotion: &'a mut WisdomPromotionStore,
+    pub learned_scorer: &'a mut LearnedScoringModel,
+    pub intervention_store: &'a mut InterventionStore,
+    pub agent_protocol_store: &'a mut AgentProtocolStore,
+    pub wisdom_lineage_store: &'a mut WisdomLineageStore,
+    pub symbol_event_log: &'a mut SymbolEventLog,
+    pub chunk_hash_idx: &'a mut HashMap<crate::ids::ChunkHash, MemoryId>,
+    pub realm_members: &'a mut HashMap<String, HashSet<MemoryId>>,
+    pub kind_members: &'a mut HashMap<String, HashSet<MemoryId>>,
+    pub coactivation_stats: &'a mut HashMap<(MemoryId, MemoryId), CoActivationStats>,
+}
+
+impl<'a> ApplyCtx<'a> {
+    pub(crate) fn reborrow(&mut self) -> ApplyCtx<'_> {
+        ApplyCtx {
+            payloads: &mut *self.payloads,
+            states: &mut *self.states,
+            assoc_edges: &mut *self.assoc_edges,
+            artifacts: &mut *self.artifacts,
+            artifact_paths: &mut *self.artifact_paths,
+            semantic_idx: &mut *self.semantic_idx,
+            time_idx: &mut *self.time_idx,
+            artifact_idx: &mut *self.artifact_idx,
+            keyword_idx: &mut *self.keyword_idx,
+            triplet_store: &mut *self.triplet_store,
+            symbol_idx: &mut *self.symbol_idx,
+            call_graph: &mut *self.call_graph,
+            code_files: &mut *self.code_files,
+            cortical_idx: &mut *self.cortical_idx,
+            session_registry: &mut *self.session_registry,
+            transcript_registry: &mut *self.transcript_registry,
+            task_registry: &mut *self.task_registry,
+            user_model_registry: &mut *self.user_model_registry,
+            theme_organ: &mut *self.theme_organ,
+            analytics_registry: &mut *self.analytics_registry,
+            msg_registry: &mut *self.msg_registry,
+            skill_registry: &mut *self.skill_registry,
+            agent_registry: &mut *self.agent_registry,
+            constraint_store: &mut *self.constraint_store,
+            trigger_store: &mut *self.trigger_store,
+            surprise_store: &mut *self.surprise_store,
+            epistemic_debt_store: &mut *self.epistemic_debt_store,
+            integration_kernel: &mut *self.integration_kernel,
+            surprise_learning: &mut *self.surprise_learning,
+            wisdom_promotion: &mut *self.wisdom_promotion,
+            learned_scorer: &mut *self.learned_scorer,
+            intervention_store: &mut *self.intervention_store,
+            agent_protocol_store: &mut *self.agent_protocol_store,
+            wisdom_lineage_store: &mut *self.wisdom_lineage_store,
+            symbol_event_log: &mut *self.symbol_event_log,
+            chunk_hash_idx: &mut *self.chunk_hash_idx,
+            realm_members: &mut *self.realm_members,
+            kind_members: &mut *self.kind_members,
+            coactivation_stats: &mut *self.coactivation_stats,
+        }
+    }
+}
+
+pub(crate) fn apply_op(op: Op, ctx: ApplyCtx) {
+    let ApplyCtx {
+        payloads,
+        states,
+        assoc_edges,
+        artifacts,
+        artifact_paths,
+        semantic_idx,
+        time_idx,
+        artifact_idx,
+        keyword_idx,
+        triplet_store,
+        symbol_idx,
+        call_graph,
+        code_files,
+        cortical_idx,
+        session_registry,
+        transcript_registry,
+        task_registry,
+        user_model_registry,
+        theme_organ,
+        analytics_registry,
+        msg_registry,
+        skill_registry,
+        agent_registry,
+        constraint_store,
+        trigger_store,
+        surprise_store,
+        epistemic_debt_store,
+        integration_kernel,
+        surprise_learning,
+        wisdom_promotion,
+        learned_scorer,
+        intervention_store,
+        agent_protocol_store,
+        wisdom_lineage_store,
+        symbol_event_log,
+        chunk_hash_idx,
+        realm_members,
+        kind_members,
+        coactivation_stats,
+    } = ctx;
     match op {
         Op::PutPayload(put) => {
             let memory_id = put.memory_id;
