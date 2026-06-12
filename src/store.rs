@@ -5805,11 +5805,15 @@ impl ChittaField {
         // preference blocks same-thread reacquisition). Production deadlock
         // 2026-06-11, caught by the deadlock-detection build.
         let payloads = {
-            // Tier order: payloads (1) before semantic_idx (2).
+            // Tier order: payloads (1) → states (1) → semantic_idx (2).
+            // Exclude deleted memories so resurrected snapshots can't resurrect
+            // forgotten content — the snapshot is the canonical post-forget state.
             let payloads_r = self.payloads.read();
+            let states_r = self.states.read();
             let idx = self.semantic_idx.read();
             payloads_r
                 .iter()
+                .filter(|(id, _)| !states_r.get(id).is_some_and(|s| s.deleted))
                 .map(|(id, p)| {
                     let mut q = p.clone();
                     if idx.get_embedding(*id).is_some() {
@@ -5823,10 +5827,17 @@ impl ChittaField {
             let states_r = self.states.read();
             let cw: std::collections::HashMap<MemoryId, i64> = states_r
                 .iter()
-                .filter(|(_, st)| st.last_cw_refresh_ms > 0)
+                .filter(|(_, st)| !st.deleted && st.last_cw_refresh_ms > 0)
                 .map(|(&id, st)| (id, st.last_cw_refresh_ms))
                 .collect();
-            (states_r.clone(), cw)
+            // Compact out deleted memories — they must not appear in the snapshot
+            // so that snapshot resurrection cannot undo a forget().
+            let live: std::collections::HashMap<MemoryId, _> = states_r
+                .iter()
+                .filter(|(_, st)| !st.deleted)
+                .map(|(id, st)| (*id, st.clone()))
+                .collect();
+            (live, cw)
         };
         let assoc_edges = self.assoc_edges.read().clone();
         let artifacts = self.artifacts.read().clone();
