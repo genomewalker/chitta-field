@@ -2563,7 +2563,7 @@ pub extern "C" fn cf_emit_event(
             payload_json: payload,
             ts_ms,
         }),
-        "msg" | "sadhana" | "dream" => Op::MsgEvent(MsgEventOp {
+        "msg" | "sadhana" | "dream" | "ledger" => Op::MsgEvent(MsgEventOp {
             event_id,
             domain: domain_str.to_string(),
             kind: kind_str.to_string(),
@@ -2616,7 +2616,7 @@ pub extern "C" fn cf_emit_event(
                     ts_ms,
                 });
             }
-            if domain_str == "msg" {
+            if matches!(domain_str, "msg" | "sadhana" | "dream" | "ledger") {
                 use crate::organ::msg::MsgEvent;
                 handle.field.msg_registry.write().insert(MsgEvent {
                     event_id,
@@ -2695,6 +2695,13 @@ pub extern "C" fn cf_get_latest_event(
             registry
                 .get_session_event(entity_id_str, kind_str)
                 .map(|s| s.to_string())
+        }
+        "ledger" | "msg" | "sadhana" | "dream" => {
+            let registry = handle.field.msg_registry.read();
+            registry
+                .get_events(domain_str, kind_str, entity_id_str, usize::MAX)
+                .last()
+                .map(|e| e.payload_json.clone())
         }
         _ => {
             return handle.err(format!(
