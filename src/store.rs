@@ -353,6 +353,140 @@ fn prune_old_snapshots(data_dir: &std::path::Path, keep: usize) {
     }
 }
 
+/// NFS ghost janitor — the residue classes prune_old_snapshots doesn't cover:
+///   - seen_offsets.<inst>.json of dead reader instances (thousands accumulate;
+///     one file per daemon lifetime). Age-gated: a LIVE peer rewrites its file
+///     every sync cycle, so anything older than `max_age_secs` is a corpse.
+///     Deleting a live peer's file would force it to re-ingest foreign
+///     segments from offset 0 — the age gate is the safety, not a nicety.
+///   - cortex.<inst>.* and orphan chitta.<inst>.<sidecar> whose instance has
+///     no chitta.<inst>.snapshot family (instances that died before a full
+///     save), same age gate.
+/// Deletions are recorded in .janitor.json; on every pass, previously-deleted
+/// names that EXIST again are counted as resurrections (this volume restores
+/// deleted files via replication) — measurement first, escalation only with
+/// data. Runs after prune_old_snapshots on every snapshot save.
+fn janitor_sweep(data_dir: &std::path::Path, own_instance: crate::ids::InstanceId, max_age_secs: u64) {
+    let now = std::time::SystemTime::now();
+    let own_hex = format!("{:08x}", own_instance);
+    let ledger_path = data_dir.join(".janitor.json");
+
+    let old_enough = |p: &std::path::Path| -> bool {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|d| d.as_secs() >= max_age_secs)
+            .unwrap_or(false)
+    };
+
+    // Family stems that exist (post-prune) — their sidecars are protected.
+    let mut family_stems: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Stems referenced by any manifest entry stay protected even without a
+    // local .snapshot (mid-save peers).
+    if let Ok(Some(m)) = crate::manifest::Manifest::load(data_dir) {
+        for cp in m.families.values().chain(m.checkpoints.iter()) {
+            if let Some(stem) = cp.snapshot.name.strip_suffix(".snapshot") {
+                family_stems.insert(stem.to_string());
+            }
+        }
+    }
+    let entries: Vec<std::path::PathBuf> = match std::fs::read_dir(data_dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+        Err(_) => return,
+    };
+    for p in &entries {
+        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with("chitta.") && name.ends_with(".snapshot") {
+                if let Some(stem) = name.strip_suffix(".snapshot") {
+                    family_stems.insert(stem.to_string());
+                }
+            }
+        }
+    }
+
+    // Previous ledger → resurrection accounting.
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
+    struct Ledger {
+        deleted: Vec<String>,
+    }
+    let prev: Ledger = std::fs::read_to_string(&ledger_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let resurrected = prev
+        .deleted
+        .iter()
+        .filter(|n| data_dir.join(n).exists())
+        .count();
+
+    let mut deleted: Vec<String> = Vec::new();
+    let mut freed: u64 = 0;
+    for p in &entries {
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+        let kill = if let Some(rest) = name.strip_prefix("seen_offsets.") {
+            rest.strip_suffix(".json")
+                .map(|hex| hex != own_hex && old_enough(p))
+                .unwrap_or(false)
+        } else if let Some(rest) = name.strip_prefix("cortex.") {
+            // cortex.<hex>.snapshot (and cortex sidecars) for instances with
+            // no full family — keep our own and anything family-protected.
+            rest.split('.').next()
+                .map(|hex| {
+                    hex != own_hex
+                        && !family_stems.contains(&format!("chitta.{hex}"))
+                        && old_enough(p)
+                })
+                .unwrap_or(false)
+        } else if let Some(rest) = name.strip_prefix("chitta.") {
+            // Orphan sidecars (no .snapshot for their stem). Never touch the
+            // snapshot itself here — prune_old_snapshots owns family removal.
+            if name.ends_with(".snapshot") {
+                false
+            } else {
+                rest.split('.').next()
+                    .map(|hex| {
+                        !family_stems.contains(&format!("chitta.{hex}")) && old_enough(p)
+                    })
+                    .unwrap_or(false)
+            }
+        } else {
+            false
+        };
+        if kill {
+            freed += std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            if std::fs::remove_file(p).is_ok() {
+                deleted.push(name.to_string());
+            }
+        }
+    }
+
+    if !deleted.is_empty() || resurrected > 0 {
+        eprintln!(
+            "[chitta-field] janitor: deleted {} ghosts ({:.1} MB); {} previously-deleted resurrected",
+            deleted.len(),
+            freed as f64 / 1e6,
+            resurrected
+        );
+    }
+    // Carry forward names still relevant for resurrection tracking (cap 10k).
+    let mut ledger = Ledger { deleted };
+    for n in prev.deleted {
+        if ledger.deleted.len() >= 10_000 {
+            break;
+        }
+        if !ledger.deleted.contains(&n) {
+            ledger.deleted.push(n);
+        }
+    }
+    if let Ok(json) = serde_json::to_string(&ledger) {
+        let tmp = ledger_path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &ledger_path);
+        }
+    }
+}
+
 // Score multipliers are now driven by the ScoringPipeline (see scoring/mod.rs).
 // Status, kind, and epistemic multipliers live in scoring/config.rs and are
 // configurable via scoring.json at runtime.
@@ -5909,6 +6043,9 @@ impl ChittaField {
         // (save() fsyncs the file and parent dir; save_payload_sidecar fsyncs the .pld).
         // Pruning before durability would delete the fallback the new snapshot replaces.
         prune_old_snapshots(&self.data_dir, 2);
+        // Ghost janitor: dead-instance residue + resurrection accounting
+        // (7-day age gate protects live peers' seen_offsets).
+        janitor_sweep(&self.data_dir, self.instance_id, 7 * 86_400);
         Ok(())
     }
 
@@ -7307,6 +7444,47 @@ mod tests {
             0,
             "second pass must collect nothing — the re-encode loop"
         );
+    }
+
+    /// Janitor: dead-instance residue goes, protected classes stay, and
+    /// resurrected (previously-deleted) files are counted via the ledger.
+    #[test]
+    fn janitor_sweep_removes_ghosts_and_tracks_resurrection() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        let touch = |name: &str| std::fs::write(d.join(name), b"x").unwrap();
+
+        // Protected: own seen_offsets, a live family + its sidecar.
+        touch("seen_offsets.aaaa0001.json");
+        touch("chitta.bbbb0002.snapshot");
+        touch("chitta.bbbb0002.emb");
+        touch("cortex.bbbb0002.snapshot");
+        // Ghosts: dead reader, orphan cortex, orphan sidecar.
+        touch("seen_offsets.dead0003.json");
+        touch("cortex.dead0004.snapshot");
+        touch("chitta.dead0005.emb");
+
+        // max_age 0 → everything is old enough (mtime gate test inverse:
+        // a huge max_age must delete nothing).
+        janitor_sweep(d, 0xaaaa_0001, u64::MAX);
+        assert!(d.join("seen_offsets.dead0003.json").exists(), "age gate must protect");
+
+        janitor_sweep(d, 0xaaaa_0001, 0);
+        assert!(d.join("seen_offsets.aaaa0001.json").exists(), "own file protected");
+        assert!(d.join("chitta.bbbb0002.snapshot").exists(), "families are prune's job");
+        assert!(d.join("chitta.bbbb0002.emb").exists(), "family sidecar protected");
+        assert!(d.join("cortex.bbbb0002.snapshot").exists(), "family cortex protected");
+        assert!(!d.join("seen_offsets.dead0003.json").exists(), "dead reader removed");
+        assert!(!d.join("cortex.dead0004.snapshot").exists(), "orphan cortex removed");
+        assert!(!d.join("chitta.dead0005.emb").exists(), "orphan sidecar removed");
+
+        // Resurrection: re-create a deleted ghost; ledger must count it (the
+        // count is logged; behaviorally it gets deleted again).
+        touch("seen_offsets.dead0003.json");
+        janitor_sweep(d, 0xaaaa_0001, 0);
+        assert!(!d.join("seen_offsets.dead0003.json").exists(), "resurrected ghost re-deleted");
+        let ledger = std::fs::read_to_string(d.join(".janitor.json")).unwrap();
+        assert!(ledger.contains("seen_offsets.dead0003.json"));
     }
 
     #[test]
