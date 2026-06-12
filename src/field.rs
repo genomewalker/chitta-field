@@ -1728,7 +1728,7 @@ pub(crate) fn apply_op(op: Op, ctx: ApplyCtx) {
             }
             semantic_idx.remove(memory_id);
             keyword_idx.remove(memory_id);
-            if let Some(payload) = payloads.get(&memory_id) {
+            if let Some(payload) = payloads.get_mut(&memory_id) {
                 time_idx.remove(memory_id, payload.authored_at_ms);
                 let remove_realm = if let Some(ids) = realm_members.get_mut(&payload.realm) {
                     ids.remove(&memory_id);
@@ -1748,8 +1748,18 @@ pub(crate) fn apply_op(op: Op, ctx: ApplyCtx) {
                 if remove_kind {
                     kind_members.remove(&payload.kind);
                 }
+                // Clear content bytes so replay doesn't resurrect deleted text.
+                payload.content = Vec::new();
             }
             artifact_idx.remove_memory(memory_id);
+            // Transitive: remove assoc_edges from/to this memory. Triplets sourced from
+            // this memory are handled by their own InvalidateTriplet WAL ops (written by
+            // forget() at deletion time); no separate replay needed here.
+            assoc_edges.remove(&memory_id);
+            for outgoing in assoc_edges.values_mut() {
+                outgoing.retain(|e| e.dst != memory_id);
+            }
+            coactivation_stats.retain(|(a, b), _| *a != memory_id && *b != memory_id);
         }
         Op::AddAssocEdge(edge_op) => {
             let entry = assoc_edges.entry(edge_op.src).or_insert_with(Vec::new);

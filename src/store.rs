@@ -1175,6 +1175,32 @@ impl ChittaField {
         self.cortical_idx.write().remove(memory_id);
         self.artifact_idx.write().remove_memory(memory_id);
 
+        // Transitive forgetting: invalidate triplets sourced from this memory (each call
+        // writes its own WAL op so replay stays consistent).
+        let sourced_triplets = self.triplet_store.read().ids_by_source_memory(memory_id);
+        for tid in sourced_triplets {
+            let _ = self.invalidate_triplet(tid);
+        }
+
+        // Remove all association edges FROM and TO this memory.
+        {
+            let mut edges = self.assoc_edges.write();
+            edges.remove(&memory_id);
+            for outgoing in edges.values_mut() {
+                outgoing.retain(|e| e.dst != memory_id);
+            }
+        }
+
+        // Prune coactivation_stats pairs that reference this memory.
+        self.coactivation_stats
+            .write()
+            .retain(|(a, b), _| *a != memory_id && *b != memory_id);
+
+        // Clear payload content bytes to reclaim memory (keep state/metadata).
+        if let Some(p) = self.payloads.write().get_mut(&memory_id) {
+            p.content = Vec::new();
+        }
+
         Ok(())
     }
 

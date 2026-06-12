@@ -386,6 +386,14 @@ impl TripletStore {
 
     /// Invalidate all active triplets whose source_file matches.
     /// Returns the IDs of invalidated triplets.
+    pub fn ids_by_source_memory(&self, memory_id: MemoryId) -> Vec<u64> {
+        self.entries
+            .iter()
+            .filter(|e| e.valid_to_ms == 0 && e.source_memory_id == Some(memory_id))
+            .map(|e| e.id)
+            .collect()
+    }
+
     pub fn invalidate_by_source_file(&mut self, source_file: &str, now_ms: i64) -> Vec<u64> {
         let mut invalidated = Vec::new();
         for entry in self.entries.iter_mut() {
