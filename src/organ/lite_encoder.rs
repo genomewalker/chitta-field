@@ -240,7 +240,7 @@ impl LiteEncoder {
             return None;
         }
 
-        candidates.select_nth_unstable_by(k, |a, b| {
+        candidates.select_nth_unstable_by(k - 1, |a, b| {
             b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
         });
         candidates.truncate(k);

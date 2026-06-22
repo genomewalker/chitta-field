@@ -751,8 +751,12 @@ const ANTONYM_PAIRS: &[(&str, &str)] = &[
 ];
 
 fn is_antonym_pair(a: &str, b: &str) -> bool {
+    fn has_word(text: &str, word: &str) -> bool {
+        text.split(|c: char| !c.is_alphanumeric())
+            .any(|tok| tok.eq_ignore_ascii_case(word))
+    }
     ANTONYM_PAIRS.iter().any(|(x, y)| {
-        (a.contains(x) && b.contains(y)) || (a.contains(y) && b.contains(x))
+        (has_word(a, x) && has_word(b, y)) || (has_word(a, y) && has_word(b, x))
     })
 }
 
