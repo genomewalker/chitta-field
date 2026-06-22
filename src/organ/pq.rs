@@ -1,11 +1,15 @@
+use crate::ops::EMBED_DIM;
 use serde::{Deserialize, Serialize};
 
 pub const N_SUBVECTORS: usize = 32;
-pub const DIM_PER_SUB: usize = 24; // 768 / 32 = 24
+pub const DIM_PER_SUB: usize = EMBED_DIM / N_SUBVECTORS;
 pub const N_CENTROIDS: usize = 256;
 pub const PQ_BYTES: usize = N_SUBVECTORS; // 32 bytes per quantized residual
 
-/// Product quantizer for 768-dim residual vectors.
+// Compile-time guard: EMBED_DIM must be a clean multiple of N_SUBVECTORS.
+const _: () = assert!(EMBED_DIM % N_SUBVECTORS == 0, "EMBED_DIM must be divisible by N_SUBVECTORS (32)");
+
+/// Product quantizer for EMBED_DIM-dimensional residual vectors.
 /// Trained once on accumulated residuals; then used for fast approximate storage.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ProductQuantizer {
