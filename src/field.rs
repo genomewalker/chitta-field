@@ -281,6 +281,8 @@ pub struct ChittaField {
     /// generality evidence; THEORY.md §6). Capped at 8 per memory.
     /// Persisted as the V23 "recall_provenance" section.
     pub(crate) recall_provenance: parking_lot::RwLock<HashMap<MemoryId, std::collections::BTreeSet<crate::ids::InstanceId>>>,
+    /// G6: quality-diversity (MAP-Elites) archive — best genome per (realm, task_type) niche.
+    pub(crate) archive: std::sync::Arc<std::sync::RwLock<crate::learner::archive::QdArchive>>,
 }
 
 impl Drop for ChittaField {
@@ -1236,6 +1238,7 @@ impl ChittaField {
             pld_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
             encode_skip: parking_lot::RwLock::new(HashSet::new()),
             recall_provenance: parking_lot::RwLock::new(recall_provenance),
+            archive: std::sync::Arc::new(std::sync::RwLock::new(crate::learner::archive::QdArchive::new())),
         })
     }
 }

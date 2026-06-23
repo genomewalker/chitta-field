@@ -202,20 +202,41 @@ pub(crate) fn now_ms() -> i64 {
 /// Input must already be sorted desc by score (true for every recall lane), so
 /// the first `per_realm_cap` survivors of each realm are its highest-scoring
 /// ones — preserving global score order while truncating to `k`.
-fn stratify_recall_hits(mut hits: Vec<RecallHit>, k: usize, divisor: usize) -> Vec<RecallHit> {
-    if divisor == 0 || k == 0 || hits.len() <= 1 {
-        hits.truncate(k);
-        return hits;
-    }
-    let per_realm_cap = k.div_ceil(divisor).max(1);
+/// Cap any single realm's share of an unscoped recall so a dominant realm can't
+/// flood results. When `reliability` is `Some`, each realm's cap is Thompson-
+/// sampled from its Beta posterior via `sample_arm` (reliable realms earn more
+/// slots; unreliable/unknown realms fall back to the anti-flooding floor of 1).
+/// `None` disables capping entirely (scoped queries are never reshaped).
+fn stratify_recall_hits(
+    mut hits: Vec<RecallHit>,
+    k: usize,
+    reliability: Option<&crate::learner::DomainReliability>,
+) -> Vec<RecallHit> {
+    let reliability = match reliability {
+        Some(r) if k > 0 && hits.len() > 1 => r,
+        _ => {
+            hits.truncate(k);
+            return hits;
+        }
+    };
+    // One seed per stratify call; per-realm draws decorrelate inside sample_arm.
+    let seed = now_ms() as u64;
+    let mut caps: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut keep = Vec::with_capacity(hits.len().min(k));
     for hit in hits.drain(..) {
         if keep.len() == k {
             break;
         }
+        let cap = *caps.entry(hit.realm.clone()).or_insert_with(|| {
+            let h = hit
+                .realm
+                .bytes()
+                .fold(seed, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            reliability.sample_arm(&hit.realm, k, h)
+        });
         let n = counts.entry(hit.realm.clone()).or_insert(0);
-        if *n < per_realm_cap {
+        if *n < cap {
             *n += 1;
             keep.push(hit);
         }
@@ -845,7 +866,11 @@ impl ChittaField {
                 extract_bm25_text(&canonical_text, self.filter_level()),
             )
         };
-        self.keyword_idx.write().index(memory_id, &index_text);
+        // Genome 'process' memories are JSON config, not prose: keep them in the
+        // semantic index (searchable) but out of the BM25 keyword index.
+        if kind != "process" {
+            self.keyword_idx.write().index(memory_id, &index_text);
+        }
         self.hdc_idx.write().insert(memory_id, &content_str, realm);
 
         // Log structured event to CEC tape; compute surprisal for strength gating.
@@ -918,7 +943,35 @@ impl ChittaField {
                 .record_correction(realm);
         }
 
+        // G6: register process-genome into the QD archive under its (realm, task_type) niche.
+        if kind == "process" {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(content) {
+                let genome_realm = v["sampler_config"]["realm"].as_str().unwrap_or("unknown").to_string();
+                let task = v["task_type"].as_str().unwrap_or("unknown").to_string();
+                let desc = crate::learner::archive::BehaviorDescriptor { realm: genome_realm, task_type: task };
+                // fitness = 0.5 default (G7/G11 will update)
+                self.archive.write().unwrap().update(desc, memory_id, 0.5);
+            }
+        }
+
         Ok((memory_id, chunk_hash))
+    }
+
+    /// Return the active cognitive-process genome: the most recently authored,
+    /// non-deleted `process` memory in the `brahman` realm, parsed as JSON.
+    /// Read-only — uses the existing kind/realm/payload indices, no QD archive.
+    pub fn active_genome(&self) -> Option<serde_json::Value> {
+        let kind_members = self.kind_members.read();
+        let ids = kind_members.get("process")?;
+        let states = self.states.read();
+        let payloads = self.payloads.read();
+        let latest = ids
+            .iter()
+            .filter_map(|id| payloads.get(id).map(|p| (*id, p)))
+            .filter(|(_, p)| p.realm == "brahman")
+            .filter(|(id, _)| states.get(id).map(|s| !s.deleted).unwrap_or(false))
+            .max_by_key(|(_, p)| p.authored_at_ms)?;
+        serde_json::from_slice(&latest.1.content).ok()
     }
 
     /// Retrieve the payload for a memory. Also records a touch access.
@@ -3244,20 +3297,35 @@ impl ChittaField {
         realm: Option<&str>,
     ) -> Result<Vec<RecallHit>> {
         // Stratified recall: cap any one realm on UNSCOPED queries so a dominant
-        // realm (e.g. compliance:auto BM25 noise) can't flood results. divisor 0
-        // disables. Targeted realm queries (realm=Some) are never reshaped.
-        let cap_divisor = if realm.is_none() {
-            self.scoring_pipeline.read().config.recall_realm_cap_divisor
+        // realm (e.g. compliance:auto BM25 noise) can't flood results. The cap is
+        // Thompson-sampled per realm from its Beta posterior (G8) so reliable
+        // realms earn more slots. Targeted queries (realm=Some) are never reshaped.
+        let stratify = realm.is_none();
+        // Over-fetch the lane when capping so the cap can backfill from
+        // non-dominant realms and still return up to k. The over-fetch factor
+        // tracks the legacy divisor knob purely as a fetch-width hint.
+        let fetch_k = if stratify {
+            let factor = self
+                .scoring_pipeline
+                .read()
+                .config
+                .recall_realm_cap_divisor
+                .max(1);
+            k.saturating_mul(factor).max(k)
         } else {
-            0
+            k
         };
-        // Over-fetch the semantic lane when capping so the cap can backfill from
-        // non-dominant realms and still return up to k.
-        let fetch_k = if cap_divisor > 0 { k.saturating_mul(cap_divisor).max(k) } else { k };
+        // Snapshot the per-realm reliability learner so the stratify pass can
+        // Thompson-sample without holding the learner lock during scoring.
+        let reliability = if stratify {
+            Some(self.learners.read().domain_reliability.clone())
+        } else {
+            None
+        };
 
         let hits = self.recall_semantic(query_embedding, fetch_k, realm)?;
         if !hits.is_empty() {
-            return Ok(stratify_recall_hits(hits, k, cap_divisor));
+            return Ok(stratify_recall_hits(hits, k, reliability.as_ref()));
         }
 
         let store_size = self.memory_count();
@@ -3271,13 +3339,13 @@ impl ChittaField {
         );
         let bm25_hits = self.recall_keyword(query_text, fetch_k)?;
         if !bm25_hits.is_empty() {
-            return Ok(stratify_recall_hits(bm25_hits, k, cap_divisor));
+            return Ok(stratify_recall_hits(bm25_hits, k, reliability.as_ref()));
         }
 
         log::warn!("BM25 fallback also empty, falling back to recency");
         let now = now_ms();
         let temporal = self.recall_temporal(0, now, realm, fetch_k)?;
-        Ok(stratify_recall_hits(temporal, k, cap_divisor))
+        Ok(stratify_recall_hits(temporal, k, reliability.as_ref()))
     }
 
     /// Recall memories associated with a file path (exact match).

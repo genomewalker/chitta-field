@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod bandit;
 pub mod context;
 pub mod domain_reliability;

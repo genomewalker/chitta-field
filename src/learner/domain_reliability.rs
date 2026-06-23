@@ -94,6 +94,26 @@ impl DomainReliability {
         v
     }
 
+    /// Thompson-sample a per-realm recall slot cap in [1, k].
+    ///
+    /// Draws from the realm's Beta posterior (exploration noise built in) and
+    /// maps the sample through the [FLOOR, CEIL] reliability window onto [1, k].
+    /// A high-reliability realm samples near `k` (more recall slots); an
+    /// unreliable or unknown realm samples near 1 (anti-flooding floor).
+    ///
+    /// `seed` decorrelates the draw across queries and realms — pass a
+    /// time-derived value mixed with the realm name from the call site.
+    pub fn sample_arm(&self, realm: &str, k: usize, seed: u64) -> usize {
+        let s = self
+            .domains
+            .get(realm)
+            .map(|p| p.sample(seed))
+            .unwrap_or(DEFAULT_RELIABILITY);
+        let frac = ((s - RELIABILITY_FLOOR) / (RELIABILITY_CEIL - RELIABILITY_FLOOR)).clamp(0.0, 1.0);
+        let cap = (frac * k as f64).round() as usize;
+        cap.max(1)
+    }
+
     /// Number of correction events recorded for `realm`.
     pub fn correction_count(&self, realm: &str) -> u32 {
         self.domains
