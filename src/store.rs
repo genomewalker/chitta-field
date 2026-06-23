@@ -616,6 +616,33 @@ impl ChittaField {
 
         let chunk_hash = compute_chunk_hash(kind, realm, content, embedding);
 
+        // Provenance key: content hash for [done] signal dedup (cross-realm, O(1)).
+        let prov_key: Option<u64> = if kind == "signal" && content.starts_with(b"[done]") {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            content.hash(&mut h);
+            Some(h.finish())
+        } else {
+            None
+        };
+
+        // Provenance gate: if same [done] content already stored in any realm → reinforce.
+        if let Some(key) = prov_key {
+            let idx = self.content_prov_idx.read();
+            if let Some(&existing_id) = idx.get(&key) {
+                drop(idx);
+                let is_alive = self.states.read()
+                    .get(&existing_id)
+                    .map(|s| !s.deleted)
+                    .unwrap_or(false);
+                if is_alive {
+                    let _ = self.update_state(existing_id, Some(0.0), Some(0.03), None, true, None);
+                    return Ok((existing_id, chunk_hash));
+                }
+            }
+        }
+
         {
             let idx = self.chunk_hash_idx.read();
             if let Some(&existing_id) = idx.get(&chunk_hash) {
@@ -730,6 +757,9 @@ impl ChittaField {
             .entry(kind.to_string())
             .or_default()
             .insert(memory_id);
+        if let Some(key) = prov_key {
+            self.content_prov_idx.write().entry(key).or_insert(memory_id);
+        }
         if !embed_pending {
             self.semantic_idx
                 .write()

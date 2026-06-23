@@ -207,6 +207,9 @@ pub struct ChittaField {
     /// Byte offsets for each foreign segment file, used by sync_foreign().
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
     pub(crate) chunk_hash_idx: RwLock<HashMap<crate::ids::ChunkHash, MemoryId>>,
+    /// Cross-realm provenance dedup for kind="signal" "[done]" records.
+    /// Key: DefaultHasher(content) as u64. Prevents re-processing already-handled files.
+    pub(crate) content_prov_idx: RwLock<HashMap<u64, MemoryId>>,
     pub(crate) realm_members: RwLock<HashMap<String, HashSet<MemoryId>>>,
     pub(crate) kind_members:  RwLock<HashMap<String, HashSet<MemoryId>>>,
     pub(crate) memory_count: Arc<AtomicUsize>,
@@ -1167,6 +1170,7 @@ impl ChittaField {
             lite_encoder: RwLock::new(loaded_lite_encoder),
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
+            content_prov_idx: RwLock::new(HashMap::new()),
             realm_members: RwLock::new(realm_members),
             kind_members:  RwLock::new(kind_members),
             memory_count: Arc::new(AtomicUsize::new(initial_memory_count)),
