@@ -154,12 +154,27 @@ pub struct ScoringConfig {
     /// unscoped recall. When false, BM25 is only a fallback for empty semantic.
     #[serde(default = "default_use_rrf")]
     pub use_rrf: bool,
+
+    // ── Field-RAG / Modern Hopfield recall ───────────────────────────
+    /// Inverse temperature β for DAM update s(t+1) = X@softmax(β·Xᵀs(t)).
+    /// Probe validated β=5-10 as the sweet spot for bge-large-en-v1.5 embeddings.
+    #[serde(default = "default_dam_beta")]
+    pub dam_beta: f32,
+    /// Number of relaxation steps T. Convergence typically within 8-10 steps.
+    #[serde(default = "default_dam_steps")]
+    pub dam_steps: usize,
+    /// Candidate pool multiplier: fetch k * dam_fetch_mul candidates for DAM reranking.
+    #[serde(default = "default_dam_fetch_mul")]
+    pub dam_fetch_mul: usize,
 }
 
 fn default_rare_entity_weight() -> f32 { 0.15 }
 fn default_recall_realm_cap_divisor() -> usize { 4 }
 fn default_rrf_k() -> f32 { 60.0 }
 fn default_use_rrf() -> bool { true }
+fn default_dam_beta() -> f32 { 10.0 }
+fn default_dam_steps() -> usize { 10 }
+fn default_dam_fetch_mul() -> usize { 4 }
 fn default_surprise_domain_actual_weight() -> f32 { 0.15 }
 fn default_surprise_domain_expected_weight() -> f32 { 0.10 }
 fn default_epistemic_debt_boost() -> f32 { 1.1 }
@@ -261,6 +276,11 @@ impl Default for ScoringConfig {
             // Reciprocal Rank Fusion (hybrid recall)
             rrf_k: 60.0,
             use_rrf: true,
+
+            // Field-RAG / Modern Hopfield
+            dam_beta: 10.0,
+            dam_steps: 10,
+            dam_fetch_mul: 4,
         }
     }
 }

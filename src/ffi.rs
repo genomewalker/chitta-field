@@ -493,6 +493,50 @@ pub extern "C" fn cf_recall_semantic_ctx(
     }
 }
 
+/// Field-RAG recall: Modern Hopfield / DAM relaxation over the HNSW candidate submatrix.
+/// query_text is used for RRF BM25 lane (pass "" to skip BM25).
+#[no_mangle]
+pub extern "C" fn cf_recall_field(
+    h: *mut CfHandle,
+    query_embedding: *const f32,
+    embedding_len: usize,
+    query_text: *const c_char,
+    realm: *const c_char,
+    k: usize,
+    hits_buf: *mut CfRecallHit,
+    hits_cap: usize,
+    hits_written: *mut usize,
+) -> c_int {
+    if h.is_null() || hits_buf.is_null() || hits_written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let embedding = unsafe { std::slice::from_raw_parts(query_embedding, embedding_len) };
+    let qtext = if query_text.is_null() {
+        ""
+    } else {
+        match unsafe { CStr::from_ptr(query_text).to_str() } {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let realm_str = if realm.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(realm).to_str() } {
+            Ok(s) => Some(s),
+            Err(e) => return handle.err(e),
+        }
+    };
+    match handle.field.recall_field(embedding, qtext, k, realm_str) {
+        Ok(hits) => {
+            write_hits(hits, hits_buf, hits_cap, hits_written);
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cf_recall_temporal(
     h: *mut CfHandle,

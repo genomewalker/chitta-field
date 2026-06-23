@@ -3407,6 +3407,94 @@ impl ChittaField {
         Ok(stratify_recall_hits(temporal, k, reliability.as_ref()))
     }
 
+    /// Field-RAG / Modern Hopfield recall.
+    ///
+    /// Runs T-step Dense Associative Memory relaxation over the HNSW candidate
+    /// submatrix: s(t+1) = X @ softmax(β · Xᵀs(t)), then re-ranks by cosine(s_T, X).
+    /// Validated (2026-06-23): β=5-10 surfaces memories HNSW misranks; 24/25 flips
+    /// on 5-query probe, target hit on "chaos nodes" at β=5 and β=10.
+    pub fn recall_field(
+        &self,
+        query_embedding: &[f32],
+        query_text: &str,
+        k: usize,
+        realm: Option<&str>,
+    ) -> Result<Vec<RecallHit>> {
+        let (beta, steps, fetch_mul) = {
+            let cfg = self.scoring_pipeline.read();
+            (cfg.config.dam_beta, cfg.config.dam_steps, cfg.config.dam_fetch_mul)
+        };
+        let fetch_k = k.saturating_mul(fetch_mul).max(k);
+
+        // Get candidates via RRF (already the best retrieval we have).
+        let mut hits = self.recall_with_fallback(query_embedding, query_text, fetch_k, realm)?;
+        if hits.len() < 2 {
+            return Ok(hits.into_iter().take(k).collect());
+        }
+
+        // Collect embeddings for the candidate submatrix X. Lock once, clone needed.
+        let embeddings: Vec<(usize, Vec<f32>)> = {
+            let idx = self.semantic_idx.read();
+            hits.iter()
+                .enumerate()
+                .filter_map(|(i, h)| {
+                    idx.get_embedding(h.memory_id).map(|e| (i, e.to_vec()))
+                })
+                .collect()
+        };
+        if embeddings.len() < 2 {
+            return Ok(hits.into_iter().take(k).collect());
+        }
+
+        // T-step DAM relaxation (pure f32, no external crates).
+        let dim = query_embedding.len();
+        let mut s: Vec<f32> = query_embedding.to_vec();
+
+        for _ in 0..steps {
+            // energies[j] = β · dot(X_j, s)
+            let mut max_e = f32::NEG_INFINITY;
+            let energies: Vec<f32> = embeddings
+                .iter()
+                .map(|(_, emb)| {
+                    let e = beta * emb.iter().zip(s.iter()).map(|(&a, &b)| a * b).sum::<f32>();
+                    if e > max_e { max_e = e; }
+                    e
+                })
+                .collect();
+
+            // softmax (numerically stable)
+            let sum_exp: f32 = energies.iter().map(|&e| (e - max_e).exp()).sum();
+            let weights: Vec<f32> = energies.iter().map(|&e| (e - max_e).exp() / sum_exp).collect();
+
+            // s_new = Σ weight_j · X_j
+            let mut s_new = vec![0.0f32; dim];
+            for (j, (_, emb)) in embeddings.iter().enumerate() {
+                let w = weights[j];
+                for (sn, &xv) in s_new.iter_mut().zip(emb.iter()) {
+                    *sn += w * xv;
+                }
+            }
+
+            // normalize
+            let norm = s_new.iter().map(|&x| x * x).sum::<f32>().sqrt();
+            if norm < 1e-12 { break; }
+            for x in &mut s_new { *x /= norm; }
+
+            let delta: f32 = s_new.iter().zip(s.iter()).map(|(&a, &b)| (a - b) * (a - b)).sum::<f32>().sqrt();
+            s = s_new;
+            if delta < 1e-6 { break; }
+        }
+
+        // Re-rank by cosine(s_T, X_j).
+        for (i, emb) in &embeddings {
+            let cos = emb.iter().zip(s.iter()).map(|(&a, &b)| a * b).sum::<f32>();
+            hits[*i].score = cos;
+            hits[*i].semantic_score = cos;
+        }
+        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(hits.into_iter().take(k).collect())
+    }
+
     /// Recall memories associated with a file path (exact match).
     pub fn recall_artifact(&self, path: &str, limit: usize) -> Result<Vec<RecallHit>> {
         let entries = self.artifact_idx.read().query_path(path, limit);
