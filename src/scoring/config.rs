@@ -137,9 +137,17 @@ pub struct ScoringConfig {
     // ── Rare-entity surprisal ─────────────────────────────────────────
     #[serde(default = "default_rare_entity_weight")]
     pub rare_entity_weight: f32,
+
+    // ── Stratified recall (anti-flooding) ────────────────────────
+    /// On unscoped recall, cap any single realm to ceil(k / divisor) hits so a
+    /// dominant realm (e.g. compliance:auto BM25 noise) can't flood results.
+    /// 0 disables the cap. Only applies when the caller passes realm=None.
+    #[serde(default = "default_recall_realm_cap_divisor")]
+    pub recall_realm_cap_divisor: usize,
 }
 
 fn default_rare_entity_weight() -> f32 { 0.15 }
+fn default_recall_realm_cap_divisor() -> usize { 4 }
 fn default_surprise_domain_actual_weight() -> f32 { 0.15 }
 fn default_surprise_domain_expected_weight() -> f32 { 0.10 }
 fn default_epistemic_debt_boost() -> f32 { 1.1 }
@@ -234,6 +242,9 @@ impl Default for ScoringConfig {
 
             // Rare-entity surprisal
             rare_entity_weight: 0.15,
+
+            // Stratified recall (anti-flooding)
+            recall_realm_cap_divisor: 4,
         }
     }
 }

@@ -197,6 +197,32 @@ pub(crate) fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Stratified recall post-processor: cap any single realm to ceil(k/divisor)
+/// hits so a dominant realm can't flood unscoped results. `divisor` 0 disables.
+/// Input must already be sorted desc by score (true for every recall lane), so
+/// the first `per_realm_cap` survivors of each realm are its highest-scoring
+/// ones — preserving global score order while truncating to `k`.
+fn stratify_recall_hits(mut hits: Vec<RecallHit>, k: usize, divisor: usize) -> Vec<RecallHit> {
+    if divisor == 0 || k == 0 || hits.len() <= 1 {
+        hits.truncate(k);
+        return hits;
+    }
+    let per_realm_cap = k.div_ceil(divisor).max(1);
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut keep = Vec::with_capacity(hits.len().min(k));
+    for hit in hits.drain(..) {
+        if keep.len() == k {
+            break;
+        }
+        let n = counts.entry(hit.realm.clone()).or_insert(0);
+        if *n < per_realm_cap {
+            *n += 1;
+            keep.push(hit);
+        }
+    }
+    keep
+}
+
 /// Delete old snapshot families from `data_dir`, keeping the `keep` most recent.
 /// Identifies families by `chitta.*.snapshot` mtime order; removes all sidecar
 /// extensions for each stale stem.
@@ -656,6 +682,13 @@ impl ChittaField {
                     // Recurrence: same observation seen again → boost confidence (+0.05)
                     // After 6+ recurrences, provisional (0.50) reaches durable tier (0.80)
                     let _ = self.update_state(existing_id, Some(0.0), Some(0.05), None, true, None);
+                    // PoE: recurrence is a weak positive signal for the realm.
+                    // 0.3 weight is low enough that repeated recurrences cannot
+                    // runaway-inflate reliability.
+                    self.learners
+                        .write()
+                        .domain_reliability
+                        .record_partial_success(realm, 0.3);
                     return Ok((existing_id, chunk_hash));
                 }
             }
@@ -3210,9 +3243,21 @@ impl ChittaField {
         k: usize,
         realm: Option<&str>,
     ) -> Result<Vec<RecallHit>> {
-        let hits = self.recall_semantic(query_embedding, k, realm)?;
+        // Stratified recall: cap any one realm on UNSCOPED queries so a dominant
+        // realm (e.g. compliance:auto BM25 noise) can't flood results. divisor 0
+        // disables. Targeted realm queries (realm=Some) are never reshaped.
+        let cap_divisor = if realm.is_none() {
+            self.scoring_pipeline.read().config.recall_realm_cap_divisor
+        } else {
+            0
+        };
+        // Over-fetch the semantic lane when capping so the cap can backfill from
+        // non-dominant realms and still return up to k.
+        let fetch_k = if cap_divisor > 0 { k.saturating_mul(cap_divisor).max(k) } else { k };
+
+        let hits = self.recall_semantic(query_embedding, fetch_k, realm)?;
         if !hits.is_empty() {
-            return Ok(hits);
+            return Ok(stratify_recall_hits(hits, k, cap_divisor));
         }
 
         let store_size = self.memory_count();
@@ -3224,14 +3269,15 @@ impl ChittaField {
             "recall_semantic returned empty with {} memories, falling back to BM25",
             store_size
         );
-        let bm25_hits = self.recall_keyword(query_text, k)?;
+        let bm25_hits = self.recall_keyword(query_text, fetch_k)?;
         if !bm25_hits.is_empty() {
-            return Ok(bm25_hits);
+            return Ok(stratify_recall_hits(bm25_hits, k, cap_divisor));
         }
 
         log::warn!("BM25 fallback also empty, falling back to recency");
         let now = now_ms();
-        self.recall_temporal(0, now, realm, k)
+        let temporal = self.recall_temporal(0, now, realm, fetch_k)?;
+        Ok(stratify_recall_hits(temporal, k, cap_divisor))
     }
 
     /// Recall memories associated with a file path (exact match).

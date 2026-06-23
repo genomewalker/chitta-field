@@ -60,6 +60,16 @@ impl DomainReliability {
             .update(1.0); // success signal
     }
 
+    /// Record a partial positive reinforcement for this realm. Recurrence
+    /// (same content observed again) is real but weak evidence of accuracy,
+    /// so it counts as a fractional success rather than a full trial.
+    pub fn record_partial_success(&mut self, realm: &str, weight: f64) {
+        self.domains
+            .entry(realm.to_string())
+            .or_insert_with(BetaPrior::new)
+            .update(weight.clamp(0.0, 1.0) as f32);
+    }
+
     /// Reliability score for `realm` in [FLOOR, CEIL].
     /// Unknown realms return DEFAULT_RELIABILITY.
     pub fn reliability(&self, realm: &str) -> f32 {
