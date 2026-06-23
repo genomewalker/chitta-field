@@ -120,7 +120,7 @@ pub(crate) fn run_cmd(cmd: &str) -> (bool, String) {
 
     let fp = unsafe { libc::popen(cstr.as_ptr(), mode.as_ptr()) };
     if fp.is_null() {
-        let errno = unsafe { *libc::__errno_location() };
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         return (false, format!("popen failed errno={errno}"));
     }
 
