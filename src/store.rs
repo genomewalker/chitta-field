@@ -207,6 +207,42 @@ pub(crate) fn now_ms() -> i64 {
 /// sampled from its Beta posterior via `sample_arm` (reliable realms earn more
 /// slots; unreliable/unknown realms fall back to the anti-flooding floor of 1).
 /// `None` disables capping entirely (scoped queries are never reshaped).
+/// Merge semantic + keyword result lists via Reciprocal Rank Fusion:
+/// `RRF(doc) = Σ_i 1/(rrf_k + rank_i(doc))` with 1-based ranks. The fused
+/// score is written into `RecallHit::score` and the list is sorted desc and
+/// truncated to `k`. Each memory appears once even if present in both lanes.
+fn rrf_merge(
+    semantic: Vec<RecallHit>,
+    keyword: Vec<RecallHit>,
+    k: usize,
+    rrf_k: f32,
+) -> Vec<RecallHit> {
+    use std::collections::HashMap;
+    let mut rrf_scores: HashMap<MemoryId, f32> = HashMap::new();
+    for (rank, hit) in semantic.iter().enumerate() {
+        *rrf_scores.entry(hit.memory_id).or_insert(0.0) += 1.0 / (rrf_k + rank as f32 + 1.0);
+    }
+    for (rank, hit) in keyword.iter().enumerate() {
+        *rrf_scores.entry(hit.memory_id).or_insert(0.0) += 1.0 / (rrf_k + rank as f32 + 1.0);
+    }
+    let mut seen: HashMap<MemoryId, RecallHit> = HashMap::new();
+    for hit in semantic.into_iter().chain(keyword.into_iter()) {
+        seen.entry(hit.memory_id).or_insert(hit);
+    }
+    let mut ranked: Vec<RecallHit> = rrf_scores
+        .into_iter()
+        .filter_map(|(id, score)| {
+            seen.remove(&id).map(|mut h| {
+                h.score = score;
+                h
+            })
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(k);
+    ranked
+}
+
 fn stratify_recall_hits(
     mut hits: Vec<RecallHit>,
     k: usize,
@@ -3322,6 +3358,29 @@ impl ChittaField {
         } else {
             None
         };
+
+        // RRF hybrid: on UNSCOPED queries, fuse semantic + BM25 ranks instead of
+        // using BM25 only as an empty-semantic fallback. Targeted queries
+        // (realm=Some) keep the legacy semantic-then-fallback path.
+        let use_rrf = stratify && self.scoring_pipeline.read().config.use_rrf;
+        if use_rrf {
+            let rrf_k = self.scoring_pipeline.read().config.rrf_k;
+            let sem = self.recall_semantic(query_embedding, fetch_k, realm)?;
+            let kw = self.recall_keyword(query_text, fetch_k)?;
+            if !sem.is_empty() || !kw.is_empty() {
+                let merged = rrf_merge(sem, kw, fetch_k, rrf_k);
+                return Ok(stratify_recall_hits(merged, k, reliability.as_ref()));
+            }
+            // Both lanes empty → fall through to recency below.
+            let store_size = self.memory_count();
+            if store_size < 10 {
+                return Ok(vec![]);
+            }
+            log::warn!("RRF hybrid empty (semantic+BM25), falling back to recency");
+            let now = now_ms();
+            let temporal = self.recall_temporal(0, now, realm, fetch_k)?;
+            return Ok(stratify_recall_hits(temporal, k, reliability.as_ref()));
+        }
 
         let hits = self.recall_semantic(query_embedding, fetch_k, realm)?;
         if !hits.is_empty() {

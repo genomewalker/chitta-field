@@ -144,10 +144,22 @@ pub struct ScoringConfig {
     /// 0 disables the cap. Only applies when the caller passes realm=None.
     #[serde(default = "default_recall_realm_cap_divisor")]
     pub recall_realm_cap_divisor: usize,
+
+    // ── Reciprocal Rank Fusion (hybrid recall) ───────────────────────
+    /// RRF constant k; standard value is 60.0. Larger k flattens the rank
+    /// weighting so deeper positions contribute more evenly.
+    #[serde(default = "default_rrf_k")]
+    pub rrf_k: f32,
+    /// Enable RRF hybrid merge of HNSW semantic + BM25 keyword results on
+    /// unscoped recall. When false, BM25 is only a fallback for empty semantic.
+    #[serde(default = "default_use_rrf")]
+    pub use_rrf: bool,
 }
 
 fn default_rare_entity_weight() -> f32 { 0.15 }
 fn default_recall_realm_cap_divisor() -> usize { 4 }
+fn default_rrf_k() -> f32 { 60.0 }
+fn default_use_rrf() -> bool { true }
 fn default_surprise_domain_actual_weight() -> f32 { 0.15 }
 fn default_surprise_domain_expected_weight() -> f32 { 0.10 }
 fn default_epistemic_debt_boost() -> f32 { 1.1 }
@@ -245,6 +257,10 @@ impl Default for ScoringConfig {
 
             // Stratified recall (anti-flooding)
             recall_realm_cap_divisor: 4,
+
+            // Reciprocal Rank Fusion (hybrid recall)
+            rrf_k: 60.0,
+            use_rrf: true,
         }
     }
 }
