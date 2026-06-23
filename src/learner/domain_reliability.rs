@@ -103,13 +103,12 @@ impl DomainReliability {
     ///
     /// `seed` decorrelates the draw across queries and realms — pass a
     /// time-derived value mixed with the realm name from the call site.
-    pub fn sample_arm(&self, realm: &str, k: usize, seed: u64) -> usize {
-        let s = self
-            .domains
-            .get(realm)
-            .map(|p| p.sample(seed))
-            .unwrap_or(DEFAULT_RELIABILITY);
-        let frac = ((s - RELIABILITY_FLOOR) / (RELIABILITY_CEIL - RELIABILITY_FLOOR)).clamp(0.0, 1.0);
+    pub fn sample_arm(&self, realm: &str, k: usize, _seed: u64) -> usize {
+        // Use the bounded reliability score [FLOOR, CEIL] rather than the raw Beta
+        // sample — avoids cold-start realms (alpha=beta=1 → mean=0.5 → cap=1) and
+        // correction-penalised realms getting starved below the sensible floor.
+        let s = self.reliability(realm) as f64;
+        let frac = (s - RELIABILITY_FLOOR) / (RELIABILITY_CEIL - RELIABILITY_FLOOR);
         let cap = (frac * k as f64).round() as usize;
         cap.max(1)
     }
