@@ -1108,6 +1108,25 @@ impl ChittaField {
             }
         };
         let lineage_epoch = prior_epoch.saturating_add(1);
+        // Rebuild content_prov_idx from live signal/[done] payloads so the dedup gate
+        // survives daemon restarts without requiring snapshot format changes.
+        let content_prov_idx: HashMap<u64, MemoryId> = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            payloads.iter()
+                .filter(|(id, p)| {
+                    p.kind == "signal"
+                        && p.content.starts_with(b"[done]")
+                        && !states.get(id).map(|s| s.deleted).unwrap_or(false)
+                })
+                .map(|(id, p)| {
+                    let mut h = DefaultHasher::new();
+                    p.content.hash(&mut h);
+                    (h.finish(), *id)
+                })
+                .collect()
+        };
+        eprintln!("[chitta-field] content_prov_idx rebuilt: {} [done] provenance records", content_prov_idx.len());
         Ok(Self {
             data_dir,
             instance_id,
@@ -1170,7 +1189,7 @@ impl ChittaField {
             lite_encoder: RwLock::new(loaded_lite_encoder),
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
-            content_prov_idx: RwLock::new(HashMap::new()),
+            content_prov_idx: RwLock::new(content_prov_idx),
             realm_members: RwLock::new(realm_members),
             kind_members:  RwLock::new(kind_members),
             memory_count: Arc::new(AtomicUsize::new(initial_memory_count)),
