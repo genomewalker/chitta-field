@@ -3362,14 +3362,19 @@ impl ChittaField {
         // RRF hybrid: on UNSCOPED queries, fuse semantic + BM25 ranks instead of
         // using BM25 only as an empty-semantic fallback. Targeted queries
         // (realm=Some) keep the legacy semantic-then-fallback path.
-        let use_rrf = stratify && self.scoring_pipeline.read().config.use_rrf;
+        let use_rrf = self.scoring_pipeline.read().config.use_rrf;
         if use_rrf {
             let rrf_k = self.scoring_pipeline.read().config.rrf_k;
             let sem = self.recall_semantic(query_embedding, fetch_k, realm)?;
-            let kw = self.recall_keyword(query_text, fetch_k)?;
+            let kw = self.recall_keyword_realm(query_text, fetch_k, realm)?;
             if !sem.is_empty() || !kw.is_empty() {
                 let merged = rrf_merge(sem, kw, fetch_k, rrf_k);
-                return Ok(stratify_recall_hits(merged, k, reliability.as_ref()));
+                // Stratify only for unscoped queries — targeted queries are already realm-filtered.
+                return Ok(if stratify {
+                    stratify_recall_hits(merged, k, reliability.as_ref())
+                } else {
+                    merged.into_iter().take(k).collect()
+                });
             }
             // Both lanes empty → fall through to recency below.
             let store_size = self.memory_count();
@@ -3379,7 +3384,11 @@ impl ChittaField {
             log::warn!("RRF hybrid empty (semantic+BM25), falling back to recency");
             let now = now_ms();
             let temporal = self.recall_temporal(0, now, realm, fetch_k)?;
-            return Ok(stratify_recall_hits(temporal, k, reliability.as_ref()));
+            return Ok(if stratify {
+                stratify_recall_hits(temporal, k, reliability.as_ref())
+            } else {
+                temporal.into_iter().take(k).collect()
+            });
         }
 
         let hits = self.recall_semantic(query_embedding, fetch_k, realm)?;
