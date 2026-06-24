@@ -3349,7 +3349,9 @@ impl ChittaField {
                 .max(1);
             k.saturating_mul(factor).max(k)
         } else {
-            k
+            // Over-fetch globally so realm post-filter has enough candidates.
+            let mul = self.scoring_pipeline.read().config.dam_fetch_mul.max(4);
+            k.saturating_mul(mul).max(k)
         };
         // Snapshot the per-realm reliability learner so the stratify pass can
         // Thompson-sample without holding the learner lock during scoring.
@@ -3365,7 +3367,25 @@ impl ChittaField {
         let use_rrf = self.scoring_pipeline.read().config.use_rrf;
         if use_rrf {
             let rrf_k = self.scoring_pipeline.read().config.rrf_k;
-            let sem = self.recall_semantic(query_embedding, fetch_k, realm)?;
+            // For realm-scoped queries, use global HNSW then post-filter instead of
+            // filtered HNSW (search_candidates). search_candidates skips memories whose
+            // flat embedding is absent even when the HNSW graph node has it, causing
+            // false sim=0 for recently-ingested memories in small realms.
+            let sem = if !stratify {
+                let global = self.recall_semantic(query_embedding, fetch_k, None)?;
+                if let Some(r) = realm {
+                    let rm = self.realm_members.read();
+                    let allowed = rm.get(r);
+                    global
+                        .into_iter()
+                        .filter(|h| allowed.map(|a| a.contains(&h.id)).unwrap_or(true))
+                        .collect()
+                } else {
+                    global
+                }
+            } else {
+                self.recall_semantic(query_embedding, fetch_k, realm)?
+            };
             let kw = self.recall_keyword_realm(query_text, fetch_k, realm)?;
             if !sem.is_empty() || !kw.is_empty() {
                 let merged = rrf_merge(sem, kw, fetch_k, rrf_k);
