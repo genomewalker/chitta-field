@@ -3391,7 +3391,34 @@ impl ChittaField {
             };
             let kw = self.recall_keyword_realm(query_text, fetch_k, realm)?;
             if !sem.is_empty() || !kw.is_empty() {
-                let merged = rrf_merge(sem, kw, fetch_k, rrf_k);
+                let mut merged = rrf_merge(sem, kw, fetch_k, rrf_k);
+
+                // Cortical SDR re-rank: second-pass RRF over the already-merged candidate set.
+                // Gated by use_cortical (default false) and a non-empty cortical index.
+                // Re-ranker shape: cortical can only reorder merged candidates, never inject new ones.
+                let use_cortical = self.scoring_pipeline.read().config.use_cortical;
+                if use_cortical && !self.cortical_idx.read().is_empty() {
+                    let cortical_rrf_k = self.scoring_pipeline.read().config.cortical_rrf_k;
+                    let code = self.sparse_encoder.read().encode(query_embedding);
+                    if !code.is_empty() {
+                        let candidate_ids: std::collections::HashSet<MemoryId> =
+                            merged.iter().map(|h| h.memory_id).collect();
+                        let cortical_ranked: Vec<RecallHit> = {
+                            let cortical = self.cortical_idx.read();
+                            let by_id: std::collections::HashMap<MemoryId, &RecallHit> =
+                                merged.iter().map(|h| (h.memory_id, h)).collect();
+                            cortical
+                                .search(&code, merged.len(), Some(&candidate_ids))
+                                .into_iter()
+                                .filter_map(|(mid, _)| by_id.get(&mid).map(|h| (*h).clone()))
+                                .collect()
+                        };
+                        if !cortical_ranked.is_empty() {
+                            merged = rrf_merge(merged, cortical_ranked, fetch_k, cortical_rrf_k);
+                        }
+                    }
+                }
+
                 // Stratify only for unscoped queries — targeted queries are already realm-filtered.
                 return Ok(if stratify {
                     stratify_recall_hits(merged, k, reliability.as_ref())

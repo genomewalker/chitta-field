@@ -166,8 +166,19 @@ pub struct ScoringConfig {
     /// Candidate pool multiplier: fetch k * dam_fetch_mul candidates for DAM reranking.
     #[serde(default = "default_dam_fetch_mul")]
     pub dam_fetch_mul: usize,
+
+    // ── Cortical SDR re-rank (third RRF pass) ────────────────────────
+    /// Enable cortical posting-index re-rank as a second RRF pass over the
+    /// already-merged HNSW+BM25 candidate set. Safe to enable once the
+    /// SparseEncoder has seen ≥1000 memories. Default: false.
+    #[serde(default)]
+    pub use_cortical: bool,
+    /// RRF constant k for the cortical re-rank pass (default 60.0).
+    #[serde(default = "default_cortical_rrf_k")]
+    pub cortical_rrf_k: f32,
 }
 
+fn default_cortical_rrf_k() -> f32 { 60.0 }
 fn default_rare_entity_weight() -> f32 { 0.15 }
 fn default_recall_realm_cap_divisor() -> usize { 4 }
 fn default_rrf_k() -> f32 { 60.0 }
@@ -281,6 +292,10 @@ impl Default for ScoringConfig {
             dam_beta: 10.0,
             dam_steps: 10,
             dam_fetch_mul: 4,
+
+            // Cortical SDR re-rank
+            use_cortical: false,
+            cortical_rrf_k: 60.0,
         }
     }
 }
