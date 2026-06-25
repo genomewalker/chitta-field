@@ -621,6 +621,45 @@ impl CorticalIndex {
         self.prototype_idx.count()
     }
 
+    /// Backfill affect_q for all indexed memories using a kind-based proxy.
+    /// Called once after loading a snapshot built with index() (affect_q=0).
+    pub fn backfill_affect_from_kind(&mut self) {
+        let kind_arousal = |k: &str| -> u8 {
+            let a: f32 = if k.to_ascii_lowercase().contains("correction") {
+                0.85
+            } else {
+                match k {
+                    "wisdom" => 0.70,
+                    "insight" => 0.50,
+                    "signal" => 0.30,
+                    "episode" | "observation" => 0.15,
+                    _ => 0.25,
+                }
+            };
+            (a * 255.0) as u8
+        };
+
+        let updates: Vec<(MemoryId, u8)> = self
+            .mem_kind
+            .iter()
+            .map(|(&mid, k)| (mid, kind_arousal(k)))
+            .collect();
+
+        for (mid, aq) in updates {
+            if let Some(code) = self.mem_codes.get(&mid) {
+                for &fid in &code.feature_ids {
+                    if let Some(list) = self.postings.get_mut(&fid) {
+                        if let Some(entry) = list.iter_mut().find(|e| e.mem_id == mid) {
+                            if entry.affect_q == 0 {
+                                entry.affect_q = aq;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn set_pq(&mut self, pq: ProductQuantizer) {
         self.pq = Some(pq);
     }

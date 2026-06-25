@@ -4737,12 +4737,11 @@ impl ChittaField {
         self.log.write().append(&op)?;
 
         // Index in cortical index
-        let strength = self
-            .states
-            .read()
-            .get(&memory_id)
-            .map(|s| s.strength)
-            .unwrap_or(0.5);
+        let (strength, state_arousal) = {
+            let st = self.states.read();
+            let s = st.get(&memory_id);
+            (s.map(|s| s.strength).unwrap_or(0.5), s.map(|s| s.affect_arousal).unwrap_or(0.0))
+        };
         let kind = self
             .payloads
             .read()
@@ -4755,9 +4754,22 @@ impl ChittaField {
             .get(&memory_id)
             .map(|p| p.authored_at_ms)
             .unwrap_or(ts_ms);
+        let affect_arousal = if state_arousal > 0.01 {
+            state_arousal
+        } else if kind.to_ascii_lowercase().contains("correction") {
+            0.85
+        } else {
+            match kind.as_str() {
+                "wisdom" => 0.70,
+                "insight" => 0.50,
+                "signal" => 0.30,
+                "episode" | "observation" => 0.15,
+                _ => 0.25,
+            }
+        };
         self.cortical_idx
             .write()
-            .index(memory_id, &code, strength, authored_at, &kind);
+            .index_with_affect(memory_id, &code, strength, authored_at, &kind, affect_arousal);
 
         Ok(())
     }
