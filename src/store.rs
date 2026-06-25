@@ -3139,7 +3139,10 @@ impl ChittaField {
         realm: Option<&str>,
     ) -> Result<Vec<RecallHit>> {
         let max_query_idf = self.keyword_idx.read().query_max_idf(query);
-        let keyword_hits = self.keyword_idx.read().search(query, k * 3);
+        // Realm-scoped queries need a larger global BM25 fetch so small-realm
+        // memories aren't squeezed out by cross-realm hits in the global corpus.
+        let bm25_fetch = if realm.is_some() { k * 12 } else { k * 3 };
+        let keyword_hits = self.keyword_idx.read().search(query, bm25_fetch);
 
         let now = now_ms();
         let payloads = self.payloads.read();
@@ -3378,7 +3381,7 @@ impl ChittaField {
                     let allowed = rm.get(r);
                     global
                         .into_iter()
-                        .filter(|h| allowed.map(|a| a.contains(&h.id)).unwrap_or(true))
+                        .filter(|h| allowed.map(|a| a.contains(&h.memory_id)).unwrap_or(true))
                         .collect()
                 } else {
                     global
