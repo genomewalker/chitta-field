@@ -289,8 +289,9 @@ impl Default for ScoringConfig {
             use_rrf: true,
 
             // Field-RAG / Modern Hopfield
-            // β=2.0: ablation showed β=10 collapses softmax to argmax at step 1,
-            // drifting settled state to top-1 candidate embedding not the query.
+            // β=2: soft attention for retrieval re-ranking (β=10 collapses to argmax
+            // in step 1, re-ranking by similarity to top-1 not query).
+            // Probe validated β=10 for attractor convergence (different use case).
             dam_beta: 2.0,
             dam_steps: 10,
             dam_fetch_mul: 4,
