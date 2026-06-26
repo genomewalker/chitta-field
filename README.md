@@ -23,12 +23,17 @@ chitta-field/
 │
 ├── Snapshots (binary, periodic)
 │   ├── chitta.snapshot                    (full state: payloads + states + indexes)
+│   ├── chitta.snapshot.emb                (sidecar: magic CTEMB + count + {u64 id, f32×EMBED_DIM} records)
+│   ├── chitta.snapshot.bin                (sidecar: binary sparse codes)
+│   ├── chitta.hnsw                        (HNSW base graph)
+│   ├── chitta.delta.hnsw                  (two-tier delta graph, active above 5K memories)
 │   └── cortex.snapshot                    (cortical sparse codes only)
 │
 └── In-RAM (rebuilt from log on open)
-    ├── SemanticIndex  (ANN: IVF coarse + LSH probing, 768-dim BGE embeddings)
+    ├── SemanticIndex  (HNSW + LSH probing, 1024-dim BGE embeddings by default)
     ├── KeywordIndex   (BM25)
     ├── CorticalIndex  (SDR, 64-of-16384 active bits)
+    ├── HDCIndex       (8192-bit binary vectors, bag-of-words bundling, Hamming recall)
     ├── TemporalIndex  (time-ordered, range queries)
     ├── TripletStore   (subject/predicate/object graph)
     ├── SymbolIndex + CallGraph (code intelligence)
@@ -58,11 +63,41 @@ On `ChittaField::open`, the library scans `data_dir` for all `*.seg` files and r
 
 This makes chitta-field safe on NFS without lock managers or fencing beyond the fencing token embedded in task/event ops.
 
+### Semantic index (HNSW)
+
+The semantic index uses HNSW as the primary ANN structure with the following constants:
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `HNSW_M` | 16 | Connections per node per layer |
+| `HNSW_M0` | 32 | Connections at layer 0 |
+| `HNSW_EF_CONSTRUCTION` | 200 | Candidate pool during insert |
+| `HNSW_EF_SEARCH` | 64 | Candidate pool during query |
+| `HNSW_ML` | 0.36067 | Level multiplier = 1/ln(16) |
+| `HNSW_THRESHOLD` | 2,000 | Switch from flat to single HNSW |
+| `HNSW_TIER2_THRESHOLD` | 5,000 | Activate two-tier delta graph |
+| `HNSW_DELTA_MERGE_RATIO` | 0.10 | Merge delta into base when delta > 10% of base |
+| `PER_REALM_HNSW_THRESHOLD` | 500 | Per-realm HNSW activation |
+| `FLAT_SCAN_MAX` | 0 | Flat scan disabled (ANN validated at 154K memories, 2026-06-11) |
+| `EMB_MMAP_MIN` | 500,000 | Embeddings stay heap-allocated below this count |
+
+LSH tables supplement HNSW: `LSH_TABLES=4`, `LSH_BITS=12`, with coarse quantizer fallback (`COARSE_CENTROIDS=256`, `COARSE_ASSIGNMENTS=2`, `MIN_PROBES=6`, `MAX_PROBES=24`, `MIN_CANDIDATES=1024`, `MAX_CANDIDATES=16384`).
+
+### Embedding dimensions
+
+Default embedding model is `bge-large-en-v1.5` at **1024 dimensions**. The dimension is build-time configurable via `CHITTA_EMBED_DIM` (must be a multiple of 64). The daemon supports drop-in GGUF replacements via `CHITTA_EMBED_MODEL`.
+
 ### Cortical index (SPAF)
 
-The Sparse Predictive Associative Field encodes each memory's 768-dim embedding into a 64-of-16384 sparse code via a `SparseEncoder`. Recall against the cortical index is a bitset intersection operation, O(active_bits) per candidate, giving sub-millisecond latency even at tens of thousands of memories.
+The Sparse Predictive Associative Field encodes each memory's embedding into a 64-of-16384 sparse code via a `SparseEncoder`. Recall against the cortical index is a bitset intersection operation, O(active_bits) per candidate, giving sub-millisecond latency even at tens of thousands of memories.
 
-A `ProductQuantizer` compresses residual embeddings for approximate recall at scale. A `LiteEncoder` (bag-of-words to sparse code, no ONNX dependency) provides a fallback encoding path that works without a runtime embedder.
+Product-key encoding: the embedding is split into two equal halves, each scored against 128-centroid sub-dictionaries, and the top-K atoms are selected from the 256-candidate shortlist. When `EMBED_DIM=768`, this splits into 2×384 against 128 sub-dicts.
+
+A `ProductQuantizer` compresses residual embeddings (32 subvectors, 256 centroids, 32 bytes output). A `LiteEncoder` (bag-of-words to sparse code, no ONNX dependency) provides a fallback encoding path that works without a runtime embedder.
+
+### HDC module
+
+A separate hyperdimensional computing module (`hdc.rs`) implements 8192-bit binary vectors (128 u64 words) for bag-of-words bundling and Hamming-distance recall. This is independent of the cortical SDR index and operates on raw term presence without embeddings.
 
 ### Iterative recall (CTM-inspired)
 
@@ -83,7 +118,7 @@ After the final pass, `cf_record_recall_batch` atomically commits all learning:
 - **Iterative resonance** — up to 3 passes with query refinement and entropy early-stop
 - **Retrieval context history** — per-memory 32-dim query sketch log for context-aware reranking
 - **Sync-weighted Hebbian edges** — co-activation diversity scales edge reinforcement
-- **Semantic recall** — ANN (IVF + LSH) over BGE-base-en-v1.5 768-dim embeddings
+- **Semantic recall** — HNSW + LSH over 1024-dim BGE embeddings (default)
 - **Keyword recall** — BM25 over memory content
 - **Temporal recall** — time-range queries with kind/realm filters
 - **Association graph** — directed weighted edges between memories (DerivedFrom, SameSession, SameArtifact, CoRetrieved, Supports, Contradicts)
@@ -127,7 +162,7 @@ Each memory carries:
 | `kind` | `String` | Semantic category (e.g. `"ssl"`, `"episode"`, `"fact"`) |
 | `realm` | `String` | Namespace / project scope |
 | `content` | `Vec<u8>` | Raw bytes (typically UTF-8 text) |
-| `embedding` | `Vec<f32>` | 768-dim BGE embedding |
+| `embedding` | `Vec<f32>` | 1024-dim BGE embedding (default; configurable via `CHITTA_EMBED_DIM`) |
 | `confidence` | `f32` | 0.0-1.0, updated by feedback |
 | `decay_rate` | `f32` | Strength loss per time unit; 0.0 = pinned |
 | `strength` | `f32` | Current salience (decays over time) |
@@ -153,7 +188,7 @@ cf_close(h);
 uint64_t memory_id;
 cf_put_memory(h, "fact", "project/foo",
     content, content_len,
-    embedding, 768,
+    embedding, 1024,
     0.8f, 0.01f, authored_at_ms,
     &memory_id);
 
@@ -167,7 +202,7 @@ cf_add_assoc_edge(h, src_id, dst_id, /*edge_type=*/0, 1.0f);
 ```c
 CfRecallHit hits[32];
 size_t written;
-cf_recall_semantic(h, query_embedding, 768, "project/foo", 10,
+cf_recall_semantic(h, query_embedding, 1024, "project/foo", 10,
     hits, 32, &written);
 
 cf_recall_temporal(h, start_ms, end_ms, "project/foo", 20,
@@ -195,13 +230,13 @@ cf_query_subject(h, "chitta-field", buf, sizeof(buf), &written);
 ```c
 uint64_t sym_id;
 cf_upsert_symbol(h, "function", "put_memory", "(kind, realm, ...) -> Result<...>",
-    "src/store.rs", 30, 120, repo_id, embedding, 768, "Store a new memory", 0, &sym_id);
+    "src/store.rs", 30, 120, repo_id, embedding, 1024, "Store a new memory", 0, &sym_id);
 
 cf_add_sym_call_edge(h, caller_id, callee_id);
 
 CfSymbolHit syms[16]; size_t written;
 cf_search_symbols_by_name(h, "recall", 10, syms, 16, &written);
-cf_search_symbols_semantic(h, query_embedding, 768, 10, syms, 16, &written);
+cf_search_symbols_semantic(h, query_embedding, 1024, 10, syms, 16, &written);
 ```
 
 ### Maintenance
@@ -216,6 +251,14 @@ uint64_t demoted = cf_run_demotion(h, now_ms);
 ## Building
 
 Requires Rust 1.92.0 (pinned via `rust-toolchain.toml`). If using conda, unset any conda-injected linker overrides before building; `build.sh` handles this automatically.
+
+The crate compiles as both `staticlib` and `rlib`.
+
+Build-time configuration via env vars:
+
+| Var | Default | Notes |
+|-----|---------|-------|
+| `CHITTA_EMBED_DIM` | `1024` | Must be a multiple of 64 |
 
 ```bash
 # Build static lib + binaries
@@ -272,32 +315,36 @@ Train the bag-of-words lite encoder from existing memories and save it to disk. 
 ~/.claude/mind/chitta-field/
 ├── {instance_id}_{seqno}.seg    (op log segment, one per writer process)
 ├── chitta.snapshot              (full state snapshot, optional, speeds startup)
-├── chitta.snapshot.emb          (v10+ sidecar: magic + count + flat {id, f32×256} embedding records)
-├── chitta.snapshot.bin          (v10+ sidecar: binary sparse codes)
+├── chitta.snapshot.emb          (sidecar: 8-byte magic CTEMB\x00\x00\x00 + 4-byte count + {u64 id, f32×EMBED_DIM} records)
+├── chitta.snapshot.bin          (sidecar: binary sparse codes)
 ├── chitta.hnsw                  (HNSW base graph, written at checkpoint)
-├── chitta.delta.hnsw            (two-tier HNSW delta graph, active above 100K memories)
+├── chitta.delta.hnsw            (two-tier HNSW delta graph, active above 5K memories)
 └── cortex.snapshot              (cortical index snapshot, optional)
 ```
 
-### v10 snapshot sidecar format
+### Snapshot sidecar format
 
-As of v5.21.45, `cf_save_full_snapshot` writes two sidecars alongside the main bincode snapshot:
+`cf_save_full_snapshot` writes two sidecars alongside the main bincode snapshot:
 
-- **`.emb` sidecar** — embeddings, removed from the main snapshot to reduce bincode serialization cost. Format: 8-byte magic (`CTEMB\x00\x00\x00`) + 4-byte little-endian count + contiguous `{u64 id, f32×256}` records. Designed for future `mmap` access.
-- **`.bin` sidecar** — binary sparse codes (bit-packed SDR representations), also separated from the main snapshot for the same reason.
+- **`.emb` sidecar** — embeddings removed from the main snapshot to reduce bincode serialization cost. Format: 8-byte magic (`CTEMB\x00\x00\x00`) + 4-byte little-endian count + contiguous `{u64 id, f32×EMBED_DIM}` records. The record width matches the build-time `CHITTA_EMBED_DIM` (default 1024).
+- **`.bin` sidecar** — binary sparse codes (bit-packed SDR representations).
 
-Older snapshots without sidecars are still readable; the loader falls back to the embedding data embedded in the bincode blob when sidecars are absent.
+Older snapshots without sidecars are still readable; the loader falls back to embedding data embedded in the bincode blob when sidecars are absent.
 
 ### Two-tier HNSW (delta graph)
 
-Above `HNSW_TIER2_THRESHOLD = 100_000` memories, the semantic index activates a two-tier insert strategy:
+Above `HNSW_TIER2_THRESHOLD = 5_000` memories, the semantic index activates a two-tier insert strategy:
 
 - **Base graph** (`chitta.hnsw`) — the large, fully connected HNSW over all memories. Rebuilt infrequently; insert cost is O(log N_total).
-- **Delta graph** (`chitta.delta.hnsw`) — a small HNSW that absorbs all new inserts. Insert cost is O(log N_delta), where N_delta ≪ N_total.
+- **Delta graph** (`chitta.delta.hnsw`) — a small HNSW that absorbs all new inserts. Insert cost is O(log N_delta), where N_delta << N_total.
 
 At checkpoint, if the delta graph contains more than 10% of the base graph's node count, the delta is merged into the base and the sidecar is reset. Queries search both graphs and merge results before reranking.
 
-Below the threshold the single-graph path is used unchanged.
+Below `HNSW_THRESHOLD = 2_000` memories the single-graph path is used. Between 2K and 5K, single-graph only. Above 5K, two-tier.
+
+Flat scan (`FLAT_SCAN_MAX = 0`) is permanently disabled as of 2026-06-11; ANN was validated correct at 154K memories.
+
+Per-realm HNSW activates independently at `PER_REALM_HNSW_THRESHOLD = 500` memories per realm.
 
 ## Cognitive organs
 
@@ -448,13 +495,13 @@ The cortical index encodes each memory as a sparse distributed representation: e
 
 ### Product-key sparse encoding
 
-Computing the top-K atoms over N=16,384 full-dimensional atoms would be O(N·d). `SparseEncoder` in `cortex.rs` instead uses the product-key decomposition: the 768-dim embedding is split into two 384-dim halves, each scored against 128-centroid sub-dictionaries, and the top-K atoms are selected from the 256-candidate shortlist. This reduces the cost to O(sqrt(N) · d), the same approach introduced for large memory layers.
+Computing the top-K atoms over N=16,384 full-dimensional atoms would be O(N·d). `SparseEncoder` in `cortex.rs` instead uses the product-key decomposition: the embedding is split into two equal halves, each scored against 128-centroid sub-dictionaries, and the top-K atoms are selected from the 256-candidate shortlist. This reduces the cost to O(sqrt(N) · d), the same approach introduced for large memory layers.
 
 > Lample, G., Sablayrolles, A., Ranzato, M. A., Denoyer, L., & Jégou, H. (2019). Large memory layers with product keys. *Advances in Neural Information Processing Systems 32 (NeurIPS 2019)*. https://arxiv.org/abs/1907.05242
 
 ### Product quantization for residual compression
 
-`ProductQuantizer` in `pq.rs` compresses residual embeddings (768-dim, 32 subvectors of 24 dims each, 256 centroids per subspace) to 32 bytes using standard product quantization.
+`ProductQuantizer` in `pq.rs` compresses residual embeddings to 32 bytes using standard product quantization (32 subvectors, 256 centroids per subspace).
 
 > Jégou, H., Douze, M., & Schmid, C. (2011). Product quantization for nearest neighbor search. *IEEE Transactions on Pattern Analysis and Machine Intelligence*, 33(1), 117-128. https://doi.org/10.1109/TPAMI.2010.57
 
@@ -500,11 +547,11 @@ The keyword index in `keyword.rs` uses BM25 with standard parameters (k1=1.2, b=
 
 ### Embeddings
 
-Semantic recall uses `nomic-embed-text-v1.5` embeddings (768-dim) by default, provided via the llama.cpp in-process embedder in the cc-soul daemon. The daemon also supports drop-in GGUF replacements via `CHITTA_EMBED_MODEL`; the `ssl_distiller_dpo` fine-tune (1536-dim, DPO-aligned) is the recommended upgrade for personal installs.
+Semantic recall uses `bge-large-en-v1.5` embeddings (1024-dim) by default, provided via the llama.cpp in-process embedder in the cc-soul daemon. The daemon also supports drop-in GGUF replacements via `CHITTA_EMBED_MODEL`. `CHITTA_EMBED_DIM` must be set at build time to match the chosen model's output dimension (must be a multiple of 64).
 
-> Nussbaum, Z., et al. (2024). Nomic Embed: Training a Reproducible Long Context Text Embedder. *arXiv:2402.01613*. https://arxiv.org/abs/2402.01613
+> Zhang, S., et al. (2023). BGE M3-Embedding: Multi-Lingual, Multi-Functionality, Multi-Granularity Text Embeddings Through Self-Knowledge Distillation. *arXiv:2309.07597*. https://arxiv.org/abs/2309.07597
 
-The semantic index uses a two-tier ANN strategy: LSH probing (4 tables, 12 bits) for primary candidate generation, falling back to IVF coarse quantizer (256 random-projection centroids) if LSH yields no candidates. Exact cosine reranking runs over the bounded candidate set (1024–16384). This bounds query cost well below brute-force even at 50K+ memories.
+The semantic index uses HNSW as the primary ANN structure, supplemented by LSH probing (4 tables, 12 bits) for coarse candidate generation. Exact cosine reranking runs over the bounded candidate set (1024-16384). Flat scan is disabled; ANN was validated at 154K memories.
 
 ## Dependencies
 
@@ -512,10 +559,14 @@ The semantic index uses a two-tier ANN strategy: LSH probing (4 tables, 12 bits)
 |-------|---------|
 | `serde` + `serde_json` + `rmp-serde` | Op serialization (MessagePack for log, JSON for FFI returns) |
 | `bincode` | Snapshot serialization |
-| `memmap2` | Memory-mapped segment file reads |
+| `memmap2` | Memory-mapped embedding reads (active above 500K memories) |
 | `parking_lot` | `RwLock` for all in-RAM indexes |
 | `crc32fast` | Frame checksums in op log |
 | `sha2` | Chunk hash (content dedup) |
+| `rayon` | Parallel index operations |
+| `roaring` | Compressed bitsets for cortical index |
+| `smallvec` | Stack-allocated small collections |
+| `pyo3` | Python bindings |
 | `byteorder` | Frame header encoding |
 | `thiserror` | Error types |
 
