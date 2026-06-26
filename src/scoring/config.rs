@@ -183,7 +183,7 @@ fn default_rare_entity_weight() -> f32 { 0.15 }
 fn default_recall_realm_cap_divisor() -> usize { 4 }
 fn default_rrf_k() -> f32 { 60.0 }
 fn default_use_rrf() -> bool { true }
-fn default_dam_beta() -> f32 { 10.0 }
+fn default_dam_beta() -> f32 { 2.0 }
 fn default_dam_steps() -> usize { 10 }
 fn default_dam_fetch_mul() -> usize { 4 }
 fn default_surprise_domain_actual_weight() -> f32 { 0.15 }
@@ -289,7 +289,9 @@ impl Default for ScoringConfig {
             use_rrf: true,
 
             // Field-RAG / Modern Hopfield
-            dam_beta: 10.0,
+            // β=2.0: ablation showed β=10 collapses softmax to argmax at step 1,
+            // drifting settled state to top-1 candidate embedding not the query.
+            dam_beta: 2.0,
             dam_steps: 10,
             dam_fetch_mul: 4,
 

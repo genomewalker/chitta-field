@@ -26,6 +26,7 @@ turbovec = { version = "0.9", optional = true }
 anyhow = "1"
 roaring = { version = "0.10", features = ["serde"] }
 rayon = "1"
+smallvec = { version = "1", features = ["union"] }
 libc = "0.2"
 pyo3 = { version = "0.22", features = ["auto-initialize"] }
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"] }

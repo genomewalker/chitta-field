@@ -451,6 +451,53 @@ pub extern "C" fn cf_recall_semantic(
     }
 }
 
+/// Hybrid recall: HNSW semantic + BM25 keyword fused via RRF.
+/// This is the real hybrid path — unlike cf_recall_semantic it calls
+/// recall_with_fallback which runs stratified RRF merge internally.
+#[no_mangle]
+pub extern "C" fn cf_recall_with_fallback(
+    h: *mut CfHandle,
+    query_embedding: *const f32,
+    embedding_len: usize,
+    query_text: *const c_char,
+    realm: *const c_char,
+    k: usize,
+    hits_buf: *mut CfRecallHit,
+    hits_cap: usize,
+    hits_written: *mut usize,
+) -> c_int {
+    if h.is_null() || hits_buf.is_null() || hits_written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let embedding = unsafe { std::slice::from_raw_parts(query_embedding, embedding_len) };
+    let query_str = if query_text.is_null() {
+        ""
+    } else {
+        match unsafe { CStr::from_ptr(query_text).to_str() } {
+            Ok(s) => s,
+            Err(e) => return handle.err(e),
+        }
+    };
+    let realm_str = if realm.is_null() {
+        None
+    } else {
+        unsafe {
+            match CStr::from_ptr(realm).to_str() {
+                Ok(s) => Some(s),
+                Err(e) => return handle.err(e),
+            }
+        }
+    };
+    match handle.field.recall_with_fallback(embedding, query_str, k, realm_str) {
+        Ok(hits) => {
+            write_hits(hits, hits_buf, hits_cap, hits_written);
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
 /// Semantic recall with affective context for mood-congruent retrieval.
 /// `query_valence` and `query_arousal` are NaN to disable affect matching.
 #[no_mangle]

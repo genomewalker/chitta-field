@@ -3,8 +3,10 @@ use crate::binary::{binarize, hamming_dist, BINARY_WORDS, HAMMING_CANDIDATES};
 use crate::ops::EMBED_DIM;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::Write;
+use std::sync::atomic::{AtomicU32, Ordering};
 use memmap2;
 use rayon::prelude::*;
+use smallvec::SmallVec;
 
 const COARSE_CENTROIDS: usize = 256;
 const COARSE_ASSIGNMENTS: usize = 2;
@@ -275,23 +277,23 @@ impl HnswGraph {
         embs: &EmbLookup<'_>,
     ) -> Vec<MemoryId> {
         let mut visited: HashSet<MemoryId> = entry_points.iter().copied().collect();
-        // candidates: min-heap by score (worst-best at top, so we can prune)
+        // candidates: max-heap by sim (best candidate at top for greedy expansion)
         let mut candidates: BinaryHeap<(OrderedF32, MemoryId)> = entry_points
-            .iter()
-            .filter_map(|&id| embs.get(id).map(|e| (OrderedF32(-dot(query, e)), id)))
-            .collect();
-        // result: max-heap by score (best at top)
-        let mut result: BinaryHeap<(OrderedF32, MemoryId)> = entry_points
             .iter()
             .filter_map(|&id| embs.get(id).map(|e| (OrderedF32(dot(query, e)), id)))
             .collect();
+        // result: min-heap by neg-sim (worst at top for O(1) eviction when |result| > ef)
+        let mut result: BinaryHeap<(OrderedF32, MemoryId)> = entry_points
+            .iter()
+            .filter_map(|&id| embs.get(id).map(|e| (OrderedF32(-dot(query, e)), id)))
+            .collect();
 
-        while let Some((neg_score, cid)) = candidates.pop() {
-            let c_score = -neg_score.0;
-            // Early stop: if worst result is better than best candidate, done
+        while let Some((pos_score, cid)) = candidates.pop() {
+            let c_score = pos_score.0;
+            // Early stop: best remaining candidate worse than worst kept result → done
             if result.len() >= ef {
-                if let Some(&(OrderedF32(best_result_score), _)) = result.peek() {
-                    if c_score < best_result_score {
+                if let Some(&(OrderedF32(neg_worst_score), _)) = result.peek() {
+                    if c_score < -neg_worst_score {
                         break;
                     }
                 }
@@ -303,9 +305,9 @@ impl HnswGraph {
                 if visited.insert(neighbor_id) {
                     let Some(e) = embs.get(neighbor_id) else { continue };
                     let sim = dot(query, e);
-                    candidates.push((OrderedF32(-sim), neighbor_id));
-                    result.push((OrderedF32(sim), neighbor_id));
-                    // Trim result to ef
+                    candidates.push((OrderedF32(sim), neighbor_id));
+                    result.push((OrderedF32(-sim), neighbor_id));
+                    // Trim result: pop worst (max of neg-sim)
                     while result.len() > ef {
                         result.pop();
                     }
@@ -360,6 +362,7 @@ impl HnswGraph {
         emb: &[f32],
         level: usize,
         embs: &EmbLookup<'_>,
+        ef_construction: usize,
     ) -> Vec<Vec<MemoryId>> {
         let current_top = self.entry_point.map(|(_, l)| l).unwrap_or(0);
         let ep = match self.entry_point {
@@ -372,7 +375,7 @@ impl HnswGraph {
         }
         let mut neighbors_per_layer = vec![vec![]; level + 1];
         for layer in (0..=level.min(current_top)).rev() {
-            let candidates = self.search_layer(emb, &ep_set, HNSW_EF_CONSTRUCTION, layer, embs);
+            let candidates = self.search_layer(emb, &ep_set, ef_construction, layer, embs);
             let m = if layer == 0 { HNSW_M0 } else { HNSW_M };
             neighbors_per_layer[layer] = self.select_neighbors(emb, &candidates, m, embs);
             ep_set = candidates;
@@ -632,63 +635,244 @@ impl SemanticIndex {
         eprintln!("[hnsw] backfill_hnsw_delta_parallel: {} delta nodes", delta.len());
         let t0 = std::time::Instant::now();
 
-        // Materialize all embeddings into an owned map for thread-safe access.
-        let mut snap_embs: HashMap<MemoryId, Vec<f32>> =
-            HashMap::with_capacity(self.embeddings.len() + self.emb_offsets.len());
-        {
-            let lookup = EmbLookup {
-                heap: &self.embeddings,
-                offsets: &self.emb_offsets,
-                mmap: &self.emb_mmap,
-            };
-            for (&id, v) in &self.embeddings {
-                snap_embs.insert(id, v.clone());
+        let tier2 = self.use_tier2();
+        // Max HNSW layers (random_level_from_seed caps at 16, so layer 0..=16).
+        const MAXL: usize = 17;
+        const EPOCH_SIZE: usize = 3000;
+        const EF_BULK: usize = 64;
+        // Limit build parallelism to avoid saturating shared-node CPU and to
+        // reduce lock contention in the parallel apply phase.
+        const BUILD_THREADS: usize = 24;
+        let build_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(BUILD_THREADS)
+            .build()
+            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
+        // ── 1. Flat embedding store (single allocation, row-major) ────────────
+        // Replaces snap_embs HashMap: eliminates per-entry pointer-chase and
+        // eliminates 144k separate heap allocations scattered across 443 MB.
+        let existing_graph = if tier2 { &self.delta_hnsw } else { &self.hnsw };
+
+        // Dense row remap: all existing nodes first, then delta.
+        let mut id_to_row_v: HashMap<MemoryId, u32> =
+            HashMap::with_capacity(existing_graph.len() + delta.len());
+        let mut row_to_id_v: Vec<MemoryId> =
+            Vec::with_capacity(existing_graph.len() + delta.len());
+        for id in existing_graph.ids().into_iter().chain(delta.iter().copied()) {
+            if !id_to_row_v.contains_key(&id) {
+                let row = row_to_id_v.len() as u32;
+                id_to_row_v.insert(id, row);
+                row_to_id_v.push(id);
             }
-            for &id in self.emb_offsets.keys() {
-                if let Some(e) = lookup.get(id) {
-                    snap_embs.entry(id).or_insert_with(|| e.to_vec());
+        }
+        let n_rows = row_to_id_v.len();
+
+        // Contiguous float buffer: arena[row * EMBED_DIM .. (row+1) * EMBED_DIM].
+        let mut arena: Vec<f32> = vec![0.0f32; n_rows * EMBED_DIM];
+        {
+            let lk = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+            for (row, &id) in row_to_id_v.iter().enumerate() {
+                if let Some(e) = lk.get(id) {
+                    arena[row * EMBED_DIM..(row + 1) * EMBED_DIM].copy_from_slice(e);
+                }
+            }
+        }
+        let arena = std::sync::Arc::new(arena);
+        let id_to_row = std::sync::Arc::new(id_to_row_v);
+        let row_to_id = std::sync::Arc::new(row_to_id_v);
+
+        // ── 2. Per-(node, layer) locked adjacency ─────────────────────────────
+        // Flat: locked_adj[row * MAXL + layer].
+        // SmallVec<[u32; 32]>: M0=32 inline — zero heap allocation for layer 0.
+        let locked_adj: std::sync::Arc<Vec<parking_lot::Mutex<SmallVec<[u32; 32]>>>> =
+            std::sync::Arc::new(
+                (0..n_rows * MAXL).map(|_| parking_lot::Mutex::new(SmallVec::new())).collect()
+            );
+
+        // Seed from existing graph (MemoryId neighbors → u32 rows).
+        for (id, nbr_layers) in &existing_graph.neighbors {
+            if let Some(&row) = id_to_row.get(id) {
+                for (layer, layer_nbrs) in nbr_layers.iter().enumerate() {
+                    if layer >= MAXL { continue; }
+                    let mut cell = locked_adj[row as usize * MAXL + layer].lock();
+                    for &nbr_id in layer_nbrs {
+                        if let Some(&nbr_row) = id_to_row.get(&nbr_id) {
+                            cell.push(nbr_row);
+                        }
+                    }
                 }
             }
         }
 
-        let tier2 = self.use_tier2();
-        let graph_snap: HnswGraph =
-            if tier2 { self.delta_hnsw.clone() } else { self.hnsw.clone() };
+        // ── 3. Atomic entry-point tracking ───────────────────────────────────
+        let ep_init = existing_graph.entry_point;
+        let entry_row = std::sync::Arc::new(AtomicU32::new(
+            ep_init.and_then(|(id, _)| id_to_row.get(&id).copied()).unwrap_or(u32::MAX)
+        ));
+        let entry_lev = std::sync::Arc::new(AtomicU32::new(
+            ep_init.map_or(0, |(_, l)| l as u32)
+        ));
 
-        // Parallel search phase: compute plans against the frozen snapshot.
+        // Also keep a MemoryId-based snap_embs for EmbLookup compat with compute_insert_plan.
+        // This is the existing pattern; we still need it for the plan-compute phase.
+        let mut snap_embs_v: HashMap<MemoryId, Vec<f32>> =
+            HashMap::with_capacity(self.embeddings.len() + self.emb_offsets.len());
+        {
+            let lk = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+            for (&id, v) in &self.embeddings { snap_embs_v.insert(id, v.clone()); }
+            for &id in self.emb_offsets.keys() {
+                if let Some(e) = lk.get(id) { snap_embs_v.entry(id).or_insert_with(|| e.to_vec()); }
+            }
+        }
+        let snap_embs = std::sync::Arc::new(snap_embs_v);
+
         let empty_offsets: HashMap<MemoryId, u64> = HashMap::new();
         let empty_mmap: Option<std::sync::Arc<memmap2::Mmap>> = None;
-        let plans: Vec<(MemoryId, usize, Vec<Vec<MemoryId>>)> = delta
-            .par_iter()
-            .filter_map(|&id| {
-                let emb = snap_embs.get(&id)?;
-                let level = random_level_from_seed(id);
-                let lookup = EmbLookup {
-                    heap: &snap_embs,
-                    offsets: &empty_offsets,
-                    mmap: &empty_mmap,
-                };
-                let plan = graph_snap.compute_insert_plan(emb, level, &lookup);
-                Some((id, level, plan))
-            })
-            .collect();
 
-        eprintln!(
-            "[hnsw] backfill_hnsw_delta_parallel: parallel phase done in {:.1}s, applying {} plans",
-            t0.elapsed().as_secs_f32(),
-            plans.len()
-        );
+        // ── 4. Epoch loop ─────────────────────────────────────────────────────
+        // Each epoch:
+        //   Phase A (parallel): compute insert plans against current self.hnsw snapshot.
+        //   Phase B (parallel): apply plans into locked_adj with per-(node,layer) locks.
+        // After each epoch, drain new nodes into self.hnsw so later epochs see a
+        // denser graph and compute better plans.
+        let n_epochs = (delta.len() + EPOCH_SIZE - 1) / EPOCH_SIZE;
 
-        // Serial apply phase: use snap_embs (already in RAM) to avoid cold mmap page faults
-        // during neighbor shrinking. This is the key to consistent ~10s vs ~75s apply time.
-        let empty_offsets2: HashMap<MemoryId, u64> = HashMap::new();
-        let empty_mmap2: Option<std::sync::Arc<memmap2::Mmap>> = None;
-        let snap_lookup = EmbLookup { heap: &snap_embs, offsets: &empty_offsets2, mmap: &empty_mmap2 };
-        for (id, level, neighbors_per_layer) in plans {
-            if tier2 {
-                self.delta_hnsw.apply_insert_plan(id, level, neighbors_per_layer, &snap_lookup);
-            } else {
-                self.hnsw.apply_insert_plan(id, level, neighbors_per_layer, &snap_lookup);
+        for (epoch_idx, chunk) in delta.chunks(EPOCH_SIZE).enumerate() {
+            // Clone the current authoritative graph for plan-compute (read-only snapshot).
+            let graph_snap: HnswGraph = if tier2 { self.delta_hnsw.clone() } else { self.hnsw.clone() };
+
+            // Phase A: parallel plan compute against frozen snapshot.
+            let se = snap_embs.clone();
+            let plans: Vec<(MemoryId, usize, Vec<Vec<MemoryId>>)> = build_pool.install(|| {
+                chunk.par_iter()
+                    .filter_map(|&id| {
+                        let emb = se.get(&id)?;
+                        let level = random_level_from_seed(id);
+                        let lookup = EmbLookup { heap: &*se, offsets: &empty_offsets, mmap: &empty_mmap };
+                        let plan = graph_snap.compute_insert_plan(emb, level, &lookup, EF_BULK);
+                        Some((id, level, plan))
+                    })
+                    .collect()
+            });
+
+            // Phase B: parallel apply into locked_adj.
+            // Forward edges (own row): each plan writes its own row — no contention.
+            // Back-edges + shrink (neighbor rows): per-(node,layer) lock, parking_lot::Mutex.
+            // Shrink reads only the flat arena (read-only, no lock) + one locked cell — correct.
+            {
+                let la    = locked_adj.clone();
+                let i2r   = id_to_row.clone();
+                let r2i   = row_to_id.clone();
+                let ar    = arena.clone();
+                let se2   = snap_embs.clone();
+                let er    = entry_row.clone();
+                let el    = entry_lev.clone();
+
+                build_pool.install(|| plans.par_iter().for_each(|(id, level, per_layer)| {
+                    let new_row = match i2r.get(id) { Some(&r) => r, None => return };
+
+                    // Forward edges: write own adjacency layers.
+                    for (layer, selected) in per_layer.iter().enumerate() {
+                        if layer >= MAXL { break; }
+                        let nbr_rows: SmallVec<[u32; 32]> = selected.iter()
+                            .filter_map(|&nbr_id| i2r.get(&nbr_id).copied())
+                            .collect();
+                        *la[new_row as usize * MAXL + layer].lock() = nbr_rows;
+                    }
+
+                    // Back-edges + shrink.
+                    for (layer, selected) in per_layer.iter().enumerate() {
+                        if layer >= MAXL { break; }
+                        let m_max = if layer == 0 { HNSW_M0 } else { HNSW_M };
+                        for &nbr_id in selected {
+                            let nbr_row = match i2r.get(&nbr_id) { Some(&r) => r, None => continue };
+                            let nbr_base = nbr_row as usize * EMBED_DIM;
+                            let nbr_emb = &ar[nbr_base..nbr_base + EMBED_DIM];
+                            let cell_idx = nbr_row as usize * MAXL + layer;
+                            let mut cell = la[cell_idx].lock();
+                            cell.push(new_row);
+                            if cell.len() > m_max {
+                                // Shrink under lock: reads arena only (no nested lock).
+                                let mut scored: Vec<(f32, u32)> = cell.iter()
+                                    .filter_map(|&r| {
+                                        let cid = *r2i.get(r as usize)?;
+                                        // Try arena first (fast, contiguous), fall back to snap_embs.
+                                        let base = r as usize * EMBED_DIM;
+                                        let e = if base + EMBED_DIM <= ar.len() {
+                                            &ar[base..base + EMBED_DIM]
+                                        } else {
+                                            se2.get(&cid)?
+                                        };
+                                        Some((dot(nbr_emb, e), r))
+                                    })
+                                    .collect();
+                                scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+                                scored.truncate(m_max);
+                                *cell = scored.into_iter().map(|(_, r)| r).collect();
+                            }
+                        }
+                    }
+
+                    // CAS-update entry point if this node has a strictly higher level.
+                    let mut cur = el.load(Ordering::Relaxed);
+                    loop {
+                        if (*level as u32) <= cur { break; }
+                        match el.compare_exchange_weak(cur, *level as u32, Ordering::Relaxed, Ordering::Relaxed) {
+                            Ok(_) => { er.store(new_row, Ordering::Relaxed); break; }
+                            Err(v) => cur = v,
+                        }
+                    }
+                }));
+            }
+
+            // Drain this epoch's new nodes from locked_adj into self.hnsw/delta_hnsw so the
+            // next epoch's graph snapshot includes them for better plan-compute quality.
+            {
+                let target = if tier2 { &mut self.delta_hnsw } else { &mut self.hnsw };
+                for &id in chunk {
+                    let row = match id_to_row.get(&id) { Some(&r) => r as usize, None => continue };
+                    let mut layers: Vec<Vec<MemoryId>> = Vec::new();
+                    for layer in 0..MAXL {
+                        let cell = locked_adj[row * MAXL + layer].lock();
+                        if cell.is_empty() { break; }
+                        layers.push(cell.iter().filter_map(|&r| row_to_id.get(r as usize).copied()).collect());
+                    }
+                    if !layers.is_empty() { target.neighbors.insert(id, layers); }
+                }
+                // Update entry point in target.
+                let ep_r = entry_row.load(Ordering::Relaxed);
+                let ep_l = entry_lev.load(Ordering::Relaxed) as usize;
+                if ep_r != u32::MAX {
+                    let ep_id = row_to_id[ep_r as usize];
+                    match target.entry_point {
+                        None => target.entry_point = Some((ep_id, ep_l)),
+                        Some((_, cur_l)) if ep_l > cur_l => target.entry_point = Some((ep_id, ep_l)),
+                        _ => {}
+                    }
+                }
+            }
+
+            eprintln!(
+                "[hnsw] backfill epoch {}/{} done in {:.1}s ({} nodes)",
+                epoch_idx + 1, n_epochs, t0.elapsed().as_secs_f32(), chunk.len()
+            );
+        }
+
+        // ── 5. Final drain: existing nodes may have updated back-links in locked_adj.
+        // Write all non-empty adjacency from locked_adj to the target graph.
+        {
+            let delta_set: HashSet<MemoryId> = delta.iter().copied().collect();
+            let target = if tier2 { &mut self.delta_hnsw } else { &mut self.hnsw };
+            for (row, &id) in row_to_id.iter().enumerate() {
+                // Delta nodes were already drained per-epoch; only sync existing nodes here.
+                if delta_set.contains(&id) { continue; }
+                let mut layers: Vec<Vec<MemoryId>> = Vec::new();
+                for layer in 0..MAXL {
+                    let cell = locked_adj[row * MAXL + layer].lock();
+                    if cell.is_empty() { break; }
+                    layers.push(cell.iter().filter_map(|&r| row_to_id.get(r as usize).copied()).collect());
+                }
+                if !layers.is_empty() { target.neighbors.insert(id, layers); }
             }
         }
 

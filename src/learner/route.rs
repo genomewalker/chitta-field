@@ -42,11 +42,16 @@ impl RouteLearner {
             QueryIntent::Code,
         ];
         for intent in &intents {
-            // Hybrid: 5 successes, 2 failures → ~71% win rate head start
-            arms.insert((intent.clone(), Route::Hybrid), BetaPrior { alpha: 5.0, beta: 2.0 });
-            // Semantic: 3 successes, 1 failure → good for semantic intent
+            // Hybrid: ~71% prior — default best strategy
+            arms.insert((intent.clone(), Route::Hybrid),   BetaPrior { alpha: 5.0, beta: 2.0 });
+            // Semantic: ~75% prior — strong for focused queries
             arms.insert((intent.clone(), Route::Semantic), BetaPrior { alpha: 3.0, beta: 1.0 });
-            // Others start uniform (alpha=1, beta=1)
+            // Keyword/Temporal/Artifact/Full/Attractor: defeatist ~40% prior.
+            // Ablation showed these score 0.3–0.5 nDCG vs 0.85 for Hybrid/Semantic.
+            // Uniform (1,1) caused ~25% of queries to route here before feedback converged.
+            for route in &[Route::Keyword, Route::Temporal, Route::Artifact, Route::Full, Route::Attractor] {
+                arms.insert((intent.clone(), route.clone()), BetaPrior { alpha: 2.0, beta: 3.0 });
+            }
         }
         Self {
             arms,
