@@ -1588,6 +1588,10 @@ impl SemanticIndex {
         self.mem_coarse.clear();
         self.mem_lsh.clear();
         self.rebuild_ann();
+        // rebuild_ann() inserts into delta_hnsw (tier2 mode). Merge immediately so
+        // save_hnsw() writes a full base graph — otherwise every restart sees a 0-node
+        // base and triggers a mega-merge CPU storm on startup.
+        self.merge_delta_into_base();
         self.trim_deleted();
     }
 
