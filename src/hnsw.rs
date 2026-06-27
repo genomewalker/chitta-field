@@ -71,15 +71,29 @@ fn random_level_from_seed(seed: u64) -> usize {
 /// Thin two-source embedding accessor used by HnswGraph methods.
 /// Holds shared references to the heap HashMap and the mmap sidecar so callers
 /// can split-borrow the struct fields (heap/offsets/mmap immutably, hnsw mutably).
+///
+/// `arena` is an optional fast path: a row-major `Vec<f32>` buffer (produced by
+/// `backfill_hnsw_delta_parallel`) paired with an `id → row` index.  When set,
+/// `get()` checks it first — O(1) with no heap allocation and perfect cache
+/// locality for the bulk-build path.
 pub(crate) struct EmbLookup<'a> {
     pub heap:    &'a HashMap<MemoryId, Vec<f32>>,
     pub offsets: &'a HashMap<MemoryId, u64>,
     pub mmap:    &'a Option<std::sync::Arc<memmap2::Mmap>>,
+    /// Row-major flat arena: `buf[row * EMBED_DIM .. (row+1) * EMBED_DIM]`.
+    /// `None` for normal (non-backfill) lookups.
+    pub arena:   Option<(&'a [f32], &'a HashMap<MemoryId, usize>)>,
 }
 
 impl<'a> EmbLookup<'a> {
     #[inline]
     pub fn get(&self, id: MemoryId) -> Option<&'a [f32]> {
+        if let Some((buf, id_to_row)) = self.arena {
+            if let Some(&row) = id_to_row.get(&id) {
+                let start = row * EMBED_DIM;
+                return Some(&buf[start..start + EMBED_DIM]);
+            }
+        }
         if let Some(&off) = self.offsets.get(&id) {
             if let Some(ref mm) = self.mmap {
                 let start = off as usize;
@@ -591,12 +605,12 @@ impl SemanticIndex {
         eprintln!("[hnsw] backfill_hnsw_delta: inserting {} delta nodes", delta.len());
         for id in delta {
             let emb_owned = {
-                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
                 embs.get(id).map(|s| s.to_vec())
             };
             if let Some(emb) = emb_owned {
                 let tier2 = self.use_tier2();
-                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
                 if tier2 {
                     self.delta_hnsw.insert(id, &emb, &embs);
                 } else {
@@ -670,7 +684,7 @@ impl SemanticIndex {
         // Contiguous float buffer: arena[row * EMBED_DIM .. (row+1) * EMBED_DIM].
         let mut arena: Vec<f32> = vec![0.0f32; n_rows * EMBED_DIM];
         {
-            let lk = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+            let lk = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
             for (row, &id) in row_to_id_v.iter().enumerate() {
                 if let Some(e) = lk.get(id) {
                     arena[row * EMBED_DIM..(row + 1) * EMBED_DIM].copy_from_slice(e);
@@ -713,21 +727,17 @@ impl SemanticIndex {
             ep_init.map_or(0, |(_, l)| l as u32)
         ));
 
-        // Also keep a MemoryId-based snap_embs for EmbLookup compat with compute_insert_plan.
-        // This is the existing pattern; we still need it for the plan-compute phase.
-        let mut snap_embs_v: HashMap<MemoryId, Vec<f32>> =
-            HashMap::with_capacity(self.embeddings.len() + self.emb_offsets.len());
-        {
-            let lk = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
-            for (&id, v) in &self.embeddings { snap_embs_v.insert(id, v.clone()); }
-            for &id in self.emb_offsets.keys() {
-                if let Some(e) = lk.get(id) { snap_embs_v.entry(id).or_insert_with(|| e.to_vec()); }
-            }
+        // Static empty maps for the arena-only EmbLookup used in Phase A.
+        // 'static lifetime satisfies any 'a bound on EmbLookup<'a>.
+        fn empty_heap() -> &'static HashMap<MemoryId, Vec<f32>> {
+            static H: std::sync::OnceLock<HashMap<MemoryId, Vec<f32>>> = std::sync::OnceLock::new();
+            H.get_or_init(HashMap::new)
         }
-        let snap_embs = std::sync::Arc::new(snap_embs_v);
-
-        let empty_offsets: HashMap<MemoryId, u64> = HashMap::new();
-        let empty_mmap: Option<std::sync::Arc<memmap2::Mmap>> = None;
+        fn empty_offsets_ref() -> &'static HashMap<MemoryId, u64> {
+            static O: std::sync::OnceLock<HashMap<MemoryId, u64>> = std::sync::OnceLock::new();
+            O.get_or_init(HashMap::new)
+        }
+        static EMPTY_MMAP: Option<std::sync::Arc<memmap2::Mmap>> = None;
 
         // ── 4. Epoch loop ─────────────────────────────────────────────────────
         // Each epoch:
@@ -742,13 +752,19 @@ impl SemanticIndex {
             let graph_snap: HnswGraph = if tier2 { self.delta_hnsw.clone() } else { self.hnsw.clone() };
 
             // Phase A: parallel plan compute against frozen snapshot.
-            let se = snap_embs.clone();
+            // arena covers all n_rows nodes — no snap_embs clone needed.
+            let ar_a = arena.clone();
+            let i2r_a = id_to_row.clone();
             let plans: Vec<(MemoryId, usize, Vec<Vec<MemoryId>>)> = build_pool.install(|| {
                 chunk.par_iter()
                     .filter_map(|&id| {
-                        let emb = se.get(&id)?;
+                        let row = *i2r_a.get(&id)?;
+                        let emb = &ar_a[row * EMBED_DIM..(row + 1) * EMBED_DIM];
                         let level = random_level_from_seed(id);
-                        let lookup = EmbLookup { heap: &*se, offsets: &empty_offsets, mmap: &empty_mmap };
+                        let lookup = EmbLookup {
+                            heap: empty_heap(), offsets: empty_offsets_ref(), mmap: &EMPTY_MMAP,
+                            arena: Some((&*ar_a, &*i2r_a)),
+                        };
                         let plan = graph_snap.compute_insert_plan(emb, level, &lookup, EF_BULK);
                         Some((id, level, plan))
                     })
@@ -764,7 +780,6 @@ impl SemanticIndex {
                 let i2r   = id_to_row.clone();
                 let r2i   = row_to_id.clone();
                 let ar    = arena.clone();
-                let se2   = snap_embs.clone();
                 let er    = entry_row.clone();
                 let el    = entry_lev.clone();
 
@@ -792,17 +807,11 @@ impl SemanticIndex {
                             let mut cell = la[cell_idx].lock();
                             cell.push(new_row);
                             if cell.len() > m_max {
-                                // Shrink under lock: reads arena only (no nested lock).
+                                // Shrink under lock: arena covers all n_rows so no fallback needed.
                                 let mut scored: Vec<(f32, u32)> = cell.iter()
                                     .filter_map(|&r| {
-                                        let cid = *r2i.get(r as usize)?;
-                                        // Try arena first (fast, contiguous), fall back to snap_embs.
                                         let base = r as usize * EMBED_DIM;
-                                        let e = if base + EMBED_DIM <= ar.len() {
-                                            &ar[base..base + EMBED_DIM]
-                                        } else {
-                                            se2.get(&cid)?
-                                        };
+                                        let e = ar.get(base..base + EMBED_DIM)?;
                                         Some((dot(nbr_emb, e), r))
                                     })
                                     .collect();
@@ -900,11 +909,11 @@ impl SemanticIndex {
         for id in ids {
             if self.deleted.contains(&id) { continue; }
             let emb_owned = {
-                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
                 embs.get(id).map(|s| s.to_vec())
             };
             if let Some(emb) = emb_owned {
-                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
                 self.hnsw.insert(id, &emb, &embs);
             }
         }
@@ -968,7 +977,7 @@ impl SemanticIndex {
             .copied()
             .collect();
         let (sum, n) = {
-            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
             let mut sum = vec![0f64; dim];
             let mut n = 0u64;
             for id in ids {
@@ -1101,7 +1110,7 @@ impl SemanticIndex {
 
         if !self.inhibit_hnsw && self.use_hnsw() && embedding_ready && !realm_is_small {
             let emb = self.embeddings[&memory_id].clone();
-            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
             if self.use_tier2() {
                 self.delta_hnsw.insert(memory_id, &emb, &embs);
             } else {
@@ -1114,7 +1123,7 @@ impl SemanticIndex {
             if let Some(r) = realm {
                 if self.per_realm_counts.get(r).copied().unwrap_or(0) >= PER_REALM_HNSW_THRESHOLD {
                     let emb = self.embeddings[&memory_id].clone();
-                    let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                    let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
                     self.per_realm_hnsw.entry(r.to_string()).or_default().insert(memory_id, &emb, &embs);
                 }
             }
@@ -1204,7 +1213,7 @@ impl SemanticIndex {
             if let Some(r) = realm {
                 if let Some(graph) = self.per_realm_hnsw.get(r) {
                     if !graph.is_empty() {
-                        let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                        let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
                         let pairs = graph.search(&query_unit, k, None, &self.deleted, &embs);
                         return pairs.into_iter()
                             .map(|(memory_id, cosine_similarity)| SemanticHit { memory_id, cosine_similarity })
@@ -1297,7 +1306,7 @@ impl SemanticIndex {
         // In two-tier mode, search both base and delta graphs, merge by similarity.
         // Only when centering is disabled — the HNSW graph is built in raw cosine space.
         if self.centroid.is_empty() && self.use_hnsw() && (!self.hnsw.is_empty() || !self.delta_hnsw.is_empty()) {
-            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
             let mut pairs: Vec<(MemoryId, f32)> = if !self.hnsw.is_empty() {
                 self.hnsw.search(&query_unit, k, allowed, &self.deleted, &embs)
             } else {
@@ -1499,7 +1508,7 @@ impl SemanticIndex {
                 .chain(self.emb_offsets.keys())
                 .copied()
                 .collect();
-            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
             self.binary_codes = all_ids.iter()
                 .filter_map(|&id| embs.get(id).map(|e| (id, binarize_centered(e, &centroid))))
                 .collect();
@@ -1570,7 +1579,7 @@ impl SemanticIndex {
             .copied()
             .collect();
         {
-            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
             self.binary_codes = all_ids.iter()
                 .filter_map(|&id| embs.get(id).map(|e| (id, binarize_centered(e, &centroid))))
                 .collect();
@@ -2111,9 +2120,9 @@ impl SemanticIndex {
         ids.sort_unstable();
         let Some(&first) = ids.first() else { return };
         {
-            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
             if let Some(emb) = embs.get(first).map(|s| s.to_vec()) {
-                let embs2 = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap };
+                let embs2 = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
                 self.hnsw.insert(first, &emb, &embs2);
             }
         }
