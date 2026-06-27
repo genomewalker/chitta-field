@@ -997,10 +997,12 @@ impl ChittaField {
     /// non-deleted `process` memory in the `brahman` realm, parsed as JSON.
     /// Read-only — uses the existing kind/realm/payload indices, no QD archive.
     pub fn active_genome(&self) -> Option<serde_json::Value> {
-        let kind_members = self.kind_members.read();
-        let ids = kind_members.get("process")?;
-        let states = self.states.read();
+        let ids: Vec<MemoryId> = {
+            let kind_members = self.kind_members.read();
+            kind_members.get("process")?.iter().copied().collect()
+        };
         let payloads = self.payloads.read();
+        let states = self.states.read();
         let latest = ids
             .iter()
             .filter_map(|id| payloads.get(id).map(|p| (*id, p)))
