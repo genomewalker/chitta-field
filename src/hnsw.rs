@@ -1587,10 +1587,15 @@ impl SemanticIndex {
         self.delta_hnsw = HnswGraph::new();
         self.mem_coarse.clear();
         self.mem_lsh.clear();
+        // rebuild_ann() skips HNSW when centroid is non-empty (centered-query path gates
+        // it off). Temporarily clear centroid so the HNSW IS built here, then restore.
+        // Without this, save_hnsw() writes a 9-byte empty file and every daemon restart
+        // triggers a full 30-60 min rebuild from scratch.
+        let saved_centroid = std::mem::take(&mut self.centroid);
         self.rebuild_ann();
-        // rebuild_ann() inserts into delta_hnsw (tier2 mode). Merge immediately so
-        // save_hnsw() writes a full base graph — otherwise every restart sees a 0-node
-        // base and triggers a mega-merge CPU storm on startup.
+        self.centroid = saved_centroid;
+        // rebuild_ann() inserts into delta_hnsw (tier2 mode). Merge into base so
+        // save_hnsw() writes a complete graph — on next startup hnsw_valid=true → no rebuild.
         self.merge_delta_into_base();
         self.trim_deleted();
     }
