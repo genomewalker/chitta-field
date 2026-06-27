@@ -727,87 +727,67 @@ impl SemanticIndex {
             ep_init.map_or(0, |(_, l)| l as u32)
         ));
 
-        // Static empty maps for the arena-only EmbLookup used in Phase A.
-        // 'static lifetime satisfies any 'a bound on EmbLookup<'a>.
-        fn empty_heap() -> &'static HashMap<MemoryId, Vec<f32>> {
-            static H: std::sync::OnceLock<HashMap<MemoryId, Vec<f32>>> = std::sync::OnceLock::new();
-            H.get_or_init(HashMap::new)
-        }
-        fn empty_offsets_ref() -> &'static HashMap<MemoryId, u64> {
-            static O: std::sync::OnceLock<HashMap<MemoryId, u64>> = std::sync::OnceLock::new();
-            O.get_or_init(HashMap::new)
-        }
-        static EMPTY_MMAP: Option<std::sync::Arc<memmap2::Mmap>> = None;
-
         // ── 4. Epoch loop ─────────────────────────────────────────────────────
-        // Each epoch:
-        //   Phase A (parallel): compute insert plans against current self.hnsw snapshot.
-        //   Phase B (parallel): apply plans into locked_adj with per-(node,layer) locks.
-        // After each epoch, drain new nodes into self.hnsw so later epochs see a
-        // denser graph and compute better plans.
+        // Phase A: parallel plan-compute against a frozen row-native CSR snapshot —
+        //          no HashMap traversal, no per-search HashSet allocation.
+        // Phase B: parallel apply into locked_adj (row-native plans, no id→row lookups).
+        // Between epochs: rebuild CSR snapshot from locked_adj in O(N·M) — ~25 ms.
         let n_epochs = (delta.len() + EPOCH_SIZE - 1) / EPOCH_SIZE;
 
-        for (epoch_idx, chunk) in delta.chunks(EPOCH_SIZE).enumerate() {
-            // Clone the current authoritative graph for plan-compute (read-only snapshot).
-            let graph_snap: HnswGraph = if tier2 { self.delta_hnsw.clone() } else { self.hnsw.clone() };
+        // Initial snapshot seeded from existing graph edges already written to locked_adj.
+        let mut build_snap = BuildSnapshot::from_locked_adj(
+            &locked_adj, n_rows,
+            entry_row.load(Ordering::Relaxed),
+            entry_lev.load(Ordering::Relaxed) as u8,
+            MAXL,
+        );
 
-            // Phase A: parallel plan compute against frozen snapshot.
-            // arena covers all n_rows nodes — no snap_embs clone needed.
-            let ar_a = arena.clone();
+        for (epoch_idx, chunk) in delta.chunks(EPOCH_SIZE).enumerate() {
+            // Phase A: parallel plan compute against frozen CSR snapshot.
+            let ar_a  = arena.clone();
             let i2r_a = id_to_row.clone();
-            let plans: Vec<(MemoryId, usize, Vec<Vec<MemoryId>>)> = build_pool.install(|| {
+            let plans: Vec<(u32, usize, Vec<SmallVec<[u32; 32]>>)> = build_pool.install(|| {
                 chunk.par_iter()
-                    .filter_map(|&id| {
-                        let row = *i2r_a.get(&id)?;
-                        let emb = &ar_a[row * EMBED_DIM..(row + 1) * EMBED_DIM];
+                    .map_init(|| Scratch::new(n_rows), |scratch, &id| {
+                        let row = *i2r_a.get(&id)? as u32;
+                        let base = row as usize * EMBED_DIM;
+                        let emb = &ar_a[base..base + EMBED_DIM];
                         let level = random_level_from_seed(id);
-                        let lookup = EmbLookup {
-                            heap: empty_heap(), offsets: empty_offsets_ref(), mmap: &EMPTY_MMAP,
-                            arena: Some((&*ar_a, &*i2r_a)),
-                        };
-                        let plan = graph_snap.compute_insert_plan(emb, level, &lookup, EF_BULK);
-                        Some((id, level, plan))
+                        let plan = compute_insert_plan_rows(
+                            &build_snap, emb, level, &ar_a, scratch, MAXL, EF_BULK,
+                        );
+                        Some((row, level, plan))
                     })
+                    .filter_map(|x| x)
                     .collect()
             });
 
             // Phase B: parallel apply into locked_adj.
-            // Forward edges (own row): each plan writes its own row — no contention.
-            // Back-edges + shrink (neighbor rows): per-(node,layer) lock, parking_lot::Mutex.
-            // Shrink reads only the flat arena (read-only, no lock) + one locked cell — correct.
+            // Plans are row-native — no MemoryId lookups in the hot path.
             {
-                let la    = locked_adj.clone();
-                let i2r   = id_to_row.clone();
-                let r2i   = row_to_id.clone();
-                let ar    = arena.clone();
-                let er    = entry_row.clone();
-                let el    = entry_lev.clone();
+                let la = locked_adj.clone();
+                let ar = arena.clone();
+                let er = entry_row.clone();
+                let el = entry_lev.clone();
 
-                build_pool.install(|| plans.par_iter().for_each(|(id, level, per_layer)| {
-                    let new_row = match i2r.get(id) { Some(&r) => r, None => return };
-
+                build_pool.install(|| plans.par_iter().for_each(|(new_row, level, per_layer)| {
                     // Forward edges: write own adjacency layers.
                     for (layer, selected) in per_layer.iter().enumerate() {
                         if layer >= MAXL { break; }
-                        let nbr_rows: SmallVec<[u32; 32]> = selected.iter()
-                            .filter_map(|&nbr_id| i2r.get(&nbr_id).copied())
-                            .collect();
-                        *la[new_row as usize * MAXL + layer].lock() = nbr_rows;
+                        *la[*new_row as usize * MAXL + layer].lock() = selected.clone();
                     }
 
                     // Back-edges + shrink.
                     for (layer, selected) in per_layer.iter().enumerate() {
                         if layer >= MAXL { break; }
                         let m_max = if layer == 0 { HNSW_M0 } else { HNSW_M };
-                        for &nbr_id in selected {
-                            let nbr_row = match i2r.get(&nbr_id) { Some(&r) => r, None => continue };
+                        for &nbr_row in selected.iter() {
                             let nbr_base = nbr_row as usize * EMBED_DIM;
                             let nbr_emb = &ar[nbr_base..nbr_base + EMBED_DIM];
                             let cell_idx = nbr_row as usize * MAXL + layer;
                             let mut cell = la[cell_idx].lock();
-                            cell.push(new_row);
+                            cell.push(*new_row);
                             if cell.len() > m_max {
-                                // Shrink under lock: arena covers all n_rows so no fallback needed.
                                 let mut scored: Vec<(f32, u32)> = cell.iter()
                                     .filter_map(|&r| {
                                         let base = r as usize * EMBED_DIM;
@@ -827,39 +807,20 @@ impl SemanticIndex {
                     loop {
                         if (*level as u32) <= cur { break; }
                         match el.compare_exchange_weak(cur, *level as u32, Ordering::Relaxed, Ordering::Relaxed) {
-                            Ok(_) => { er.store(new_row, Ordering::Relaxed); break; }
+                            Ok(_) => { er.store(*new_row, Ordering::Relaxed); break; }
                             Err(v) => cur = v,
                         }
                     }
                 }));
             }
 
-            // Drain this epoch's new nodes from locked_adj into self.hnsw/delta_hnsw so the
-            // next epoch's graph snapshot includes them for better plan-compute quality.
-            {
-                let target = if tier2 { &mut self.delta_hnsw } else { &mut self.hnsw };
-                for &id in chunk {
-                    let row = match id_to_row.get(&id) { Some(&r) => r as usize, None => continue };
-                    let mut layers: Vec<Vec<MemoryId>> = Vec::new();
-                    for layer in 0..MAXL {
-                        let cell = locked_adj[row * MAXL + layer].lock();
-                        if cell.is_empty() { break; }
-                        layers.push(cell.iter().filter_map(|&r| row_to_id.get(r as usize).copied()).collect());
-                    }
-                    if !layers.is_empty() { target.neighbors.insert(id, layers); }
-                }
-                // Update entry point in target.
-                let ep_r = entry_row.load(Ordering::Relaxed);
-                let ep_l = entry_lev.load(Ordering::Relaxed) as usize;
-                if ep_r != u32::MAX {
-                    let ep_id = row_to_id[ep_r as usize];
-                    match target.entry_point {
-                        None => target.entry_point = Some((ep_id, ep_l)),
-                        Some((_, cur_l)) if ep_l > cur_l => target.entry_point = Some((ep_id, ep_l)),
-                        _ => {}
-                    }
-                }
-            }
+            // Rebuild CSR snapshot for next epoch — O(N·M), replaces HnswGraph clone + HashMap drain.
+            build_snap = BuildSnapshot::from_locked_adj(
+                &locked_adj, n_rows,
+                entry_row.load(Ordering::Relaxed),
+                entry_lev.load(Ordering::Relaxed) as u8,
+                MAXL,
+            );
 
             eprintln!(
                 "[hnsw] backfill epoch {}/{} done in {:.1}s ({} nodes)",
@@ -867,14 +828,11 @@ impl SemanticIndex {
             );
         }
 
-        // ── 5. Final drain: existing nodes may have updated back-links in locked_adj.
-        // Write all non-empty adjacency from locked_adj to the target graph.
+        // ── 5. Final drain: write all locked_adj rows to target (delta + existing).
+        // No mid-epoch drain means all rows are written here for the first time.
         {
-            let delta_set: HashSet<MemoryId> = delta.iter().copied().collect();
             let target = if tier2 { &mut self.delta_hnsw } else { &mut self.hnsw };
             for (row, &id) in row_to_id.iter().enumerate() {
-                // Delta nodes were already drained per-epoch; only sync existing nodes here.
-                if delta_set.contains(&id) { continue; }
                 let mut layers: Vec<Vec<MemoryId>> = Vec::new();
                 for layer in 0..MAXL {
                     let cell = locked_adj[row * MAXL + layer].lock();
@@ -882,6 +840,16 @@ impl SemanticIndex {
                     layers.push(cell.iter().filter_map(|&r| row_to_id.get(r as usize).copied()).collect());
                 }
                 if !layers.is_empty() { target.neighbors.insert(id, layers); }
+            }
+            let ep_r = entry_row.load(Ordering::Relaxed);
+            let ep_l = entry_lev.load(Ordering::Relaxed) as usize;
+            if ep_r != u32::MAX {
+                let ep_id = row_to_id[ep_r as usize];
+                match target.entry_point {
+                    None => target.entry_point = Some((ep_id, ep_l)),
+                    Some((_, cur_l)) if ep_l > cur_l => target.entry_point = Some((ep_id, ep_l)),
+                    _ => {}
+                }
             }
         }
 
@@ -2269,6 +2237,144 @@ impl SemanticIndex {
             }
         }
     }
+}
+
+// ── HNSW bulk-build helpers ───────────────────────────────────────────────────
+
+/// Flat CSR view of locked_adj — built after each Phase B for Phase A beam search.
+/// No HashMap, no MemoryId: all traversal uses u32 row indices into the flat arena.
+struct BuildSnapshot {
+    n_rows:      usize,
+    entry_row:   u32,   // u32::MAX when no entry point yet
+    entry_level: u8,
+    /// offsets[row * maxl + layer .. +1] indexes into nbrs
+    offsets:     Vec<u32>,
+    nbrs:        Vec<u32>,
+}
+
+impl BuildSnapshot {
+    fn from_locked_adj(
+        locked_adj: &[parking_lot::Mutex<SmallVec<[u32; 32]>>],
+        n_rows: usize,
+        entry_row: u32,
+        entry_level: u8,
+        maxl: usize,
+    ) -> Self {
+        let n_cells = n_rows * maxl;
+        let mut offsets = vec![0u32; n_cells + 1];
+        for i in 0..n_cells {
+            offsets[i + 1] = offsets[i] + locked_adj[i].lock().len() as u32;
+        }
+        let total = offsets[n_cells] as usize;
+        let mut nbrs = vec![0u32; total];
+        for i in 0..n_cells {
+            let cell = locked_adj[i].lock();
+            let start = offsets[i] as usize;
+            nbrs[start..start + cell.len()].copy_from_slice(&cell);
+        }
+        BuildSnapshot { n_rows, entry_row, entry_level, offsets, nbrs }
+    }
+
+    #[inline]
+    fn layer_neighbors(&self, row: u32, layer: usize, maxl: usize) -> &[u32] {
+        let base = row as usize * maxl + layer;
+        &self.nbrs[self.offsets[base] as usize..self.offsets[base + 1] as usize]
+    }
+}
+
+/// Per-thread scratch for bulk beam search — generation-mark visited set, no per-search alloc.
+struct Scratch {
+    visited: Vec<u32>,
+    gen:     u32,
+}
+impl Scratch {
+    fn new(n_rows: usize) -> Self { Scratch { visited: vec![0u32; n_rows], gen: 1 } }
+    fn reset(&mut self) {
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 { self.visited.fill(0); self.gen = 1; }
+    }
+    #[inline]
+    fn visit(&mut self, row: u32) -> bool {
+        let slot = &mut self.visited[row as usize];
+        if *slot == self.gen { return false; }
+        *slot = self.gen;
+        true
+    }
+}
+
+fn search_layer_rows(
+    snap: &BuildSnapshot,
+    query: &[f32],
+    entry_rows: &[u32],
+    ef: usize,
+    layer: usize,
+    arena: &[f32],
+    scratch: &mut Scratch,
+    maxl: usize,
+) -> Vec<u32> {
+    scratch.reset();
+    let mut candidates: BinaryHeap<(OrderedF32, u32)> = BinaryHeap::new();
+    let mut result: BinaryHeap<(OrderedF32, u32)> = BinaryHeap::new();
+    for &row in entry_rows {
+        if (row as usize) < snap.n_rows && scratch.visit(row) {
+            let base = row as usize * EMBED_DIM;
+            let sim = dot(query, &arena[base..base + EMBED_DIM]);
+            candidates.push((OrderedF32(sim), row));
+            result.push((OrderedF32(-sim), row));
+        }
+    }
+    while let Some((pos_score, crow)) = candidates.pop() {
+        if result.len() >= ef {
+            if let Some(&(OrderedF32(neg_worst), _)) = result.peek() {
+                if pos_score.0 < -neg_worst { break; }
+            }
+        }
+        for &nrow in snap.layer_neighbors(crow, layer, maxl) {
+            if (nrow as usize) < snap.n_rows && scratch.visit(nrow) {
+                let nb = nrow as usize * EMBED_DIM;
+                let sim = dot(query, &arena[nb..nb + EMBED_DIM]);
+                candidates.push((OrderedF32(sim), nrow));
+                result.push((OrderedF32(-sim), nrow));
+                while result.len() > ef { result.pop(); }
+            }
+        }
+    }
+    result.into_iter().map(|(_, r)| r).collect()
+}
+
+fn compute_insert_plan_rows(
+    snap: &BuildSnapshot,
+    emb: &[f32],
+    level: usize,
+    arena: &[f32],
+    scratch: &mut Scratch,
+    maxl: usize,
+    ef_bulk: usize,
+) -> Vec<SmallVec<[u32; 32]>> {
+    if snap.entry_row == u32::MAX {
+        return vec![SmallVec::new(); level + 1];
+    }
+    let current_top = snap.entry_level as usize;
+    let mut ep_set = vec![snap.entry_row];
+    // Greedy descent from top layer to level+1 (ef=1 for speed)
+    for layer in (level + 1..=current_top).rev() {
+        let next = search_layer_rows(snap, emb, &ep_set, 1, layer, arena, scratch, maxl);
+        if !next.is_empty() { ep_set = next; }
+    }
+    let mut plan: Vec<SmallVec<[u32; 32]>> = vec![SmallVec::new(); level + 1];
+    for layer in (0..=level.min(current_top)).rev() {
+        let candidates = search_layer_rows(snap, emb, &ep_set, ef_bulk, layer, arena, scratch, maxl);
+        let m = if layer == 0 { HNSW_M0 } else { HNSW_M };
+        let mut scored: Vec<(f32, u32)> = candidates.iter().map(|&r| {
+            let base = r as usize * EMBED_DIM;
+            (dot(emb, &arena[base..base + EMBED_DIM]), r)
+        }).collect();
+        scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        scored.truncate(m);
+        plan[layer] = scored.iter().map(|(_, r)| *r).collect();
+        ep_set = candidates;
+    }
+    plan
 }
 
 fn default_coarse_centroids() -> Vec<Vec<f32>> {
