@@ -521,6 +521,9 @@ impl ChittaField {
         // an old-vsid store's content + metadata (embeddings dropped → re_embed refills the
         // compiled vector space from content). OFF by default; never set in normal daemon operation.
         let migrate_reembed = std::env::var_os("CHITTA_MIGRATE_REEMBED").is_some();
+        // Like migrate_reembed for the shdr model-ID fence, but still loads .emb so
+        // ANN indices can be rebuilt from existing embeddings. For `chittad reindex`.
+        let reindex_mode = std::env::var_os("CHITTA_REINDEX_MODE").is_some();
         for candidate in &candidates {
             match FullSnapshot::load(candidate) {
                 Ok(mut snap) => {
@@ -604,7 +607,7 @@ impl ChittaField {
                                 );
                                 // accept: leave loaded_header = None → a fresh lineage is minted,
                                 // which also escapes the stale writer's reused family id.
-                            } else if !migrate_reembed {
+                            } else if !migrate_reembed && !reindex_mode {
                                 eprintln!(
                                     "[chitta-field] REFUSING snapshot {:?}: .shdr vector_space \
                                      (model={} dim={} tfv={}) != compiled (model={} dim={} tfv={}); \
@@ -614,6 +617,12 @@ impl ChittaField {
                                     crate::ops::TEXT_FORMAT_VERSION
                                 );
                                 continue;
+                            } else if reindex_mode {
+                                eprintln!(
+                                    "[chitta-field] [reindex] accepting foreign-vsid snapshot {:?} \
+                                     (model={} dim={} tfv={}) to rebuild ANN from existing embeddings",
+                                    candidate, hdr.model_id, hdr.embed_dim, hdr.text_format_version,
+                                );
                             } else {
                                 eprintln!(
                                     "[chitta-field] [migrate] accepting foreign-vsid snapshot {:?} (.shdr \
@@ -728,10 +737,12 @@ impl ChittaField {
         let mut replay_coactivation_stats = snapshot_coactivation_stats;
         triplet_store.correction_states = snap_correction_states;
         // Load embedding + binary-code sidecars, then HNSW — all before WAL replay.
-        if let Some(snap_path) = best_full_path.as_ref().filter(|_| !migrate_reembed) {
-            // [migrate] when CHITTA_MIGRATE_REEMBED is set, this whole block is skipped: the
-            // foreign-vector .emb/.bin/.mu/.hnsw sidecars are never loaded, so every memory has
-            // no embedding and re_embed refills the compiled vector space from content (.pld).
+        if let Some(snap_path) = best_full_path.as_ref().filter(|_| !migrate_reembed || reindex_mode) {
+            // [migrate] when CHITTA_MIGRATE_REEMBED is set (and not reindex_mode), this whole block
+            // is skipped: the foreign-vector .emb/.bin/.mu/.hnsw sidecars are never loaded, so every
+            // memory has no embedding and re_embed refills the compiled vector space from content (.pld).
+            // [reindex] CHITTA_REINDEX_MODE accepts the snapshot despite model-ID mismatch AND loads
+            // existing embeddings so force_reindex() can rebuild ANN indices from them.
             // .emb: flat binary embeddings (v10+). For v9 snapshots the sidecar won't exist
             // yet, so this is a no-op and embeddings remain populated from bincode.
             let emb_loaded = semantic_idx.load_embeddings_sidecar(&snap_path.with_extension("emb"));
