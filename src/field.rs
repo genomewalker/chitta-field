@@ -1438,10 +1438,28 @@ impl ChittaField {
         instance_id: crate::ids::InstanceId,
     ) -> HashMap<PathBuf, u64> {
         let path = Self::seen_offsets_path(data_dir, instance_id);
-        std::fs::read_to_string(&path)
+        if let Some(saved) = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        {
+            return saved;
+        }
+        // No saved file — this is a new instance_id (fresh restart). Seed seen_offsets
+        // from current segment file sizes so sync_foreign doesn't re-apply every op
+        // from the startup replay. Segments that exist now were fully replayed at startup;
+        // only bytes written AFTER this open() should be treated as new foreign ops.
+        let mut offsets = HashMap::new();
+        let seg_dir = data_dir.join("segments");
+        if let Ok(rd) = std::fs::read_dir(&seg_dir) {
+            for entry in rd.flatten() {
+                if entry.metadata().map(|m| m.is_file()).unwrap_or(false) {
+                    if let Ok(meta) = std::fs::metadata(entry.path()) {
+                        offsets.insert(entry.path(), meta.len());
+                    }
+                }
+            }
+        }
+        offsets
     }
 
     fn persist_seen_offsets(&self) {
