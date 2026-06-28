@@ -906,6 +906,23 @@ impl SemanticIndex {
         self.inhibit_hnsw = v;
     }
 
+    /// If the base HNSW is empty but the delta is not, promote delta→base so
+    /// save_hnsw() serialises the full graph.  Called on the snapshot clone
+    /// inside save_full_snapshot() — does NOT touch the live index.
+    pub fn promote_delta_to_base_if_empty(&mut self) {
+        if self.hnsw.is_empty() && !self.delta_hnsw.is_empty() {
+            std::mem::swap(&mut self.hnsw, &mut self.delta_hnsw);
+        }
+    }
+
+    /// Check whether an embedding exists without reading mmap data (no NFS I/O).
+    /// Use instead of get_embedding().is_some() when only presence is needed —
+    /// get_embedding() reads EMBED_DIM*4 bytes from an NFS-backed mmap, causing
+    /// one page fault per call (146k × ~1ms = 146s deadlock during snapshot clone).
+    pub fn has_embedding(&self, id: MemoryId) -> bool {
+        self.emb_offsets.contains_key(&id) || self.embeddings.contains_key(&id)
+    }
+
     /// Read-only access to an embedding by memory ID.
     pub fn get_embedding(&self, id: MemoryId) -> Option<&[f32]> {
         if let Some(&off) = self.emb_offsets.get(&id) {

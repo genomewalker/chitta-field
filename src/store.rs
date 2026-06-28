@@ -6169,20 +6169,50 @@ impl ChittaField {
         // preference blocks same-thread reacquisition). Production deadlock
         // 2026-06-11, caught by the deadlock-detection build.
         let payloads = {
-            // Tier order: payloads (1) → states (1) → semantic_idx (2).
-            // Exclude deleted memories so resurrected snapshots can't resurrect
-            // forgotten content — the snapshot is the canonical post-forget state.
+            // Phase 1: collect embedded IDs without holding payloads or states locks.
+            // Releasing semantic_idx.read() before acquiring payloads.read() prevents
+            // parking_lot write-preference from cascading across all three locks at once.
+            // ceiling: payloads.read() is still held during Phase 2 clone — put_memory
+            // writes will still queue, but the hold time is ~10x shorter (no embedding alloc).
+            // upgrade: Arc<MemoryPayload> in the store HashMap would make clone O(1).
+            let embedded_ids: std::collections::HashSet<MemoryId> = {
+                let idx = self.semantic_idx.read();
+                idx.all_ids().collect()
+            };
+
+            // Phase 2: clone payloads under payloads+states only (2 locks, not 3).
+            // Build MemoryPayload literals that skip embedding.clone() for HNSW-indexed
+            // memories: saves ~12KB × N transient Vec<f32> allocs inside the lock.
             let payloads_r = self.payloads.read();
             let states_r = self.states.read();
-            let idx = self.semantic_idx.read();
             payloads_r
                 .iter()
                 .filter(|(id, _)| !states_r.get(id).is_some_and(|s| s.deleted))
                 .map(|(id, p)| {
-                    let mut q = p.clone();
-                    if idx.get_embedding(*id).is_some() {
-                        q.embedding = Vec::new();
-                    }
+                    let q = MemoryPayload {
+                        embedding: if embedded_ids.contains(id) {
+                            Vec::new()
+                        } else {
+                            p.embedding.clone()
+                        },
+                        memory_id: p.memory_id,
+                        version: p.version,
+                        chunk_hash: p.chunk_hash,
+                        created_at_ms: p.created_at_ms,
+                        authored_at_ms: p.authored_at_ms,
+                        kind: p.kind.clone(),
+                        realm: p.realm.clone(),
+                        content: p.content.clone(),
+                        embedding_model: p.embedding_model.clone(),
+                        artifact_refs: p.artifact_refs.clone(),
+                        source_session: p.source_session.clone(),
+                        source_tool: p.source_tool.clone(),
+                        harness: p.harness.clone(),
+                        provenance: p.provenance.clone(),
+                        candidate: p.candidate,
+                        embedding_model_id: p.embedding_model_id.clone(),
+                        embedding_dim: p.embedding_dim,
+                    };
                     (*id, q)
                 })
                 .collect()
@@ -6230,7 +6260,7 @@ impl ChittaField {
         let interaction_ledger = self.interaction_ledger.read().clone();
         let predicate_store = self.predicate_store.read().clone();
         let recall_provenance = self.recall_provenance.read().clone();
-        let snap = FullSnapshot {
+        let mut snap = FullSnapshot {
             snapshot_seqno: seqno,
             payloads,
             states,
@@ -6289,6 +6319,9 @@ impl ChittaField {
             // Dirty-skip: if the index hasn't mutated since this instance's
             // last successful sidecar write, the files on disk are already
             // current — skip the ~800MB of rewrites (THEORY.md §8 Phase 2).
+            // Promote delta→base on the clone so save_hnsw() serialises the full
+            // graph.  The live index is untouched; only the snapshot clone is swapped.
+            snap.semantic_idx.promote_delta_to_base_if_empty();
             let idx = &snap.semantic_idx;
             let idx_mutations = idx.mutation_count();
             let last = self
@@ -6297,7 +6330,11 @@ impl ChittaField {
             // Existence guard on .emb only: the other sidecars are written
             // conditionally (empty HNSW/centroid produce no file), so their
             // absence matches the previous save rather than invalidating it.
-            let clean = last == idx_mutations && emb_path.exists();
+            // Exception: if the .hnsw on disk is a 9-byte stub (empty base, nodes
+            // are all in delta) the promote above has now swapped them — force a
+            // rewrite even if the mutation counter hasn't changed.
+            let hnsw_stub = hnsw_path.metadata().map(|m| m.len() <= 9).unwrap_or(true);
+            let clean = last == idx_mutations && emb_path.exists() && !hnsw_stub;
             if clean {
                 eprintln!("[chitta-field] index sidecars unchanged since last save — skipping rewrite");
             } else {
