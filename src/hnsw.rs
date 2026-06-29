@@ -1290,6 +1290,33 @@ impl SemanticIndex {
         if flat_max > 0 && self.total_embedding_count() <= flat_max {
             let center = std::env::var_os("CHITTA_FLAT_SCAN_RAW").is_none()
                 && self.centroid.len() == EMBED_DIM;
+            // Raw-cosine arm: turbovec inner-product == cosine over unit vectors.
+            // (Centered arm below stays scalar — turbovec can't reproduce .mu
+            // centering.) Over-fetch when an allowed/realm filter is present so
+            // post-hoc filtering still yields up to k survivors.
+            if !center {
+                if let Some(q) = normalize(query) {
+                    self.ensure_turbo();
+                    let guard = self.turbo.lock();
+                    if let Some(ts) = guard.as_ref() {
+                        let fetch = if allowed.is_some() { k.saturating_mul(4).max(k) } else { k };
+                        let res = ts.index.search(&q, fetch.min(ts.ids.len().max(1)));
+                        let mut hits: Vec<SemanticHit> = Vec::with_capacity(k);
+                        let idxs = res.indices_for_query(0);
+                        let scs = res.scores_for_query(0);
+                        for (row, sc) in idxs.iter().zip(scs.iter()) {
+                            if *row < 0 { continue; }
+                            let Some(&id) = ts.ids.get(*row as usize) else { continue; };
+                            if self.deleted.contains(&id) { continue; }
+                            if let Some(a) = allowed { if !a.contains(&id) { continue; } }
+                            if !sc.is_finite() { continue; }
+                            hits.push(SemanticHit { memory_id: id, cosine_similarity: *sc });
+                            if hits.len() >= k { break; }
+                        }
+                        return hits;
+                    }
+                }
+            }
             // Centered+normalized query (query_unit) when centering; else raw-normalized.
             let q_opt = if center { Some(query_unit.clone()) } else { normalize(query) };
             if let Some(q) = q_opt {
