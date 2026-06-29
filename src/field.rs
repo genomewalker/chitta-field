@@ -1459,6 +1459,15 @@ impl ChittaField {
                 }
             }
         }
+        // Persist immediately so the next restart loads from file (fast path)
+        // rather than re-scanning segment sizes.
+        if let Ok(json) = serde_json::to_string(&offsets) {
+            let path = Self::seen_offsets_path(data_dir, instance_id);
+            let tmp = path.with_extension("tmp");
+            if std::fs::write(&tmp, &json).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
         offsets
     }
 

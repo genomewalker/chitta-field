@@ -183,8 +183,8 @@ fn default_rare_entity_weight() -> f32 { 0.15 }
 fn default_recall_realm_cap_divisor() -> usize { 4 }
 fn default_rrf_k() -> f32 { 60.0 }
 fn default_use_rrf() -> bool { true }
-fn default_dam_beta() -> f32 { 2.0 }
-fn default_dam_steps() -> usize { 10 }
+fn default_dam_beta() -> f32 { 6.0 }
+fn default_dam_steps() -> usize { 2 }
 fn default_dam_fetch_mul() -> usize { 4 }
 fn default_surprise_domain_actual_weight() -> f32 { 0.15 }
 fn default_surprise_domain_expected_weight() -> f32 { 0.10 }
@@ -289,11 +289,11 @@ impl Default for ScoringConfig {
             use_rrf: true,
 
             // Field-RAG / Modern Hopfield
-            // β=2: soft attention for retrieval re-ranking (β=10 collapses to argmax
-            // in step 1, re-ranking by similarity to top-1 not query).
-            // Probe validated β=10 for attractor convergence (different use case).
-            dam_beta: 2.0,
-            dam_steps: 10,
+            // β=6, steps=2: grade-recall sweep shows β=2/steps=10 over-mixes (candidate
+            // centroid drift zeros out secondary gold). Higher β sharpens the attractor;
+            // fewer steps prevents drift-to-centroid. Sweep {4,5,6,8,10}×{1,2,3} to tune.
+            dam_beta: 6.0,
+            dam_steps: 2,
             dam_fetch_mul: 4,
 
             // Cortical SDR re-rank
