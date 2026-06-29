@@ -4,6 +4,9 @@ use crate::ops::EMBED_DIM;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use parking_lot::Mutex;
+use turbovec::TurboQuantIndex;
 use memmap2;
 use rayon::prelude::*;
 use smallvec::SmallVec;
@@ -458,6 +461,17 @@ pub struct SemanticHit {
     pub cosine_similarity: f32,
 }
 
+/// Lazily-built 4-bit TurboQuant index over the normalized embedding matrix.
+/// Rebuilt from heap/mmap embeddings whenever `built_at_mutation` lags
+/// `SemanticIndex::mutations`. NOT serialized (rebuilt on demand at startup).
+struct TurboState {
+    index: TurboQuantIndex,
+    /// turbovec row -> MemoryId (insertion order = add order).
+    ids: Vec<MemoryId>,
+    /// `mutations` value the index was built at; stale when it lags.
+    built_at_mutation: u64,
+}
+
 /// Approximate semantic index over normalized memory embeddings.
 ///
 /// Uses a coarse centroid assignment to generate candidate buckets, then exact
@@ -534,6 +548,11 @@ pub struct SemanticIndex {
     /// Byte offset of the f32×EMBED_DIM data for each memory in emb_mmap.
     #[serde(skip)]
     emb_offsets: HashMap<MemoryId, u64>,
+    /// Lazy 4-bit TurboQuant index for the flat-scan fallback path. Arc<Mutex>
+    /// so SemanticIndex stays Clone/Send/Sync and `&self` search can rebuild.
+    /// Never serialized; rebuilt on demand once total count >= HNSW_THRESHOLD.
+    #[serde(skip, default)]
+    turbo: Arc<Mutex<Option<TurboState>>>,
 }
 
 impl SemanticIndex {
@@ -560,6 +579,7 @@ impl SemanticIndex {
             per_id_realm: HashMap::new(),
             emb_mmap: None,
             emb_offsets: HashMap::new(),
+            turbo: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1020,6 +1040,39 @@ impl SemanticIndex {
     pub fn all_ids(&self) -> impl Iterator<Item = MemoryId> + '_ {
         self.embeddings.keys().copied()
             .chain(self.emb_offsets.keys().copied())
+    }
+
+    /// Ensure the lazy 4-bit TurboQuant index is current. Rebuilds from the
+    /// normalized embedding matrix when the cache is empty or its build
+    /// watermark lags `self.mutations`. No-op below HNSW_THRESHOLD or when the
+    /// embedding dim is incompatible with turbovec (dim % 8 != 0). Holds the
+    /// turbo Mutex only; safe under a shared `&self` borrow.
+    fn ensure_turbo(&self) {
+        if self.total_embedding_count() < HNSW_THRESHOLD {
+            return;
+        }
+        let mut guard = self.turbo.lock();
+        if guard.as_ref().map(|t| t.built_at_mutation == self.mutations).unwrap_or(false) {
+            return;
+        }
+        let mut index = match TurboQuantIndex::new(EMBED_DIM, 4) {
+            Ok(i) => i,
+            Err(_) => { *guard = None; return; }
+        };
+        let mut flat: Vec<f32> = Vec::with_capacity(self.total_embedding_count() * EMBED_DIM);
+        let mut ids: Vec<MemoryId> = Vec::with_capacity(self.total_embedding_count());
+        for id in self.all_ids() {
+            if self.deleted.contains(&id) { continue; }
+            let Some(emb) = self.get_embedding(id) else { continue; };
+            if emb.len() != EMBED_DIM { continue; }
+            let Some(unit) = normalize(emb) else { continue; };
+            flat.extend_from_slice(&unit);
+            ids.push(id);
+        }
+        if ids.is_empty() { *guard = None; return; }
+        index.add(&flat);
+        index.prepare();
+        *guard = Some(TurboState { index, ids, built_at_mutation: self.mutations });
     }
 
     /// Activate mmap mode: build offset index from .emb sidecar, then clear the heap HashMap.
