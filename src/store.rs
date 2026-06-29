@@ -3521,18 +3521,66 @@ impl ChittaField {
                 break;
             }
 
+            // Build a 4-bit TurboQuant index over the candidate submatrix once
+            // per hop. turbovec inner-product over unit vectors == cosine, which
+            // matches the scalar dots below (stored embs are unit). Used for the
+            // DAM energies (all candidates, k = n) and the final re-rank. Falls
+            // back to scalar when construction is unavailable (dim % 8 != 0).
+            let turbo: Option<(turbovec::TurboQuantIndex, Vec<usize>)> = (|| {
+                let n = embeddings.len();
+                if dim == 0 || dim % 8 != 0 { return None; }
+                let mut idx = turbovec::TurboQuantIndex::new(dim, 4).ok()?;
+                let mut flat = Vec::with_capacity(n * dim);
+                let mut row_hit: Vec<usize> = Vec::with_capacity(n);
+                for (i, emb) in &embeddings {
+                    let norm = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if norm < 1e-12 { return None; }
+                    flat.extend(emb.iter().map(|x| x / norm));
+                    row_hit.push(*i);
+                }
+                idx.add(&flat);
+                idx.prepare();
+                Some((idx, row_hit))
+            })();
+
             // T-step DAM relaxation.
             let mut s: Vec<f32> = query.clone();
             for _ in 0..steps {
+                // Energies = beta * (X · s). turbovec needs a unit query to
+                // return cosine; `s` is unit after the first step's renormalize,
+                // but the initial `s = query` may not be — normalize for scoring.
+                let n = embeddings.len();
+                let mut energies: Vec<f32> = vec![0.0; n];
                 let mut max_e = f32::NEG_INFINITY;
-                let energies: Vec<f32> = embeddings
-                    .iter()
-                    .map(|(_, emb)| {
-                        let e = beta * emb.iter().zip(s.iter()).map(|(&a, &b)| a * b).sum::<f32>();
-                        if e > max_e { max_e = e; }
-                        e
-                    })
-                    .collect();
+                let scored = turbo.as_ref().and_then(|(idx, row_hit)| {
+                    let sn = {
+                        let nrm = s.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        if nrm < 1e-12 { return None; }
+                        s.iter().map(|x| x / nrm).collect::<Vec<f32>>()
+                    };
+                    let res = idx.search(&sn, n);
+                    let idxs = res.indices_for_query(0);
+                    let scs = res.scores_for_query(0);
+                    for (row, sc) in idxs.iter().zip(scs.iter()) {
+                        if *row < 0 { continue; }
+                        // row indexes the submatrix; row_hit maps it to the
+                        // candidate slot (== position in `embeddings`).
+                        let pos = *row as usize;
+                        if let Some(slot) = row_hit.get(pos).copied() {
+                            // find energies position: energies is keyed by
+                            // embeddings-vec order, which equals row order.
+                            let _ = slot;
+                        }
+                        energies[pos] = beta * *sc;
+                    }
+                    Some(())
+                });
+                if scored.is_none() {
+                    for (j, (_, emb)) in embeddings.iter().enumerate() {
+                        energies[j] = beta * emb.iter().zip(s.iter()).map(|(&a, &b)| a * b).sum::<f32>();
+                    }
+                }
+                for &e in &energies { if e > max_e { max_e = e; } }
 
                 let sum_exp: f32 = energies.iter().map(|&e| (e - max_e).exp()).sum();
                 let weights: Vec<f32> =
@@ -3556,10 +3604,30 @@ impl ChittaField {
             }
 
             // Re-rank this hop's hits by cosine(s_T, X_j).
-            for (i, emb) in &embeddings {
-                let cos = emb.iter().zip(s.iter()).map(|(&a, &b)| a * b).sum::<f32>();
-                hits[*i].score = cos;
-                hits[*i].semantic_score = cos;
+            // cosine(s_T, X_j) via turbovec when available, else scalar.
+            let final_scored = turbo.as_ref().and_then(|(idx, _)| {
+                let nrm = s.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if nrm < 1e-12 { return None; }
+                let sn: Vec<f32> = s.iter().map(|x| x / nrm).collect();
+                let res = idx.search(&sn, embeddings.len());
+                let idxs = res.indices_for_query(0);
+                let scs = res.scores_for_query(0);
+                for (row, sc) in idxs.iter().zip(scs.iter()) {
+                    if *row < 0 { continue; }
+                    let pos = *row as usize;
+                    if let Some((i, _)) = embeddings.get(pos) {
+                        hits[*i].score = *sc;
+                        hits[*i].semantic_score = *sc;
+                    }
+                }
+                Some(())
+            });
+            if final_scored.is_none() {
+                for (i, emb) in &embeddings {
+                    let cos = emb.iter().zip(s.iter()).map(|(&a, &b)| a * b).sum::<f32>();
+                    hits[*i].score = cos;
+                    hits[*i].semantic_score = cos;
+                }
             }
             hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
             all_hits.extend(hits);
