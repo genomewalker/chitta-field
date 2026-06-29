@@ -1,7 +1,7 @@
 //! Offline TurboQuant A/B against the production .emb sidecar (read-only).
 //! Gold = exact f32 cosine. Compares latency, recall@10, and memory vs the
 //! current SemanticIndex search path. Run:
-//!   CHITTA_EMB_PATH=<...>.emb cargo test --release --features turbovec-bench \
+//!   CHITTA_EMB_PATH=<...>.emb cargo test --release \
 //!     turbovec_ab -- --ignored --nocapture
 
 use crate::hnsw::SemanticIndex;

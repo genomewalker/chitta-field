@@ -60,5 +60,5 @@ pub use state::MemoryState;
 pub use log::{ChainHash, ZERO_HASH};
 pub use store::FilterLevel;
 
-#[cfg(all(test, feature = "turbovec-bench"))]
+#[cfg(test)]
 mod turbovec_bench;
