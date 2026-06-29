@@ -3468,12 +3468,12 @@ impl ChittaField {
         Ok(stratify_recall_hits(temporal, k, reliability.as_ref()))
     }
 
-    /// Field-RAG / Modern Hopfield recall.
+    /// Field-RAG / Modern Hopfield recall with optional multi-hop expansion.
     ///
-    /// Runs T-step Dense Associative Memory relaxation over the HNSW candidate
-    /// submatrix: s(t+1) = X @ softmax(β · Xᵀs(t)), then re-ranks by cosine(s_T, X).
-    /// Validated (2026-06-23): β=5-10 surfaces memories HNSW misranks; 24/25 flips
-    /// on 5-query probe, target hit on "chaos nodes" at β=5 and β=10.
+    /// Each hop: fetch candidates via RRF, run T-step DAM relaxation over the
+    /// candidate submatrix (s(t+1) = X @ softmax(β·Xᵀs(t))), re-rank by cosine(s_T, X).
+    /// With dam_hops > 1: use s_T as the refined query vector for the next hop,
+    /// excluding already-fetched IDs. Final output is the union re-sorted by score.
     pub fn recall_field(
         &self,
         query_embedding: &[f32],
@@ -3481,79 +3481,98 @@ impl ChittaField {
         k: usize,
         realm: Option<&str>,
     ) -> Result<Vec<RecallHit>> {
-        let (beta, steps, fetch_mul) = {
+        let (beta, steps, fetch_mul, hops) = {
             let cfg = self.scoring_pipeline.read();
-            (cfg.config.dam_beta, cfg.config.dam_steps, cfg.config.dam_fetch_mul)
+            (cfg.config.dam_beta, cfg.config.dam_steps, cfg.config.dam_fetch_mul,
+             cfg.config.dam_hops.max(1))
         };
         let fetch_k = k.saturating_mul(fetch_mul).max(k);
-
-        // Get candidates via RRF (already the best retrieval we have).
-        let mut hits = self.recall_with_fallback(query_embedding, query_text, fetch_k, realm)?;
-        if hits.len() < 2 {
-            return Ok(hits.into_iter().take(k).collect());
-        }
-
-        // Collect embeddings for the candidate submatrix X. Lock once, clone needed.
-        let embeddings: Vec<(usize, Vec<f32>)> = {
-            let idx = self.semantic_idx.read();
-            hits.iter()
-                .enumerate()
-                .filter_map(|(i, h)| {
-                    idx.get_embedding(h.memory_id).map(|e| (i, e.to_vec()))
-                })
-                .collect()
-        };
-        if embeddings.len() < 2 {
-            return Ok(hits.into_iter().take(k).collect());
-        }
-
-        // T-step DAM relaxation (pure f32, no external crates).
         let dim = query_embedding.len();
-        let mut s: Vec<f32> = query_embedding.to_vec();
 
-        for _ in 0..steps {
-            // energies[j] = β · dot(X_j, s)
-            let mut max_e = f32::NEG_INFINITY;
-            let energies: Vec<f32> = embeddings
-                .iter()
-                .map(|(_, emb)| {
-                    let e = beta * emb.iter().zip(s.iter()).map(|(&a, &b)| a * b).sum::<f32>();
-                    if e > max_e { max_e = e; }
-                    e
-                })
-                .collect();
+        let mut all_hits: Vec<RecallHit> = Vec::new();
+        let mut query: Vec<f32> = query_embedding.to_vec();
 
-            // softmax (numerically stable)
-            let sum_exp: f32 = energies.iter().map(|&e| (e - max_e).exp()).sum();
-            let weights: Vec<f32> = energies.iter().map(|&e| (e - max_e).exp() / sum_exp).collect();
+        for _hop in 0..hops {
+            // Exclude IDs already collected in prior hops.
+            let seen: std::collections::HashSet<u64> =
+                all_hits.iter().map(|h| h.memory_id).collect();
 
-            // s_new = Σ weight_j · X_j
-            let mut s_new = vec![0.0f32; dim];
-            for (j, (_, emb)) in embeddings.iter().enumerate() {
-                let w = weights[j];
-                for (sn, &xv) in s_new.iter_mut().zip(emb.iter()) {
-                    *sn += w * xv;
-                }
+            let mut hits = self.recall_with_fallback(&query, query_text, fetch_k, realm)?;
+            if _hop > 0 {
+                hits.retain(|h| !seen.contains(&h.memory_id));
+            }
+            if hits.len() < 2 {
+                all_hits.extend(hits);
+                break;
             }
 
-            // normalize
-            let norm = s_new.iter().map(|&x| x * x).sum::<f32>().sqrt();
-            if norm < 1e-12 { break; }
-            for x in &mut s_new { *x /= norm; }
+            // Collect embeddings for the candidate submatrix X.
+            let embeddings: Vec<(usize, Vec<f32>)> = {
+                let idx = self.semantic_idx.read();
+                hits.iter()
+                    .enumerate()
+                    .filter_map(|(i, h)| {
+                        idx.get_embedding(h.memory_id).map(|e| (i, e.to_vec()))
+                    })
+                    .collect()
+            };
+            if embeddings.len() < 2 {
+                all_hits.extend(hits);
+                break;
+            }
 
-            let delta: f32 = s_new.iter().zip(s.iter()).map(|(&a, &b)| (a - b) * (a - b)).sum::<f32>().sqrt();
-            s = s_new;
-            if delta < 1e-6 { break; }
+            // T-step DAM relaxation.
+            let mut s: Vec<f32> = query.clone();
+            for _ in 0..steps {
+                let mut max_e = f32::NEG_INFINITY;
+                let energies: Vec<f32> = embeddings
+                    .iter()
+                    .map(|(_, emb)| {
+                        let e = beta * emb.iter().zip(s.iter()).map(|(&a, &b)| a * b).sum::<f32>();
+                        if e > max_e { max_e = e; }
+                        e
+                    })
+                    .collect();
+
+                let sum_exp: f32 = energies.iter().map(|&e| (e - max_e).exp()).sum();
+                let weights: Vec<f32> =
+                    energies.iter().map(|&e| (e - max_e).exp() / sum_exp).collect();
+
+                let mut s_new = vec![0.0f32; dim];
+                for (j, (_, emb)) in embeddings.iter().enumerate() {
+                    let w = weights[j];
+                    for (sn, &xv) in s_new.iter_mut().zip(emb.iter()) {
+                        *sn += w * xv;
+                    }
+                }
+
+                let norm = s_new.iter().map(|&x| x * x).sum::<f32>().sqrt();
+                if norm < 1e-12 { break; }
+                for x in &mut s_new { *x /= norm; }
+                let delta: f32 = s_new
+                    .iter().zip(s.iter()).map(|(&a, &b)| (a - b) * (a - b)).sum::<f32>().sqrt();
+                s = s_new;
+                if delta < 1e-6 { break; }
+            }
+
+            // Re-rank this hop's hits by cosine(s_T, X_j).
+            for (i, emb) in &embeddings {
+                let cos = emb.iter().zip(s.iter()).map(|(&a, &b)| a * b).sum::<f32>();
+                hits[*i].score = cos;
+                hits[*i].semantic_score = cos;
+            }
+            hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            all_hits.extend(hits);
+
+            // s_T becomes the query for the next hop.
+            query = s;
         }
 
-        // Re-rank by cosine(s_T, X_j).
-        for (i, emb) in &embeddings {
-            let cos = emb.iter().zip(s.iter()).map(|(&a, &b)| a * b).sum::<f32>();
-            hits[*i].score = cos;
-            hits[*i].semantic_score = cos;
-        }
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(hits.into_iter().take(k).collect())
+        // Merge: sort by score, dedup keeping highest, truncate.
+        all_hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        let mut seen = std::collections::HashSet::new();
+        all_hits.retain(|h| seen.insert(h.memory_id));
+        Ok(all_hits.into_iter().take(k).collect())
     }
 
     /// Recall memories associated with a file path (exact match).

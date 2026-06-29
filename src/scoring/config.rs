@@ -166,6 +166,11 @@ pub struct ScoringConfig {
     /// Candidate pool multiplier: fetch k * dam_fetch_mul candidates for DAM reranking.
     #[serde(default = "default_dam_fetch_mul")]
     pub dam_fetch_mul: usize,
+    /// Multi-hop count: after DAM relaxation produces s_T, use it as a new query for
+    /// additional retrieval passes (excluding already-fetched IDs). 1 = single-hop
+    /// (current behaviour). 2 = one extra hop using s_T as the refined query vector.
+    #[serde(default = "default_dam_hops")]
+    pub dam_hops: usize,
 
     // ── Cortical SDR re-rank (third RRF pass) ────────────────────────
     /// Enable cortical posting-index re-rank as a second RRF pass over the
@@ -186,6 +191,7 @@ fn default_use_rrf() -> bool { true }
 fn default_dam_beta() -> f32 { 6.0 }
 fn default_dam_steps() -> usize { 2 }
 fn default_dam_fetch_mul() -> usize { 4 }
+fn default_dam_hops() -> usize { 1 }
 fn default_surprise_domain_actual_weight() -> f32 { 0.15 }
 fn default_surprise_domain_expected_weight() -> f32 { 0.10 }
 fn default_epistemic_debt_boost() -> f32 { 1.1 }
@@ -295,6 +301,7 @@ impl Default for ScoringConfig {
             dam_beta: 6.0,
             dam_steps: 2,
             dam_fetch_mul: 4,
+            dam_hops: 1,
 
             // Cortical SDR re-rank
             use_cortical: false,
