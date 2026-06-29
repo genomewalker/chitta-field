@@ -6352,7 +6352,13 @@ impl ChittaField {
             // Exception: if the .hnsw on disk is a 9-byte stub (empty base, nodes
             // are all in delta) the promote above has now swapped them — force a
             // rewrite even if the mutation counter hasn't changed.
-            let hnsw_stub = hnsw_path.metadata().map(|m| m.len() <= 9).unwrap_or(true);
+            // Stub guard: only relevant when the HNSW graph has actual nodes
+            // (i.e. total_embedding_count >= HNSW_THRESHOLD and promote ran).
+            // Below the threshold the HNSW is intentionally not built and
+            // save_hnsw() legitimately writes a ≤9-byte stub — that is correct
+            // and must not force a sidecar rewrite.
+            let hnsw_stub = idx.hnsw_len() > 0
+                && hnsw_path.metadata().map(|m| m.len() <= 9).unwrap_or(false);
             let clean = last == idx_mutations && emb_path.exists() && !hnsw_stub;
             if clean {
                 eprintln!("[chitta-field] index sidecars unchanged since last save — skipping rewrite");
