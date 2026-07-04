@@ -41,15 +41,20 @@ const HNSW_ML: f64 = 0.36067; // 1/ln(16)
 // Below this, binary Hamming + linear scan (search_candidates) handles it.
 const PER_REALM_HNSW_THRESHOLD: usize = 500;
 
-// Flat scan disabled by default since 2026-06-11: the ANN path was validated
-// against flat at 154k memories — 20-40x faster (12.5s → 0.3-0.6s per recall;
-// CW-refresh searches drop from ~150ms to ~1ms, retiring the scan-convoy
-// class) with bit-identical LOCOMO retrieval F1 on every question and top-5
-// ranking parity on live probes. The historical regression this constant
-// guarded against ("relevant items buried at 3-34%") did not reproduce on
-// the matured graph + centering. Re-enable flat per-process with
-// CHITTA_FLAT_SCAN_MAX=<n> (stores ≤ n scan exhaustively) for A/B or rollback.
-pub(crate) const FLAT_SCAN_MAX: usize = 0;
+// Flat scan re-enabled by default 2026-07-04: the 2026-06-11 disable rested on
+// LOCOMO F1 parity, but GOLDEN_SET v6 (154 realm-scoped queries) shows the
+// binary-Hamming ANN path buries the true answer at rank 11-19 of 20 — the exact
+// "relevant items buried" regression the constant was meant to guard. Root cause:
+// hamming_candidates prefilters 108k memories to HAMMING_CANDIDATES=400 by lossy
+// 1-bit sign codes, so the gold routinely misses the rescore set (measured: gold
+// cosine 0.87, but sim=0.000 and rank 19 via the ANN path). mean nDCG@20 hybrid
+// 0.331 → 0.712 with exact scan. The 12.5s/recall that motivated the disable was
+// the SCALAR centered arm; the turbovec raw arm (default below) is exact-cosine,
+// SIMD-quantized, and fast (154-query eval runs in seconds, CW-refresh ~1ms) —
+// so re-enabling flat no longer reintroduces the scan-convoy. Above this cap the
+// binary ANN path still serves (a separate quality problem at that scale).
+// Override per-process with CHITTA_FLAT_SCAN_MAX=<n> (0 = force ANN path).
+pub(crate) const FLAT_SCAN_MAX: usize = 2_000_000;
 
 // .emb mmap activation threshold (field.rs): below this the embeddings stay
 // in the heap, so scans never fault on a page whose backing file a
@@ -1288,7 +1293,15 @@ impl SemanticIndex {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(FLAT_SCAN_MAX);
         if flat_max > 0 && self.total_embedding_count() <= flat_max {
-            let center = std::env::var_os("CHITTA_FLAT_SCAN_RAW").is_none()
+            // Default to the RAW turbovec arm: exact-cosine ranking parity with the
+            // centered scalar arm on GOLDEN_SET v6 (gold ranks #1 either way) but SIMD-fast
+            // instead of 8.5s/query, so it is viable as the standing recall path (and keeps
+            // CW-refresh's k=9 probes at ~1ms). Centering removes bge anisotropy but that
+            // buys no ranking gain here while forcing the scalar path — so it is opt-in via
+            // CHITTA_FLAT_SCAN_CENTER=1 for A/B. CHITTA_FLAT_SCAN_RAW retained as a no-op
+            // alias that also selects raw.
+            let center = std::env::var_os("CHITTA_FLAT_SCAN_CENTER").is_some()
+                && std::env::var_os("CHITTA_FLAT_SCAN_RAW").is_none()
                 && self.centroid.len() == EMBED_DIM;
             // Raw-cosine arm: turbovec inner-product == cosine over unit vectors.
             // (Centered arm below stays scalar — turbovec can't reproduce .mu
