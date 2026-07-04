@@ -752,14 +752,19 @@ impl ChittaField {
         }
 
         // Semantic novelty gate (Omni-SimpleMem selective ingestion):
-        // If a near-duplicate already exists (cosine_sim ≥ 0.88), skip storage and
-        // lightly reinforce the existing memory instead of creating a new node.
-        // Only deduplicates within the same realm — cross-realm near-matches must
-        // produce independent nodes to prevent silent cross-realm reinforcement.
+        // If a near-duplicate already exists (cosine_sim ≥ dedup_cosine_threshold,
+        // default 0.88), skip storage and lightly reinforce the existing memory
+        // instead of creating a new node. Only deduplicates within the same realm —
+        // cross-realm near-matches must produce independent nodes to prevent silent
+        // cross-realm reinforcement.
         if !embed_pending {
+            let (dedup_thresh, dedup_upper) = {
+                let cfg = &self.scoring_pipeline.read().config;
+                (cfg.dedup_cosine_threshold, cfg.dedup_cosine_upper)
+            };
             let neighbors = self.semantic_idx.read().search(embedding, 1, None, None);
             if let Some(top) = neighbors.first() {
-                if top.cosine_similarity >= 0.88 && top.cosine_similarity < 0.9999 {
+                if top.cosine_similarity >= dedup_thresh && top.cosine_similarity < dedup_upper {
                     let candidate_realm = self.payloads.read()
                         .get(&top.memory_id)
                         .map(|p| p.realm.clone())

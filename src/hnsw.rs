@@ -507,6 +507,11 @@ pub struct SemanticIndex {
     /// Over-bumping is safe (loses the skip, never correctness).
     #[serde(skip)]
     mutations: u64,
+    /// Writes/removes since the frozen centroid was last validated against the
+    /// live corpus mean (runtime-only; a restart just delays one drift check —
+    /// the centroid itself persists via the `.mu` sidecar).
+    #[serde(skip)]
+    centroid_stale_writes: u64,
     #[serde(skip)]
     lsh_planes: Vec<Vec<Vec<f32>>>,
     #[serde(skip)]
@@ -570,6 +575,7 @@ impl SemanticIndex {
             mem_coarse: HashMap::new(),
             centroid: Vec::new(),
             mutations: 0,
+            centroid_stale_writes: 0,
             lsh_planes: default_lsh_planes(),
             lsh_buckets: vec![HashMap::new(); LSH_TABLES],
             mem_lsh: HashMap::new(),
@@ -1030,6 +1036,78 @@ impl SemanticIndex {
         }
     }
 
+    /// Rebuild every sign-bit binary code (and the flat scan buffer) from the
+    /// current embeddings, centered against the current centroid. O(N·dim).
+    fn rebinarize_all(&mut self) {
+        let centroid = self.centroid.clone();
+        let all_ids: Vec<MemoryId> = self.embeddings.keys()
+            .chain(self.emb_offsets.keys())
+            .copied()
+            .collect();
+        {
+            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
+            self.binary_codes = all_ids.iter()
+                .filter_map(|&id| embs.get(id).map(|e| (id, binarize_centered(e, &centroid))))
+                .collect();
+        }
+        self.binary_vec.clear();
+        self.binary_vec_pos.clear();
+        for (id, codes) in &self.binary_codes {
+            let arr: [u64; BINARY_WORDS] = codes[..BINARY_WORDS].try_into().unwrap_or([0u64; BINARY_WORDS]);
+            self.binary_vec_pos.insert(*id, self.binary_vec.len());
+            self.binary_vec.push((*id, arr));
+        }
+    }
+
+    /// Centroid-drift maintenance for the centered binary-Hamming path.
+    ///
+    /// Codes and queries are centered against the SAME frozen centroid, so they
+    /// never disagree with each other — but as the corpus drifts, the frozen mean
+    /// loses its anisotropy-correction power and Hamming distance decorrelates
+    /// from cosine (recall decay at >FLAT_SCAN_MAX scale). Called from
+    /// upsert()/remove(): O(1) until ~10% of the corpus has churned (min 512;
+    /// env CHITTA_CENTROID_REBUILD_WRITES), then one O(N·dim) mean recompute.
+    /// Codes are re-binarized (second O(N·dim) pass) only when the fresh mean
+    /// actually diverges (cos < 0.995; env CHITTA_CENTROID_DRIFT_COS) — below
+    /// that the frozen centroid is kept and codes stay byte-identical.
+    fn maybe_refresh_centroid(&mut self) {
+        if self.centroid.len() != EMBED_DIM {
+            return; // centering disabled — raw sign codes never drift
+        }
+        self.centroid_stale_writes += 1;
+        if self.inhibit_hnsw {
+            return; // WAL replay — defer to the first post-replay write
+        }
+        let trigger = std::env::var("CHITTA_CENTROID_REBUILD_WRITES").ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| ((self.total_embedding_count() / 10) as u64).max(512));
+        if self.centroid_stale_writes < trigger {
+            return;
+        }
+        self.centroid_stale_writes = 0;
+        let frozen = std::mem::take(&mut self.centroid);
+        self.compute_centroid();
+        if self.centroid.len() != frozen.len() {
+            self.centroid = frozen; // degenerate corpus — keep the frozen mean
+            return;
+        }
+        let denom = l2_norm(&frozen) * l2_norm(&self.centroid);
+        let cos = if denom > 1e-12 { dot(&frozen, &self.centroid) / denom } else { 0.0 };
+        let gate = std::env::var("CHITTA_CENTROID_DRIFT_COS").ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.995);
+        if cos >= gate {
+            eprintln!("[hnsw] centroid drift check: cos={:.4} >= {:.4} — keeping frozen mean", cos, gate);
+            self.centroid = frozen; // negligible drift — existing codes stay valid
+            return;
+        }
+        eprintln!(
+            "[hnsw] centroid drift cos={:.4} < {:.4} — adopting fresh mean, re-binarizing {} codes",
+            cos, gate, self.total_embedding_count()
+        );
+        self.rebinarize_all();
+    }
+
     /// True if this memory has a usable (non-zero norm) embedding in the index.
     /// Returns false for missing, zero-vector, or NaN embeddings — those score 0.0
     /// against every query and need to be re-embedded.
@@ -1178,6 +1256,8 @@ impl SemanticIndex {
                 }
             }
         }
+
+        self.maybe_refresh_centroid();
     }
 
     /// Mark a memory as deleted — excluded from future search results.
@@ -1234,6 +1314,8 @@ impl SemanticIndex {
                 }
             }
         }
+
+        self.maybe_refresh_centroid();
     }
 
     /// Search for k nearest neighbours to `query` by cosine similarity.
@@ -1658,24 +1740,8 @@ impl SemanticIndex {
         // derive binary codes in the centered space so the Hamming prefilter and cosine
         // rerank agree. Cloned out to avoid borrowing self while mutating binary_codes.
         self.compute_centroid();
-        let centroid = self.centroid.clone();
-        let all_ids: Vec<MemoryId> = self.embeddings.keys()
-            .chain(self.emb_offsets.keys())
-            .copied()
-            .collect();
-        {
-            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
-            self.binary_codes = all_ids.iter()
-                .filter_map(|&id| embs.get(id).map(|e| (id, binarize_centered(e, &centroid))))
-                .collect();
-        }
-        self.binary_vec.clear();
-        self.binary_vec_pos.clear();
-        for (id, codes) in &self.binary_codes {
-            let arr: [u64; BINARY_WORDS] = codes[..BINARY_WORDS].try_into().unwrap_or([0u64; BINARY_WORDS]);
-            self.binary_vec_pos.insert(*id, self.binary_vec.len());
-            self.binary_vec.push((*id, arr));
-        }
+        self.centroid_stale_writes = 0;
+        self.rebinarize_all();
         // Clear graphs so rebuild_ann's hnsw_valid check fails and forces a full rebuild.
         self.hnsw = HnswGraph::new();
         self.delta_hnsw = HnswGraph::new();
