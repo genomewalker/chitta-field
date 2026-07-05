@@ -1209,8 +1209,9 @@ impl ChittaField {
         // Snapshot (id, realm, text) under the payloads read-lock, then release it
         // before taking the span_store write-lock to avoid holding both at once.
         let snapshot: Vec<(u64, String, String)> = {
-            let states = self.states.read();
+            // payloads is ordered before states — acquire in that order (lock-order audit).
             let payloads = self.payloads.read();
+            let states = self.states.read();
             payloads
                 .iter()
                 .filter(|(id, _)| states.get(id).map(|s| !s.deleted).unwrap_or(false))
