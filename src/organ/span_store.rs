@@ -689,10 +689,11 @@ impl SpanStore {
             if e.text.is_empty() {
                 continue; // tombstone (GC'd span awaiting compaction)
             }
-            // realm scoping at source
-            let occ = match realm_filter {
+            // realm scoping at source; capture the per-realm occurrence count so a
+            // scoped query reports in-realm frequency, not the global total.
+            let occ: Option<(u16, u32)> = match realm_filter {
                 Some(rid) => match e.realms.iter().find(|r| r.realm_id == rid) {
-                    Some(_) => Some(rid),
+                    Some(ro) => Some((rid, ro.count)),
                     None => continue,
                 },
                 None => None,
@@ -747,7 +748,7 @@ impl SpanStore {
             hits.push(SpanHit {
                 text: e.text.clone(),
                 class: e.class,
-                count: e.count,
+                count: occ.map(|(_, c)| c).unwrap_or(e.count),
                 last_ms: e.last_ms,
                 realm: loc_realm,
                 session,
