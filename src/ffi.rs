@@ -9248,3 +9248,117 @@ pub extern "C" fn cf_cw_refresh_sweep(h: *mut CfHandle, budget: usize) -> i64 {
     let handle = unsafe { &*h };
     handle.field.cw_refresh_sweep(budget) as i64
 }
+
+// ── Span Lane FFI ───────────────────────────────────────────────────────────
+
+/// Query the span lane. Returns a JSON array of {text,class,count,last_ms,realm,
+/// session,line,score}. `realm` NULL/empty = unscoped. No GPU, no LLM. Free with
+/// cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_span_query(
+    h: *mut CfHandle,
+    query: *const c_char,
+    realm: *const c_char,
+    k: usize,
+) -> *mut c_char {
+    if h.is_null() || query.is_null() {
+        return json_null("cf_span_query: null argument");
+    }
+    let handle = unsafe { &*h };
+    let q = unsafe { match CStr::from_ptr(query).to_str() { Ok(s)=>s, Err(_)=>return json_null("cf_span_query: bad utf8") } };
+    let realm_s = if realm.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(realm).to_str().ok().filter(|s| !s.is_empty()) }
+    };
+    let hits = handle.field.span_query(q, realm_s, if k == 0 { 6 } else { k });
+    let arr: Vec<serde_json::Value> = hits.into_iter().map(|(text, class, count, last_ms, realm, session, line, score, memory_ids)| {
+        serde_json::json!({
+            "text": text, "class": class, "count": count, "last_ms": last_ms,
+            "realm": realm, "session": session, "line": line, "score": score,
+            "memory_ids": memory_ids,
+        })
+    }).collect();
+    match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
+        Ok(s) => s.into_raw(),
+        Err(e) => json_null(format!("cf_span_query: {e}")),
+    }
+}
+
+/// Forward edge: verbatim atoms a recalled memory references. JSON array of
+/// {text,class,count,realm}. Free with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_span_for_memory(h: *mut CfHandle, memory_id: u64, k: usize) -> *mut c_char {
+    if h.is_null() { return json_null("cf_span_for_memory: null argument"); }
+    let handle = unsafe { &*h };
+    let atoms = handle.field.span_for_memory(memory_id, if k == 0 { 6 } else { k });
+    let arr: Vec<serde_json::Value> = atoms.into_iter().map(|(text, class, count, realm)| {
+        serde_json::json!({ "text": text, "class": class, "count": count, "realm": realm })
+    }).collect();
+    match CString::new(serde_json::to_string(&arr).unwrap_or_default()) {
+        Ok(s) => s.into_raw(),
+        Err(e) => json_null(format!("cf_span_for_memory: {e}")),
+    }
+}
+
+/// Link one memory's text into the span store (idempotent). Returns new spans.
+#[no_mangle]
+pub extern "C" fn cf_span_ingest_memory(
+    h: *mut CfHandle,
+    memory_id: u64,
+    text: *const c_char,
+    realm: *const c_char,
+) -> i64 {
+    if h.is_null() || text.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let t = unsafe { match CStr::from_ptr(text).to_str() { Ok(s)=>s, Err(_)=>return -1 } };
+    let r = if realm.is_null() { "brahman" } else {
+        unsafe { CStr::from_ptr(realm).to_str().unwrap_or("brahman") }
+    };
+    handle.field.span_ingest_memory(memory_id, t, r) as i64
+}
+
+/// Backfill the memory→span edge over all live memories. Returns JSON
+/// {linked,new_spans}.
+#[no_mangle]
+pub extern "C" fn cf_span_backfill_memories(h: *mut CfHandle) -> *mut c_char {
+    if h.is_null() { return json_null("cf_span_backfill_memories: null argument"); }
+    let handle = unsafe { &*h };
+    let (linked, new_spans) = handle.field.span_backfill_memories();
+    let s = format!("{{\"linked\":{linked},\"new_spans\":{new_spans}}}");
+    match CString::new(s) { Ok(cs)=>cs.into_raw(), Err(e)=>json_null(format!("cf_span_backfill_memories: {e}")) }
+}
+
+/// Full backfill over `projects_dir`. Returns JSON {unique,new,redacted}.
+#[no_mangle]
+pub extern "C" fn cf_span_backfill(h: *mut CfHandle, projects_dir: *const c_char) -> *mut c_char {
+    if h.is_null() || projects_dir.is_null() {
+        return json_null("cf_span_backfill: null argument");
+    }
+    let handle = unsafe { &*h };
+    let dir = unsafe { match CStr::from_ptr(projects_dir).to_str() { Ok(s)=>s, Err(_)=>return json_null("cf_span_backfill: bad utf8") } };
+    let (unique, new, redacted) = handle.field.span_backfill(std::path::Path::new(dir));
+    let s = format!("{{\"unique\":{unique},\"new\":{new},\"redacted\":{redacted}}}");
+    match CString::new(s) { Ok(cs)=>cs.into_raw(), Err(e)=>json_null(format!("cf_span_backfill: {e}")) }
+}
+
+/// Incrementally ingest one transcript file. Returns count of new atoms.
+#[no_mangle]
+pub extern "C" fn cf_span_ingest(h: *mut CfHandle, transcript_path: *const c_char) -> i64 {
+    if h.is_null() || transcript_path.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let p = unsafe { match CStr::from_ptr(transcript_path).to_str() { Ok(s)=>s, Err(_)=>return -1 } };
+    handle.field.span_ingest_transcript(std::path::Path::new(p)) as i64
+}
+
+/// Returns JSON {unique,disk_bytes,redacted_total}.
+#[no_mangle]
+pub extern "C" fn cf_span_stats(h: *mut CfHandle) -> *mut c_char {
+    if h.is_null() { return json_null("cf_span_stats: null argument"); }
+    let handle = unsafe { &*h };
+    let (unique, disk, redacted) = handle.field.span_stats();
+    let s = format!("{{\"unique\":{unique},\"disk_bytes\":{disk},\"redacted_total\":{redacted}}}");
+    match CString::new(s) { Ok(cs)=>cs.into_raw(), Err(e)=>json_null(format!("cf_span_stats: {e}")) }
+}

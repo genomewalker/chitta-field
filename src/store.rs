@@ -1158,6 +1158,106 @@ impl ChittaField {
         Ok(())
     }
 
+    // ── Span Lane (verbatim transcript atoms) ──────────────────────────────────
+
+    /// Query the span lane. No embedding, no GPU, no LLM. `realm=None` is
+    /// unscoped; a realm that has no atoms returns empty (no cross-project leak).
+    /// Returns (text, class, count, last_ms, realm, session, line, score,
+    /// memory_ids) tuples. `memory_ids` is the reverse edge — beliefs referencing
+    /// this atom — so a matched span can jump to the memories that mention it.
+    pub fn span_query(
+        &self,
+        query: &str,
+        realm: Option<&str>,
+        k: usize,
+    ) -> Vec<(String, u8, u32, i64, String, String, u32, f32, Vec<u64>)> {
+        self.span_store
+            .write()
+            .query(query, realm, k)
+            .into_iter()
+            .map(|h| {
+                (h.text, h.class, h.count, h.last_ms, h.realm, h.session, h.line, h.score, h.memory_ids)
+            })
+            .collect()
+    }
+
+    /// Forward edge: the verbatim atoms a recalled memory's text references.
+    /// Returns (text, class, count, realm) tuples, most-distinctive first.
+    pub fn span_for_memory(&self, memory_id: u64, k: usize) -> Vec<(String, u8, u32, String)> {
+        self.span_store
+            .read()
+            .spans_for_memory(memory_id, k)
+            .into_iter()
+            .map(|h| (h.text, h.class, h.count, h.realm))
+            .collect()
+    }
+
+    /// Link one memory's text into the span store (idempotent by content hash).
+    pub fn span_ingest_memory(&self, memory_id: u64, text: &str, realm: &str) -> u64 {
+        let mut s = self.span_store.write();
+        let stats = s.ingest_memory(memory_id, text, realm);
+        if stats.new_spans > 0 {
+            s.save();
+        }
+        stats.new_spans
+    }
+
+    /// Backfill the memory→span edge over every live memory. Idempotent: a
+    /// memory whose text is unchanged since last link is skipped. Returns
+    /// (memories_linked, new_spans).
+    pub fn span_backfill_memories(&self) -> (u64, u64) {
+        // Snapshot (id, realm, text) under the payloads read-lock, then release it
+        // before taking the span_store write-lock to avoid holding both at once.
+        let snapshot: Vec<(u64, String, String)> = {
+            let states = self.states.read();
+            let payloads = self.payloads.read();
+            payloads
+                .iter()
+                .filter(|(id, _)| states.get(id).map(|s| !s.deleted).unwrap_or(false))
+                .map(|(id, p)| {
+                    (*id, p.realm.clone(), String::from_utf8_lossy(&p.content).into_owned())
+                })
+                .collect()
+        };
+        let mut linked = 0u64;
+        let mut new_spans = 0u64;
+        {
+            let mut s = self.span_store.write();
+            for (id, realm, text) in &snapshot {
+                let stats = s.ingest_memory(*id, text, realm);
+                new_spans += stats.new_spans;
+                if s.has_memory_link(*id) {
+                    linked += 1;
+                }
+            }
+            s.save();
+        }
+        (linked, new_spans)
+    }
+
+    /// Incrementally ingest one transcript from its watermark. Idempotent.
+    pub fn span_ingest_transcript(&self, path: &std::path::Path) -> u64 {
+        let mut s = self.span_store.write();
+        let stats = s.ingest_transcript(path);
+        if stats.new_spans > 0 {
+            s.save();
+        }
+        stats.new_spans
+    }
+
+    /// Full backfill over a projects dir. Returns (unique_total, new, redacted).
+    pub fn span_backfill(&self, projects_dir: &std::path::Path) -> (usize, u64, u64) {
+        let mut s = self.span_store.write();
+        let stats = s.ingest_dir(projects_dir);
+        (s.len(), stats.new_spans, stats.redacted)
+    }
+
+    /// (unique_total, on_disk_bytes, redacted_total).
+    pub fn span_stats(&self) -> (usize, u64, u64) {
+        let s = self.span_store.read();
+        (s.len(), s.on_disk_bytes(), s.redacted_total())
+    }
+
     // ── Soul REPL session persistence ──────────────────────────────────────────
 
     pub fn repl_session_get(&self, id: &str) -> Option<String> {
@@ -1354,6 +1454,16 @@ impl ChittaField {
         self.coactivation_stats
             .write()
             .retain(|(a, b), _| *a != memory_id && *b != memory_id);
+
+        // Span edge: drop this memory's atom links. A span survives if still
+        // referenced by a transcript locator or another memory; it is GC'd only
+        // when its refcount hits zero. O(this memory's spans), not a full scan.
+        {
+            let mut s = self.span_store.write();
+            if s.unlink_memory(memory_id) > 0 {
+                s.save();
+            }
+        }
 
         // Clear payload content bytes to reclaim memory (keep state/metadata).
         if let Some(p) = self.payloads.write().get_mut(&memory_id) {

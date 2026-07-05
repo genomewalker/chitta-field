@@ -227,6 +227,9 @@ pub struct ChittaField {
     pub(crate) ack_scores: RwLock<HashMap<MemoryId, i32>>,
     /// Soul REPL session namespaces — persisted to repl_sessions.json (not in snapshot).
     pub(crate) repl_sessions: RwLock<crate::repl_sessions::ReplSessionStore>,
+    /// Span Lane — verbatim transcript atoms; persisted to spans.bin (not in
+    /// snapshot; rebuilt on write, decay-immune by construction).
+    pub(crate) span_store: RwLock<crate::organ::span_store::SpanStore>,
     /// Hyperdimensional Computing index — O(n) Hamming recall, no floats.
     pub(crate) hdc_idx:    RwLock<crate::hdc::HdcStore>,
     pub(crate) event_tape:   RwLock<crate::organ::event_tape::EventTape>,
@@ -1055,6 +1058,7 @@ impl ChittaField {
         let loaded_seen_offsets = Self::load_seen_offsets(&data_dir, instance_id);
         let scoring_config = crate::scoring::config::ScoringConfig::load(&data_dir);
         let loaded_repl_sessions = crate::repl_sessions::ReplSessionStore::load(&data_dir);
+        let loaded_span_store = crate::organ::span_store::SpanStore::load(&data_dir);
 
         // Build HDC index — load from sidecar if available (fast path), else rebuild.
         let mut hdc_store = crate::hdc::HdcStore::new();
@@ -1212,6 +1216,7 @@ impl ChittaField {
             kind_stats:  RwLock::new(HashMap::new()),
             ack_scores:  RwLock::new(snap_ack_scores),
             repl_sessions: RwLock::new(loaded_repl_sessions),
+            span_store: RwLock::new(loaded_span_store),
             pending_recall: Mutex::new(PendingRecallEffects::default()),
             coactivation_stats: RwLock::new({
                 let mut cs = replay_coactivation_stats;
