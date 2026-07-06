@@ -3467,6 +3467,41 @@ impl ChittaField {
         k: usize,
         realm: Option<&str>,
     ) -> Result<Vec<RecallHit>> {
+        self.recall_with_fallback_windowed(query_embedding, query_text, k, realm, None)
+    }
+
+    /// Time-windowed hybrid recall: the window GATES candidates (authored_at_ms
+    /// membership in time_idx), semantic relevance still RANKS. Never
+    /// recency-sorts — recency-ordered temporal recall floods context with
+    /// operationally-fresh noise (stored correction). window=None is exactly
+    /// recall_with_fallback.
+    pub fn recall_with_fallback_windowed(
+        &self,
+        query_embedding: &[f32],
+        query_text: &str,
+        k: usize,
+        realm: Option<&str>,
+        window: Option<(i64, i64)>,
+    ) -> Result<Vec<RecallHit>> {
+        // Window membership set, built from the temporal B-tree and dropped
+        // before any lane runs (taken alone: no lock-ordering pair created).
+        let allowed: Option<std::collections::HashSet<MemoryId>> = window.map(|(f, t)| {
+            self.time_idx
+                .read()
+                .range_query(f, t, realm, usize::MAX)
+                .into_iter()
+                .map(|e| e.memory_id)
+                .collect()
+        });
+        let gate = |v: Vec<RecallHit>| -> Vec<RecallHit> {
+            match &allowed {
+                Some(a) => v.into_iter().filter(|h| a.contains(&h.memory_id)).collect(),
+                None => v,
+            }
+        };
+        // Windowed queries over-fetch harder: the gate discards out-of-window
+        // candidates, so lanes need more raw width to fill k.
+        let window_mul: usize = if window.is_some() { 2 } else { 1 };
         // Stratified recall: cap any one realm on UNSCOPED queries so a dominant
         // realm (e.g. compliance:auto BM25 noise) can't flood results. The cap is
         // Thompson-sampled per realm from its Beta posterior (G8) so reliable
@@ -3482,11 +3517,11 @@ impl ChittaField {
                 .config
                 .recall_realm_cap_divisor
                 .max(1);
-            k.saturating_mul(factor).max(k)
+            k.saturating_mul(factor).max(k).saturating_mul(window_mul)
         } else {
             // Over-fetch globally so realm post-filter has enough candidates.
             let mul = self.scoring_pipeline.read().config.dam_fetch_mul.max(4);
-            k.saturating_mul(mul).max(k)
+            k.saturating_mul(mul).max(k).saturating_mul(window_mul)
         };
         // Snapshot the per-realm reliability learner so the stratify pass can
         // Thompson-sample without holding the learner lock during scoring.
@@ -3521,7 +3556,8 @@ impl ChittaField {
             } else {
                 self.recall_semantic(query_embedding, fetch_k, realm)?
             };
-            let kw = self.recall_keyword_realm(query_text, fetch_k, realm)?;
+            let sem = gate(sem);
+            let kw = gate(self.recall_keyword_realm(query_text, fetch_k, realm)?);
             if !sem.is_empty() || !kw.is_empty() {
                 let mut merged = rrf_merge(sem, kw, fetch_k, rrf_k);
 
@@ -3552,16 +3588,32 @@ impl ChittaField {
                 }
 
                 // Stratify only for unscoped queries — targeted queries are already realm-filtered.
-                return Ok(if stratify {
+                let mut out = if stratify {
                     stratify_recall_hits(merged, k, reliability.as_ref())
                 } else {
                     merged.into_iter().take(k).collect()
-                });
+                };
+                // Starvation backfill: the window gate can leave the lanes short.
+                // Fill from window members ranked BY COSINE to the query — the
+                // window gates, semantic still ranks.
+                if out.len() < k {
+                    if let Some((f, t)) = window {
+                        self.window_backfill(&mut out, k, f, t, realm, query_embedding)?;
+                    }
+                }
+                return Ok(out);
             }
             // Both lanes empty → fall through to recency below.
             let store_size = self.memory_count();
             if store_size < 10 {
                 return Ok(vec![]);
+            }
+            if let Some((f, t)) = window {
+                // Windowed query with empty lanes: rank window members by cosine,
+                // never by recency.
+                let mut out = Vec::new();
+                self.window_backfill(&mut out, k, f, t, realm, query_embedding)?;
+                return Ok(out);
             }
             log::warn!("RRF hybrid empty (semantic+BM25), falling back to recency");
             let now = now_ms();
@@ -3573,14 +3625,26 @@ impl ChittaField {
             });
         }
 
-        let hits = self.recall_semantic(query_embedding, fetch_k, realm)?;
+        let hits = gate(self.recall_semantic(query_embedding, fetch_k, realm)?);
         if !hits.is_empty() {
-            return Ok(stratify_recall_hits(hits, k, reliability.as_ref()));
+            let mut out = stratify_recall_hits(hits, k, reliability.as_ref());
+            if out.len() < k {
+                if let Some((f, t)) = window {
+                    self.window_backfill(&mut out, k, f, t, realm, query_embedding)?;
+                }
+            }
+            return Ok(out);
         }
 
         let store_size = self.memory_count();
         if store_size < 10 {
             return Ok(vec![]);
+        }
+
+        if let Some((f, t)) = window {
+            let mut out = Vec::new();
+            self.window_backfill(&mut out, k, f, t, realm, query_embedding)?;
+            return Ok(out);
         }
 
         log::warn!(
@@ -3596,6 +3660,38 @@ impl ChittaField {
         let now = now_ms();
         let temporal = self.recall_temporal(0, now, realm, fetch_k)?;
         Ok(stratify_recall_hits(temporal, k, reliability.as_ref()))
+    }
+
+    /// Fill `out` up to `k` with window members ranked by cosine similarity to
+    /// the query embedding (embeddings are L2-normalized: dot == cosine).
+    /// recall_temporal builds the payload-backed hits; its recency ORDER is
+    /// discarded — cosine ranks. Cost bounded: at most 4k window members scored.
+    fn window_backfill(
+        &self,
+        out: &mut Vec<RecallHit>,
+        k: usize,
+        from_ms: i64,
+        to_ms: i64,
+        realm: Option<&str>,
+        query_embedding: &[f32],
+    ) -> Result<()> {
+        let have: std::collections::HashSet<MemoryId> =
+            out.iter().map(|h| h.memory_id).collect();
+        let mut pool: Vec<RecallHit> = self
+            .recall_temporal(from_ms, to_ms, realm, k.saturating_mul(4).max(64))?
+            .into_iter()
+            .filter(|h| !have.contains(&h.memory_id))
+            .collect();
+        for h in pool.iter_mut() {
+            h.semantic_score = self
+                .embedding_of(h.memory_id)
+                .map(|e| e.iter().zip(query_embedding).map(|(a, b)| a * b).sum())
+                .unwrap_or(0.0);
+            h.score = h.semantic_score;
+        }
+        pool.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        out.extend(pool.into_iter().take(k - out.len()));
+        Ok(())
     }
 
     /// Field-RAG / Modern Hopfield recall with optional multi-hop expansion.
@@ -7520,6 +7616,51 @@ mod tests {
         assert_eq!(payload.content, b"hello world");
         assert_eq!(payload.kind, "wisdom");
         assert_eq!(payload.chunk_hash, hash);
+    }
+
+    // Windowed hybrid recall: the ts window GATES (authored_at_ms membership),
+    // semantic similarity RANKS. In-window low-relevance noise must not outrank
+    // in-window relevant hits, and out-of-window hits must never appear.
+    #[test]
+    fn test_windowed_recall_gates_by_time_ranks_by_semantic() {
+        let (field, _tmp) = open_test_field();
+        let day = 86_400_000i64;
+        let now = now_ms();
+        // Same embedding direction = relevant; orthogonal = noise.
+        let mut rel = vec![0.0f32; crate::ops::EMBED_DIM];
+        rel[0] = 1.0;
+        let mut noise = vec![0.0f32; crate::ops::EMBED_DIM];
+        noise[1] = 1.0;
+        let (old_rel, _) = field
+            .put_memory("wisdom", "wtest", b"relevant fact from three weeks ago window test", &rel,
+                0.9, 0.001, now - 21 * day, vec![], None, None)
+            .unwrap();
+        let (in_rel, _) = field
+            .put_memory("wisdom", "wtest", b"relevant fact from two days ago window test", &rel,
+                0.9, 0.001, now - 2 * day, vec![], None, None)
+            .unwrap();
+        let (in_noise, _) = field
+            .put_memory("wisdom", "wtest", b"unrelated compliance chatter fresh entry", &noise,
+                0.9, 0.001, now - 1 * day, vec![], None, None)
+            .unwrap();
+        let window = Some((now - 7 * day, now));
+        let hits = field
+            .recall_with_fallback_windowed(&rel, "relevant fact window test", 3, Some("wtest"), window)
+            .unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.memory_id).collect();
+        assert!(!ids.contains(&old_rel), "out-of-window hit leaked through the gate: {ids:?}");
+        assert!(ids.contains(&in_rel), "in-window relevant hit missing: {ids:?}");
+        assert_eq!(ids.first(), Some(&in_rel),
+            "semantic must rank above fresher noise (recency-sort pollution): {ids:?}");
+        // Freshest-but-irrelevant may appear via backfill, but never above the relevant hit.
+        if let Some(pos_noise) = ids.iter().position(|i| *i == in_noise) {
+            assert!(pos_noise > 0);
+        }
+        // No window → out-of-window memory is reachable again (no frozen state).
+        let all = field
+            .recall_with_fallback(&rel, "relevant fact window test", 5, Some("wtest"))
+            .unwrap();
+        assert!(all.iter().any(|h| h.memory_id == old_rel));
     }
 
     // Span-lane live path: a NEW memory's atoms must be queryable and edge-linked

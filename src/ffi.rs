@@ -457,6 +457,8 @@ pub extern "C" fn cf_recall_semantic(
 /// Hybrid recall: HNSW semantic + BM25 keyword fused via RRF.
 /// This is the real hybrid path — unlike cf_recall_semantic it calls
 /// recall_with_fallback which runs stratified RRF merge internally.
+/// start_ms/end_ms: optional authored_at_ms window GATE (0/0 = disabled);
+/// the window gates candidates, semantic relevance still ranks.
 #[no_mangle]
 pub extern "C" fn cf_recall_with_fallback(
     h: *mut CfHandle,
@@ -465,6 +467,8 @@ pub extern "C" fn cf_recall_with_fallback(
     query_text: *const c_char,
     realm: *const c_char,
     k: usize,
+    start_ms: i64,
+    end_ms: i64,
     hits_buf: *mut CfRecallHit,
     hits_cap: usize,
     hits_written: *mut usize,
@@ -492,12 +496,49 @@ pub extern "C" fn cf_recall_with_fallback(
             }
         }
     };
-    match handle.field.recall_with_fallback(embedding, query_str, k, realm_str) {
+    let window = if start_ms == 0 && end_ms == 0 { None } else { Some((start_ms, end_ms)) };
+    match handle
+        .field
+        .recall_with_fallback_windowed(embedding, query_str, k, realm_str, window)
+    {
         Ok(hits) => {
             write_hits(hits, hits_buf, hits_cap, hits_written);
             handle.ok()
         }
         Err(e) => handle.err(e),
+    }
+}
+
+/// Parse a natural-language temporal phrase out of a query. Deterministic,
+/// no LLM. Returns a JSON string `{"from_ms":..,"to_ms":..,"stripped":".."}`
+/// (caller frees with cf_free_string) or null when no phrase matches.
+/// tz_offset_min: caller's local UTC offset in minutes (calendar math runs
+/// in local wall time).
+#[no_mangle]
+pub extern "C" fn cf_parse_time_window(
+    query: *const c_char,
+    now_ms: i64,
+    tz_offset_min: i32,
+) -> *mut c_char {
+    if query.is_null() {
+        return std::ptr::null_mut();
+    }
+    let q = match unsafe { CStr::from_ptr(query).to_str() } {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match crate::organ::time_window::parse_time_window(q, now_ms, tz_offset_min) {
+        Some(w) => {
+            let json = serde_json::json!({
+                "from_ms": w.from_ms.max(0),
+                "to_ms": w.to_ms,
+                "stripped": w.stripped,
+            });
+            CString::new(json.to_string())
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut())
+        }
+        None => std::ptr::null_mut(),
     }
 }
 

@@ -15,6 +15,7 @@ pub mod session;
 pub mod symbol;
 pub mod task;
 pub mod temporal;
+pub mod time_window;
 pub mod theme_organ;
 pub mod transcript;
 pub mod triplet;
