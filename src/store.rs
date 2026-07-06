@@ -4670,12 +4670,80 @@ impl ChittaField {
 
     /// Search symbols by name (exact or prefix match).
     pub fn search_symbols_by_name(&self, query: &str, limit: usize) -> Vec<SymbolEntry> {
+        self.search_symbols_by_name_scoped(query, limit, None)
+    }
+
+    /// Search symbols by name, optionally restricted to file paths containing
+    /// `path_filter` (repo/directory scoping).
+    pub fn search_symbols_by_name_scoped(
+        &self,
+        query: &str,
+        limit: usize,
+        path_filter: Option<&str>,
+    ) -> Vec<SymbolEntry> {
         self.symbol_idx
             .read()
-            .search_by_name(query, limit)
+            .search_by_name_scoped(query, limit, path_filter)
             .into_iter()
             .cloned()
             .collect()
+    }
+
+    /// Remove every symbol in a file (per-file invalidation before re-extract).
+    /// Each removal is WAL-logged via Op::RemoveSymbol, so replay converges.
+    pub fn remove_symbols_by_file(&self, file_path: &str) -> Result<usize> {
+        let ids: Vec<u64> = self
+            .symbol_idx
+            .read()
+            .by_file(file_path)
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        for &id in &ids {
+            self.remove_symbol(id)?;
+        }
+        Ok(ids.len())
+    }
+
+    /// GC the symbol index: stale-line duplicates, excluded paths (plugin
+    /// caches, build deps), and dead files. Dry-run returns what WOULD be
+    /// removed. Removals go through Op::RemoveSymbol (WAL-durable, reversible
+    /// only via re-index — callers should snapshot first).
+    pub fn dedupe_symbols(
+        &self,
+        dry_run: bool,
+        check_fs: bool,
+        path_excludes: &[String],
+    ) -> Result<serde_json::Value> {
+        let (cand, total) = {
+            let idx = self.symbol_idx.read();
+            (idx.collect_gc_candidates(check_fs, path_excludes), idx.count())
+        };
+        let would_remove = cand.dup.len() + cand.excluded.len() + cand.dead.len();
+        let mut removed = 0usize;
+        if !dry_run {
+            for id in cand
+                .dup
+                .iter()
+                .chain(cand.excluded.iter())
+                .chain(cand.dead.iter())
+            {
+                self.remove_symbol(*id)?;
+                removed += 1;
+            }
+        }
+        Ok(serde_json::json!({
+            "total": total,
+            "dup": cand.dup.len(),
+            "excluded_path": cand.excluded.len(),
+            "dead_path": cand.dead.len(),
+            "would_remove": would_remove,
+            "removed": removed,
+            "dry_run": dry_run,
+            "top_dirs": cand.top_dirs.iter()
+                .map(|(d, n)| serde_json::json!({"dir": d, "count": n}))
+                .collect::<Vec<_>>(),
+        }))
     }
 
     /// Semantic symbol search: find k nearest by cosine similarity.

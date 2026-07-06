@@ -1048,6 +1048,17 @@ impl ChittaField {
 
         let triplet_id_alloc = Arc::new(TripletIdAllocator::new(triplet_store.next_id()));
 
+        // Heal the symbol index's derived maps (by_name/dedup) from by_id —
+        // snapshots written before the dedup-key fix carry line-keyed dedup
+        // entries and by_name buckets with recycled ids.
+        let symbol_dups = symbol_idx.rebuild_derived();
+        if symbol_dups > 0 {
+            eprintln!(
+                "[chitta-field] symbol index: {} duplicate entries detected (run dedupe_symbols to GC)",
+                symbol_dups
+            );
+        }
+
         // Sync symbol and code-file id allocators from the loaded indexes.
         let max_symbol_id = symbol_idx.max_id().unwrap_or(0);
         let symbol_id_alloc = Arc::new(TripletIdAllocator::new(max_symbol_id + 1));

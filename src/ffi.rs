@@ -2051,6 +2051,112 @@ pub extern "C" fn cf_symbols_in_file(
     handle.ok()
 }
 
+/// Search symbols by name restricted to file paths containing `path_filter`
+/// (NULL/empty = unscoped). Returns number written via *written.
+#[no_mangle]
+pub extern "C" fn cf_search_symbols_by_name_scoped(
+    h: *mut CfHandle,
+    query: *const c_char,
+    limit: usize,
+    path_filter: *const c_char,
+    buf: *mut CfSymbolHit,
+    buf_len: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || query.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let query_str = match unsafe { CStr::from_ptr(query).to_str() } {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    let filter = if path_filter.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(path_filter).to_str() } {
+            Ok(s) if !s.is_empty() => Some(s),
+            Ok(_) => None,
+            Err(e) => return handle.err(e),
+        }
+    };
+
+    let results = handle
+        .field
+        .search_symbols_by_name_scoped(query_str, limit, filter);
+    write_symbol_hits(&results, 1.0, buf, buf_len, written);
+    handle.ok()
+}
+
+/// Remove every symbol in a file (per-file invalidation before re-extract).
+#[no_mangle]
+pub extern "C" fn cf_remove_symbols_by_file(
+    h: *mut CfHandle,
+    file_path: *const c_char,
+    out_removed: *mut usize,
+) -> c_int {
+    if h.is_null() || file_path.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let path_str = match unsafe { CStr::from_ptr(file_path).to_str() } {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    match handle.field.remove_symbols_by_file(path_str) {
+        Ok(n) => {
+            if !out_removed.is_null() {
+                unsafe { *out_removed = n };
+            }
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
+/// GC the symbol index. `path_excludes` is a comma-separated substring list
+/// (NULL/empty = none). Writes a JSON stats object to buf.
+#[no_mangle]
+pub extern "C" fn cf_dedupe_symbols(
+    h: *mut CfHandle,
+    dry_run: c_int,
+    check_fs: c_int,
+    path_excludes: *const c_char,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let excludes: Vec<String> = if path_excludes.is_null() {
+        Vec::new()
+    } else {
+        match unsafe { CStr::from_ptr(path_excludes).to_str() } {
+            Ok(s) => s
+                .split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect(),
+            Err(e) => return handle.err(e),
+        }
+    };
+    match handle
+        .field
+        .dedupe_symbols(dry_run != 0, check_fs != 0, &excludes)
+    {
+        Ok(stats) => {
+            let json_str = match serde_json::to_string(&stats) {
+                Ok(s) => s,
+                Err(e) => return handle.err(e),
+            };
+            write_json_buf(&json_str, buf, buf_cap, written)
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
 /// Add a call edge between two symbols.
 #[no_mangle]
 pub extern "C" fn cf_add_sym_call_edge(h: *mut CfHandle, caller_id: u64, callee_id: u64) -> c_int {

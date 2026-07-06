@@ -174,6 +174,21 @@ int cf_search_symbols_semantic(CfHandle* h,
 int cf_symbols_in_file(CfHandle* h, const char* file_path,
     CfSymbolHit* buf, size_t buf_len, size_t* written);
 
+/* path_filter: substring the file_path must contain (NULL/empty = unscoped) */
+int cf_search_symbols_by_name_scoped(CfHandle* h,
+    const char* query, size_t limit, const char* path_filter,
+    CfSymbolHit* buf, size_t buf_len, size_t* written);
+
+/* Remove every symbol in a file (per-file invalidation before re-extract). */
+int cf_remove_symbols_by_file(CfHandle* h, const char* file_path,
+    size_t* out_removed);
+
+/* GC the symbol index. path_excludes = comma-separated substrings (NULL = none).
+   Writes JSON stats {total,dup,excluded_path,dead_path,would_remove,removed,
+   dry_run,top_dirs} to buf. */
+int cf_dedupe_symbols(CfHandle* h, int dry_run, int check_fs,
+    const char* path_excludes, uint8_t* buf, size_t buf_cap, size_t* written);
+
 int cf_add_sym_call_edge(CfHandle* h, uint64_t caller_id, uint64_t callee_id);
 
 int cf_get_callees(CfHandle* h, uint64_t symbol_id,
