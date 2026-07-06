@@ -1716,7 +1716,15 @@ impl ChittaField {
         }
 
         let now = now_ms();
-        let result_limit = k.saturating_mul(3).max(k);
+        // Realm-filtered HNSW traversal needs a wider beam: with an allowed-set
+        // the graph skips most neighbors, and at k*3 a memory that is the true
+        // in-realm nearest neighbor can be unreachable (observed: rank 0 at
+        // ef~1920, absent at ef~180 on a 109k store). Floor of 128 when filtered.
+        let result_limit = if realm.is_some() {
+            k.saturating_mul(3).max(128)
+        } else {
+            k.saturating_mul(3).max(k)
+        };
         // realm_members guard scoped to the search: holding it (a late-order
         // lock) across the states/idx acquisitions below deadlocks against
         // put_memory, which holds states.write while taking realm_members.write.
