@@ -995,6 +995,12 @@ impl ChittaField {
             }
         }
 
+        // Span-lane live link: extract this memory's verbatim atoms and form the
+        // memory↔span edge immediately (idempotent by content hash). In-RAM only;
+        // the periodic span flush persists — keeps the sidecar serialize off the
+        // write hot path. No other locks are held here (span_store is last).
+        self.span_link_memory(memory_id, &String::from_utf8_lossy(content), realm);
+
         Ok((memory_id, chunk_hash))
     }
 
@@ -1192,14 +1198,25 @@ impl ChittaField {
             .collect()
     }
 
-    /// Link one memory's text into the span store (idempotent by content hash).
+    /// Link one memory's text into the span store (idempotent by content hash),
+    /// persisting immediately. For write hot paths use span_link_memory instead.
     pub fn span_ingest_memory(&self, memory_id: u64, text: &str, realm: &str) -> u64 {
         let mut s = self.span_store.write();
         let stats = s.ingest_memory(memory_id, text, realm);
-        if stats.new_spans > 0 {
-            s.save();
-        }
+        s.save_if_dirty();
         stats.new_spans
+    }
+
+    /// Deferred-persistence memory link for write hot paths (put_memory /
+    /// content update): links in RAM only; span_flush persists periodically.
+    pub fn span_link_memory(&self, memory_id: u64, text: &str, realm: &str) {
+        self.span_store.write().ingest_memory(memory_id, text, realm);
+    }
+
+    /// Persist the span store iff it has unsaved changes. Called periodically
+    /// by the queue processor and on daemon shutdown. Returns true iff saved.
+    pub fn span_flush(&self) -> bool {
+        self.span_store.write().save_if_dirty()
     }
 
     /// Backfill the memory→span edge over every live memory. Idempotent: a
@@ -1237,13 +1254,10 @@ impl ChittaField {
     }
 
     /// Incrementally ingest one transcript from its watermark. Idempotent.
+    /// In-RAM only (called from the queue thread on register/distill); the
+    /// periodic span_flush persists spans and watermark together.
     pub fn span_ingest_transcript(&self, path: &std::path::Path) -> u64 {
-        let mut s = self.span_store.write();
-        let stats = s.ingest_transcript(path);
-        if stats.new_spans > 0 {
-            s.save();
-        }
-        stats.new_spans
+        self.span_store.write().ingest_transcript(path).new_spans
     }
 
     /// Full backfill over a projects dir. Returns (unique_total, new, redacted).
@@ -7506,6 +7520,34 @@ mod tests {
         assert_eq!(payload.content, b"hello world");
         assert_eq!(payload.kind, "wisdom");
         assert_eq!(payload.chunk_hash, hash);
+    }
+
+    // Span-lane live path: a NEW memory's atoms must be queryable and edge-linked
+    // immediately after put_memory — no manual backfill (the exact gap the owner
+    // hit: a fresh memory with a unique path stayed invisible to the lane).
+    #[test]
+    fn test_put_memory_auto_links_spans() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.1f32; crate::ops::EMBED_DIM];
+        let content = b"results live at /projects/unique/spanlane/auto_link_probe.tsv.gz now";
+        let (id, _) = field
+            .put_memory("wisdom", "spantest", content, &emb, 0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+
+        let hits = field.span_query("auto_link_probe", Some("spantest"), 6);
+        assert!(!hits.is_empty(), "new memory's atom not auto-ingested");
+        assert!(
+            hits.iter().any(|h| h.0.contains("auto_link_probe.tsv.gz") && h.8.contains(&id)),
+            "atom missing the memory_id reverse edge: {hits:?}"
+        );
+        // Forward edge: the memory expands to its verbatim atom.
+        let fwd = field.span_for_memory(id, 4);
+        assert!(fwd.iter().any(|a| a.0.contains("auto_link_probe.tsv.gz")));
+
+        // forget() unlinks; the memory-only span hits refcount zero → gone.
+        field.forget(id).unwrap();
+        let hits = field.span_query("auto_link_probe", Some("spantest"), 6);
+        assert!(hits.is_empty(), "forgotten memory's atoms must be GC'd: {hits:?}");
     }
 
     // ── Replay confluence (THEORY.md §2) ────────────────────────────────────

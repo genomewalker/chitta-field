@@ -158,6 +158,10 @@ pub struct SpanStore {
     redacted_total: u64,
     #[serde(skip)]
     path: PathBuf,
+    /// Unsaved in-RAM changes (live-path ingest defers the ~50MB serialize off
+    /// the memory-write hot path; the daemon's periodic span flush persists).
+    #[serde(skip)]
+    dirty: bool,
 }
 
 fn fnv1a(class: u8, s: &str) -> u64 {
@@ -227,10 +231,19 @@ impl SpanStore {
         self.maybe_compact();
         if let Ok(bytes) = bincode::serialize(self) {
             let tmp = self.path.with_extension("bin.tmp");
-            if std::fs::write(&tmp, &bytes).is_ok() {
-                let _ = std::fs::rename(&tmp, &self.path);
+            if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &self.path).is_ok() {
+                self.dirty = false;
             }
         }
+    }
+
+    /// Persist only if there are unsaved changes. Returns true iff a save ran.
+    pub fn save_if_dirty(&mut self) -> bool {
+        if !self.dirty {
+            return false;
+        }
+        self.save();
+        !self.dirty
     }
 
     pub fn len(&self) -> usize {
@@ -414,6 +427,7 @@ impl SpanStore {
         }
         self.mem_watermarks.insert(memory_id, content_hash);
         self.mutations = self.mutations.wrapping_add(stats.new_spans.max(1));
+        self.dirty = true;
         stats
     }
 
@@ -426,7 +440,9 @@ impl SpanStore {
         let indices = match self.mem_adjacency.remove(&memory_id) {
             Some(v) => v,
             None => {
-                self.mem_watermarks.remove(&memory_id);
+                if self.mem_watermarks.remove(&memory_id).is_some() {
+                    self.dirty = true;
+                }
                 return 0;
             }
         };
@@ -449,6 +465,7 @@ impl SpanStore {
         if touched > 0 {
             self.mutations = self.mutations.wrapping_add(touched);
         }
+        self.dirty = true;
         touched
     }
 
@@ -546,6 +563,9 @@ impl SpanStore {
             .insert(path_str, (off + consumed as u64, line_no));
         if stats.new_spans > 0 {
             self.mutations = self.mutations.wrapping_add(stats.new_spans);
+        }
+        if consumed > 0 || stats.new_spans > 0 {
+            self.dirty = true;
         }
         stats
     }

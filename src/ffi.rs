@@ -120,7 +120,10 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
 #[no_mangle]
 pub extern "C" fn cf_close(h: *mut CfHandle) {
     if !h.is_null() {
-        unsafe { drop(Box::from_raw(h)) };
+        let b = unsafe { Box::from_raw(h) };
+        // Persist any span links deferred off the write hot path.
+        b.field.span_flush();
+        drop(b);
     }
 }
 
@@ -5319,6 +5322,9 @@ pub extern "C" fn cf_update_memory_content(
     handle.field.keyword_idx.write().index(id, &content_str);
     // Re-encode cortical sparse code for updated content/embedding
     let _ = handle.field.encode_memory(id);
+    // Span-lane re-link: changed content unlinks stale atoms then relinks
+    // (watermark supersede). In-RAM; the periodic span flush persists.
+    handle.field.span_link_memory(id, &content_str, &mem_realm);
     handle.ok()
 }
 
@@ -9351,6 +9357,17 @@ pub extern "C" fn cf_span_ingest(h: *mut CfHandle, transcript_path: *const c_cha
     let handle = unsafe { &*h };
     let p = unsafe { match CStr::from_ptr(transcript_path).to_str() { Ok(s)=>s, Err(_)=>return -1 } };
     handle.field.span_ingest_transcript(std::path::Path::new(p)) as i64
+}
+
+/// Persist the span store iff it has unsaved live-path changes. Returns 1 if
+/// a save ran, 0 if clean, -1 on null handle.
+#[no_mangle]
+pub extern "C" fn cf_span_flush(h: *mut CfHandle) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    handle.field.span_flush() as c_int
 }
 
 /// Returns JSON {unique,disk_bytes,redacted_total}.
