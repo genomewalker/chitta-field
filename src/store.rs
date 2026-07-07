@@ -1100,6 +1100,91 @@ impl ChittaField {
         removed
     }
 
+    /// One-shot retro-backfill of #13 SameSession edges over EXISTING memories.
+    /// Groups non-deleted, session-tagged memories by (source_session, realm),
+    /// orders each group by created_at_ms, and links each memory to its up-to-K
+    /// most-recent prior siblings with decaying-weight SameSession edges — the
+    /// same rule densify_write_edges applies at write time, but retroactively so
+    /// historical golds that predate the write hook get their edges.
+    ///
+    /// `apply=false` is a DRY RUN: counts the sibling pairs the rule would create
+    /// plus a group-size histogram, and writes nothing. Idempotent: add_assoc_edge
+    /// merges by max weight and SameSession is created by no other path, so
+    /// re-running (or running after write-time densify) is safe.
+    ///
+    /// Returns (sessions, memories_in_sessions, pairs, histogram) where histogram
+    /// buckets group sizes as [1, 2, 3-5, 6-10, 11-50, 51+]. Applied directed
+    /// edges = pairs * 2 (bidirectional).
+    pub fn densify_backfill(&self, apply: bool) -> (u64, u64, u64, [u64; 6]) {
+        const DENSIFY_K: usize = 3;
+        const BASE_WEIGHT: f32 = 0.6;
+        const DECAY: f32 = 0.7;
+        // Snapshot (id, realm, session, created_at_ms) under payloads->states
+        // (lock-order: payloads before states), then release before mutating.
+        let mut rows: Vec<(MemoryId, String, String, i64)> = {
+            let payloads = self.payloads.read();
+            let states = self.states.read();
+            payloads
+                .iter()
+                .filter(|(id, _)| states.get(id).map(|s| !s.deleted).unwrap_or(false))
+                .filter_map(|(id, p)| {
+                    p.source_session
+                        .as_ref()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| (*id, p.realm.clone(), s.clone(), p.created_at_ms))
+                })
+                .collect()
+        };
+        // Contiguous (session, realm) groups, time-ordered within each.
+        rows.sort_by(|a, b| {
+            a.2.cmp(&b.2)
+                .then(a.1.cmp(&b.1))
+                .then(a.3.cmp(&b.3))
+                .then(a.0.cmp(&b.0))
+        });
+        let mut sessions = 0u64;
+        let mut mem_in_sessions = 0u64;
+        let mut pairs = 0u64;
+        let mut hist = [0u64; 6];
+        let mut i = 0;
+        while i < rows.len() {
+            let mut j = i + 1;
+            while j < rows.len() && rows[j].2 == rows[i].2 && rows[j].1 == rows[i].1 {
+                j += 1;
+            }
+            let group = &rows[i..j];
+            let n = group.len();
+            sessions += 1;
+            mem_in_sessions += n as u64;
+            let bucket = match n {
+                1 => 0,
+                2 => 1,
+                3..=5 => 2,
+                6..=10 => 3,
+                11..=50 => 4,
+                _ => 5,
+            };
+            hist[bucket] += 1;
+            // Each memory links back to its up-to-K most-recent prior siblings,
+            // decaying weight per step (0.6, 0.42, 0.294) — matches the write hook.
+            for idx in 1..n {
+                let k = idx.min(DENSIFY_K);
+                for back in 1..=k {
+                    pairs += 1;
+                    if apply {
+                        let cur = group[idx].0;
+                        let prev = group[idx - back].0;
+                        let weight = BASE_WEIGHT * DECAY.powi((back - 1) as i32);
+                        let _ = self.add_assoc_edge(cur, prev, EdgeType::SameSession, weight);
+                        let _ = self.add_assoc_edge(prev, cur, EdgeType::SameSession, weight);
+                    }
+                }
+            }
+            i = j;
+        }
+        (sessions, mem_in_sessions, pairs, hist)
+    }
+
     /// Return the active cognitive-process genome: the most recently authored,
     /// non-deleted `process` memory in the `brahman` realm, parsed as JSON.
     /// Read-only — uses the existing kind/realm/payload indices, no QD archive.

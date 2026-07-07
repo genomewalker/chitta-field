@@ -9496,6 +9496,20 @@ pub extern "C" fn cf_span_backfill_memories(h: *mut CfHandle) -> *mut c_char {
     match CString::new(s) { Ok(cs)=>cs.into_raw(), Err(e)=>json_null(format!("cf_span_backfill_memories: {e}")) }
 }
 
+/// #13 retro-backfill of SameSession edges. apply=false is a dry run (counts
+/// only). Returns JSON {apply,sessions,memories_in_sessions,pairs,directed_edges,histogram}.
+#[no_mangle]
+pub extern "C" fn cf_densify_backfill(h: *mut CfHandle, apply: bool) -> *mut c_char {
+    if h.is_null() { return json_null("cf_densify_backfill: null argument"); }
+    let handle = unsafe { &*h };
+    let (sessions, mems, pairs, hist) = handle.field.densify_backfill(apply);
+    let s = format!(
+        "{{\"apply\":{apply},\"sessions\":{sessions},\"memories_in_sessions\":{mems},\"pairs\":{pairs},\"directed_edges\":{},\"histogram\":{{\"n1\":{},\"n2\":{},\"n3_5\":{},\"n6_10\":{},\"n11_50\":{},\"n51plus\":{}}}}}",
+        pairs * 2, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]
+    );
+    match CString::new(s) { Ok(cs)=>cs.into_raw(), Err(e)=>json_null(format!("cf_densify_backfill: {e}")) }
+}
+
 /// Full backfill over `projects_dir`. Returns JSON {unique,new,redacted}.
 #[no_mangle]
 pub extern "C" fn cf_span_backfill(h: *mut CfHandle, projects_dir: *const c_char) -> *mut c_char {
