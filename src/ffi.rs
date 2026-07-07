@@ -9510,6 +9510,25 @@ pub extern "C" fn cf_densify_backfill(h: *mut CfHandle, apply: bool) -> *mut c_c
     match CString::new(s) { Ok(cs)=>cs.into_raw(), Err(e)=>json_null(format!("cf_densify_backfill: {e}")) }
 }
 
+/// Assoc-graph census. Returns JSON array of 6 per-EdgeType entries (wire
+/// numbering: DerivedFrom=0..Contradicts=5), each {type,count,weights:[5]}
+/// with weight buckets <0.05, 0.05-0.2, 0.2-0.5, 0.5-0.8, >=0.8.
+#[no_mangle]
+pub extern "C" fn cf_assoc_census(h: *mut CfHandle) -> *mut c_char {
+    if h.is_null() { return json_null("cf_assoc_census: null argument"); }
+    let handle = unsafe { &*h };
+    let census = handle.field.assoc_census();
+    const NAMES: [&str; 6] = ["DerivedFrom", "SameSession", "SameArtifact", "CoRetrieved", "Supports", "Contradicts"];
+    let entries: Vec<String> = census.iter().enumerate().map(|(i, (count, w))| {
+        format!(
+            "{{\"type\":\"{}\",\"count\":{count},\"weights\":[{},{},{},{},{}]}}",
+            NAMES[i], w[0], w[1], w[2], w[3], w[4]
+        )
+    }).collect();
+    let s = format!("[{}]", entries.join(","));
+    match CString::new(s) { Ok(cs)=>cs.into_raw(), Err(e)=>json_null(format!("cf_assoc_census: {e}")) }
+}
+
 /// Full backfill over `projects_dir`. Returns JSON {unique,new,redacted}.
 #[no_mangle]
 pub extern "C" fn cf_span_backfill(h: *mut CfHandle, projects_dir: *const c_char) -> *mut c_char {

@@ -1100,6 +1100,41 @@ impl ChittaField {
         removed
     }
 
+    /// Assoc-graph census: per-EdgeType directed-edge count plus a weight
+    /// histogram (buckets: <0.05, 0.05-0.2, 0.2-0.5, 0.5-0.8, >=0.8). Read-only;
+    /// the measure-first gate for plasticity levers (e.g. Gate B co-retrieval
+    /// decay needs to know whether CoRetrieved edges exist at all before a
+    /// decay rule is worth building).
+    pub fn assoc_census(&self) -> [(u64, [u64; 5]); 6] {
+        let mut out = [(0u64, [0u64; 5]); 6];
+        let edges = self.assoc_edges.read();
+        for list in edges.values() {
+            for e in list {
+                // Same wire numbering as ffi.rs et_u8 (Supports=4, Contradicts=5),
+                // NOT declaration order — keeps tool output consistent with
+                // cooccurrence_graph edge_type values.
+                let t = match e.edge_type {
+                    EdgeType::DerivedFrom => 0usize,
+                    EdgeType::SameSession => 1,
+                    EdgeType::SameArtifact => 2,
+                    EdgeType::CoRetrieved => 3,
+                    EdgeType::Supports => 4,
+                    EdgeType::Contradicts => 5,
+                };
+                out[t].0 += 1;
+                let b = match e.weight {
+                    w if w < 0.05 => 0,
+                    w if w < 0.2 => 1,
+                    w if w < 0.5 => 2,
+                    w if w < 0.8 => 3,
+                    _ => 4,
+                };
+                out[t].1[b] += 1;
+            }
+        }
+        out
+    }
+
     /// One-shot retro-backfill of #13 SameSession edges over EXISTING memories.
     /// Groups non-deleted, session-tagged memories by (source_session, realm),
     /// orders each group by created_at_ms, and links each memory to its up-to-K
