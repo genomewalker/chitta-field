@@ -790,6 +790,10 @@ impl ChittaField {
             authored_at_ms
         };
 
+        // Captured before `source_session` is moved into the op below; used by
+        // the write-time densification hook (SameSession chain) at the tail.
+        let densify_session = source_session.clone();
+
         let op = PutPayloadOp {
             memory_id,
             version: 0,
@@ -1001,7 +1005,99 @@ impl ChittaField {
         // write hot path. No other locks are held here (span_store is last).
         self.span_link_memory(memory_id, &String::from_utf8_lossy(content), realm);
 
+        // Write-time causal densification (#13): link this memory to its recent
+        // same-session, same-realm siblings with SameSession edges. Default off;
+        // gated by CHITTA_DENSIFY. edge_legal() drops rationalization pairs.
+        self.densify_write_edges(memory_id, realm, densify_session.as_deref());
+
         Ok((memory_id, chunk_hash))
+    }
+
+    /// Write-time SameSession chain (#13). When enabled, links `new_id` to the
+    /// last K same-session, same-realm, non-deleted memories with bidirectional
+    /// SameSession edges of decaying weight, then records `new_id` in the ring.
+    ///
+    /// Bidirectional so the new memory is reachable from its siblings and vice
+    /// versa in graph recall (assoc_edges is keyed by src). edge_legal() inside
+    /// add_assoc_edge silently drops any pair that would launder speculation as
+    /// evidence, so the surviving chain respects the Phase-16 kind lattice.
+    ///
+    /// Rollback: `remove_assoc_edges_by_type(EdgeType::SameSession)` — no other
+    /// code path creates SameSession edges, so removal is surgical.
+    fn densify_write_edges(&self, new_id: MemoryId, realm: &str, session: Option<&str>) {
+        use std::sync::atomic::Ordering;
+        if !self.densify_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let session = match session {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return,
+        };
+        const DENSIFY_K: usize = 3;
+        const BASE_WEIGHT: f32 = 0.6; // EdgeType::SameSession nominal weight.
+        const DECAY: f32 = 0.7; // Older siblings link more weakly.
+
+        // Snapshot the recent sibling ids under session_recent alone, then drop
+        // that lock BEFORE taking payloads/states. payloads is ordered earlier
+        // than session_recent, so holding session_recent while acquiring payloads
+        // is a lock-order inversion (deadlock risk) — collect ids first, filter
+        // after. Already in the ring → set_source_session fired after put_memory
+        // already carried the session; skip the double-fire.
+        let candidates: Vec<MemoryId> = {
+            let ring = self.session_recent.read();
+            match ring.get(&session) {
+                Some(q) if q.contains(&new_id) => return,
+                Some(q) => q.iter().rev().filter(|id| **id != new_id).copied().collect(),
+                None => Vec::new(),
+            }
+        };
+        let recent: Vec<MemoryId> = {
+            let payloads = self.payloads.read();
+            let states = self.states.read();
+            candidates
+                .into_iter()
+                .filter(|id| payloads.get(id).map(|p| p.realm == realm).unwrap_or(false))
+                .filter(|id| states.get(id).map(|s| !s.deleted).unwrap_or(false))
+                .take(DENSIFY_K)
+                .collect()
+        };
+
+        let mut weight = BASE_WEIGHT;
+        for prev in recent {
+            // Bidirectional; edge_legal drops illegal directions internally.
+            let _ = self.add_assoc_edge(new_id, prev, EdgeType::SameSession, weight);
+            let _ = self.add_assoc_edge(prev, new_id, EdgeType::SameSession, weight);
+            weight *= DECAY;
+        }
+
+        // Record this memory as the newest in the session ring (bounded to K).
+        let mut ring = self.session_recent.write();
+        let q = ring.entry(session).or_default();
+        q.push_back(new_id);
+        while q.len() > DENSIFY_K {
+            q.pop_front();
+        }
+    }
+
+    /// Remove all assoc edges of a given type across the whole graph. Returns
+    /// the number removed. Surgical rollback for #13 densification
+    /// (EdgeType::SameSession — no other path creates that type).
+    ///
+    /// In-RAM mutation persisted at the next snapshot, matching the store's
+    /// existing convention for edge mutation (see set_source_session).
+    /// ceiling: a crash between this call and the next snapshot save replays the
+    /// original AddAssocEdge ops from the WAL and resurrects the edges; upgrade:
+    /// call save_full_snapshot() right after to truncate the WAL.
+    pub fn remove_assoc_edges_by_type(&self, edge_type: EdgeType) -> usize {
+        let mut removed = 0usize;
+        let mut edges = self.assoc_edges.write();
+        for list in edges.values_mut() {
+            let before = list.len();
+            list.retain(|e| e.edge_type != edge_type);
+            removed += before - list.len();
+        }
+        edges.retain(|_, list| !list.is_empty());
+        removed
     }
 
     /// Return the active cognitive-process genome: the most recently authored,
@@ -1692,7 +1788,18 @@ impl ChittaField {
         k: usize,
         realm: Option<&str>,
     ) -> Result<Vec<RecallHit>> {
-        self.recall_semantic_ctx(query_embedding, k, realm, None, None)
+        self.recall_semantic_ctx(query_embedding, k, realm, None, None, true)
+    }
+
+    /// Measurement recall: identical ranking, but skips co-retrieval
+    /// strengthening so an eval/diagnostic never mutates the store it reads.
+    pub fn recall_semantic_measure(
+        &self,
+        query_embedding: &[f32],
+        k: usize,
+        realm: Option<&str>,
+    ) -> Result<Vec<RecallHit>> {
+        self.recall_semantic_ctx(query_embedding, k, realm, None, None, false)
     }
 
     /// Semantic recall with affective context.
@@ -1707,6 +1814,7 @@ impl ChittaField {
         realm: Option<&str>,
         query_valence: Option<f32>,
         query_arousal: Option<f32>,
+        strengthen: bool,
     ) -> Result<Vec<RecallHit>> {
         if query_embedding.len() != EMBED_DIM {
             return Err(FieldError::InvalidEmbedDim {
@@ -1957,7 +2065,9 @@ impl ChittaField {
         drop(pipeline);
         drop(learners);
         drop(ack_scores);
-        self.enqueue_recall_effects(&hit_ids);
+        if strengthen {
+            self.enqueue_recall_effects(&hit_ids);
+        }
 
         Ok(hits)
     }
@@ -2188,7 +2298,7 @@ impl ChittaField {
 
     /// Keyword (BM25) recall.
     pub fn recall_keyword(&self, query: &str, k: usize) -> Result<Vec<RecallHit>> {
-        self.recall_keyword_ctx(query, k, None, None, None)
+        self.recall_keyword_ctx(query, k, None, None, None, true)
     }
     /// Realm-scoped keyword recall: drops hits outside `realm` (None = unscoped) so the BM25
     /// lane honours --realm and never bleeds other projects' memories into a scoped query.
@@ -2198,7 +2308,17 @@ impl ChittaField {
         k: usize,
         realm: Option<&str>,
     ) -> Result<Vec<RecallHit>> {
-        self.recall_keyword_ctx(query, k, None, None, realm)
+        self.recall_keyword_ctx(query, k, None, None, realm, true)
+    }
+
+    /// Measurement keyword recall: skips co-retrieval strengthening.
+    pub fn recall_keyword_measure(
+        &self,
+        query: &str,
+        k: usize,
+        realm: Option<&str>,
+    ) -> Result<Vec<RecallHit>> {
+        self.recall_keyword_ctx(query, k, None, None, realm, false)
     }
 
     /// HDC recall: O(n) Hamming-distance search over binary hypervectors.
@@ -3277,6 +3397,7 @@ impl ChittaField {
         query_valence: Option<f32>,
         query_arousal: Option<f32>,
         realm: Option<&str>,
+        strengthen: bool,
     ) -> Result<Vec<RecallHit>> {
         let max_query_idf = self.keyword_idx.read().query_max_idf(query);
         // Realm-scoped queries need a larger global BM25 fetch so small-realm
@@ -3373,7 +3494,9 @@ impl ChittaField {
         drop(pipeline);
         drop(learners);
         drop(ack_scores);
-        self.enqueue_recall_effects(&hit_ids);
+        if strengthen {
+            self.enqueue_recall_effects(&hit_ids);
+        }
 
         Ok(hits)
     }
@@ -3394,13 +3517,13 @@ impl ChittaField {
         // Fetch candidate chunks from both semantic and keyword lanes
         let fetch_limit = k * 20;
         let mut candidates: Vec<crate::recall::RecallHit> = if let Some(emb) = query_embedding {
-            self.recall_semantic_ctx(emb, fetch_limit, realm, None, None)?
+            self.recall_semantic_ctx(emb, fetch_limit, realm, None, None, true)?
         } else {
             Vec::new()
         };
 
         // Merge in keyword hits, deduplicating by memory_id (keep max score)
-        let kw_hits = self.recall_keyword_ctx(query_text, fetch_limit, None, None, None)?;
+        let kw_hits = self.recall_keyword_ctx(query_text, fetch_limit, None, None, None, true)?;
         let mut seen: std::collections::HashSet<crate::ids::MemoryId> =
             candidates.iter().map(|h| h.memory_id).collect();
         for h in kw_hits {
@@ -4066,13 +4189,18 @@ impl ChittaField {
 
     /// Set the source_session tag on a memory payload. In-memory only; persisted at next snapshot.
     pub fn set_source_session(&self, memory_id: MemoryId, session_id: &str) -> Result<()> {
-        let mut payloads = self.payloads.write();
-        if let Some(p) = payloads.get_mut(&memory_id) {
+        let realm = {
+            let mut payloads = self.payloads.write();
+            let p = payloads.get_mut(&memory_id).ok_or(FieldError::NotFound(memory_id))?;
             p.source_session = Some(session_id.to_string());
-            Ok(())
-        } else {
-            Err(FieldError::NotFound(memory_id))
-        }
+            p.realm.clone()
+        };
+        // #13 densification: the daemon path puts with session=None and attaches
+        // the session here (cf_put_memory carries no session), so this is the
+        // moment the SameSession chain can form. Idempotent: skips ids already
+        // in the ring, and add_assoc_edge dedups edges by (dst, type).
+        self.densify_write_edges(memory_id, &realm, Some(session_id));
+        Ok(())
     }
 
     /// Extract entity seeds from a query string: capitalized words (≥3 chars),
@@ -8484,6 +8612,91 @@ mod tests {
             field2.cw_refresh_inflight.read().is_empty(),
             "empty update rounds must not leak reservations"
         );
+    }
+
+    #[test]
+    fn test_densify_write_edges_pair() {
+        // #13 controlled prospective pair test (drift-independent, binary gate):
+        // a symptom memory and its root-cause memory written in the same session
+        // + realm must be linked by a bidirectional SameSession edge, making each
+        // 1-hop reachable from the other. Rollback removes exactly those edges.
+        use std::sync::atomic::Ordering;
+        let (field, _tmp) = open_test_field();
+        field.densify_enabled.store(true, Ordering::Relaxed);
+
+        // Distinct embeddings (cos 0.707 < dedup threshold) so B is not merged.
+        let mut emb_a = vec![0.0f32; crate::ops::EMBED_DIM];
+        emb_a[0] = 1.0;
+        let mut emb_b = vec![0.0f32; crate::ops::EMBED_DIM];
+        emb_b[0] = 1.0;
+        emb_b[1] = 1.0;
+        let sess = Some("pairtest-session".to_string());
+
+        let (a, _) = field
+            .put_memory("episode", "test", b"symptom: recall degrades over days",
+                &emb_a, 0.9, 0.001, 0, vec![], sess.clone(), None)
+            .unwrap();
+        let (b, _) = field
+            .put_memory("episode", "test", b"root cause: eval strengthens wrong edges",
+                &emb_b, 0.9, 0.001, 0, vec![], sess.clone(), None)
+            .unwrap();
+        assert_ne!(a, b, "B must be a distinct memory, not deduped into A");
+
+        let na = field.list_neighbors(a).unwrap();
+        let nb = field.list_neighbors(b).unwrap();
+        assert!(
+            na.iter().any(|e| e.dst == b && e.edge_type == EdgeType::SameSession),
+            "root-cause must be reachable from symptom via a SameSession edge",
+        );
+        assert!(
+            nb.iter().any(|e| e.dst == a && e.edge_type == EdgeType::SameSession),
+            "densification edge must be bidirectional",
+        );
+
+        // Surgical rollback: removes exactly the two densification edges.
+        let removed = field.remove_assoc_edges_by_type(EdgeType::SameSession);
+        assert_eq!(removed, 2, "both edge directions must be removed");
+        assert!(field.list_neighbors(a).unwrap().is_empty());
+        assert!(field.list_neighbors(b).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_densify_via_set_source_session() {
+        // Production daemon flow: cf_put_memory carries session=None; the C++
+        // handler attaches it via set_source_session right after. The chain
+        // must form at that attach point, and must not double-fire when the
+        // session was already known at put time.
+        use std::sync::atomic::Ordering;
+        let (field, _tmp) = open_test_field();
+        field.densify_enabled.store(true, Ordering::Relaxed);
+
+        let mut emb_a = vec![0.0f32; crate::ops::EMBED_DIM];
+        emb_a[0] = 1.0;
+        let mut emb_b = vec![0.0f32; crate::ops::EMBED_DIM];
+        emb_b[1] = 1.0;
+
+        let (a, _) = field
+            .put_memory("episode", "test", b"daemon-path write A", &emb_a, 0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+        let (b, _) = field
+            .put_memory("episode", "test", b"daemon-path write B", &emb_b, 0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+        // No session at put time → no edges yet.
+        assert!(field.list_neighbors(a).unwrap().is_empty());
+
+        field.set_source_session(a, "daemon-sess").unwrap();
+        field.set_source_session(b, "daemon-sess").unwrap();
+        let nb = field.list_neighbors(b).unwrap();
+        assert!(
+            nb.iter().any(|e| e.dst == a && e.edge_type == EdgeType::SameSession),
+            "attach-time densification must link B to its session sibling A",
+        );
+
+        // Re-attach must not duplicate edges (ring guard).
+        field.set_source_session(b, "daemon-sess").unwrap();
+        let nb2 = field.list_neighbors(b).unwrap();
+        let same_count = nb2.iter().filter(|e| e.dst == a && e.edge_type == EdgeType::SameSession).count();
+        assert_eq!(same_count, 1, "re-attach must not duplicate the edge");
     }
 
     #[test]

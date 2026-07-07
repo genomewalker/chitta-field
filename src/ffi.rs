@@ -428,6 +428,7 @@ pub extern "C" fn cf_recall_semantic(
     hits_buf: *mut CfRecallHit,
     hits_cap: usize,
     hits_written: *mut usize,
+    no_learn: bool,
 ) -> c_int {
     if h.is_null() || hits_buf.is_null() || hits_written.is_null() {
         return -1;
@@ -445,7 +446,12 @@ pub extern "C" fn cf_recall_semantic(
         }
     };
 
-    match handle.field.recall_semantic(embedding, k, realm_str) {
+    let recalled = if no_learn {
+        handle.field.recall_semantic_measure(embedding, k, realm_str)
+    } else {
+        handle.field.recall_semantic(embedding, k, realm_str)
+    };
+    match recalled {
         Ok(hits) => {
             write_hits(hits, hits_buf, hits_cap, hits_written);
             handle.ok()
@@ -575,7 +581,7 @@ pub extern "C" fn cf_recall_semantic_ctx(
     let qv = if query_valence.is_nan() { None } else { Some(query_valence) };
     let qa = if query_arousal.is_nan() { None } else { Some(query_arousal) };
 
-    match handle.field.recall_semantic_ctx(embedding, k, realm_str, qv, qa) {
+    match handle.field.recall_semantic_ctx(embedding, k, realm_str, qv, qa, true) {
         Ok(hits) => {
             write_hits(hits, hits_buf, hits_cap, hits_written);
             handle.ok()
@@ -847,6 +853,7 @@ pub extern "C" fn cf_recall_keyword(
     hits_buf: *mut CfRecallHit,
     hits_cap: usize,
     hits_written: *mut usize,
+    no_learn: bool,
 ) -> c_int {
     if h.is_null() || query.is_null() || hits_buf.is_null() || hits_written.is_null() {
         return -1;
@@ -868,7 +875,12 @@ pub extern "C" fn cf_recall_keyword(
         }
     };
 
-    match handle.field.recall_keyword_realm(query_str, k, realm_opt) {
+    let recalled = if no_learn {
+        handle.field.recall_keyword_measure(query_str, k, realm_opt)
+    } else {
+        handle.field.recall_keyword_realm(query_str, k, realm_opt)
+    };
+    match recalled {
         Ok(hits) => {
             write_hits(hits, hits_buf, hits_cap, hits_written);
             handle.ok()
@@ -6001,6 +6013,7 @@ mod tests {
                 hits.as_mut_ptr(),
                 hits.len(),
                 &mut written,
+                false,
             );
             assert_eq!(r, 0);
             assert_eq!(written, 1);
@@ -6072,6 +6085,7 @@ mod tests {
                 hits.as_mut_ptr(),
                 hits.len(),
                 &mut written,
+                false,
             );
             assert_eq!(written, 0);
 

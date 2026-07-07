@@ -212,6 +212,14 @@ pub struct ChittaField {
     pub(crate) content_prov_idx: RwLock<HashMap<u64, MemoryId>>,
     pub(crate) realm_members: RwLock<HashMap<String, HashSet<MemoryId>>>,
     pub(crate) kind_members:  RwLock<HashMap<String, HashSet<MemoryId>>>,
+    /// Write-time densification: per-session recency ring (last K memory ids),
+    /// used to add SameSession assoc edges linking a new memory to its recent
+    /// same-session siblings. Transient — not persisted (recency only spans a
+    /// live session, never a restart boundary).
+    pub(crate) session_recent: RwLock<HashMap<String, std::collections::VecDeque<MemoryId>>>,
+    /// Write-time densification gate. Default off; enabled via CHITTA_DENSIFY=1
+    /// at construction so the write rule stays reviewable before it goes live.
+    pub(crate) densify_enabled: std::sync::atomic::AtomicBool,
     pub(crate) memory_count: Arc<AtomicUsize>,
     pub(crate) pending_embed_count: Arc<AtomicUsize>,
     pub(crate) last_compact_ms: Arc<std::sync::atomic::AtomicI64>,
@@ -1220,6 +1228,10 @@ impl ChittaField {
             content_prov_idx: RwLock::new(content_prov_idx),
             realm_members: RwLock::new(realm_members),
             kind_members:  RwLock::new(kind_members),
+            session_recent: RwLock::new(HashMap::new()),
+            densify_enabled: std::sync::atomic::AtomicBool::new(
+                std::env::var("CHITTA_DENSIFY").map(|v| v == "1").unwrap_or(false),
+            ),
             memory_count: Arc::new(AtomicUsize::new(initial_memory_count)),
             pending_embed_count: Arc::new(AtomicUsize::new(init_pending)),
             last_compact_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),

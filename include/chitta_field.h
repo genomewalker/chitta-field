@@ -61,7 +61,8 @@ int cf_upsert_artifact(CfHandle* h,
 int cf_recall_semantic(CfHandle* h,
     const float* query_embedding, size_t embedding_len,
     const char* realm, size_t k,
-    CfRecallHit* hits_buf, size_t hits_cap, size_t* hits_written);
+    CfRecallHit* hits_buf, size_t hits_cap, size_t* hits_written,
+    bool no_learn);
 
 int cf_recall_semantic_ctx(CfHandle* h,
     const float* query_embedding, size_t embedding_len,
@@ -88,7 +89,8 @@ int cf_expand_associations(CfHandle* h,
 
 int cf_recall_keyword(CfHandle* h,
     const char* query, size_t k, const char* realm,
-    CfRecallHit* hits_buf, size_t hits_cap, size_t* hits_written);
+    CfRecallHit* hits_buf, size_t hits_cap, size_t* hits_written,
+    bool no_learn);
 
 int cf_get_content(CfHandle* h, uint64_t memory_id,
     uint8_t* buf, size_t buf_cap, size_t* written);
