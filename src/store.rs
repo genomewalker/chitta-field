@@ -1190,6 +1190,72 @@ impl ChittaField {
         (survivors, pruned)
     }
 
+    /// #14 fine-tune: read-only dump of the memory graph for offline training-
+    /// pair mining. Writes two files into `out_dir`:
+    ///   nodes.jsonl — one live (non-deleted) memory per line: id, kind, realm,
+    ///                 status, source_session, provenance, created_at_ms,
+    ///                 confidence, strength, access_count, content (utf8-lossy)
+    ///   edges.jsonl — every assoc edge: src, dst, t (wire u8), w
+    /// Vectors are NOT dumped — payload.embedding is empty post-V23; read the
+    /// snapshot family's .emb sidecar directly ([magic u64][count u64] then
+    /// (id u64 + EMBED_DIM f32) records, all LE).
+    /// All policy (gold exclusion, realm filters, splits) lives in the Python
+    /// miner — this stays a dumb, deterministic snapshot of substrate state.
+    /// Returns (nodes_written, edges_written).
+    pub fn dump_training_graph(&self, out_dir: &std::path::Path) -> std::io::Result<(u64, u64)> {
+        use std::io::Write;
+        std::fs::create_dir_all(out_dir)?;
+
+        let payloads = self.payloads.read();
+        let states = self.states.read();
+
+        let mut nodes = std::io::BufWriter::new(std::fs::File::create(out_dir.join("nodes.jsonl"))?);
+        let mut n_nodes = 0u64;
+        for (id, p) in payloads.iter() {
+            let Some(s) = states.get(id) else { continue };
+            if s.deleted {
+                continue;
+            }
+            let line = serde_json::json!({
+                "id": id,
+                "kind": p.kind,
+                "realm": p.realm,
+                "status": format!("{:?}", s.status),
+                "source_session": p.source_session,
+                "provenance": p.provenance,
+                "created_at_ms": s.created_at_ms,
+                "confidence": s.confidence,
+                "strength": s.strength,
+                "access_count": s.access_count,
+                "content": String::from_utf8_lossy(&p.content),
+            });
+            writeln!(nodes, "{line}")?;
+            n_nodes += 1;
+        }
+        drop(payloads);
+        drop(states);
+
+        let mut edges_f = std::io::BufWriter::new(std::fs::File::create(out_dir.join("edges.jsonl"))?);
+        let mut n_edges = 0u64;
+        let edges = self.assoc_edges.read();
+        for (src, list) in edges.iter() {
+            for e in list {
+                // Wire numbering (matches ffi edge_type_from_u8).
+                let t: u8 = match e.edge_type {
+                    EdgeType::DerivedFrom => 0,
+                    EdgeType::SameSession => 1,
+                    EdgeType::SameArtifact => 2,
+                    EdgeType::CoRetrieved => 3,
+                    EdgeType::Supports => 4,
+                    EdgeType::Contradicts => 5,
+                };
+                writeln!(edges_f, "{{\"src\":{},\"dst\":{},\"t\":{},\"w\":{}}}", src, e.dst, t, e.weight)?;
+                n_edges += 1;
+            }
+        }
+        Ok((n_nodes, n_edges))
+    }
+
     /// One-shot retro-backfill of #13 SameSession edges over EXISTING memories.
     /// Groups non-deleted, session-tagged memories by (source_session, realm),
     /// orders each group by created_at_ms, and links each memory to its up-to-K
