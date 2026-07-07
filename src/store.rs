@@ -8785,6 +8785,63 @@ mod tests {
     }
 
     #[test]
+    fn test_densify_backfill() {
+        // Retro-backfill over historical memories: session-tagged writes made
+        // while the write-hook was OFF (densify_enabled=false — the pre-#13
+        // world) must gain the same K=3 decaying SameSession chain when
+        // densify_backfill(apply=true) runs. Dry run writes nothing; re-apply
+        // is idempotent; untagged memories are ignored.
+        let (field, _tmp) = open_test_field();
+        let sess = Some("hist-sess".to_string());
+
+        let mut ids = Vec::new();
+        for i in 0..4u8 {
+            let mut emb = vec![0.0f32; crate::ops::EMBED_DIM];
+            emb[i as usize] = 1.0;
+            let (id, _) = field
+                .put_memory("episode", "test", format!("hist write {i}").as_bytes(),
+                    &emb, 0.9, 0.001, 0, vec![], sess.clone(), None)
+                .unwrap();
+            ids.push(id);
+        }
+        // One untagged memory: must not join any group.
+        let mut emb = vec![0.0f32; crate::ops::EMBED_DIM];
+        emb[5] = 1.0;
+        field
+            .put_memory("episode", "test", b"untagged", &emb, 0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+
+        // Write-hook off → no edges yet despite session tags.
+        assert!(field.list_neighbors(ids[3]).unwrap().is_empty());
+
+        // Dry run: 1 session group of 4 → pairs = 1+2+3 = 6; nothing written.
+        let (sessions, mems, pairs, hist) = field.densify_backfill(false);
+        assert_eq!((sessions, mems, pairs), (1, 4, 6));
+        assert_eq!(hist[2], 1, "group of 4 lands in the 3-5 bucket");
+        assert!(field.list_neighbors(ids[3]).unwrap().is_empty(), "dry run must write nothing");
+
+        // Apply: newest links to its 3 priors with decaying weight.
+        let (_, _, pairs_applied, _) = field.densify_backfill(true);
+        assert_eq!(pairs_applied, 6);
+        let n3 = field.list_neighbors(ids[3]).unwrap();
+        let same: Vec<_> = n3.iter().filter(|e| e.edge_type == EdgeType::SameSession).collect();
+        assert_eq!(same.len(), 3, "newest must link to all 3 priors");
+        let w = |dst| same.iter().find(|e| e.dst == dst).unwrap().weight;
+        assert!((w(ids[2]) - 0.6).abs() < 1e-6);
+        assert!((w(ids[1]) - 0.42).abs() < 1e-6);
+        assert!((w(ids[0]) - 0.294).abs() < 1e-6);
+
+        // Idempotent: re-apply changes nothing.
+        field.densify_backfill(true);
+        assert_eq!(
+            field.list_neighbors(ids[3]).unwrap().iter()
+                .filter(|e| e.edge_type == EdgeType::SameSession).count(),
+            3,
+            "re-apply must not duplicate edges"
+        );
+    }
+
+    #[test]
     fn test_forget() {
         let (field, _tmp) = open_test_field();
         let embedding = vec![0.0f32; crate::ops::EMBED_DIM];
