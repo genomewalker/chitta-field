@@ -9529,6 +9529,27 @@ pub extern "C" fn cf_assoc_census(h: *mut CfHandle) -> *mut c_char {
     match CString::new(s) { Ok(cs)=>cs.into_raw(), Err(e)=>json_null(format!("cf_assoc_census: {e}")) }
 }
 
+/// Gate B: decay + floor-prune one assoc EdgeType (wire numbering, see
+/// edge_type_from_u8). apply=false is a dry run. Returns JSON
+/// {apply,edge_type,factor,prune_below,survivors,pruned}.
+#[no_mangle]
+pub extern "C" fn cf_assoc_decay(
+    h: *mut CfHandle,
+    edge_type: u8,
+    factor: f32,
+    prune_below: f32,
+    apply: bool,
+) -> *mut c_char {
+    if h.is_null() { return json_null("cf_assoc_decay: null argument"); }
+    let handle = unsafe { &*h };
+    let et = edge_type_from_u8(edge_type);
+    let (survivors, pruned) = handle.field.assoc_decay(et, factor, prune_below, apply);
+    let s = format!(
+        "{{\"apply\":{apply},\"edge_type\":{edge_type},\"factor\":{factor},\"prune_below\":{prune_below},\"survivors\":{survivors},\"pruned\":{pruned}}}"
+    );
+    match CString::new(s) { Ok(cs)=>cs.into_raw(), Err(e)=>json_null(format!("cf_assoc_decay: {e}")) }
+}
+
 /// Full backfill over `projects_dir`. Returns JSON {unique,new,redacted}.
 #[no_mangle]
 pub extern "C" fn cf_span_backfill(h: *mut CfHandle, projects_dir: *const c_char) -> *mut c_char {

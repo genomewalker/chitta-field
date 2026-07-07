@@ -220,6 +220,11 @@ pub struct ChittaField {
     /// Write-time densification gate. Default off; enabled via CHITTA_DENSIFY=1
     /// at construction so the write rule stays reviewable before it goes live.
     pub(crate) densify_enabled: std::sync::atomic::AtomicBool,
+    /// Gate B plasticity gate. Default off; enabled via CHITTA_PLASTICITY_DECAY=1
+    /// at construction. When on: the hourly demotion pass decays CoRetrieved
+    /// edges (x0.98, prune <0.05) and drain applies a 0.1 materialization floor
+    /// to new co-retrieval pairs (single co-occurrences never become edges).
+    pub(crate) plasticity_decay_enabled: std::sync::atomic::AtomicBool,
     pub(crate) memory_count: Arc<AtomicUsize>,
     pub(crate) pending_embed_count: Arc<AtomicUsize>,
     pub(crate) last_compact_ms: Arc<std::sync::atomic::AtomicI64>,
@@ -1231,6 +1236,9 @@ impl ChittaField {
             session_recent: RwLock::new(HashMap::new()),
             densify_enabled: std::sync::atomic::AtomicBool::new(
                 std::env::var("CHITTA_DENSIFY").map(|v| v == "1").unwrap_or(false),
+            ),
+            plasticity_decay_enabled: std::sync::atomic::AtomicBool::new(
+                std::env::var("CHITTA_PLASTICITY_DECAY").map(|v| v == "1").unwrap_or(false),
             ),
             memory_count: Arc::new(AtomicUsize::new(initial_memory_count)),
             pending_embed_count: Arc::new(AtomicUsize::new(init_pending)),

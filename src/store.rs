@@ -1135,6 +1135,61 @@ impl ChittaField {
         out
     }
 
+    /// Gate B: multiplicative decay + floor-prune for one assoc EdgeType.
+    /// Every edge of `edge_type` has its weight multiplied by `factor`; edges
+    /// ending below `prune_below` are removed. `apply=false` is a DRY RUN
+    /// (counts only, no mutation). Serves both the hourly plasticity pass
+    /// (0.98 / 0.05, gated CHITTA_PLASTICITY_DECAY via run_demotion_pass) and
+    /// the one-shot saturation migration (factor 1.0, prune_below 0.2) through
+    /// the assoc_decay tool. Returns (survivors, pruned).
+    ///
+    /// In-RAM mutation persisted at the next snapshot (same convention and
+    /// WAL-replay ceiling as remove_assoc_edges_by_type above).
+    pub fn assoc_decay(
+        &self,
+        edge_type: EdgeType,
+        factor: f32,
+        prune_below: f32,
+        apply: bool,
+    ) -> (u64, u64) {
+        let mut survivors = 0u64;
+        let mut pruned = 0u64;
+        if apply {
+            let mut edges = self.assoc_edges.write();
+            for list in edges.values_mut() {
+                list.retain_mut(|e| {
+                    if e.edge_type != edge_type {
+                        return true;
+                    }
+                    e.weight *= factor;
+                    if e.weight < prune_below {
+                        pruned += 1;
+                        false
+                    } else {
+                        survivors += 1;
+                        true
+                    }
+                });
+            }
+            edges.retain(|_, list| !list.is_empty());
+        } else {
+            let edges = self.assoc_edges.read();
+            for list in edges.values() {
+                for e in list {
+                    if e.edge_type != edge_type {
+                        continue;
+                    }
+                    if e.weight * factor < prune_below {
+                        pruned += 1;
+                    } else {
+                        survivors += 1;
+                    }
+                }
+            }
+        }
+        (survivors, pruned)
+    }
+
     /// One-shot retro-backfill of #13 SameSession edges over EXISTING memories.
     /// Groups non-deleted, session-tagged memories by (source_session, realm),
     /// orders each group by created_at_ms, and links each memory to its up-to-K
@@ -1883,7 +1938,23 @@ impl ChittaField {
             }
         }
 
+        // Gate B inflow floor: add_assoc_edge merges by MAX, so a pair seen once
+        // per drain window stays frozen at 0.05 forever — that class is 21M of
+        // the 28.6M CoRetrieved edges. Requiring >=0.1 (two co-occurrences in
+        // one window) stops the noise band at the source; repeat singles on an
+        // existing edge were max-merge no-ops anyway (minus the WAL append).
+        let floor = if self
+            .plasticity_decay_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0.1
+        } else {
+            0.0
+        };
         for ((src, dst), weight) in pending.co_retrieval_pairs {
+            if weight < floor {
+                continue;
+            }
             let _ = self.add_assoc_edge(src, dst, EdgeType::CoRetrieved, weight);
         }
 
@@ -7583,6 +7654,20 @@ impl ChittaField {
         }
         for id in to_delete {
             self.forget(id)?;
+        }
+
+        // Gate B outflow: hourly CoRetrieved decay + floor-prune. An untouched
+        // co-retrieval edge halves in ~34 passes (0.98^34); anything that decays
+        // below 0.05 is noise and is dropped. Paired with the drain-side 0.1
+        // materialization floor so decay isn't fighting a firehose.
+        if self
+            .plasticity_decay_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let (survivors, pruned) = self.assoc_decay(EdgeType::CoRetrieved, 0.98, 0.05, true);
+            if pruned > 0 {
+                eprintln!("[plasticity] CoRetrieved decay: {survivors} survive, {pruned} pruned");
+            }
         }
 
         Ok((demoted, deleted))
