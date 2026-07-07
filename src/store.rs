@@ -1869,7 +1869,9 @@ impl ChittaField {
         };
 
         for memory_id in pending.strengthen {
-            let _ = self.update_state(memory_id, Some(0.01), None, None, true, None);
+            // Recall no longer inflates strength (S0: the uniform +0.01 tick is
+            // rank-inert noise). Touch-only keeps recency/spacing signals intact.
+            let _ = self.update_state(memory_id, None, None, None, true, None);
             let mut states = self.states.write();
             if let Some(st) = states.get_mut(&memory_id) {
                 st.recompute_spacing_quality();
