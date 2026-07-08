@@ -672,7 +672,85 @@ fn compute_geometry(embeddings: &[&[f32]], group_name: &str) -> Option<serde_jso
     }))
 }
 
+/// Extract deterministic provenance keys from a `[done]` record body.
+///
+/// Grammar (from the file-provenance ritual):
+///   `[done] input:<path> sha:<first-8-of-sha256> task:<what> output:<path> status:...`
+///
+/// Returns normalized exact-match keys: `sha:<hex>` (content identity — the
+/// primary key, since NFS resurrects deleted paths so path != identity) and
+/// `input:<path>` (the human handle). Both map to the same record so a lookup
+/// by either the file's content-hash or its path resolves deterministically —
+/// this is the keyed lane that replaces fuzzy semantic recall for the
+/// anti-reprocessing question "have I already done this?".
+pub(crate) fn parse_prov_keys(content: &[u8]) -> Vec<String> {
+    let text = match std::str::from_utf8(content) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    if !text.starts_with("[done]") {
+        return Vec::new();
+    }
+    let mut keys = Vec::new();
+    for tok in text.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("sha:") {
+            let v = v.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            if v.len() >= 6 && v.chars().all(|c| c.is_ascii_hexdigit()) {
+                keys.push(format!("sha:{}", v.to_ascii_lowercase()));
+            }
+        } else if let Some(v) = tok.strip_prefix("input:") {
+            let v = v.trim_matches(|c: char| c == '"' || c == ',');
+            if !v.is_empty() {
+                keys.push(format!("input:{v}"));
+            }
+        }
+    }
+    keys
+}
+
 impl ChittaField {
+    /// Deterministic provenance lookup — the keyed lane for capability #1
+    /// (anti-reprocessing). Given a content-hash and/or an input path, returns
+    /// the earliest live `[done]` record that registered a matching key, or
+    /// `None`. This is an O(1) exact-key lookup that BYPASSES the fuzzy
+    /// BM25+HNSW retriever entirely: no embedding, no ranking, no false
+    /// neighbours. `sha` is tried first (content identity), then `input` path.
+    /// Both args accept a raw value or an already-prefixed key.
+    pub fn provenance_lookup(&self, sha: &str, input: &str) -> Option<(MemoryId, String)> {
+        let idx = self.prov_key_idx.read();
+        let mut candidates: Vec<String> = Vec::new();
+        let sha = sha.trim();
+        if !sha.is_empty() {
+            let s = sha.strip_prefix("sha:").unwrap_or(sha).to_ascii_lowercase();
+            candidates.push(format!("sha:{s}"));
+        }
+        let input = input.trim();
+        if !input.is_empty() {
+            let p = input.strip_prefix("input:").unwrap_or(input);
+            candidates.push(format!("input:{p}"));
+        }
+        for key in candidates {
+            if let Some(&id) = idx.get(&key) {
+                let alive = self
+                    .states
+                    .read()
+                    .get(&id)
+                    .map(|s| !s.deleted)
+                    .unwrap_or(false);
+                if alive {
+                    let content = self
+                        .payloads
+                        .read()
+                        .get(&id)
+                        .map(|p| String::from_utf8_lossy(&p.content).into_owned())
+                        .unwrap_or_default();
+                    return Some((id, content));
+                }
+            }
+        }
+        None
+    }
+
     /// Store a new memory. Returns `(MemoryId, ChunkHash)`.
     pub fn put_memory(
         &self,
@@ -858,6 +936,16 @@ impl ChittaField {
             .insert(memory_id);
         if let Some(key) = prov_key {
             self.content_prov_idx.write().entry(key).or_insert(memory_id);
+        }
+        // Keyed provenance lane: index parsed (sha / input-path) keys so the
+        // deterministic anti-reprocessing lookup can hit this record by exact
+        // key. Gated to kind=="signal" to match the load-time rebuild exactly.
+        // or_insert => earliest live record wins (chronological on the live path;
+        // the rebuild sorts by created_at to match).
+        if kind == "signal" {
+            for pk in parse_prov_keys(content) {
+                self.prov_key_idx.write().entry(pk).or_insert(memory_id);
+            }
         }
         if !embed_pending {
             self.semantic_idx
@@ -9675,5 +9763,51 @@ mod tests {
             .recall_with_fallback(&vec![0.0f32; crate::ops::EMBED_DIM], "unique_term_0", 5, None)
             .unwrap();
         assert!(!hits.is_empty(), "fallback should return results");
+    }
+
+    /// Capability #1 (anti-reprocessing): the keyed provenance lane resolves a
+    /// `[done]` record by content-hash OR input path through an exact O(1) lookup
+    /// that never touches the fuzzy retriever, keeps the earliest record when a
+    /// sha is re-registered under different surrounding text, survives snapshot
+    /// save/reopen (rebuilt deterministically from live payloads), and misses
+    /// cleanly for unknown keys.
+    #[test]
+    fn provenance_keyed_lane_exact_lookup_and_persists() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let put = |field: &ChittaField, body: &str| {
+            field
+                .put_memory("signal", "cc-soul", body.as_bytes(), &[], 0.8, 0.001, 0, vec![], None, None)
+                .unwrap()
+                .0
+        };
+
+        let (first_id, second_id) = {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            let a = put(&field, "[done] input:/data/x.fastq sha:deadbeef12 task:qc output:/out/x.tsv status:ok");
+            // Same sha, different task text: escapes the byte-identical string gate,
+            // so it stores as a second live record — the keyed lane must still
+            // resolve to the EARLIEST record.
+            let b = put(&field, "[done] input:/data/x.fastq sha:deadbeef12 task:requant output:/out/x2.tsv status:ok");
+            assert_ne!(a, b, "same-sha different-text must be two records");
+
+            assert_eq!(field.provenance_lookup("deadbeef12", "").unwrap().0, a, "sha lookup -> earliest");
+            assert_eq!(field.provenance_lookup("", "/data/x.fastq").unwrap().0, a, "path lookup -> earliest");
+            assert_eq!(field.provenance_lookup("sha:deadbeef12", "").unwrap().0, a, "prefixed arg resolves");
+            assert!(field.provenance_lookup("deadbeef12", "").unwrap().1.contains("task:qc"), "returns earliest content");
+            assert!(field.provenance_lookup("cafef00d99", "/nope").is_none(), "unknown key misses cleanly");
+
+            field.save_full_snapshot().unwrap();
+            (a, b)
+        };
+        assert_ne!(first_id, second_id);
+
+        // Reopen: lane rebuilt from live payloads, deterministically earliest.
+        let field = ChittaField::open(data_dir).unwrap();
+        assert_eq!(field.provenance_lookup("deadbeef12", "").unwrap().0, first_id, "rebuilt lane keeps earliest after reopen");
+        assert!(field.provenance_lookup("deadbeef12", "").unwrap().1.contains("task:qc"));
+        assert!(field.provenance_lookup("cafef00d99", "").is_none());
     }
 }

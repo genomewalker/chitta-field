@@ -889,6 +889,54 @@ pub extern "C" fn cf_recall_keyword(
     }
 }
 
+/// Deterministic provenance lookup (keyed lane, capability #1).
+/// Returns 0 and fills `out_id` + `buf` (NUL-terminated record content) on a
+/// hit; returns 1 (no fields written) on a clean miss; negative on error.
+/// `sha` is tried first (content identity), then `input` path. Either may be
+/// NULL/empty. No embedding, no ranking — an exact-key HashMap lookup.
+#[no_mangle]
+pub extern "C" fn cf_provenance_lookup(
+    h: *mut CfHandle,
+    sha: *const c_char,
+    input: *const c_char,
+    out_id: *mut u64,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || out_id.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let to_str = |p: *const c_char| -> &str {
+        if p.is_null() {
+            ""
+        } else {
+            unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("")
+        }
+    };
+    let sha_str = to_str(sha);
+    let input_str = to_str(input);
+
+    match handle.field.provenance_lookup(sha_str, input_str) {
+        Some((id, content)) => {
+            let bytes = content.as_bytes();
+            if bytes.len() >= buf_cap {
+                unsafe { *written = bytes.len(); }
+                return -2;
+            }
+            unsafe {
+                *out_id = id;
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+                *buf.add(bytes.len()) = 0;
+                *written = bytes.len();
+            }
+            handle.ok()
+        }
+        None => 1,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cf_recall_hdc(
     h: *mut CfHandle,

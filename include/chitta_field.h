@@ -95,6 +95,12 @@ int cf_recall_keyword(CfHandle* h,
 int cf_get_content(CfHandle* h, uint64_t memory_id,
     uint8_t* buf, size_t buf_cap, size_t* written);
 
+/* Deterministic provenance lookup (keyed lane). 0=hit (fills out_id+buf),
+   1=clean miss, <0=error. sha tried first, then input path; either may be NULL. */
+int cf_provenance_lookup(CfHandle* h,
+    const char* sha, const char* input,
+    uint64_t* out_id, uint8_t* buf, size_t buf_cap, size_t* written);
+
 int cf_get_kind(CfHandle* h, uint64_t memory_id,
     uint8_t* buf, size_t buf_cap);
 

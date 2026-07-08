@@ -210,6 +210,12 @@ pub struct ChittaField {
     /// Cross-realm provenance dedup for kind="signal" "[done]" records.
     /// Key: DefaultHasher(content) as u64. Prevents re-processing already-handled files.
     pub(crate) content_prov_idx: RwLock<HashMap<u64, MemoryId>>,
+    /// Keyed provenance lane (capability #1, anti-reprocessing). Semantic exact
+    /// keys parsed out of `[done]` records ("sha:<hex>", "input:<path>") ->
+    /// earliest live record id. Powers `provenance_lookup`, a deterministic O(1)
+    /// query that bypasses the fuzzy retriever. Derived from live payloads and
+    /// rebuilt on load (no snapshot-format change, migration-free, rollback-safe).
+    pub(crate) prov_key_idx: RwLock<HashMap<String, MemoryId>>,
     pub(crate) realm_members: RwLock<HashMap<String, HashSet<MemoryId>>>,
     pub(crate) kind_members:  RwLock<HashMap<String, HashSet<MemoryId>>>,
     /// Write-time densification: per-session recency ring (last K memory ids),
@@ -1168,6 +1174,32 @@ impl ChittaField {
                 .collect()
         };
         eprintln!("[chitta-field] content_prov_idx rebuilt: {} [done] provenance records", content_prov_idx.len());
+        // Rebuild the keyed provenance lane from live [done] payloads. Sorted by
+        // created_at ascending + or_insert => earliest record wins per key,
+        // matching the live put_memory path deterministically (HashMap iteration
+        // order is otherwise nondeterministic, and multiple records can share a
+        // sha/path key).
+        let prov_key_idx: HashMap<String, MemoryId> = {
+            let mut live: Vec<_> = payloads
+                .iter()
+                .filter(|(id, p)| {
+                    p.kind == "signal"
+                        && p.content.starts_with(b"[done]")
+                        && !states.get(id).map(|s| s.deleted).unwrap_or(false)
+                })
+                .collect();
+            // (created_at, memory_id) so equal-timestamp records break ties by
+            // allocation order — matching the live put_memory call order exactly.
+            live.sort_by_key(|(id, p)| (p.created_at_ms, **id));
+            let mut idx: HashMap<String, MemoryId> = HashMap::new();
+            for (id, p) in live {
+                for pk in crate::store::parse_prov_keys(&p.content) {
+                    idx.entry(pk).or_insert(*id);
+                }
+            }
+            idx
+        };
+        eprintln!("[chitta-field] prov_key_idx rebuilt: {} keyed provenance entries", prov_key_idx.len());
         Ok(Self {
             data_dir,
             instance_id,
@@ -1231,6 +1263,7 @@ impl ChittaField {
             seen_offsets: RwLock::new(loaded_seen_offsets),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
             content_prov_idx: RwLock::new(content_prov_idx),
+            prov_key_idx: RwLock::new(prov_key_idx),
             realm_members: RwLock::new(realm_members),
             kind_members:  RwLock::new(kind_members),
             session_recent: RwLock::new(HashMap::new()),
