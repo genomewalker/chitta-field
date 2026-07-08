@@ -244,6 +244,11 @@ pub struct ChittaField {
     pub(crate) pending_embed_count: Arc<AtomicUsize>,
     pub(crate) last_compact_ms: Arc<std::sync::atomic::AtomicI64>,
     pub(crate) pending_recall: Mutex<PendingRecallEffects>,
+    /// Staged HNSW insert plan for the deferred-batched-insert backfill path
+    /// (Step-1 re-architecture). `backfill_stage()` fills the ids under a brief
+    /// write; `backfill_plan()` computes the plan off the write lock;
+    /// `backfill_apply()` drains it under a brief write. `None` when idle.
+    pub(crate) backfill_plan_stage: Mutex<Option<crate::store::BackfillStage>>,
     pub(crate) coactivation_stats: RwLock<HashMap<(MemoryId, MemoryId), CoActivationStats>>,
     /// Asymmetric Hopfield network for energy-based attractor recall. FEP §3.2.
     pub(crate) hopfield: RwLock<HopfieldNetwork>,
@@ -1315,6 +1320,7 @@ impl ChittaField {
             repl_sessions: RwLock::new(loaded_repl_sessions),
             span_store: RwLock::new(loaded_span_store),
             pending_recall: Mutex::new(PendingRecallEffects::default()),
+            backfill_plan_stage: Mutex::new(None),
             coactivation_stats: RwLock::new({
                 let mut cs = replay_coactivation_stats;
                 let n = cs.len();

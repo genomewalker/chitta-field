@@ -24,6 +24,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const RESERVOIR_SIZE: usize = 500;
 
+/// In-flight state for the deferred-batched-insert backfill (stage → plan → apply).
+/// Held in `ChittaField::backfill_plan_stage`. `staged_ids` = every memory durably
+/// staged (embed_pending cleared at apply); `plan_ids` ⊆ staged_ids = those needing a
+/// global-HNSW plan; `plan` is filled off the write lock by `backfill_plan`.
+pub struct BackfillStage {
+    pub(crate) staged_ids: Vec<MemoryId>,
+    pub(crate) plan_ids:   Vec<MemoryId>,
+    pub(crate) plan:       Option<crate::hnsw::DeltaBatchPlan>,
+}
+
 pub(crate) struct GroupStats {
     sum:            Vec<f64>,
     sum_sq:         Vec<f64>,
@@ -4840,6 +4850,143 @@ impl ChittaField {
             }
         }
         Ok(())
+    }
+
+    // ── Deferred batched backfill (Step-1 re-architecture) ─────────────────────
+    //
+    // Splits the per-item `backfill_embedding` (WAL + payload + O(log N) HNSW insert,
+    // all under one `semantic_idx.write()`) into three phases so the expensive HNSW
+    // neighbor search runs OFF the write lock:
+    //
+    //   stage(items) — WAL + payload meta + metadata upsert (coarse/LSH/binary/embeddings
+    //                  map), but NOT the global HNSW insert. Brief write. MUST be called
+    //                  under the C++ rpc_mutex (acquire_lock), same as backfill_embedding.
+    //   plan()       — compute HNSW insert plans under `semantic_idx.read()` (concurrent
+    //                  with recall). MUST be called WITHOUT the rpc_mutex, so recall (which
+    //                  needs the shared rpc_mutex) is not blocked while the search runs.
+    //   apply()      — wire the plans into the graph + clear embed_pending. Brief write.
+    //                  MUST be called under the rpc_mutex — preserves the rpc→semantic_idx
+    //                  lock order, so no new ABBA vs sync_foreign.
+    //
+    // Correctness: the durable state (WAL + payload) lands in stage(); a crash between
+    // stage and apply just leaves the memory embed_pending (re-picked next drain) — no
+    // torn graph, no lost write. A concurrent writer inserting between plan and apply is
+    // untouched by apply (see apply_delta_batch). Recall parity: id-seeded levels match
+    // the load-time backfill_hnsw_delta_parallel path, so the resulting graph is
+    // build-order-independent and equivalent to the per-item path.
+
+    /// Phase 1: durable stage of a backfill batch. Returns the number of ids that
+    /// still need a global-HNSW plan (drives whether `plan()` has work to do).
+    pub fn backfill_stage(&self, items: &[(MemoryId, Vec<f32>)]) -> Result<usize> {
+        // Pass 1 (WAL + payload meta): collect the valid (id, embedding, realm) tuples.
+        let mut valid: Vec<(MemoryId, &Vec<f32>, Option<String>)> = Vec::with_capacity(items.len());
+        for (memory_id, embedding) in items {
+            let memory_id = *memory_id;
+            if embedding.len() != EMBED_DIM {
+                return Err(FieldError::InvalidEmbedDim { expected: EMBED_DIM, actual: embedding.len() });
+            }
+            // Skip ids that are gone or already embedded (mirrors backfill_embedding).
+            let existing_content = {
+                let payloads = self.payloads.read();
+                let states = self.states.read();
+                match states.get(&memory_id) {
+                    None => continue,
+                    Some(st) if !st.embed_pending => continue,
+                    Some(_) => payloads.get(&memory_id).map(|p| p.content.clone()).unwrap_or_default(),
+                }
+            };
+            // WAL: persist the embedding via UpdateMemoryContent (empty content reuses existing).
+            let op = Op::UpdateMemoryContent(crate::ops::UpdateMemoryContentOp {
+                memory_id,
+                content: existing_content,
+                embedding: embedding.clone(),
+                op_ts_ms: now_ms(),
+            });
+            self.log.write().append(&op)?;
+            // Payload embedding metadata — the vector itself lives only in the semantic index.
+            let realm_for_upsert = {
+                let mut payloads = self.payloads.write();
+                if let Some(p) = payloads.get_mut(&memory_id) {
+                    p.embedding = Vec::new();
+                    p.embedding_model = EMBED_MODEL_ID.to_string();
+                    p.embedding_model_id = EMBED_MODEL_ID.to_string();
+                    p.embedding_dim = EMBED_DIM as u32;
+                    Some(p.realm.clone())
+                } else {
+                    None
+                }
+            };
+            valid.push((memory_id, embedding, realm_for_upsert));
+        }
+        self.log.write().flush_buf().ok();
+        // Pass 2 (metadata upsert): ONE semantic_idx.write() for the whole batch, not one
+        // per item — a single acquisition means a waiting recall reader starves for one
+        // brief metadata write, not the full burst (parking_lot writer-preference would
+        // otherwise let per-item re-acquisition starve readers across the whole chunk).
+        let mut staged_ids: Vec<MemoryId> = Vec::with_capacity(valid.len());
+        let mut plan_ids: Vec<MemoryId> = Vec::new();
+        {
+            let mut idx = self.semantic_idx.write();
+            for (memory_id, embedding, realm) in &valid {
+                let needs_plan = idx.upsert_deferred(*memory_id, (*embedding).clone(), realm.as_deref());
+                staged_ids.push(*memory_id);
+                if needs_plan { plan_ids.push(*memory_id); }
+            }
+        }
+        let n_plan = plan_ids.len();
+        *self.backfill_plan_stage.lock() = Some(BackfillStage { staged_ids, plan_ids, plan: None });
+        Ok(n_plan)
+    }
+
+    /// Phase 2: compute HNSW insert plans off the write lock. No-op if nothing staged.
+    /// Call WITHOUT the C++ rpc_mutex so recall is not blocked during the search.
+    pub fn backfill_plan(&self) {
+        let plan_ids = {
+            let stage = self.backfill_plan_stage.lock();
+            match stage.as_ref() {
+                Some(s) if !s.plan_ids.is_empty() => s.plan_ids.clone(),
+                _ => return,
+            }
+        };
+        let plan = self.semantic_idx.read().plan_delta_batch(&plan_ids);
+        if let Some(s) = self.backfill_plan_stage.lock().as_mut() {
+            s.plan = Some(plan);
+        }
+    }
+
+    /// Phase 3: wire the staged plan into the graph and clear embed_pending. Returns the
+    /// number of memories whose embed_pending was cleared. Call under the C++ rpc_mutex.
+    pub fn backfill_apply(&self) -> usize {
+        let stage = match self.backfill_plan_stage.lock().take() {
+            Some(s) => s,
+            None => return 0,
+        };
+        if let Some(plan) = stage.plan {
+            self.semantic_idx.write().apply_delta_batch(plan);
+        }
+        for &id in &stage.staged_ids {
+            let _ = self.encode_memory(id);
+        }
+        let mut states = self.states.write();
+        for &id in &stage.staged_ids {
+            if let Some(st) = states.get_mut(&id) {
+                if st.embed_pending {
+                    st.embed_pending = false;
+                    self.pending_embed_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        stage.staged_ids.len()
+    }
+
+    /// Convenience: run the full stage → plan → apply sequence in one call. Used by the
+    /// lock-free embed_loop drain and by tests. Does NOT take the C++ rpc_mutex, so it
+    /// relies solely on the internal semantic_idx lock discipline (safe for the embed_loop
+    /// path, which never held acquire_lock). Returns the number of memories backfilled.
+    pub fn backfill_embeddings_batch(&self, items: &[(MemoryId, Vec<f32>)]) -> Result<usize> {
+        self.backfill_stage(items)?;
+        self.backfill_plan();
+        Ok(self.backfill_apply())
     }
 
     /// Force a full rebuild of all derived search structures (binary codes, coarse,
@@ -9999,5 +10146,132 @@ mod tests {
         assert_ne!(hit.0, old_id, "rebuilt lane keeps the SUPERSEDING correction after reopen");
         assert!(hit.1.contains("ETXTBSY"), "rebuilt lane surfaces newest body");
         assert!(field.correction_check("totally unrelated question").is_none());
+    }
+
+    // ── Deferred-batched-insert (Step-1 re-architecture) proofs ────────────────
+
+    fn lcg_vec(seed: u64, dim: usize) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (0..dim).map(|_| {
+            s ^= s >> 33; s = s.wrapping_mul(0xff51afd7ed558ccd); s ^= s >> 33;
+            ((s >> 11) as f64 / (1u64 << 53) as f64) as f32 - 0.5
+        }).collect()
+    }
+    fn unit(v: &[f32]) -> Vec<f32> {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        v.iter().map(|x| x / n).collect()
+    }
+
+    /// Recall@k PARITY gate: the deferred-batched insert path must match the per-item
+    /// path. For the PRODUCTION recall path (flat scan over the embeddings map, active
+    /// below FLAT_SCAN_MAX=2M) the two are bitwise-identical (same `upsert_meta`); for
+    /// the HNSW fallback graph they must be approximation-equivalent.
+    #[test]
+    fn test_deferred_batch_recall_parity() {
+        use crate::hnsw::SemanticIndex;
+        use crate::ops::EMBED_DIM;
+        const N: u64 = 5200;   // > HNSW_TIER2_THRESHOLD (5000): exercises the delta tier
+        const Q: usize = 30;
+        const K: usize = 10;
+
+        let items: Vec<(u64, Vec<f32>)> = (1..=N).map(|i| (i, lcg_vec(i, EMBED_DIM))).collect();
+
+        // Model production: a pre-existing base graph (built at load by the epoch-based
+        // backfill_hnsw_delta_parallel), then INCREMENTAL backfill of new memories. Seed
+        // both paths identically, then diverge: A per-item upsert, B deferred-batched.
+        const SEED: usize = 3000;
+        let mut a = SemanticIndex::new();
+        let mut b = SemanticIndex::new();
+        for (id, e) in &items[..SEED] {
+            a.upsert(*id, e.clone(), Some("test"));
+            b.upsert(*id, e.clone(), Some("test"));
+        }
+        // Incremental tail — the path under test.
+        for (id, e) in &items[SEED..] { a.upsert(*id, e.clone(), Some("test")); }
+        for (id, e) in &items[SEED..] { b.upsert_deferred(*id, e.clone(), Some("test")); }
+        for chunk in items[SEED..].chunks(100) {   // 100 = daemon pending_embeddings(100) batch
+            let ids: Vec<u64> = chunk.iter().map(|(id, _)| *id).collect();
+            let plan = b.plan_delta_batch(&ids);
+            b.apply_delta_batch(plan);
+        }
+
+        // Ground-truth brute-force cosine top-k.
+        let normed: Vec<(u64, Vec<f32>)> = items.iter().map(|(id, e)| (*id, unit(e))).collect();
+        let (mut flat_identical, mut ra, mut rb) = (0usize, 0.0f64, 0.0f64);
+        for qi in 0..Q {
+            let q = unit(&lcg_vec(1_000_000 + qi as u64, EMBED_DIM));
+            let mut bf: Vec<(f32, u64)> = normed.iter()
+                .map(|(id, e)| (e.iter().zip(&q).map(|(x, y)| x * y).sum::<f32>(), *id)).collect();
+            bf.sort_unstable_by(|x, y| y.0.total_cmp(&x.0));
+            let truth: std::collections::HashSet<u64> = bf.iter().take(K).map(|(_, id)| *id).collect();
+
+            // (a) Production path (default env = flat scan): must be IDENTICAL A vs B.
+            let fa: Vec<u64> = a.search(&q, K, None, None).into_iter().map(|h| h.memory_id).collect();
+            let fb: Vec<u64> = b.search(&q, K, None, None).into_iter().map(|h| h.memory_id).collect();
+            if fa == fb { flat_identical += 1; }
+
+            // (b) HNSW fallback graph: approximation-equivalent quality.
+            let ha: std::collections::HashSet<u64> = a.hnsw_search_test(&q, K).into_iter().map(|h| h.memory_id).collect();
+            let hb: std::collections::HashSet<u64> = b.hnsw_search_test(&q, K).into_iter().map(|h| h.memory_id).collect();
+            ra += truth.intersection(&ha).count() as f64 / K as f64;
+            rb += truth.intersection(&hb).count() as f64 / K as f64;
+        }
+        ra /= Q as f64; rb /= Q as f64;
+        eprintln!("[parity] flat-path identical: {flat_identical}/{Q}  |  HNSW recall@{K}: per-item={ra:.3} batched={rb:.3}");
+        assert_eq!(flat_identical, Q, "production flat-scan recall must be identical A vs B");
+        assert!(rb > 0.0, "batched HNSW path returns hits");
+        assert!(rb >= ra - 0.05, "batched HNSW recall {rb:.3} within 0.05 of per-item {ra:.3}");
+    }
+
+    /// WRITES-DON'T-BLOCK-READS proof: measure the total EXCLUSIVE (write-lock) hold time
+    /// to insert a batch — this is exactly what blocks recall (recall needs the shared
+    /// lock; a held write lock stalls it). Per-item holds the write lock across the
+    /// O(log N) global + per-realm HNSW neighbor SEARCH for every item. The deferred path
+    /// holds it only for cheap metadata + the pointer-wire apply; the search runs under a
+    /// READ lock (plan), which recall can share. Stable metric (a sum, not a noisy
+    /// worst-case) — mirrors the daemon's [lockprof] EXCLUSIVE-hold reduction.
+    #[test]
+    fn test_deferred_batch_exclusive_hold() {
+        use crate::hnsw::SemanticIndex;
+        use crate::ops::EMBED_DIM;
+        const SEED: u64 = 5000;    // > HNSW_TIER2_THRESHOLD: global delta tier active
+        const BATCH: usize = 500;
+        // 3 realms, each ~1/3 of the corpus (> 500): per-realm HNSW active too, so both
+        // graph inserts (global + per-realm) are on the write path in the per-item case.
+        let realm_of = |i: u64| -> &'static str { ["ra", "rb", "rc"][(i % 3) as usize] };
+        let seed: Vec<(u64, Vec<f32>)> = (1..=SEED).map(|i| (i, lcg_vec(i, EMBED_DIM))).collect();
+        let tail: Vec<(u64, Vec<f32>)> =
+            (SEED + 1..=SEED + BATCH as u64).map(|i| (i, lcg_vec(i, EMBED_DIM))).collect();
+        let build = || {
+            let mut s = SemanticIndex::new();
+            for (id, e) in &seed { s.upsert(*id, e.clone(), Some(realm_of(*id))); }
+            s
+        };
+
+        // Per-item: every upsert holds the write lock across the HNSW neighbor search.
+        let mut a = build();
+        let mut hold_a = std::time::Duration::ZERO;
+        for (id, e) in &tail {
+            let t = std::time::Instant::now();
+            a.upsert(*id, e.clone(), Some(realm_of(*id)));
+            hold_a += t.elapsed();
+        }
+
+        // Batched: EXCLUSIVE hold = metadata write + apply write. The neighbor search
+        // (plan_delta_batch) runs OFF the write lock and is NOT counted — the whole point.
+        let mut b = build();
+        let ids: Vec<u64> = tail.iter().map(|(id, _)| *id).collect();
+        let t0 = std::time::Instant::now();
+        for (id, e) in &tail { b.upsert_deferred(*id, e.clone(), Some(realm_of(*id))); }
+        let mut hold_b = t0.elapsed();                 // metadata (exclusive)
+        let plan = b.plan_delta_batch(&ids);           // OFF-LOCK (read) — not counted
+        let t1 = std::time::Instant::now();
+        b.apply_delta_batch(plan);
+        hold_b += t1.elapsed();                         // apply (exclusive)
+
+        eprintln!("[exclusive-hold] per-item={:?} batched={:?} (search moved off-lock into plan)",
+                  hold_a, hold_b);
+        assert!(hold_b.as_micros() * 3 < hold_a.as_micros(),
+            "batched exclusive hold {hold_b:?} must be <⅓ of per-item {hold_a:?}");
     }
 }

@@ -446,6 +446,40 @@ impl HnswGraph {
             self.entry_point = Some((id, level));
         }
     }
+
+    /// Fast apply of a pre-computed insert plan WITHOUT distance-based neighbor shrink.
+    /// Wires the new node's forward edges (already ≤ M, selected in compute_insert_plan)
+    /// and appends back-edges (neighbor → new), capped at 3×M so lists stay bounded.
+    /// Deferring the O(M·dim) shrink keeps the write-lock hold at O(plan·M) pointer ops
+    /// (microseconds, not the ~1ms/node the shrink costs) — this is what lets the daemon
+    /// hold the exclusive rpc_mutex only briefly during apply. The exact shrink is
+    /// reconciled at the next delta→base merge, which rebuilds via insert() (proper
+    /// heuristic selection). Bounded growth keeps HNSW search valid meanwhile.
+    pub(crate) fn wire_precomputed(&mut self, id: MemoryId, level: usize, per_layer: &[Vec<MemoryId>]) {
+        let current_top = self.entry_point.map(|(_, l)| l).unwrap_or(0);
+        self.neighbors.insert(id, vec![Vec::new(); level + 1]);
+        if self.entry_point.is_none() {
+            self.entry_point = Some((id, level));
+            return;
+        }
+        for (layer, selected) in per_layer.iter().enumerate() {
+            if layer >= level + 1 { break; }
+            if let Some(nn) = self.neighbors.get_mut(&id) {
+                if layer < nn.len() { nn[layer] = selected.clone(); }
+            }
+            let cap = if layer == 0 { HNSW_M0 } else { HNSW_M } * 3;
+            for &nbr in selected {
+                if let Some(nl) = self.neighbors.get_mut(&nbr) {
+                    if layer < nl.len() && nl[layer].len() < cap {
+                        nl[layer].push(id);
+                    }
+                }
+            }
+        }
+        if level > current_top {
+            self.entry_point = Some((id, level));
+        }
+    }
 }
 
 /// Newtype for f32 that implements Ord via total_cmp. Used in BinaryHeap.
@@ -464,6 +498,25 @@ impl Ord for OrderedF32 {
 pub struct SemanticHit {
     pub memory_id: MemoryId,
     pub cosine_similarity: f32,
+}
+
+/// Pre-computed HNSW insert plan for a deferred batch (Step-1 deferred-batched-insert).
+/// Produced off-lock by `SemanticIndex::plan_delta_batch` (`&self`, under a read lock)
+/// and consumed by `apply_delta_batch` (`&mut self`, under a brief write lock). `Send`
+/// so it can be staged on `ChittaField` and applied on another thread.
+pub struct DeltaBatchPlan {
+    /// True when the global plan targets the delta tier; false when it targets base.
+    tier2: bool,
+    /// Global-graph plans: `(id, level, neighbors_per_layer)`.
+    plans: Vec<(MemoryId, usize, Vec<Vec<MemoryId>>)>,
+    /// Per-realm-graph plans: `(id, realm, level, neighbors_per_layer)`.
+    realm_plans: Vec<(MemoryId, String, usize, Vec<Vec<MemoryId>>)>,
+}
+
+impl DeltaBatchPlan {
+    /// Number of node-insertions this plan will wire in (global + per-realm).
+    pub fn len(&self) -> usize { self.plans.len() + self.realm_plans.len() }
+    pub fn is_empty(&self) -> bool { self.plans.is_empty() && self.realm_plans.is_empty() }
 }
 
 /// Lazily-built 4-bit TurboQuant index over the normalized embedding matrix.
@@ -954,6 +1007,21 @@ impl SemanticIndex {
         self.emb_offsets.contains_key(&id) || self.embeddings.contains_key(&id)
     }
 
+    /// Test-only: force the two-tier HNSW search path (base + delta merge), bypassing
+    /// the flat-scan / binary-Hamming routing in `search`. Lets parity tests compare the
+    /// GRAPH built by the per-item vs deferred-batched insert paths directly.
+    #[cfg(test)]
+    pub fn hnsw_search_test(&self, query: &[f32], k: usize) -> Vec<SemanticHit> {
+        let Some(query_unit) = self.center_norm(query) else { return vec![] };
+        let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
+        let mut pairs = self.hnsw.search(&query_unit, k, None, &self.deleted, &embs);
+        pairs.extend(self.delta_hnsw.search(&query_unit, k, None, &self.deleted, &embs));
+        pairs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        pairs.dedup_by_key(|p| p.0);
+        pairs.truncate(k);
+        pairs.into_iter().map(|(memory_id, cosine_similarity)| SemanticHit { memory_id, cosine_similarity }).collect()
+    }
+
     /// Read-only access to an embedding by memory ID.
     pub fn get_embedding(&self, id: MemoryId) -> Option<&[f32]> {
         if let Some(&off) = self.emb_offsets.get(&id) {
@@ -1185,8 +1253,10 @@ impl SemanticIndex {
         Ok(())
     }
 
-    /// Add or update an embedding. Un-deletes the entry if it was soft-deleted.
-    pub fn upsert(&mut self, memory_id: MemoryId, mut embedding: Vec<f32>, realm: Option<&str>) {
+    /// Shared metadata bookkeeping for `upsert`/`upsert_deferred`: normalize,
+    /// coarse/LSH/binary codes, embeddings-map insert, per-realm counts. Does NOT
+    /// touch the global HNSW graph. Returns `(embedding_ready, realm_is_small)`.
+    fn upsert_meta(&mut self, memory_id: MemoryId, mut embedding: Vec<f32>, realm: Option<&str>) -> (bool, bool) {
         self.mutations += 1;
         self.remove(memory_id);
         normalize_in_place(&mut embedding);
@@ -1235,18 +1305,11 @@ impl SemanticIndex {
         let realm_is_small = realm.map(|r|
             self.per_realm_counts.get(r).copied().unwrap_or(0) < PER_REALM_HNSW_THRESHOLD
         ).unwrap_or(false);
+        (embedding_ready, realm_is_small)
+    }
 
-        if !self.inhibit_hnsw && self.use_hnsw() && embedding_ready && !realm_is_small {
-            let emb = self.embeddings[&memory_id].clone();
-            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
-            if self.use_tier2() {
-                self.delta_hnsw.insert(memory_id, &emb, &embs);
-            } else {
-                self.hnsw.insert(memory_id, &emb, &embs);
-            }
-        }
-
-        // Per-realm HNSW: build when realm is large enough for its own graph.
+    /// Per-realm HNSW insert — build when realm is large enough for its own graph.
+    fn upsert_per_realm(&mut self, memory_id: MemoryId, realm: Option<&str>, embedding_ready: bool) {
         if embedding_ready {
             if let Some(r) = realm {
                 if self.per_realm_counts.get(r).copied().unwrap_or(0) >= PER_REALM_HNSW_THRESHOLD {
@@ -1256,8 +1319,114 @@ impl SemanticIndex {
                 }
             }
         }
+    }
 
+    /// Add or update an embedding. Un-deletes the entry if it was soft-deleted.
+    pub fn upsert(&mut self, memory_id: MemoryId, embedding: Vec<f32>, realm: Option<&str>) {
+        let (embedding_ready, realm_is_small) = self.upsert_meta(memory_id, embedding, realm);
+        if !self.inhibit_hnsw && self.use_hnsw() && embedding_ready && !realm_is_small {
+            let emb = self.embeddings[&memory_id].clone();
+            let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
+            if self.use_tier2() {
+                self.delta_hnsw.insert(memory_id, &emb, &embs);
+            } else {
+                self.hnsw.insert(memory_id, &emb, &embs);
+            }
+        }
+        self.upsert_per_realm(memory_id, realm, embedding_ready);
         self.maybe_refresh_centroid();
+    }
+
+    /// Deferred-HNSW variant of `upsert`: performs all metadata bookkeeping but SKIPS
+    /// BOTH expensive graph inserts — the global delta/base HNSW AND the per-realm HNSW
+    /// (they activate at the same 500-member threshold, so both must move off the write
+    /// lock for the fix to land). Returns `true` when the node needs a graph plan; the
+    /// caller drives `plan_delta_batch`/`apply_delta_batch` so the O(log N) neighbor
+    /// search runs off the write lock.
+    pub fn upsert_deferred(&mut self, memory_id: MemoryId, embedding: Vec<f32>, realm: Option<&str>) -> bool {
+        let (embedding_ready, realm_is_small) = self.upsert_meta(memory_id, embedding, realm);
+        self.maybe_refresh_centroid();
+        if !embedding_ready { return false; }
+        let global = !self.inhibit_hnsw && self.use_hnsw() && !realm_is_small;
+        let per_realm = realm
+            .map(|r| self.per_realm_counts.get(r).copied().unwrap_or(0) >= PER_REALM_HNSW_THRESHOLD)
+            .unwrap_or(false);
+        global || per_realm
+    }
+
+    /// Off-lock (`&self`) plan phase for a deferred batch insert (Step-1 of the
+    /// deferred-batched-insert re-architecture). Computes HNSW neighbor plans for
+    /// `ids` against the CURRENT active-tier graph WITHOUT mutating it, so it runs
+    /// under `semantic_idx.read()` (concurrent with recall) instead of the write lock.
+    /// Nodes already present, soft-deleted, or without a ready embedding are skipped.
+    /// Levels are id-seeded (order-independent), matching `backfill_hnsw_delta_parallel`.
+    pub fn plan_delta_batch(&self, ids: &[MemoryId]) -> DeltaBatchPlan {
+        let tier2 = self.use_tier2();
+        let global_graph = if tier2 { &self.delta_hnsw } else { &self.hnsw };
+        let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
+        let global_active = !self.inhibit_hnsw && self.use_hnsw();
+        // Global-graph plans (parallel). Skipped for small realms, matching `upsert`.
+        let plans: Vec<(MemoryId, usize, Vec<Vec<MemoryId>>)> = if global_active {
+            ids.par_iter().filter_map(|&id| {
+                if self.deleted.contains(&id) { return None; }
+                if self.hnsw.contains(id) || self.delta_hnsw.contains(id) { return None; }
+                let realm_small = self.per_id_realm.get(&id)
+                    .map(|r| self.per_realm_counts.get(r).copied().unwrap_or(0) < PER_REALM_HNSW_THRESHOLD)
+                    .unwrap_or(false);
+                if realm_small { return None; }
+                let emb = embs.get(id)?;
+                if emb.len() != EMBED_DIM { return None; }
+                let level = random_level_from_seed(id);
+                Some((id, level, global_graph.compute_insert_plan(emb, level, &embs, HNSW_EF_CONSTRUCTION)))
+            }).collect()
+        } else {
+            Vec::new()
+        };
+        // Per-realm-graph plans (parallel). A node ≥ threshold in its realm is planned
+        // against that realm's graph (empty when the realm's graph does not exist yet —
+        // apply creates it via or_default()).
+        let realm_plans: Vec<(MemoryId, String, usize, Vec<Vec<MemoryId>>)> = ids
+            .par_iter()
+            .filter_map(|&id| {
+                if self.deleted.contains(&id) { return None; }
+                let r = self.per_id_realm.get(&id)?;
+                if self.per_realm_counts.get(r).copied().unwrap_or(0) < PER_REALM_HNSW_THRESHOLD { return None; }
+                if self.per_realm_hnsw.get(r).map(|g| g.contains(id)).unwrap_or(false) { return None; }
+                let emb = embs.get(id)?;
+                if emb.len() != EMBED_DIM { return None; }
+                let level = random_level_from_seed(id);
+                let empty = HnswGraph::new();
+                let graph = self.per_realm_hnsw.get(r).unwrap_or(&empty);
+                Some((id, r.clone(), level, graph.compute_insert_plan(emb, level, &embs, HNSW_EF_CONSTRUCTION)))
+            })
+            .collect();
+        DeltaBatchPlan { tier2, plans, realm_plans }
+    }
+
+    /// Brief (`&mut self`) apply phase: wire a pre-computed batch plan into the live
+    /// active-tier graph. O(batch × M) pointer work — no distance search — so the
+    /// write lock is held for milliseconds, not the O(log N) neighbor search. Nodes
+    /// a concurrent writer inserted between plan and apply are untouched (their entries
+    /// are preserved; only the batch nodes are wired in), so no torn graph / lost write.
+    pub fn apply_delta_batch(&mut self, plan: DeltaBatchPlan) {
+        if plan.is_empty() { return; }
+        self.mutations += 1;
+        // Disjoint-field split borrow: mutate the graph fields, read `deleted`.
+        let SemanticIndex { hnsw, delta_hnsw, per_realm_hnsw, deleted, .. } = self;
+        // Global graph.
+        let target = if plan.tier2 { delta_hnsw } else { hnsw };
+        for (id, level, per_layer) in &plan.plans {
+            if deleted.contains(id) { continue; }
+            if target.contains(*id) { continue; }
+            target.wire_precomputed(*id, *level, per_layer);
+        }
+        // Per-realm graphs (created on first insert via or_default).
+        for (id, realm, level, per_layer) in &plan.realm_plans {
+            if deleted.contains(id) { continue; }
+            let g = per_realm_hnsw.entry(realm.clone()).or_default();
+            if g.contains(*id) { continue; }
+            g.wire_precomputed(*id, *level, per_layer);
+        }
     }
 
     /// Mark a memory as deleted — excluded from future search results.

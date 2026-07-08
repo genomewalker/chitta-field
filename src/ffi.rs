@@ -1640,6 +1640,60 @@ pub extern "C" fn cf_backfill_embedding(
     }
 }
 
+// ── Deferred batched backfill (Step-1) — three-phase FFI ───────────────────────
+// The C++ backfill thread calls stage → plan → apply per chunk, holding the
+// exclusive rpc_mutex (acquire_lock) around stage and apply ONLY, so the O(log N)
+// neighbor search in plan runs off the rpc_mutex (recall not blocked). See
+// ChittaField::backfill_stage/plan/apply for the lock discipline.
+
+/// Phase 1 (call under rpc_mutex). `embeddings` is `n * embed_dim` row-major f32.
+/// Writes the number of ids still needing a global-HNSW plan to `out_plan_count`.
+#[no_mangle]
+pub extern "C" fn cf_backfill_stage(
+    h: *mut CfHandle,
+    ids: *const u64,
+    embeddings: *const f32,
+    n: usize,
+    embed_dim: usize,
+    out_plan_count: *mut usize,
+) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    if (ids.is_null() || embeddings.is_null()) && n != 0 { return -1; }
+    let ids_slice = if n == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(ids, n) } };
+    let emb_slice = if n == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(embeddings, n * embed_dim) } };
+    let items: Vec<(u64, Vec<f32>)> = ids_slice.iter().enumerate()
+        .map(|(i, &id)| (id, emb_slice[i * embed_dim..(i + 1) * embed_dim].to_vec()))
+        .collect();
+    match handle.field.backfill_stage(&items) {
+        Ok(plan_count) => {
+            if !out_plan_count.is_null() { unsafe { *out_plan_count = plan_count; } }
+            handle.ok()
+        }
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Phase 2 (call WITHOUT rpc_mutex): compute HNSW plans off the write lock.
+#[no_mangle]
+pub extern "C" fn cf_backfill_plan(h: *mut CfHandle) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    handle.field.backfill_plan();
+    handle.ok()
+}
+
+/// Phase 3 (call under rpc_mutex): apply plans + clear embed_pending. Writes the
+/// number of memories whose embed_pending was cleared to `out_applied`.
+#[no_mangle]
+pub extern "C" fn cf_backfill_apply(h: *mut CfHandle, out_applied: *mut usize) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let n = handle.field.backfill_apply();
+    if !out_applied.is_null() { unsafe { *out_applied = n; } }
+    handle.ok()
+}
+
 #[no_mangle]
 pub extern "C" fn cf_pending_embeddings(
     h: *mut CfHandle, out_ids: *mut u64, max_ids: usize, out_count: *mut usize,
