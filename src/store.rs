@@ -718,16 +718,23 @@ pub(crate) fn parse_prov_keys(content: &[u8]) -> Vec<String> {
     keys
 }
 
-/// SSL structural markers + pure English function words. Kept intentionally
-/// minimal: only tokens that carry no trigger signal AND would pair into a
-/// non-distinctive bigram. Content verbs like "run"/"cp"/"over" are NOT stopped
-/// — they are exactly the tokens that make a mistake phrase distinctive, and
-/// over-stopping collapses a phrase past the 2-token bigram floor (the original
-/// bug: "cp over the running binary" reduced to a single token and never keyed).
+/// SSL structural markers + English function words + conversational-frame verbs
+/// that leak across unrelated turns ("can you run", "how should I check ...").
+/// The precision sweep found these frame words are the top false-fire drivers:
+/// they pair into generic bigrams shared by many stored corrections, so a
+/// normal turn injects an irrelevant one. Distinctive short commands ("cp",
+/// "rm", "ls", "db") and content prepositions ("over") are NOT stopped — they
+/// are what make a mistake phrase specific, and over-stopping collapses a phrase
+/// past the 2-token bigram floor (the original bug: "cp over the running binary"
+/// reduced to a single token and never keyed).
 const CORRECTION_STOPWORDS: &[&str] = &[
     "use", "not", "the", "and", "for", "with", "was", "are", "you", "your",
     "that", "this", "from", "into", "but", "its", "to", "of", "in", "on", "at",
     "by", "is", "it", "as", "or", "be", "do", "so", "an", "if", "we", "my",
+    // conversational-frame leakers surfaced by the false-fire sweep
+    "can", "how", "what", "should", "have", "need", "want", "about", "check",
+    "run", "dont", "get", "make", "did", "does", "could", "would", "will",
+    "our", "no", "yes",
 ];
 
 /// Lowercase, split on non-alphanumerics, drop function-word / single-char
@@ -742,6 +749,34 @@ fn norm_correction_tokens(s: &str) -> Vec<String> {
         .filter(|t| t.len() >= 2 && !CORRECTION_STOPWORDS.contains(t))
         .map(|t| t.to_string())
         .collect()
+}
+
+/// Strip memory-metadata footer lines (`kind:`/`tags:`/`visibility:`/`realm:`/
+/// `source_session:`/`confidence:`) and filesystem-path / URL whitespace-tokens
+/// from a correction body before bigram extraction. Without this the ~81% of
+/// corrections that carry no explicit `NOT:`/`WRONG:` line fall back to the
+/// whole body, whose path segments (`/maps/projects/caeg/...`) and metadata
+/// footer produce generic bigrams (`projects_caeg`, `kind_correction`) shared
+/// across nearly every stored correction — the dominant false-fire source in
+/// the sweep. Paths are single whitespace-tokens, so dropping any token
+/// containing `/` removes them cleanly.
+/// ceiling: also drops legitimate "and/or"-style tokens; upgrade: tokenize
+/// slashes only inside path-shaped runs.
+fn clean_correction_text(s: &str) -> String {
+    s.lines()
+        .filter(|l| {
+            let t = l.trim().to_ascii_lowercase();
+            !(t.starts_with("kind:")
+                || t.starts_with("tags:")
+                || t.starts_with("visibility:")
+                || t.starts_with("realm:")
+                || t.starts_with("source_session:")
+                || t.starts_with("confidence:"))
+        })
+        .flat_map(|l| l.split_whitespace())
+        .filter(|w| !w.contains('/'))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Order-preserving adjacent bigrams of normalized tokens, namespaced
@@ -783,7 +818,20 @@ pub(crate) fn parse_correction_keys(content: &[u8]) -> Vec<String> {
         .unwrap_or_else(|| {
             text.trim_start_matches("[correction]").to_string()
         });
-    correction_bigram_keys(&norm_correction_tokens(&wrong))
+    let cleaned = clean_correction_text(&wrong);
+    // Distinct-key gate: only index a correction that yields >= 2 DISTINCT
+    // bigrams. A 1-bigram correction would sit on a single (often generic) key
+    // and, under the AND firing rule in `correction_check`, could never reach the
+    // 2-key threshold anyway — so keying it only lets it steal a shared key from
+    // a fully-keyable correction (latest-wins overwrite). Leaving it unindexed
+    // keeps it on the fuzzy lane (no regression).
+    let mut keys = correction_bigram_keys(&norm_correction_tokens(&cleaned));
+    keys.sort();
+    keys.dedup();
+    if keys.len() < 2 {
+        return Vec::new();
+    }
+    keys
 }
 
 impl ChittaField {
@@ -840,22 +888,39 @@ impl ChittaField {
     /// from the top-k. The first element of the tuple is the newest fired
     /// correction's id (for exposed-correction / M-metric tracking).
     pub fn correction_check(&self, text: &str) -> Option<(MemoryId, String)> {
+        use std::collections::HashMap;
         const MAX_FIRED: usize = 3;
-        let keys = correction_bigram_keys(&norm_correction_tokens(text));
-        if keys.is_empty() {
+        // AND firing rule: a correction fires only when >= 2 of ITS distinct
+        // bigrams recur in this turn. A single shared/generic bigram is NOT
+        // enough — that OR rule made ~44% of normal turns inject an irrelevant
+        // stored correction (precision sweep). Requiring 2 distinct bigrams of
+        // the same correction cut the false-fire rate to single digits while
+        // keeping the vast majority of corrections fireable; the rest fall
+        // through to the fuzzy lane (no regression).
+        let mut keys = correction_bigram_keys(&norm_correction_tokens(text));
+        keys.sort();
+        keys.dedup();
+        if keys.len() < 2 {
             return None;
         }
-        let mut ids: Vec<MemoryId> = Vec::new();
+        // Count how many of the turn's DISTINCT bigrams map to each correction.
+        // The index is single-valued (latest-wins), so each key resolves to one
+        // correction id; a per-id count of 2 means two distinct trigger bigrams
+        // of that correction co-occur in the turn.
+        let mut per_id: HashMap<MemoryId, usize> = HashMap::new();
         {
             let idx = self.correction_key_idx.read();
             for k in &keys {
                 if let Some(&id) = idx.get(k) {
-                    if !ids.contains(&id) {
-                        ids.push(id);
-                    }
+                    *per_id.entry(id).or_insert(0) += 1;
                 }
             }
         }
+        let mut ids: Vec<MemoryId> = per_id
+            .into_iter()
+            .filter(|&(_, n)| n >= 2)
+            .map(|(id, _)| id)
+            .collect();
         if ids.is_empty() {
             return None;
         }
