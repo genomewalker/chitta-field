@@ -937,6 +937,50 @@ pub extern "C" fn cf_provenance_lookup(
     }
 }
 
+/// Deterministic correction lookup (keyed lane, capability #2 — durable
+/// corrections with override semantics). Given free turn/context text, fills
+/// `out_id` (newest fired correction) + `buf` (NUL-terminated; up to 3 fired
+/// corrections joined by "\n---\n") on a hit; returns 1 (no fields written) on
+/// a clean miss; negative on error. `text` may be NULL/empty. An exact-key
+/// bigram probe — no embedding, no ranking, no fuzzy miss.
+#[no_mangle]
+pub extern "C" fn cf_correction_check(
+    h: *mut CfHandle,
+    text: *const c_char,
+    out_id: *mut u64,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || out_id.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let text_str = if text.is_null() {
+        ""
+    } else {
+        unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("")
+    };
+
+    match handle.field.correction_check(text_str) {
+        Some((id, content)) => {
+            let bytes = content.as_bytes();
+            if bytes.len() >= buf_cap {
+                unsafe { *written = bytes.len(); }
+                return -2;
+            }
+            unsafe {
+                *out_id = id;
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+                *buf.add(bytes.len()) = 0;
+                *written = bytes.len();
+            }
+            handle.ok()
+        }
+        None => 1,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cf_recall_hdc(
     h: *mut CfHandle,

@@ -101,6 +101,13 @@ int cf_provenance_lookup(CfHandle* h,
     const char* sha, const char* input,
     uint64_t* out_id, uint8_t* buf, size_t buf_cap, size_t* written);
 
+/* Deterministic correction lookup (keyed lane, capability #2). 0=hit (fills
+   out_id + buf with up to 3 fired [correction] records, newest first), 1=clean
+   miss, <0=error. text may be NULL. Exact-key bigram probe — no fuzzy recall. */
+int cf_correction_check(CfHandle* h,
+    const char* text,
+    uint64_t* out_id, uint8_t* buf, size_t buf_cap, size_t* written);
+
 int cf_get_kind(CfHandle* h, uint64_t memory_id,
     uint8_t* buf, size_t buf_cap);
 

@@ -708,6 +708,74 @@ pub(crate) fn parse_prov_keys(content: &[u8]) -> Vec<String> {
     keys
 }
 
+/// SSL structural markers + pure English function words. Kept intentionally
+/// minimal: only tokens that carry no trigger signal AND would pair into a
+/// non-distinctive bigram. Content verbs like "run"/"cp"/"over" are NOT stopped
+/// — they are exactly the tokens that make a mistake phrase distinctive, and
+/// over-stopping collapses a phrase past the 2-token bigram floor (the original
+/// bug: "cp over the running binary" reduced to a single token and never keyed).
+const CORRECTION_STOPWORDS: &[&str] = &[
+    "use", "not", "the", "and", "for", "with", "was", "are", "you", "your",
+    "that", "this", "from", "into", "but", "its", "to", "of", "in", "on", "at",
+    "by", "is", "it", "as", "or", "be", "do", "so", "an", "if", "we", "my",
+];
+
+/// Lowercase, split on non-alphanumerics, drop function-word / single-char
+/// tokens. Floor is 2 chars so meaningful short commands ("cp", "rm", "ls",
+/// "db") survive. Shared by the store and query sides so a stored trigger and a
+/// recurring turn normalize identically.
+fn norm_correction_tokens(s: &str) -> Vec<String> {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .filter(|t| t.len() >= 2 && !CORRECTION_STOPWORDS.contains(t))
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Order-preserving adjacent bigrams of normalized tokens, namespaced
+/// `correction:bg:<a>_<b>`. The bigram — not the unigram — is the trigger unit:
+/// a single word over-fires on unrelated turns, a two-word phrase from the
+/// actual mistake rarely collides. Returns `[]` when there are < 2 significant
+/// tokens (that correction stays on the fuzzy lane — no regression).
+fn correction_bigram_keys(tokens: &[String]) -> Vec<String> {
+    tokens
+        .windows(2)
+        .map(|w| format!("correction:bg:{}_{}", w[0], w[1]))
+        .collect()
+}
+
+/// Trigger keys for the correction keyed lane (capability #2, durable
+/// corrections with override semantics). A `[correction]` record is stored as
+/// `USE: <right>\nNOT: <wrong>`; the *wrong* phrase is the trigger — when it
+/// recurs in a turn the correction must FIRE (not compete on cosine and lose).
+/// Extracts the `NOT:`/`WRONG:` mistake line (falls back to the whole body for
+/// the free-form "User corrected me" form), normalizes it, and emits its
+/// distinctive bigrams as exact keys. Returns `[]` for non-`[correction]`
+/// content or a mistake too short to bigram.
+pub(crate) fn parse_correction_keys(content: &[u8]) -> Vec<String> {
+    let text = match std::str::from_utf8(content) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    if !text.starts_with("[correction]") {
+        return Vec::new();
+    }
+    let wrong = text
+        .lines()
+        .find_map(|l| {
+            let t = l.trim();
+            t.strip_prefix("NOT:")
+                .or_else(|| t.strip_prefix("WRONG:"))
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| {
+            text.trim_start_matches("[correction]").to_string()
+        });
+    correction_bigram_keys(&norm_correction_tokens(&wrong))
+}
+
 impl ChittaField {
     /// Deterministic provenance lookup — the keyed lane for capability #1
     /// (anti-reprocessing). Given a content-hash and/or an input path, returns
@@ -749,6 +817,59 @@ impl ChittaField {
             }
         }
         None
+    }
+
+    /// Deterministic correction lookup — the keyed lane for capability #2
+    /// (durable corrections with override semantics). Given free turn/context
+    /// text, generates the same normalized bigram keys and probes the
+    /// correction index. Returns up to `MAX_FIRED` distinct *live* corrections
+    /// whose corrected-mistake trigger recurs in the text, NEWEST FIRST
+    /// (latest-wins), joined by `\n---\n`. This is an O(turn_tokens) set of
+    /// exact HashMap reads that BYPASSES the fuzzy BM25+HNSW retriever entirely
+    /// — the correction can no longer lose on cosine similarity and be dropped
+    /// from the top-k. The first element of the tuple is the newest fired
+    /// correction's id (for exposed-correction / M-metric tracking).
+    pub fn correction_check(&self, text: &str) -> Option<(MemoryId, String)> {
+        const MAX_FIRED: usize = 3;
+        let keys = correction_bigram_keys(&norm_correction_tokens(text));
+        if keys.is_empty() {
+            return None;
+        }
+        let mut ids: Vec<MemoryId> = Vec::new();
+        {
+            let idx = self.correction_key_idx.read();
+            for k in &keys {
+                if let Some(&id) = idx.get(k) {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        if ids.is_empty() {
+            return None;
+        }
+        // Monotonic ids => descending == newest correction first.
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        let states = self.states.read();
+        let payloads = self.payloads.read();
+        let mut out: Vec<String> = Vec::new();
+        let mut newest: Option<MemoryId> = None;
+        for id in ids {
+            if states.get(&id).map(|s| s.deleted).unwrap_or(true) {
+                continue;
+            }
+            if let Some(p) = payloads.get(&id) {
+                if newest.is_none() {
+                    newest = Some(id);
+                }
+                out.push(String::from_utf8_lossy(&p.content).into_owned());
+                if out.len() >= MAX_FIRED {
+                    break;
+                }
+            }
+        }
+        newest.map(|id| (id, out.join("\n---\n")))
     }
 
     /// Store a new memory. Returns `(MemoryId, ChunkHash)`.
@@ -946,6 +1067,15 @@ impl ChittaField {
             for pk in parse_prov_keys(content) {
                 self.prov_key_idx.write().entry(pk).or_insert(memory_id);
             }
+        }
+        // Correction keyed lane (capability #2, durable corrections with
+        // override). Index the mistake's distinctive bigrams -> this correction.
+        // `insert` (NOT `or_insert`): a newer correction sharing a trigger key
+        // SUPERSEDES the older one for that key (LATEST-WINS). Self-gated on the
+        // `[correction]` prefix inside parse_correction_keys, so no kind check —
+        // matches the load-time rebuild exactly.
+        for ck in parse_correction_keys(content) {
+            self.correction_key_idx.write().insert(ck, memory_id);
         }
         if !embed_pending {
             self.semantic_idx
@@ -9809,5 +9939,65 @@ mod tests {
         assert_eq!(field.provenance_lookup("deadbeef12", "").unwrap().0, first_id, "rebuilt lane keeps earliest after reopen");
         assert!(field.provenance_lookup("deadbeef12", "").unwrap().1.contains("task:qc"));
         assert!(field.provenance_lookup("cafef00d99", "").is_none());
+    }
+
+    /// Capability #2: durable corrections with override semantics. Proves the
+    /// correction keyed lane fires deterministically when the corrected
+    /// mistake's trigger recurs in a turn (an exact bigram probe, no fuzzy
+    /// retriever), applies LATEST-WINS + SUPERSEDE when a newer correction
+    /// shares a trigger, misses cleanly on unrelated turns, and rebuilds
+    /// deterministically (newest-wins) across a snapshot save/reopen.
+    #[test]
+    fn correction_keyed_lane_fires_latest_wins_and_persists() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let put = |field: &ChittaField, body: &str| {
+            field
+                .put_memory("correction", "cc-soul", body.as_bytes(), &[], 0.9, 0.001, 0, vec![], None, None)
+                .unwrap()
+                .0
+        };
+
+        let old_id = {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            // A correction whose mistake is "cp over the running binary".
+            let a = put(&field, "[correction] USE: install atomic rename\nNOT: cp over the running binary");
+
+            // Trigger recurs in a turn -> the correction FIRES (the exact bigram
+            // "running_binary"/"cp_over"... survives after stopword strip).
+            let hit = field.correction_check("can I just cp over the running binary to deploy?");
+            assert!(hit.is_some(), "recurring mistake trigger must fire the correction");
+            assert_eq!(hit.as_ref().unwrap().0, a, "fires the stored correction id");
+            assert!(hit.unwrap().1.contains("install atomic rename"), "surfaces the USE: fix");
+
+            // Unrelated turn -> clean miss (no fuzzy false-positive).
+            assert!(field.correction_check("what's the weather in the terminal today").is_none(),
+                    "unrelated turn must miss cleanly");
+
+            // Too-short correction (< 2 significant tokens) never indexes -> stays
+            // on the fuzzy lane, so it can't be found by the keyed probe.
+            let _short = put(&field, "[correction] USE: yes\nNOT: no");
+            assert!(field.correction_check("no").is_none(), "sub-bigram correction is not keyed");
+
+            // LATEST-WINS / SUPERSEDE: a newer correction sharing the trigger
+            // replaces the old one for that key.
+            let b = put(&field, "[correction] USE: install -m 0755 atomic\nNOT: cp over the running binary ETXTBSY");
+            let hit2 = field.correction_check("cp over the running binary now").unwrap();
+            assert_eq!(hit2.0, b, "newest correction supersedes older for a shared trigger");
+            assert!(hit2.1.contains("ETXTBSY"), "surfaces the superseding correction body");
+            assert_ne!(a, b);
+
+            field.save_full_snapshot().unwrap();
+            a
+        };
+
+        // Reopen: lane rebuilt from live payloads, deterministically newest-wins.
+        let field = ChittaField::open(data_dir).unwrap();
+        let hit = field.correction_check("cp over the running binary now").unwrap();
+        assert_ne!(hit.0, old_id, "rebuilt lane keeps the SUPERSEDING correction after reopen");
+        assert!(hit.1.contains("ETXTBSY"), "rebuilt lane surfaces newest body");
+        assert!(field.correction_check("totally unrelated question").is_none());
     }
 }
