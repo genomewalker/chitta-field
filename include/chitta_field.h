@@ -108,6 +108,13 @@ int cf_correction_check(CfHandle* h,
     const char* text,
     uint64_t* out_id, uint8_t* buf, size_t buf_cap, size_t* written);
 
+/* Deterministic task-state lookup (keyed lane, capability #3). 0=hit (fills
+   out_id + buf with the LATEST [task] record for the slug), 1=clean miss,
+   <0=error. id may be NULL. Exact-key HashMap read — no fuzzy recall. */
+int cf_task_state_lookup(CfHandle* h,
+    const char* id,
+    uint64_t* out_id, uint8_t* buf, size_t buf_cap, size_t* written);
+
 int cf_get_kind(CfHandle* h, uint64_t memory_id,
     uint8_t* buf, size_t buf_cap);
 

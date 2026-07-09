@@ -834,6 +834,53 @@ pub(crate) fn parse_correction_keys(content: &[u8]) -> Vec<String> {
     keys
 }
 
+/// Normalize a task slug to the canonical index key `task:<slug>`. Lowercase,
+/// keep `[a-z0-9._-]`, collapse everything else out. A task's slug is its one
+/// stable handle (unlike a path, which NFS resurrects) so a single normalized
+/// key is the whole identity — no need for the multi-key fan-out the provenance
+/// (sha+path) and correction (bigram) lanes carry.
+fn norm_task_key(slug: &str) -> Option<String> {
+    let s: String = slug
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if s.is_empty() { None } else { Some(format!("task:{s}")) }
+}
+
+/// Extract the deterministic task-state key from a `[task]` record body.
+///
+/// Grammar (from the task-state ritual):
+///   `[task] id:<slug> status:<in-progress|blocked|done> next:<what> ...`
+///
+/// The indexable key is `task:<slug>` derived from the first `id:<slug>` (or
+/// `task:<slug>`) token — a task has ONE identity, so this returns at most one
+/// key. Self-gated on the `[task]` prefix (kind-independent) so the live path
+/// and the load-time rebuild share one gate, mirroring `parse_correction_keys`.
+/// Returns `[]` for non-`[task]` content or a record with no usable slug (that
+/// record stays on the fuzzy lane — no regression).
+pub(crate) fn parse_task_keys(content: &[u8]) -> Vec<String> {
+    let text = match std::str::from_utf8(content) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    if !text.starts_with("[task]") {
+        return Vec::new();
+    }
+    for tok in text.split_whitespace() {
+        let slug = tok
+            .strip_prefix("id:")
+            .or_else(|| tok.strip_prefix("task:"));
+        if let Some(slug) = slug {
+            if let Some(key) = norm_task_key(slug) {
+                return vec![key];
+            }
+        }
+    }
+    Vec::new()
+}
+
 impl ChittaField {
     /// Deterministic provenance lookup — the keyed lane for capability #1
     /// (anti-reprocessing). Given a content-hash and/or an input path, returns
@@ -945,6 +992,36 @@ impl ChittaField {
             }
         }
         newest.map(|id| (id, out.join("\n---\n")))
+    }
+
+    /// Deterministic task-state lookup — the keyed lane for capability #3 (task
+    /// hand-off across discontinuous sessions). Given a task slug, returns the
+    /// LATEST live `[task]` record for that id, or `None`. An O(1) exact-key
+    /// HashMap read that BYPASSES the fuzzy BM25+HNSW retriever entirely: no
+    /// embedding, no ranking. Unlike provenance (write-once, earliest wins), a
+    /// task's status EVOLVES, so the index is latest-wins (SUPERSEDE) — the same
+    /// discipline as the correction lane. `id` accepts a raw slug or an
+    /// already-prefixed `task:<slug>` key.
+    pub fn task_state_lookup(&self, id: &str) -> Option<(MemoryId, String)> {
+        let raw = id.trim().strip_prefix("task:").unwrap_or(id.trim());
+        let key = norm_task_key(raw)?;
+        let mem_id = *self.task_key_idx.read().get(&key)?;
+        let alive = self
+            .states
+            .read()
+            .get(&mem_id)
+            .map(|s| !s.deleted)
+            .unwrap_or(false);
+        if !alive {
+            return None;
+        }
+        let content = self
+            .payloads
+            .read()
+            .get(&mem_id)
+            .map(|p| String::from_utf8_lossy(&p.content).into_owned())
+            .unwrap_or_default();
+        Some((mem_id, content))
     }
 
     /// Store a new memory. Returns `(MemoryId, ChunkHash)`.
@@ -1151,6 +1228,14 @@ impl ChittaField {
         // matches the load-time rebuild exactly.
         for ck in parse_correction_keys(content) {
             self.correction_key_idx.write().insert(ck, memory_id);
+        }
+        // Task-state keyed lane (capability #3, task hand-off). Index the task's
+        // slug -> this record. `insert` (NOT `or_insert`): a newer status for the
+        // same task SUPERSEDES the older one (LATEST-WINS), since status evolves
+        // in-progress -> done. Self-gated on the `[task]` prefix inside
+        // parse_task_keys, so no kind check — matches the load-time rebuild.
+        for tk in parse_task_keys(content) {
+            self.task_key_idx.write().insert(tk, memory_id);
         }
         if !embed_pending {
             self.semantic_idx
@@ -10211,6 +10296,53 @@ mod tests {
         assert_ne!(hit.0, old_id, "rebuilt lane keeps the SUPERSEDING correction after reopen");
         assert!(hit.1.contains("ETXTBSY"), "rebuilt lane surfaces newest body");
         assert!(field.correction_check("totally unrelated question").is_none());
+    }
+
+    /// Capability #3: task hand-off across discontinuous sessions. Proves the
+    /// task-state keyed lane resolves a `[task]` record by its slug through an
+    /// exact O(1) lookup, applies LATEST-WINS when the status evolves
+    /// (in-progress -> done), returns the DONE record after the update, misses
+    /// cleanly on an unknown id, and rebuilds deterministically (newest-wins)
+    /// across a snapshot save/reopen.
+    #[test]
+    fn task_state_keyed_lane_latest_wins_and_persists() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Stored kind:signal like the [job]/[done] rituals; the lane self-gates
+        // on the [task] prefix, not the kind.
+        let put = |field: &ChittaField, body: &str| {
+            field
+                .put_memory("signal", "cc-soul", body.as_bytes(), &[], 0.8, 0.001, 0, vec![], None, None)
+                .unwrap()
+                .0
+        };
+
+        let done_id = {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            let a = put(&field, "[task] id:foo status:in-progress next:wire the FFI layer");
+            // Same task, evolved status -> a second live record; the lane must
+            // resolve to the LATEST (done), not the first (in-progress).
+            let b = put(&field, "[task] id:foo status:done next:ship it");
+            assert_ne!(a, b, "evolving status stores as two records");
+
+            let hit = field.task_state_lookup("foo").unwrap();
+            assert_eq!(hit.0, b, "slug lookup -> LATEST record (recency wins)");
+            assert!(hit.1.contains("status:done"), "returns the newest status");
+            assert_eq!(field.task_state_lookup("task:foo").unwrap().0, b, "prefixed arg resolves");
+            assert!(field.task_state_lookup("bar").is_none(), "unknown id misses cleanly");
+
+            field.save_full_snapshot().unwrap();
+            b
+        };
+
+        // Reopen: lane rebuilt from live payloads, deterministically newest-wins.
+        let field = ChittaField::open(data_dir).unwrap();
+        let hit = field.task_state_lookup("foo").unwrap();
+        assert_eq!(hit.0, done_id, "rebuilt lane keeps the LATEST record after reopen");
+        assert!(hit.1.contains("status:done"), "rebuilt lane surfaces newest status");
+        assert!(field.task_state_lookup("bar").is_none());
     }
 
     // ── Deferred-batched-insert (Step-1 re-architecture) proofs ────────────────

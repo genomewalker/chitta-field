@@ -981,6 +981,50 @@ pub extern "C" fn cf_correction_check(
     }
 }
 
+/// Deterministic task-state lookup (keyed lane, capability #3 — task hand-off
+/// across discontinuous sessions). Given a task slug, fills `out_id` + `buf`
+/// (NUL-terminated record content) with the LATEST live `[task]` record for
+/// that id on a hit; returns 1 (no fields written) on a clean miss; negative on
+/// error. `id` may be NULL/empty. An exact-key HashMap read — no embedding, no
+/// ranking. Latest-wins: status evolves, so the newest record is returned.
+#[no_mangle]
+pub extern "C" fn cf_task_state_lookup(
+    h: *mut CfHandle,
+    id: *const c_char,
+    out_id: *mut u64,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || out_id.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let id_str = if id.is_null() {
+        ""
+    } else {
+        unsafe { CStr::from_ptr(id) }.to_str().unwrap_or("")
+    };
+
+    match handle.field.task_state_lookup(id_str) {
+        Some((mid, content)) => {
+            let bytes = content.as_bytes();
+            if bytes.len() >= buf_cap {
+                unsafe { *written = bytes.len(); }
+                return -2;
+            }
+            unsafe {
+                *out_id = mid;
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+                *buf.add(bytes.len()) = 0;
+                *written = bytes.len();
+            }
+            handle.ok()
+        }
+        None => 1,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cf_recall_hdc(
     h: *mut CfHandle,

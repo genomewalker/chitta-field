@@ -225,6 +225,14 @@ pub struct ChittaField {
     /// similarity ~99% of the time. Derived, rebuilt on load (no snapshot-format
     /// change, migration-free, rollback-safe — same discipline as prov_key_idx).
     pub(crate) correction_key_idx: RwLock<HashMap<String, MemoryId>>,
+    /// Task-state keyed lane (capability #3, task hand-off across discontinuous
+    /// sessions). Task slug (`task:<slug>`) -> the NEWEST live `[task]` record id
+    /// for that task (LATEST-WINS / SUPERSEDE, since status evolves). Powers
+    /// `task_state_lookup`, a deterministic O(1) exact-key probe that answers
+    /// "what is the current state of task X?" without the fuzzy retriever.
+    /// Derived, rebuilt on load (no snapshot-format change, migration-free,
+    /// rollback-safe — same discipline as correction_key_idx).
+    pub(crate) task_key_idx: RwLock<HashMap<String, MemoryId>>,
     pub(crate) realm_members: RwLock<HashMap<String, HashSet<MemoryId>>>,
     pub(crate) kind_members:  RwLock<HashMap<String, HashSet<MemoryId>>>,
     /// Write-time densification: per-session recency ring (last K memory ids),
@@ -1237,6 +1245,29 @@ impl ChittaField {
             idx
         };
         eprintln!("[chitta-field] correction_key_idx rebuilt: {} keyed correction triggers", correction_key_idx.len());
+        // Rebuild the task-state keyed lane from live [task] payloads. Sorted
+        // ASCENDING by (created_at, id) + `insert` (overwrite) => the NEWEST
+        // record wins per task slug, matching the live put_memory insert order
+        // exactly (LATEST-WINS / SUPERSEDE) — same discipline as the correction
+        // rebuild (status evolves, so newest state wins, unlike provenance).
+        let task_key_idx: HashMap<String, MemoryId> = {
+            let mut live: Vec<_> = payloads
+                .iter()
+                .filter(|(id, p)| {
+                    p.content.starts_with(b"[task]")
+                        && !states.get(id).map(|s| s.deleted).unwrap_or(false)
+                })
+                .collect();
+            live.sort_by_key(|(id, p)| (p.created_at_ms, **id));
+            let mut idx: HashMap<String, MemoryId> = HashMap::new();
+            for (id, p) in live {
+                for tk in crate::store::parse_task_keys(&p.content) {
+                    idx.insert(tk, *id);
+                }
+            }
+            idx
+        };
+        eprintln!("[chitta-field] task_key_idx rebuilt: {} keyed task-state entries", task_key_idx.len());
         Ok(Self {
             data_dir,
             instance_id,
@@ -1302,6 +1333,7 @@ impl ChittaField {
             content_prov_idx: RwLock::new(content_prov_idx),
             prov_key_idx: RwLock::new(prov_key_idx),
             correction_key_idx: RwLock::new(correction_key_idx),
+            task_key_idx: RwLock::new(task_key_idx),
             realm_members: RwLock::new(realm_members),
             kind_members:  RwLock::new(kind_members),
             session_recent: RwLock::new(HashMap::new()),
