@@ -992,6 +992,10 @@ impl ChittaField {
             let hnsw_count = semantic_idx.hnsw_len();
             let total      = semantic_idx.total_embedding_count();
             if hnsw_count > 0 && hnsw_count == total {
+                // Promote delta→base (O(1) swap) so save_hnsw serialises the full
+                // graph, not a 9-byte empty-base stub — mirrors save_full_snapshot.
+                // Without this the next restart re-backfills the whole delta tier.
+                semantic_idx.promote_delta_to_base_if_empty();
                 if let Err(e) = semantic_idx.save_hnsw(&snap_path.with_extension("hnsw")) {
                     eprintln!("[chitta-field] WARNING: failed to save post-replay HNSW: {e}");
                 } else {
