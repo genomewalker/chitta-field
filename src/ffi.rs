@@ -62,6 +62,7 @@ fn edge_type_from_u8(v: u8) -> EdgeType {
         2 => EdgeType::SameArtifact,
         3 => EdgeType::CoRetrieved,
         4 => EdgeType::Supports,
+        6 => EdgeType::SemanticNeighbor,
         _ => EdgeType::Contradicts,
     }
 }
@@ -6049,6 +6050,7 @@ pub extern "C" fn cf_get_assoc_edges(
             crate::ops::EdgeType::CoRetrieved  => 3,
             crate::ops::EdgeType::Supports     => 4,
             crate::ops::EdgeType::Contradicts  => 5,
+            crate::ops::EdgeType::SemanticNeighbor => 6,
         }
     }
 
@@ -9753,6 +9755,19 @@ pub extern "C" fn cf_densify_backfill(h: *mut CfHandle, apply: bool) -> *mut c_c
     match CString::new(s) { Ok(cs)=>cs.into_raw(), Err(e)=>json_null(format!("cf_densify_backfill: {e}")) }
 }
 
+/// Dense-kNN SemanticNeighbor edge backfill. apply=false is a dry run (counts
+/// only). Returns JSON {apply,k,min_cos,memories_scanned,memories_with_neighbors,directed_edges}.
+#[no_mangle]
+pub extern "C" fn cf_semantic_backfill(h: *mut CfHandle, apply: bool, k: usize, min_cos: f32) -> *mut c_char {
+    if h.is_null() { return json_null("cf_semantic_backfill: null argument"); }
+    let handle = unsafe { &*h };
+    let (scanned, with_nb, edges) = handle.field.semantic_backfill(apply, k, min_cos);
+    let s = format!(
+        "{{\"apply\":{apply},\"k\":{k},\"min_cos\":{min_cos},\"memories_scanned\":{scanned},\"memories_with_neighbors\":{with_nb},\"directed_edges\":{edges}}}"
+    );
+    match CString::new(s) { Ok(cs)=>cs.into_raw(), Err(e)=>json_null(format!("cf_semantic_backfill: {e}")) }
+}
+
 /// Assoc-graph census. Returns JSON array of 6 per-EdgeType entries (wire
 /// numbering: DerivedFrom=0..Contradicts=5), each {type,count,weights:[5]}
 /// with weight buckets <0.05, 0.05-0.2, 0.2-0.5, 0.5-0.8, >=0.8.
@@ -9761,7 +9776,7 @@ pub extern "C" fn cf_assoc_census(h: *mut CfHandle) -> *mut c_char {
     if h.is_null() { return json_null("cf_assoc_census: null argument"); }
     let handle = unsafe { &*h };
     let census = handle.field.assoc_census();
-    const NAMES: [&str; 6] = ["DerivedFrom", "SameSession", "SameArtifact", "CoRetrieved", "Supports", "Contradicts"];
+    const NAMES: [&str; 7] = ["DerivedFrom", "SameSession", "SameArtifact", "CoRetrieved", "Supports", "Contradicts", "SemanticNeighbor"];
     let entries: Vec<String> = census.iter().enumerate().map(|(i, (count, w))| {
         format!(
             "{{\"type\":\"{}\",\"count\":{count},\"weights\":[{},{},{},{},{}]}}",

@@ -216,6 +216,12 @@ pub enum EdgeType {
     CoRetrieved,
     Contradicts,
     Supports,
+    /// Dense-kNN semantic-neighbor link (wire 6). Memory↔memory similarity edge
+    /// built by semantic_backfill from the HNSW index — the first genuine
+    /// knowledge relation in the assoc graph, distinct from CoRetrieved's
+    /// circular retrieval-history popularity prior. Exempt from the Phase16/17
+    /// kind lattice: a similarity link is not an evidence citation.
+    SemanticNeighbor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

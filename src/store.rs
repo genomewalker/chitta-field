@@ -1483,8 +1483,8 @@ impl ChittaField {
     /// the measure-first gate for plasticity levers (e.g. Gate B co-retrieval
     /// decay needs to know whether CoRetrieved edges exist at all before a
     /// decay rule is worth building).
-    pub fn assoc_census(&self) -> [(u64, [u64; 5]); 6] {
-        let mut out = [(0u64, [0u64; 5]); 6];
+    pub fn assoc_census(&self) -> [(u64, [u64; 5]); 7] {
+        let mut out = [(0u64, [0u64; 5]); 7];
         let edges = self.assoc_edges.read();
         for list in edges.values() {
             for e in list {
@@ -1498,6 +1498,7 @@ impl ChittaField {
                     EdgeType::CoRetrieved => 3,
                     EdgeType::Supports => 4,
                     EdgeType::Contradicts => 5,
+                    EdgeType::SemanticNeighbor => 6,
                 };
                 out[t].0 += 1;
                 let b = match e.weight {
@@ -1626,6 +1627,7 @@ impl ChittaField {
                     EdgeType::CoRetrieved => 3,
                     EdgeType::Supports => 4,
                     EdgeType::Contradicts => 5,
+                    EdgeType::SemanticNeighbor => 6,
                 };
                 writeln!(edges_f, "{{\"src\":{},\"dst\":{},\"t\":{},\"w\":{}}}", src, e.dst, t, e.weight)?;
                 n_edges += 1;
@@ -1717,6 +1719,63 @@ impl ChittaField {
             i = j;
         }
         (sessions, mem_in_sessions, pairs, hist)
+    }
+
+    /// One-shot retro-backfill of SemanticNeighbor edges — the first genuine
+    /// memory↔memory *knowledge* relation in the assoc graph. For each
+    /// non-deleted memory with an embedding, query the realm-scoped HNSW index
+    /// for its top-K dense-cosine neighbors and add bidirectional
+    /// SemanticNeighbor edges weighted by cosine. Unlike CoRetrieved (a circular
+    /// retrieval-history popularity prior), these encode actual semantic
+    /// relatedness, so PPR bridges over real relations, not co-retrieval
+    /// popularity.
+    ///
+    /// Realm-scoped (search passes each memory's own realm) so edges never cross
+    /// project boundaries. `min_cos` floors edge quality; `k` caps out-degree.
+    /// SemanticNeighbor is exempt from the Phase16/17 kind lattice in
+    /// add_assoc_edge, so backfill emits no laundering triplets.
+    ///
+    /// `apply=false` is a DRY RUN: runs the same searches and counts candidate
+    /// directed edges, writing nothing. Idempotent: add_assoc_edge merges by max
+    /// weight and SemanticNeighbor is created by no other path, so re-running is
+    /// safe. Returns (memories_scanned, memories_with_neighbors, directed_edges).
+    pub fn semantic_backfill(&self, apply: bool, k: usize, min_cos: f32) -> (u64, u64, u64) {
+        let k = k.max(1);
+        let rows: Vec<(MemoryId, String)> = {
+            let payloads = self.payloads.read();
+            let states = self.states.read();
+            payloads
+                .iter()
+                .filter(|(id, _)| states.get(id).map(|s| !s.deleted).unwrap_or(false))
+                .map(|(id, p)| (*id, p.realm.clone()))
+                .collect()
+        };
+        let mut scanned = 0u64;
+        let mut with_neighbors = 0u64;
+        let mut edges = 0u64;
+        for (id, realm) in &rows {
+            scanned += 1;
+            let Some(emb) = self.embedding_of(*id) else { continue };
+            let realm_opt = if realm.is_empty() { None } else { Some(realm.as_str()) };
+            // k+1: the query memory returns itself at rank 0; skip it below.
+            let neighbors = self.semantic_idx.read().search(&emb, k + 1, None, realm_opt);
+            let mut linked = false;
+            for nb in neighbors {
+                if nb.memory_id == *id { continue; }
+                if nb.cosine_similarity < min_cos { continue; }
+                // Bidirectional: kNN is not symmetric, so add both directions
+                // explicitly to guarantee PPR can traverse either way. Cosine is
+                // symmetric, so both edges carry the same weight.
+                edges += 2;
+                if apply {
+                    let _ = self.add_assoc_edge(*id, nb.memory_id, EdgeType::SemanticNeighbor, nb.cosine_similarity);
+                    let _ = self.add_assoc_edge(nb.memory_id, *id, EdgeType::SemanticNeighbor, nb.cosine_similarity);
+                }
+                linked = true;
+            }
+            if linked { with_neighbors += 1; }
+        }
+        (scanned, with_neighbors, edges)
     }
 
     /// Return the active cognitive-process genome: the most recently authored,
@@ -2223,8 +2282,11 @@ impl ChittaField {
             }
         }
 
-        // Phase 16/17: edge-legality + candidate-band checks.
-        {
+        // Phase 16/17: edge-legality + candidate-band checks. SemanticNeighbor is
+        // a structural similarity link, not an evidence citation, so it is exempt
+        // from the kind lattice — otherwise a bidirectional similarity backfill
+        // emits an illegal-edge/laundering triplet for every blocked pair.
+        if !matches!(edge_type, EdgeType::SemanticNeighbor) {
             let payloads = self.payloads.read();
             let src_payload = payloads.get(&src);
             let dst_payload = payloads.get(&dst);
@@ -2743,6 +2805,7 @@ impl ChittaField {
         let w_sameartifact = get_f("CHITTA_PPR_W_SAMEARTIFACT", 0.8);
         let w_samesession = get_f("CHITTA_PPR_W_SAMESESSION", 0.6);
         let w_coretrieved = get_f("CHITTA_PPR_W_CORETRIEVED", 0.35);
+        let w_semneighbor = get_f("CHITTA_PPR_W_SEMNEIGHBOR", 0.7);
         let frontier_cap = get_u("CHITTA_PPR_FRONTIER_CAP", 4000).max(seed_ids.len());
         let max_iters = get_u("CHITTA_PPR_MAX_ITERS", 25).max(1);
         // Per-node out-degree cap: a few high-degree hubs (one memory here has
@@ -2761,6 +2824,7 @@ impl ChittaField {
                 EdgeType::CoRetrieved => w_coretrieved,
                 EdgeType::Supports => 0.4,
                 EdgeType::Contradicts => 0.3,
+                EdgeType::SemanticNeighbor => w_semneighbor,
             }
         };
 
@@ -3074,6 +3138,7 @@ impl ChittaField {
                 EdgeType::CoRetrieved => 0.5,
                 EdgeType::Supports => 0.4,
                 EdgeType::Contradicts => 0.3,
+                EdgeType::SemanticNeighbor => 0.7,
             }
         };
 
