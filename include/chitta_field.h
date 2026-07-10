@@ -87,6 +87,11 @@ int cf_expand_associations(CfHandle* h,
     size_t max_hops, size_t limit,
     CfRecallHit* hits_buf, size_t hits_cap, size_t* hits_written);
 
+int cf_ppr_lane(CfHandle* h,
+    const uint64_t* seed_ids, const float* seed_weights, size_t seed_count,
+    size_t top_g,
+    uint64_t* out_ids, float* out_scores, size_t out_cap, size_t* out_written);
+
 int cf_recall_keyword(CfHandle* h,
     const char* query, size_t k, const char* realm,
     CfRecallHit* hits_buf, size_t hits_cap, size_t* hits_written,

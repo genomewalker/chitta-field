@@ -750,6 +750,47 @@ pub extern "C" fn cf_expand_associations(
     }
 }
 
+/// Personalized-PageRank injection lane. Seeds (ids + weights) come from the
+/// caller's top fused hits; returns up to `top_g` graph-reachable (id, score)
+/// pairs with the seeds excluded, written into the parallel out_ids/out_scores
+/// arrays. *out_written is the count actually written (<= out_cap).
+#[no_mangle]
+pub extern "C" fn cf_ppr_lane(
+    h: *mut CfHandle,
+    seed_ids: *const u64,
+    seed_weights: *const f32,
+    seed_count: usize,
+    top_g: usize,
+    out_ids: *mut u64,
+    out_scores: *mut f32,
+    out_cap: usize,
+    out_written: *mut usize,
+) -> c_int {
+    if h.is_null()
+        || seed_ids.is_null()
+        || seed_weights.is_null()
+        || out_ids.is_null()
+        || out_scores.is_null()
+        || out_written.is_null()
+    {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let seeds = unsafe { std::slice::from_raw_parts(seed_ids, seed_count) };
+    let weights = unsafe { std::slice::from_raw_parts(seed_weights, seed_count) };
+
+    let lane = handle.field.ppr_lane(seeds, weights, top_g);
+    let n = lane.len().min(out_cap);
+    unsafe {
+        for (i, (id, score)) in lane.iter().take(n).enumerate() {
+            *out_ids.add(i) = *id;
+            *out_scores.add(i) = *score;
+        }
+        *out_written = n;
+    }
+    handle.ok()
+}
+
 /// Get payload content for a memory. Writes UTF-8 content into buf (null-terminated).
 /// Returns 0 on success, -1 if not found/deleted, -2 if buf too small — in that
 /// case *written is set to the required content length (excluding the NUL) so the
@@ -1735,6 +1776,18 @@ pub extern "C" fn cf_backfill_apply(h: *mut CfHandle, out_applied: *mut usize) -
     let handle = unsafe { &*h };
     let n = handle.field.backfill_apply();
     if !out_applied.is_null() { unsafe { *out_applied = n; } }
+    handle.ok()
+}
+
+/// Persist the delta HNSW sidecar so the next restart LOADS it instead of cold-
+/// reinserting the delta from scratch. Off-lock safe (takes only semantic_idx.read()).
+/// Writes the number of delta nodes persisted to `out_persisted` (0 = nothing/failed).
+#[no_mangle]
+pub extern "C" fn cf_persist_delta_hnsw(h: *mut CfHandle, out_persisted: *mut usize) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let n = handle.field.persist_delta_hnsw();
+    if !out_persisted.is_null() { unsafe { *out_persisted = n; } }
     handle.ok()
 }
 

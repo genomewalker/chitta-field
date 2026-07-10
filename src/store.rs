@@ -2709,6 +2709,345 @@ impl ChittaField {
         Ok(hits)
     }
 
+    /// SOTA HippoRAG-style Personalized-PageRank lane over the association graph.
+    ///
+    /// Seeds are the query's top fused hits, weighted by their fused score. A
+    /// single PPR pass (power iteration with restart) spreads that mass over a
+    /// lazily-expanded neighborhood, ranking graph-reachable memories the
+    /// lexical/semantic lanes never surfaced — the multi-hop bridge that shares
+    /// no query terms with the question. Returns the top-`top_g` stationary
+    /// nodes EXCLUDING the seeds (the injection); seeds are already ranked.
+    ///
+    /// Edge transition weight = type_prior * stored_weight, row-normalized per
+    /// source. CoRetrieved (the weak Hebbian lane) is down-weighted vs the
+    /// strong DerivedFrom provenance lane. All knobs are env-gated. The frontier
+    /// is capped so the walk stays local and fast — it never materializes the
+    /// whole node graph, only the seeds' bounded neighborhood.
+    pub fn ppr_lane(
+        &self,
+        seed_ids: &[MemoryId],
+        seed_weights: &[f32],
+        top_g: usize,
+    ) -> Vec<(MemoryId, f32)> {
+        if seed_ids.is_empty() || top_g == 0 {
+            return Vec::new();
+        }
+        let get_f = |k: &str, d: f32| {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let get_u = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let alpha = get_f("CHITTA_PPR_ALPHA", 0.15).clamp(0.01, 0.99);
+        let w_derived = get_f("CHITTA_PPR_W_DERIVED", 1.0);
+        let w_sameartifact = get_f("CHITTA_PPR_W_SAMEARTIFACT", 0.8);
+        let w_samesession = get_f("CHITTA_PPR_W_SAMESESSION", 0.6);
+        let w_coretrieved = get_f("CHITTA_PPR_W_CORETRIEVED", 0.35);
+        let frontier_cap = get_u("CHITTA_PPR_FRONTIER_CAP", 4000).max(seed_ids.len());
+        let max_iters = get_u("CHITTA_PPR_MAX_ITERS", 25).max(1);
+        // Per-node out-degree cap: a few high-degree hubs (one memory here has
+        // >6k assoc edges) make the in-set adjacency dense, so the power
+        // iteration degrades to O(iters * n^2) — the measured 35s recall stall.
+        // Keep only each node's top-K edges by transition weight; a hub's mass is
+        // diffuse and the tail edges contribute negligibly to the stationary rank.
+        let max_degree = get_u("CHITTA_PPR_MAX_DEGREE", 64).max(1);
+        const HOP_BUDGET: usize = 4;
+
+        let type_prior = |et: &EdgeType| -> f32 {
+            match et {
+                EdgeType::DerivedFrom => w_derived,
+                EdgeType::SameArtifact => w_sameartifact,
+                EdgeType::SameSession => w_samesession,
+                EdgeType::CoRetrieved => w_coretrieved,
+                EdgeType::Supports => 0.4,
+                EdgeType::Contradicts => 0.3,
+            }
+        };
+
+        let pipeline_config = self.scoring_pipeline.read().config.clone();
+        let states = self.states.read();
+        let assoc_edges = self.assoc_edges.read();
+
+        let legal = |id: &MemoryId| -> bool {
+            match states.get(id) {
+                None => false,
+                Some(s) if s.deleted => false,
+                Some(s) => {
+                    crate::scoring::status_multiplier(&s.status, &pipeline_config).is_some()
+                }
+            }
+        };
+
+        // Lazy BFS: build the local node set (seeds first) bounded by a small hop
+        // budget and a hard frontier cap. Nearest-first exploration keeps the walk
+        // concentrated where PPR mass actually lands.
+        let mut index: std::collections::HashMap<MemoryId, usize> =
+            std::collections::HashMap::new();
+        let mut nodes: Vec<MemoryId> = Vec::new();
+        for &s in seed_ids {
+            index.entry(s).or_insert_with(|| {
+                let i = nodes.len();
+                nodes.push(s);
+                i
+            });
+        }
+        let seed_n = nodes.len();
+        let mut queue: std::collections::VecDeque<(MemoryId, usize)> =
+            nodes.iter().map(|&id| (id, 0usize)).collect();
+        while let Some((node, hop)) = queue.pop_front() {
+            if hop >= HOP_BUDGET || nodes.len() >= frontier_cap {
+                continue;
+            }
+            let neighbors = match assoc_edges.get(&node) {
+                Some(v) => v,
+                None => continue,
+            };
+            // Cap fan-out to the top-`max_degree` neighbors by transition weight so
+            // a single hub cannot flood the frontier with its low-weight tail.
+            let mut cand: Vec<(f32, MemoryId)> = neighbors
+                .iter()
+                .map(|e| (type_prior(&e.edge_type) * e.weight.max(0.0), e.dst))
+                .filter(|&(w, _)| w > 0.0)
+                .collect();
+            if cand.len() > max_degree {
+                cand.select_nth_unstable_by(max_degree, |a, b| {
+                    b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                cand.truncate(max_degree);
+            }
+            for (_, dst) in cand {
+                if index.contains_key(&dst) || !legal(&dst) {
+                    continue;
+                }
+                if nodes.len() >= frontier_cap {
+                    break;
+                }
+                index.insert(dst, nodes.len());
+                nodes.push(dst);
+                queue.push_back((dst, hop + 1));
+            }
+        }
+
+        let n = nodes.len();
+        // Row-normalized transition rows restricted to the explored set.
+        let mut adj: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+        for (i, &src) in nodes.iter().enumerate() {
+            if let Some(edges) = assoc_edges.get(&src) {
+                let mut row: Vec<(usize, f32)> = Vec::new();
+                for edge in edges {
+                    if let Some(&j) = index.get(&edge.dst) {
+                        let w = type_prior(&edge.edge_type) * edge.weight.max(0.0);
+                        if w > 0.0 {
+                            row.push((j, w));
+                        }
+                    }
+                }
+                // Bound the row to top-`max_degree` by weight: this is what keeps
+                // the power iteration O(iters * n * max_degree) instead of O(n^2).
+                if row.len() > max_degree {
+                    row.select_nth_unstable_by(max_degree, |a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    row.truncate(max_degree);
+                }
+                let sum: f32 = row.iter().map(|e| e.1).sum();
+                if sum > 0.0 {
+                    for e in &mut row {
+                        e.1 /= sum;
+                    }
+                    adj[i] = row;
+                }
+            }
+        }
+        drop(assoc_edges);
+        drop(states);
+
+        // Restart distribution: seed_weights normalized over the seeds, 0 else.
+        let mut restart = vec![0.0f32; n];
+        let mut wsum = 0.0f32;
+        for (k, &s) in seed_ids.iter().enumerate() {
+            if let Some(&i) = index.get(&s) {
+                let w = seed_weights.get(k).copied().unwrap_or(1.0).max(0.0);
+                restart[i] += w;
+                wsum += w;
+            }
+        }
+        if wsum <= 0.0 {
+            let u = 1.0 / seed_n as f32;
+            for r in restart.iter_mut().take(seed_n) {
+                *r = u;
+            }
+        } else {
+            for r in &mut restart {
+                *r /= wsum;
+            }
+        }
+
+        // Power iteration: p_{t+1} = (1-alpha) Pᵀ p_t + alpha r. Dangling mass
+        // (nodes with no in-set out-edges) is redistributed through the restart
+        // vector so p stays a proper distribution and the walk converges.
+        let mut p = restart.clone();
+        let mut next = vec![0.0f32; n];
+        for _ in 0..max_iters {
+            for i in 0..n {
+                next[i] = alpha * restart[i];
+            }
+            let mut dangling = 0.0f32;
+            for i in 0..n {
+                if adj[i].is_empty() {
+                    dangling += p[i];
+                    continue;
+                }
+                let out = (1.0 - alpha) * p[i];
+                for &(j, w) in &adj[i] {
+                    next[j] += out * w;
+                }
+            }
+            if dangling > 0.0 {
+                let spread = (1.0 - alpha) * dangling;
+                for i in 0..n {
+                    next[i] += spread * restart[i];
+                }
+            }
+            let mut delta = 0.0f32;
+            for i in 0..n {
+                delta += (next[i] - p[i]).abs();
+            }
+            std::mem::swap(&mut p, &mut next);
+            if delta < 1e-4 {
+                break;
+            }
+        }
+
+        // Rank non-seed nodes by stationary score; return top_g.
+        let mut ranked: Vec<(MemoryId, f32)> = nodes
+            .iter()
+            .enumerate()
+            .skip(seed_n)
+            .filter(|&(i, _)| p[i] > 0.0)
+            .map(|(i, &id)| (id, p[i]))
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(top_g);
+        ranked
+    }
+
+    /// Gated PPR injection for the MCP hybrid-recall path. Seed the PPR lane from
+    /// the current top hits and RRF-merge its stationary ranking back in,
+    /// INJECTING graph-reachable memories the lexical/semantic lanes missed.
+    /// Default OFF: the dev ablation showed it regresses single_hop nDCG for a
+    /// noise-level multihop gain (net-negative), so it ships dormant. Enable with
+    /// `CHITTA_PPR_LANE=1`. Injected nodes carry `semantic_score` 0.0, so any
+    /// cosine abstain gate is unaffected. Mirrors the C++ tier-2 PPR lane in
+    /// field_memory_recall.cpp.
+    fn ppr_inject(&self, hits: &mut Vec<RecallHit>) {
+        if std::env::var("CHITTA_PPR_LANE").ok().as_deref() != Some("1") {
+            return;
+        }
+        if hits.len() < 2 {
+            return;
+        }
+        let get_u = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let get_f = |k: &str, d: f32| {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let seeds_n = get_u("CHITTA_PPR_SEEDS", 5);
+        let top_g = get_u("CHITTA_PPR_G", 15);
+        let lane_w = get_f("CHITTA_PPR_LANE_W", 1.0);
+
+        let seed_ids: Vec<MemoryId> = hits.iter().take(seeds_n).map(|h| h.memory_id).collect();
+        let seed_w: Vec<f32> = hits.iter().take(seeds_n).map(|h| h.score.max(1e-6)).collect();
+        let lane = self.ppr_lane(&seed_ids, &seed_w, top_g);
+        if lane.is_empty() {
+            return;
+        }
+
+        const RRF_K: f32 = 60.0;
+        let mut fused: std::collections::HashMap<MemoryId, f32> =
+            std::collections::HashMap::new();
+        let mut by_id: std::collections::HashMap<MemoryId, RecallHit> =
+            std::collections::HashMap::new();
+        for (rank, h) in hits.iter().enumerate() {
+            *fused.entry(h.memory_id).or_insert(0.0) += 1.0 / (RRF_K + (rank + 1) as f32);
+            by_id.entry(h.memory_id).or_insert_with(|| h.clone());
+        }
+
+        let payloads = self.payloads.read();
+        let states = self.states.read();
+        let pipeline_config = self.scoring_pipeline.read().config.clone();
+        let now = now_ms();
+        for (rank, (mid, _)) in lane.iter().enumerate() {
+            let contrib = lane_w * (1.0 / (RRF_K + (rank + 1) as f32));
+            if by_id.contains_key(mid) {
+                *fused.entry(*mid).or_insert(0.0) += contrib;
+                continue;
+            }
+            // Hydrate an injected node into a full RecallHit (graph-derived: no
+            // semantic score/weight, mirrors expand_associations' construction).
+            let state = match states.get(mid) {
+                Some(s) if !s.deleted => s,
+                _ => continue,
+            };
+            let status_mul =
+                match crate::scoring::status_multiplier(&state.status, &pipeline_config) {
+                    Some(m) => m,
+                    None => continue,
+                };
+            let payload = match payloads.get(mid) {
+                Some(p) => p,
+                None => continue,
+            };
+            *fused.entry(*mid).or_insert(0.0) += contrib;
+            let eff_strength = state.effective_strength(now);
+            by_id.insert(
+                *mid,
+                RecallHit {
+                    memory_id: *mid,
+                    score: 0.0,
+                    semantic_score: 0.0,
+                    ts_ms: payload.created_at_ms,
+                    kind: payload.kind.clone(),
+                    realm: payload.realm.clone(),
+                    strength: eff_strength,
+                    confidence: state.confidence,
+                    access_count: state.access_count,
+                    content: String::from_utf8(payload.content.clone()).unwrap_or_default(),
+                    semantic_weight: 0.0,
+                    status_mul,
+                    epistemic_mul: 0.0,
+                    strength_factor: 0.0,
+                    affect_valence: 0.0,
+                    affect_arousal: 0.0,
+                    actr_activation: 0.0,
+                    surprise_boost: 1.0,
+                    arousal_boost: 1.0,
+                    mood_congruence: 1.0,
+                    frustration_boost: 1.0,
+                    interference_factor: 1.0,
+                    spacing_boost: 1.0,
+                },
+            );
+        }
+        drop(payloads);
+        drop(states);
+
+        let mut order: Vec<(MemoryId, f32)> = fused
+            .into_iter()
+            .filter(|(id, _)| by_id.contains_key(id))
+            .collect();
+        order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut merged = Vec::with_capacity(order.len());
+        for (mid, s) in order {
+            if let Some(mut h) = by_id.remove(&mid) {
+                h.score = s;
+                merged.push(h);
+            }
+        }
+        *hits = merged;
+    }
+
     /// Expand from seed memory IDs via typed association edges (max 2 hops).
     ///
     /// Returns memories discovered via the association graph, scored by
@@ -4328,6 +4667,10 @@ impl ChittaField {
             let kw = gate(self.recall_keyword_realm(query_text, fetch_k, realm)?);
             if !sem.is_empty() || !kw.is_empty() {
                 let mut merged = rrf_merge(sem, kw, fetch_k, rrf_k);
+                // PPR injection lane: seed from the top fused hits and RRF-merge
+                // the association-graph stationary ranking back in, injecting
+                // topic-bridged multi-hop memories. Gated by CHITTA_PPR_LANE.
+                self.ppr_inject(&mut merged);
 
                 // Cortical SDR re-rank: second-pass RRF over the already-merged candidate set.
                 // Gated by use_cortical (default false) and a non-empty cortical index.
@@ -5137,6 +5480,37 @@ impl ChittaField {
         self.backfill_stage(items)?;
         self.backfill_plan();
         Ok(self.backfill_apply())
+    }
+
+    /// Persist the live delta HNSW tier to its sidecar so the NEXT restart LOADS the
+    /// delta graph instead of cold-reinserting every runtime-added node from scratch
+    /// (single-threaded, ~minutes once the corpus grows). Pure optimization, never a
+    /// hard dependency: on startup a missing/stale/unreadable delta.hnsw silently falls
+    /// back to the existing backfill/rebuild path (normalize_all's hnsw_len==total gate).
+    ///
+    /// Writes to the DETERMINISTIC snapshot stem this instance loads on open
+    /// (`chitta.<instance>.delta.hnsw`, mirroring save_full_snapshot's path at
+    /// store.rs:7639), via save_delta_hnsw's write-temp + atomic-rename (NFS-safe on
+    /// Isilon — no delete-then-write). The n==0 guard skips the write entirely when the
+    /// delta is empty, avoiding save_delta_hnsw's remove_file branch (an NFS delete).
+    ///
+    /// Takes only semantic_idx.read() (like a recall) — safe to call OFF the rpc_mutex,
+    /// so it never blocks live recalls. Returns the number of delta nodes persisted
+    /// (0 = nothing to persist or write failed; both are non-fatal).
+    pub fn persist_delta_hnsw(&self) -> usize {
+        let idx = self.semantic_idx.read();
+        let n = idx.delta_len();
+        if n == 0 {
+            return 0;
+        }
+        let path = self
+            .data_dir
+            .join(format!("chitta.{:08x}.delta.hnsw", self.instance_id));
+        if let Err(e) = idx.save_delta_hnsw(&path) {
+            eprintln!("[chitta-field] WARNING: persist_delta_hnsw failed: {e}");
+            return 0;
+        }
+        n
     }
 
     /// Force a full rebuild of all derived search structures (binary codes, coarse,

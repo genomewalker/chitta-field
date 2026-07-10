@@ -657,6 +657,12 @@ impl SemanticIndex {
         self.hnsw.len() + self.delta_hnsw.len()
     }
 
+    /// Node count of the delta tier only. Used to gate the runtime delta-sidecar
+    /// persist (skip the write — and its NFS delete-on-empty branch — when empty).
+    pub fn delta_len(&self) -> usize {
+        self.delta_hnsw.len()
+    }
+
     /// True when the HNSW graph is the active search path.
     #[inline]
     fn use_hnsw(&self) -> bool {
