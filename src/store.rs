@@ -973,8 +973,8 @@ impl ChittaField {
         }
         // Monotonic ids => descending == newest correction first.
         ids.sort_unstable_by(|a, b| b.cmp(a));
-        let states = self.states.read();
         let payloads = self.payloads.read();
+        let states = self.states.read();
         let mut out: Vec<String> = Vec::new();
         let mut newest: Option<MemoryId> = None;
         for id in ids {
