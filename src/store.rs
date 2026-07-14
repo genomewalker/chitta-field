@@ -5654,6 +5654,13 @@ impl ChittaField {
     /// drained by failure paths as well as success paths, so a lost embedding leaves the queue
     /// empty and the store reports perfect health over a half-empty index. Derive coverage from
     /// the index; never infer it from the queue.
+    /// The stored vector for a memory, exactly as the index holds it.
+    /// Nothing else exposes this — which is why a document embedded into the wrong
+    /// vector space has been undetectable from outside the process.
+    pub fn get_embedding(&self, id: MemoryId) -> Option<Vec<f32>> {
+        self.semantic_idx.read().get_embedding(id).map(|v| v.to_vec())
+    }
+
     pub fn embed_coverage(&self) -> (usize, usize) {
         const MIN_EMBED_CHARS: usize = 20;
         // Locks are taken one at a time, never nested (get_memory() re-locks `states`).

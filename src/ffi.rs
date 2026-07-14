@@ -2081,6 +2081,20 @@ pub extern "C" fn cf_embed_coverage(
     handle.ok()
 }
 
+/// Copy a memory's stored vector into `out` (capacity `cap` floats).
+/// Returns the number of floats written, or 0 if the memory has no embedding.
+#[no_mangle]
+pub extern "C" fn cf_get_embedding(
+    h: *mut CfHandle, id: u64, out: *mut f32, cap: usize,
+) -> usize {
+    if h.is_null() || out.is_null() { return 0; }
+    let handle = unsafe { &*h };
+    let Some(v) = handle.field.get_embedding(id) else { return 0 };
+    let n = v.len().min(cap);
+    unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), out, n); }
+    n
+}
+
 #[no_mangle]
 pub extern "C" fn cf_force_clear_embed_pending(
     h: *mut CfHandle, ids: *const u64, count: usize, out_cleared: *mut usize,
