@@ -1,5 +1,5 @@
 [build]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=x86-64-v4"]
 
 [env]
 CHITTA_EMBED_DIM = "768"
