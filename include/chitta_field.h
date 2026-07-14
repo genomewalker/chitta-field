@@ -164,6 +164,10 @@ size_t cf_pending_count(const CfHandle* h);
 /** Ingest new ops from foreign-instance segment files on shared storage.
  *  Safe to call from any thread. Returns ops applied, -1 on error. */
 int    cf_sync_foreign(CfHandle* h);
+/* sync_foreign split into two phases so the disk reads never run under the daemon's rpc lock.
+ * collect: does the (possibly NFS-blocking) reads, no rpc lock.  apply: in-memory, rpc lock. */
+int    cf_sync_foreign_collect(CfHandle* h);
+int    cf_sync_foreign_apply(CfHandle* h);
 
 /* Code Intelligence */
 

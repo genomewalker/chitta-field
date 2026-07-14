@@ -149,6 +149,16 @@ pub(crate) struct PendingRecallEffects {
 // Enforcement: build with `--features deadlock-detection` (CI does) to get a
 // checker thread that dumps lock cycles; there is no static ordering check, so
 // keep new multi-lock sites tier-ordered.
+/// Peer ops read off disk by `sync_foreign_collect`, not yet applied to state by
+/// `sync_foreign_apply`. Buffering between the two phases is what lets the disk reads run
+/// outside the daemon's global rpc_mutex_ without losing ops: `seen_offsets` advances at
+/// collect time, so an unapplied batch would otherwise never be re-read.
+#[derive(Default)]
+pub(crate) struct PendingForeign {
+    pub(crate) ops: Vec<(crate::ids::InstanceId, Op)>,
+    pub(crate) coverage: std::collections::BTreeMap<crate::ids::InstanceId, u64>,
+}
+
 pub struct ChittaField {
     #[allow(dead_code)]
     pub(crate) data_dir: PathBuf,
@@ -206,6 +216,12 @@ pub struct ChittaField {
     pub(crate) lite_encoder: RwLock<Option<LiteEncoder>>,
     /// Byte offsets for each foreign segment file, used by sync_foreign().
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
+    /// Foreign ops read off disk by sync_foreign_collect(), awaiting sync_foreign_apply().
+    /// The two phases are split so the segment reads — which hit a hard-mounted NFS volume and
+    /// can block in uninterruptible D state indefinitely — never run under the daemon's global
+    /// rpc_mutex_. Holding that lock across a stalled read froze every request while the socket
+    /// kept accepting connections (the "wedged daemon", 2026-07-14).
+    pub(crate) pending_foreign: RwLock<PendingForeign>,
     pub(crate) chunk_hash_idx: RwLock<HashMap<crate::ids::ChunkHash, MemoryId>>,
     /// Cross-realm provenance dedup for kind="signal" "[done]" records.
     /// Key: DefaultHasher(content) as u64. Prevents re-processing already-handled files.
@@ -1333,6 +1349,7 @@ impl ChittaField {
             symbol_event_log: RwLock::new(symbol_event_log),
             lite_encoder: RwLock::new(loaded_lite_encoder),
             seen_offsets: RwLock::new(loaded_seen_offsets),
+            pending_foreign: RwLock::new(PendingForeign::default()),
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
             content_prov_idx: RwLock::new(content_prov_idx),
             prov_key_idx: RwLock::new(prov_key_idx),
@@ -1423,6 +1440,20 @@ impl ChittaField {
     ///
     /// Returns the count of ops applied.
     pub fn sync_foreign(&self) -> crate::error::Result<usize> {
+        self.sync_foreign_collect()?;
+        self.sync_foreign_apply()
+    }
+
+    /// Phase 1: read new peer ops off disk into `pending_foreign`. Acquires NO state guards
+    /// beyond `seen_offsets` (which no request path touches), so the caller must NOT hold the
+    /// daemon's global rpc_mutex_ here — every read below can block forever on a hard-mounted
+    /// NFS volume, and under that lock the whole daemon stops answering.
+    ///
+    /// Offsets advance here, so a batch that is collected but never applied would be lost.
+    /// It isn't: ops accumulate in `pending_foreign` until an apply drains them.
+    ///
+    /// Returns the number of ops now pending.
+    pub fn sync_foreign_collect(&self) -> crate::error::Result<usize> {
         use crate::log::{collect_foreign_segments, replay_from_offset};
 
         let foreign_segs = collect_foreign_segments(&self.data_dir, self.instance_id)?;
@@ -1450,9 +1481,31 @@ impl ChittaField {
             }
         }
 
-        if ops.is_empty() {
-            return Ok(0);
+        let mut pending = self.pending_foreign.write();
+        pending.ops.append(&mut ops);
+        for (inst, max) in fresh_coverage {
+            let e = pending.coverage.entry(inst).or_insert(0);
+            if max > *e { *e = max; }
         }
+        Ok(pending.ops.len())
+    }
+
+    /// Phase 2: apply the ops collected by `sync_foreign_collect`. This is the part that takes
+    /// ~40 write guards in canonical order, so the daemon holds its exclusive rpc_mutex_ across
+    /// it (deadlock fix, 2026-06-11 — see simple_cli.cpp). Pure in-memory: no disk reads.
+    ///
+    /// Returns the count of ops applied.
+    pub fn sync_foreign_apply(&self) -> crate::error::Result<usize> {
+        let (ops, fresh_coverage) = {
+            let mut pending = self.pending_foreign.write();
+            if pending.ops.is_empty() {
+                return Ok(0);
+            }
+            (
+                std::mem::take(&mut pending.ops),
+                std::mem::take(&mut pending.coverage),
+            )
+        };
 
         let count = ops.len();
 
@@ -1566,6 +1619,75 @@ impl ChittaField {
         }
 
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod sync_foreign_split_tests {
+    use super::*;
+
+    fn write_one(f: &ChittaField, content: &str) {
+        f.put_memory(
+            "episode",
+            "test",
+            content.as_bytes(),
+            &[0.1f32; 768],
+            1.0,
+            0.0,
+            0,
+            Vec::new(),
+            None,
+            None,
+        )
+        .expect("put_memory");
+        f.flush().expect("flush");
+    }
+
+    /// collect() advances seen_offsets, so those bytes are never re-read. If a collected batch
+    /// could be dropped before apply(), the ops would be gone for good. Assert it survives:
+    /// a second collect (which finds nothing new) must not discard what the first one buffered.
+    #[test]
+    fn collected_ops_survive_until_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = ChittaField::open(dir.path().to_path_buf()).unwrap();
+        // `local` must exist BEFORE the peer writes: a fresh instance seeds seen_offsets from
+        // current segment sizes (see load_seen_offsets), so one opened afterwards starts at EOF
+        // and would legitimately see nothing to sync.
+        let local = ChittaField::open(dir.path().to_path_buf()).unwrap();
+        write_one(&peer, "peer wrote this");
+        let before = local.memory_count();
+
+        let pending = local.sync_foreign_collect().unwrap();
+        assert!(pending > 0, "collect should buffer the peer's ops");
+        assert_eq!(local.memory_count(), before, "collect must not mutate state");
+
+        // Offsets are now past the peer's ops. A second collect finds nothing new — and must
+        // not lose the batch the first one buffered.
+        let still_pending = local.sync_foreign_collect().unwrap();
+        assert_eq!(still_pending, pending, "second collect dropped the buffered ops");
+
+        let applied = local.sync_foreign_apply().unwrap();
+        assert_eq!(applied, pending, "apply must drain exactly what was collected");
+        assert!(local.memory_count() > before, "peer memory should now be visible");
+
+        // Draining is idempotent: nothing left to apply.
+        assert_eq!(local.sync_foreign_apply().unwrap(), 0);
+    }
+
+    /// The split must be behaviour-preserving: sync_foreign() == collect() + apply().
+    #[test]
+    fn sync_foreign_still_applies_peer_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = ChittaField::open(dir.path().to_path_buf()).unwrap();
+        let local = ChittaField::open(dir.path().to_path_buf()).unwrap();
+        write_one(&peer, "one");
+        write_one(&peer, "two");
+        let before = local.memory_count();
+        let applied = local.sync_foreign().unwrap();
+
+        assert!(applied > 0, "sync_foreign applied nothing");
+        assert!(local.memory_count() > before);
+        assert_eq!(local.sync_foreign().unwrap(), 0, "re-sync should be a no-op");
     }
 }
 

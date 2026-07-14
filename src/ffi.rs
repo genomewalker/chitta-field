@@ -1980,6 +1980,36 @@ pub extern "C" fn cf_sync_foreign(h: *mut CfHandle) -> c_int {
     }
 }
 
+/// Phase 1 of sync_foreign: read new peer ops off disk into an internal pending buffer.
+/// Does disk I/O; on a hard-mounted NFS volume it can block indefinitely. Call it WITHOUT
+/// holding the daemon's rpc lock. Returns the number of ops now pending, or -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_sync_foreign_collect(h: *mut CfHandle) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    match handle.field.sync_foreign_collect() {
+        Ok(count) => count as c_int,
+        Err(e) => handle.err(e),
+    }
+}
+
+/// Phase 2 of sync_foreign: apply the pending ops to in-memory state. Takes ~40 write guards,
+/// does no disk reads. Call it WITH the daemon's exclusive rpc lock held.
+/// Returns the count of ops applied, or -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_sync_foreign_apply(h: *mut CfHandle) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    match handle.field.sync_foreign_apply() {
+        Ok(count) => count as c_int,
+        Err(e) => handle.err(e),
+    }
+}
+
 /// Flush write buffer to OS.
 #[no_mangle]
 pub extern "C" fn cf_flush(h: *mut CfHandle) -> c_int {
