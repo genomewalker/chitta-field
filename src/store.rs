@@ -5644,6 +5644,36 @@ impl ChittaField {
         n
     }
 
+    /// Semantic-index coverage: (eligible, embedded).
+    ///
+    /// `eligible` = live memories with content long enough to embed — the ones that SHOULD
+    /// have a vector. `embedded` = those the index actually holds one for. The gap is the
+    /// number of memories reachable by BM25 only, and no ranker change can ever surface them.
+    ///
+    /// This exists because `pending_count` CANNOT answer the question: the embed queue is
+    /// drained by failure paths as well as success paths, so a lost embedding leaves the queue
+    /// empty and the store reports perfect health over a half-empty index. Derive coverage from
+    /// the index; never infer it from the queue.
+    pub fn embed_coverage(&self) -> (usize, usize) {
+        const MIN_EMBED_CHARS: usize = 20;
+        // Locks are taken one at a time, never nested (get_memory() re-locks `states`).
+        let live: Vec<MemoryId> = {
+            let states = self.states.read();
+            states.iter().filter(|(_, st)| !st.deleted).map(|(id, _)| *id).collect()
+        };
+        let eligible: Vec<MemoryId> = {
+            let payloads = self.payloads.read();
+            live.into_iter()
+                .filter(|id| payloads.get(id)
+                    .map(|p| p.content.len() >= MIN_EMBED_CHARS)
+                    .unwrap_or(false))
+                .collect()
+        };
+        let idx = self.semantic_idx.read();
+        let embedded = eligible.iter().filter(|id| idx.has_embedding(**id)).count();
+        (eligible.len(), embedded)
+    }
+
     /// Force-clear embed_pending for specific IDs (maintenance tool).
     pub fn force_clear_embed_pending(&self, ids: &[MemoryId]) -> usize {
         let mut states = self.states.write();

@@ -2067,6 +2067,20 @@ pub extern "C" fn cf_purge_orphan_embed_pending(h: *mut CfHandle, out_cleared: *
     handle.ok()
 }
 
+/// Semantic-index coverage: how many memories SHOULD have a vector vs how many DO.
+/// `pending_count` cannot answer this — the queue drains on failure as well as success.
+#[no_mangle]
+pub extern "C" fn cf_embed_coverage(
+    h: *mut CfHandle, out_eligible: *mut usize, out_embedded: *mut usize,
+) -> c_int {
+    if h.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let (eligible, embedded) = handle.field.embed_coverage();
+    if !out_eligible.is_null() { unsafe { *out_eligible = eligible; } }
+    if !out_embedded.is_null() { unsafe { *out_embedded = embedded; } }
+    handle.ok()
+}
+
 #[no_mangle]
 pub extern "C" fn cf_force_clear_embed_pending(
     h: *mut CfHandle, ids: *const u64, count: usize, out_cleared: *mut usize,

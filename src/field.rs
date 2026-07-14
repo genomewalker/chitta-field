@@ -1000,6 +1000,32 @@ impl ChittaField {
                 }
             }
         }
+        // Embed reconciliation — runs EVERY start, deliberately unguarded.
+        // purge_wrong_dim() above re-queues embeddings of the WRONG dim. Nothing re-queued
+        // MISSING ones: an embedding lost to a decode failure (vak_llama embed_one returns a
+        // zero vector) or to force_clear_embed_pending was gone for good, because embed_pending
+        // was already false and no startup check ever looked for absent vectors. The memory
+        // stayed keyword-only forever while pending_count reported 0 — the queue drains on
+        // failure as well as success, so it cannot be used as a coverage metric. Derive
+        // coverage from the index instead of trusting the flag.
+        {
+            const MIN_EMBED_CHARS: usize = 20;
+            let mut requeued = 0usize;
+            for (id, payload) in &payloads {
+                if payload.content.len() < MIN_EMBED_CHARS { continue; }
+                if semantic_idx.has_embedding(*id) { continue; }
+                if let Some(state) = states.get_mut(id) {
+                    if !state.embed_pending && !state.deleted {
+                        state.embed_pending = true;
+                        requeued += 1;
+                    }
+                }
+            }
+            if requeued > 0 {
+                eprintln!("[chitta-field] embed reconciliation: {requeued} content-bearing \
+                           memories had NO embedding — re-queued for backfill");
+            }
+        }
         semantic_idx.normalize_all();
         // After WAL replay, the HNSW may have been backfilled with entries beyond the snapshot.
         // Persist the updated HNSW sidecar now so the next restart loads a complete graph
