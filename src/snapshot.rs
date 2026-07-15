@@ -83,6 +83,10 @@ const FULL_SNAPSHOT_MAGIC: u64         = 0xF011_5741_7E00_0017; // V23
 
 /// Magic for the payload content sidecar (.pld).
 const PLD_MAGIC: u64 = 0x504C_4400_0000_0001; // "PLD\0\0\0\0\x01"
+// Retrieval-surface sidecar (.rsf): id -> natural-language embed surface. Stored
+// OUTSIDE the bincode Snapshot (like .pld/.emb) so adding it never breaks old
+// snapshot reads. Missing sidecar = no surface = embed falls back to content.
+const RSF_MAGIC: u64 = 0x5253_4600_0000_0001; // "RSF\0\0\0\0\x01"
 
 /// Magic for the store-identity sidecar (.shdr).
 const SHDR_MAGIC: u64 = 0x5348_4452_0000_0001; // "SHDR\0\0\0\x01"
@@ -1311,6 +1315,48 @@ impl FullSnapshot {
         true
     }
 
+    /// Save the retrieval-surface sidecar (.rsf): id -> NL embed surface bytes.
+    /// Format mirrors .pld: [RSF_MAGIC:u64][count:u64]([id:u64][len:u32][bytes]×count).
+    pub fn save_retrieval_surface_sidecar(path: &Path, surfaces: &HashMap<MemoryId, Vec<u8>>) -> std::io::Result<()> {
+        let tmp = path.with_extension("rsf.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&RSF_MAGIC.to_le_bytes())?;
+            f.write_all(&(surfaces.len() as u64).to_le_bytes())?;
+            for (&id, bytes) in surfaces {
+                f.write_all(&id.to_le_bytes())?;
+                f.write_all(&(bytes.len() as u32).to_le_bytes())?;
+                f.write_all(bytes)?;
+            }
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load the .rsf sidecar. Missing/corrupt returns an empty map (embed then
+    /// falls back to content) — never fatal, since content is the authoritative copy.
+    pub fn load_retrieval_surface_sidecar(path: &Path) -> HashMap<MemoryId, Vec<u8>> {
+        let mut out = HashMap::new();
+        let bytes = match std::fs::read(path) { Ok(b) => b, Err(_) => return out };
+        if bytes.len() < 16 { return out; }
+        let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        if magic != RSF_MAGIC { return out; }
+        let count = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let mut off = 16usize;
+        for _ in 0..count {
+            if off + 12 > bytes.len() { break; }
+            let id = u64::from_le_bytes(bytes[off..off+8].try_into().unwrap());
+            let len = u32::from_le_bytes(bytes[off+8..off+12].try_into().unwrap()) as usize;
+            off += 12;
+            if off + len > bytes.len() { break; }
+            out.insert(id, bytes[off..off+len].to_vec());
+            off += len;
+        }
+        eprintln!("[chitta-field] loaded .rsf sidecar: {} surface entries", out.len());
+        out
+    }
+
     /// Read only the magic and snapshot_seqno without deserializing the full snapshot.
     pub fn peek_seqno(path: &Path) -> Result<u64> {
         let f = std::fs::File::open(path)?;
@@ -2093,6 +2139,30 @@ impl FullSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rsf_sidecar_roundtrip_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chitta.abc.snapshot");
+        let rsf = path.with_extension("rsf");
+
+        // Missing sidecar → empty map, no panic (old snapshot family).
+        assert!(FullSnapshot::load_retrieval_surface_sidecar(&rsf).is_empty());
+
+        // Round-trip: surfaces survive save→load byte-identical, incl. UTF-8 + empty-ish.
+        let mut surfaces: HashMap<MemoryId, Vec<u8>> = HashMap::new();
+        surfaces.insert(1, b"The rtk submodule was removed and merged to main.".to_vec());
+        surfaces.insert(2, "unicode: reduced 25GB\u{2192}7GB RSS".as_bytes().to_vec());
+        surfaces.insert(u64::MAX, vec![0u8; 4096]);
+        FullSnapshot::save_retrieval_surface_sidecar(&rsf, &surfaces).unwrap();
+
+        let loaded = FullSnapshot::load_retrieval_surface_sidecar(&rsf);
+        assert_eq!(loaded, surfaces);
+
+        // Truncated/corrupt sidecar → empty map, no panic (fallback to content).
+        std::fs::write(&rsf, b"short").unwrap();
+        assert!(FullSnapshot::load_retrieval_surface_sidecar(&rsf).is_empty());
+    }
 
     fn legacy_v4_state() -> LegacyMemoryStateV4 {
         LegacyMemoryStateV4 {

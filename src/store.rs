@@ -340,7 +340,7 @@ fn prune_covered_segments(
 
 fn prune_old_snapshots(data_dir: &std::path::Path, keep: usize) {
     const SIDECAR_EXTS: &[&str] = &[
-        "snapshot", "hdc", "emb", "bin", "mu", "shdr", "hnsw", "realm_hnsw", "pld", "sup.json",
+        "snapshot", "hdc", "emb", "bin", "mu", "shdr", "hnsw", "realm_hnsw", "pld", "sup.json", "rsf",
     ];
     let delta_ext = "delta.hnsw";
 
@@ -1798,6 +1798,24 @@ impl ChittaField {
     }
 
     /// Retrieve the payload for a memory. Also records a touch access.
+    /// Stage B: set (or clear, if empty) the natural-language retrieval surface for a
+    /// memory. When set, this is what gets embedded instead of the telegraphic content.
+    pub fn set_retrieval_surface(&self, memory_id: MemoryId, surface: &str) {
+        if surface.is_empty() {
+            self.retrieval_surfaces.write().remove(&memory_id);
+        } else {
+            self.retrieval_surfaces.write().insert(memory_id, surface.as_bytes().to_vec());
+        }
+    }
+
+    /// Stage B: the retrieval surface for a memory, if one was stored.
+    pub fn get_retrieval_surface(&self, memory_id: MemoryId) -> Option<String> {
+        self.retrieval_surfaces
+            .read()
+            .get(&memory_id)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    }
+
     pub fn get_memory(&self, memory_id: MemoryId) -> Result<MemoryPayload> {
         {
             let states = self.states.read();
@@ -5388,11 +5406,51 @@ impl ChittaField {
         let realm_for_upsert = self.payloads.read()
             .get(&memory_id)
             .map(|p| p.realm.clone());
+
+        // Semantic dedup — the check that store.rs:1111 CANNOT run on the normal path.
+        // Every memory is written embed_pending with an empty vector, so the write-time
+        // dedup guard (`if !embed_pending`) is always false and near-duplicates accumulate
+        // unbounded. This is the first moment the vector exists; search runs BEFORE this
+        // memory's own vector is upserted, so k=1 returns the nearest OTHER memory.
+        // A hit supersedes THIS (newer) memory rather than deleting it: reversible, keeps
+        // provenance/triplet references, excluded from recall, and reinforces the original.
+        let mut superseded_by: Option<MemoryId> = None;
+        {
+            let (dedup_thresh, dedup_upper) = {
+                let cfg = &self.scoring_pipeline.read().config;
+                (cfg.dedup_cosine_threshold, cfg.dedup_cosine_upper)
+            };
+            let neighbors = self.semantic_idx.read().search(embedding, 1, None, None);
+            if let Some(top) = neighbors.first() {
+                if top.memory_id != memory_id
+                    && top.cosine_similarity >= dedup_thresh
+                    && top.cosine_similarity < dedup_upper
+                {
+                    let same_realm = self.payloads.read()
+                        .get(&top.memory_id)
+                        .map(|p| Some(&p.realm) == realm_for_upsert.as_ref())
+                        .unwrap_or(false);
+                    let alive = self.states.read()
+                        .get(&top.memory_id)
+                        .map(|s| !s.deleted)
+                        .unwrap_or(false);
+                    if same_realm && alive {
+                        superseded_by = Some(top.memory_id);
+                    }
+                }
+            }
+        }
+
         self.semantic_idx.write().upsert(
             memory_id,
             embedding.to_vec(),
             realm_for_upsert.as_deref(),
         );
+
+        if let Some(original) = superseded_by {
+            let _ = self.set_memory_status(memory_id, crate::state::MemoryStatus::Superseded);
+            let _ = self.update_state(original, Some(0.0), Some(0.02), None, true, None);
+        }
 
         // Re-encode cortical sparse index (non-fatal)
         let _ = self.encode_memory(memory_id);
@@ -8162,6 +8220,18 @@ impl ChittaField {
                 )))?;
             self.pld_saved_at
                 .store(pld_mutations_at_clone, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Stage B: persist retrieval surfaces to the .rsf sidecar (never bincode).
+        // Best-effort: content is the authoritative copy, so a failed .rsf just means
+        // recall falls back to embedding content — no data loss, unlike .pld.
+        {
+            let surfaces = self.retrieval_surfaces.read();
+            if !surfaces.is_empty() {
+                let rsf_path = path.with_extension("rsf");
+                if let Err(e) = FullSnapshot::save_retrieval_surface_sidecar(&rsf_path, &surfaces) {
+                    eprintln!("[chitta-field] .rsf sidecar save failed (non-fatal): {e}");
+                }
+            }
         }
         // Strip content and embeddings from bincode (live in sidecars now).
         for payload in snap.payloads.values_mut() {

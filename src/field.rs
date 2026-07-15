@@ -172,6 +172,10 @@ pub struct ChittaField {
     pub(crate) id_alloc: Arc<MemoryIdAllocator>,
     pub(crate) artifact_id_alloc: Arc<ArtifactIdAllocator>,
     pub(crate) payloads: RwLock<HashMap<MemoryId, MemoryPayload>>,
+    /// Stage B dual-store: id -> natural-language retrieval surface. When present,
+    /// this (not the telegraphic content) is what gets embedded, so recall matches
+    /// natural-language queries. Persisted to the .rsf sidecar, never into bincode.
+    pub(crate) retrieval_surfaces: RwLock<HashMap<MemoryId, Vec<u8>>>,
     pub(crate) states: RwLock<HashMap<MemoryId, MemoryState>>,
     pub(crate) assoc_edges: RwLock<HashMap<MemoryId, Vec<AssocEdge>>>,
     pub(crate) artifacts: RwLock<HashMap<String, ArtifactId>>,
@@ -405,6 +409,7 @@ impl ChittaField {
         let artifact_id_alloc = Arc::new(ArtifactIdAllocator::with_instance(instance_id));
 
         let mut payloads: HashMap<MemoryId, MemoryPayload> = HashMap::new();
+        let mut retrieval_surfaces: HashMap<MemoryId, Vec<u8>> = HashMap::new();
         let mut recall_provenance: HashMap<MemoryId, std::collections::BTreeSet<crate::ids::InstanceId>> = HashMap::new();
         let mut states: HashMap<MemoryId, MemoryState> = HashMap::new();
         let mut assoc_edges: HashMap<MemoryId, Vec<AssocEdge>> = HashMap::new();
@@ -698,6 +703,9 @@ impl ChittaField {
                     }
                     snap.triplet_store.load_supersession_sidecar(&candidate.with_extension("sup.json"));
                     payloads = snap.payloads;
+                    // Stage B: load retrieval surfaces alongside content. Absent on
+                    // pre-Stage-B families → empty map → embed falls back to content.
+                    retrieval_surfaces = FullSnapshot::load_retrieval_surface_sidecar(&candidate.with_extension("rsf"));
                     recall_provenance = snap.recall_provenance;
                     states = snap.states;
                     assoc_edges = snap.assoc_edges;
@@ -1323,6 +1331,7 @@ impl ChittaField {
             id_alloc,
             artifact_id_alloc,
             payloads: RwLock::new(payloads),
+            retrieval_surfaces: RwLock::new(retrieval_surfaces),
             states: RwLock::new(states),
             assoc_edges: RwLock::new(assoc_edges),
             artifacts: RwLock::new(artifacts),
