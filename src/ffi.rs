@@ -828,6 +828,68 @@ pub extern "C" fn cf_get_content(
     }
 }
 
+/// Stage B: get the natural-language retrieval surface for a memory into buf.
+/// written=0 (with a NUL) when no surface is stored — caller then embeds content.
+/// Returns -2 (with required len in `written`) if the surface exceeds buf_cap.
+#[no_mangle]
+pub extern "C" fn cf_get_retrieval_surface(
+    h: *mut CfHandle,
+    memory_id: u64,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || buf.is_null() || written.is_null() || buf_cap == 0 {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    match handle.field.get_retrieval_surface(memory_id) {
+        Some(s) => {
+            let bytes = s.as_bytes();
+            if bytes.len() >= buf_cap {
+                unsafe { *written = bytes.len(); }
+                return -2;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+                *buf.add(bytes.len()) = 0;
+                *written = bytes.len();
+            }
+            handle.ok()
+        }
+        None => {
+            unsafe {
+                *buf = 0;
+                *written = 0;
+            }
+            handle.ok()
+        }
+    }
+}
+
+/// Stage B: set (surface non-empty) or clear (surface empty/null) a memory's
+/// natural-language retrieval surface. `surface` is a UTF-8 byte buffer of `len`.
+#[no_mangle]
+pub extern "C" fn cf_set_retrieval_surface(
+    h: *mut CfHandle,
+    memory_id: u64,
+    surface: *const u8,
+    len: usize,
+) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let s = if surface.is_null() || len == 0 {
+        String::new()
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(surface, len) };
+        String::from_utf8_lossy(slice).into_owned()
+    };
+    handle.field.set_retrieval_surface(memory_id, &s);
+    handle.ok()
+}
+
 /// Get kind string for a memory into buf.
 #[no_mangle]
 pub extern "C" fn cf_get_kind(
