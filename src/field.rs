@@ -2157,6 +2157,9 @@ pub(crate) fn apply_op(op: Op, ctx: ApplyCtx) {
         Op::InvalidateTriplet(inv) => {
             triplet_store.invalidate(inv.triplet_id, inv.invalidated_at_ms);
         }
+        Op::SupersedeTriplet(s) => {
+            triplet_store.supersede(s.old_id, s.new_id, s.superseded_at_ms);
+        }
         Op::UpsertSymbol(s) => {
             let entry = SymbolEntry {
                 id: s.symbol_id,

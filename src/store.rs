@@ -5915,8 +5915,19 @@ impl ChittaField {
     }
 
     /// Mark triplet `old_id` as superseded by `new_id` at `at_ms`.
-    pub fn triplet_supersede(&self, old_id: u64, new_id: u64, at_ms: i64) {
+    /// Durable: writes a SupersedeTriplet op to the WAL, then applies in-memory.
+    /// Was RAM-only (persisted solely via the .sup.json snapshot sidecar), so a
+    /// segment-only replay silently lost the revision — this restores THEORY.md
+    /// invariant #1 (state = f(op set)) for belief revision.
+    pub fn triplet_supersede(&self, old_id: u64, new_id: u64, at_ms: i64) -> Result<()> {
+        let op = Op::SupersedeTriplet(crate::ops::SupersedeTripletOp {
+            old_id,
+            new_id,
+            superseded_at_ms: at_ms,
+        });
+        let _seqno = self.log.write().append(&op)?;
         self.triplet_store.write().supersede(old_id, new_id, at_ms);
+        Ok(())
     }
 
     /// BFS graph traversal from `start` node.
@@ -10251,6 +10262,38 @@ mod tests {
     }
 
     #[test]
+    fn test_supersede_survives_wal_replay() {
+        // Regression (SOTA review 2b): supersession was RAM-only + serde(skip),
+        // persisted solely via the .sup.json snapshot sidecar. With no snapshot
+        // taken, a reopen replays purely from the WAL — so the revision survives
+        // ONLY if SupersedeTriplet is a real op. Before the fix, old_id reappeared.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let old_id;
+        {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            old_id = field
+                .add_triplet("chitta".into(), "uses".into(), "duckdb".into(), 1.0, None, None)
+                .unwrap();
+            let new_id = field
+                .add_triplet("chitta".into(), "uses".into(), "sqlite".into(), 1.0, None, None)
+                .unwrap();
+            field.triplet_supersede(old_id, new_id, now_ms()).unwrap();
+
+            let live = field.query_subject_as_of("chitta", i64::MAX).unwrap();
+            assert!(!live.iter().any(|e| e.id == old_id), "superseded pre-reopen");
+        }
+
+        // Reopen: no snapshot was written, so this is a pure WAL replay.
+        let field2 = ChittaField::open(data_dir.clone()).unwrap();
+        let after = field2.query_subject_as_of("chitta", i64::MAX).unwrap();
+        assert!(
+            !after.iter().any(|e| e.id == old_id),
+            "supersession must survive WAL-only replay"
+        );
+    }
+
+    #[test]
     fn test_integration_query_entity() {
         let tmp = TempDir::new().unwrap();
         let field = ChittaField::open(tmp.path().join("data")).unwrap();
@@ -10925,6 +10968,11 @@ mod tests {
         const SEED: usize = 3000;
         let mut a = SemanticIndex::new();
         let mut b = SemanticIndex::new();
+        // Build the HNSW graph regardless of size: below flat_scan_max() production
+        // serves via flat scan and never builds it, but this test probes the graph
+        // directly (hnsw_search_test) to compare per-item vs batched construction.
+        a.force_hnsw_build_for_test();
+        b.force_hnsw_build_for_test();
         for (id, e) in &items[..SEED] {
             a.upsert(*id, e.clone(), Some("test"));
             b.upsert(*id, e.clone(), Some("test"));

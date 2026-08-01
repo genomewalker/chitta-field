@@ -9555,8 +9555,10 @@ pub extern "C" fn cf_triplet_supersede(
 ) -> c_int {
     if h.is_null() { return -1; }
     let handle = unsafe { &*h };
-    handle.field.triplet_supersede(old_id, new_id, at_ms);
-    0
+    match handle.field.triplet_supersede(old_id, new_id, at_ms) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
 }
 
 /// BFS graph traversal from `start`. Returns JSON array of TraversalHit.

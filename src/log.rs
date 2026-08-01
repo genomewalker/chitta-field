@@ -69,6 +69,7 @@ use crate::ops::{
     OP_INVALIDATE_TRIPLETS_BY_SOURCE_FILE,
     OP_UPDATE_MEMORY_KIND,
     OP_SYMBOL_EVENT,
+    OP_SUPERSEDE_TRIPLET,
 };
 
 fn op_type_byte(op: &Op) -> u8 {
@@ -141,6 +142,7 @@ fn op_type_byte(op: &Op) -> u8 {
         Op::InvalidateTripletsBySourceFile(_) => OP_INVALIDATE_TRIPLETS_BY_SOURCE_FILE,
         Op::UpdateMemoryKind(_) => OP_UPDATE_MEMORY_KIND,
         Op::SymbolEvent(_) => OP_SYMBOL_EVENT,
+        Op::SupersedeTriplet(_) => OP_SUPERSEDE_TRIPLET,
     }
 }
 

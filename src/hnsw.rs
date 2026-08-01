@@ -56,6 +56,21 @@ const PER_REALM_HNSW_THRESHOLD: usize = 500;
 // Override per-process with CHITTA_FLAT_SCAN_MAX=<n> (0 = force ANN path).
 pub(crate) const FLAT_SCAN_MAX: usize = 2_000_000;
 
+// Process-resolved flat-scan cap (env override, read once). Both the search
+// short-circuit and the HNSW build gate key off this so they never diverge:
+// at/below the cap the exact flat scan serves, so building/merging/snapshotting
+// HNSW there is dead work (search never consults it). 0 = force the ANN path.
+pub(crate) fn flat_scan_max() -> usize {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("CHITTA_FLAT_SCAN_MAX")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(FLAT_SCAN_MAX)
+    })
+}
+
 // .emb mmap activation threshold (field.rs): below this the embeddings stay
 // in the heap, so scans never fault on a page whose backing file a
 // consolidation prune (or, multi-node, a peer's sidecar rewrite over NFS)
@@ -594,6 +609,10 @@ pub struct SemanticIndex {
     /// when binary Hamming will be the active search path after normalize_all()).
     #[serde(skip)]
     inhibit_hnsw: bool,
+    /// Test-only: force `use_hnsw()` true regardless of size so graph-construction
+    /// parity can be probed below `flat_scan_max()` (where production never builds it).
+    #[serde(skip)]
+    force_hnsw_build: bool,
     /// Per-realm HNSW graphs — built for realms exceeding PER_REALM_HNSW_THRESHOLD.
     /// Saved to .realm_hnsw sidecar. Seeded by seed_realm_map() at load time.
     #[serde(skip)]
@@ -638,6 +657,7 @@ impl SemanticIndex {
             binary_vec: Vec::new(),
             binary_vec_pos: HashMap::new(),
             inhibit_hnsw: false,
+            force_hnsw_build: false,
             per_realm_hnsw: HashMap::new(),
             per_realm_counts: HashMap::new(),
             per_id_realm: HashMap::new(),
@@ -664,9 +684,16 @@ impl SemanticIndex {
     }
 
     /// True when the HNSW graph is the active search path.
+    /// Gated on `flat_scan_max()`, not `HNSW_THRESHOLD`: below the flat-scan cap the
+    /// exact scan serves every query, so building HNSW there was pure overhead (built,
+    /// merged, snapshotted, never consulted). With the ANN path forced (cap 0) we still
+    /// build above the small floor so ANN always has a graph to serve.
     #[inline]
     fn use_hnsw(&self) -> bool {
-        self.total_embedding_count() >= HNSW_THRESHOLD
+        if self.force_hnsw_build { return self.total_embedding_count() >= HNSW_THRESHOLD; }
+        let fmax = flat_scan_max();
+        if fmax == 0 { return self.total_embedding_count() >= HNSW_THRESHOLD; }
+        self.total_embedding_count() > fmax
     }
 
     /// True when two-tier mode is active: new inserts go to delta_hnsw, not hnsw.
@@ -994,6 +1021,11 @@ impl SemanticIndex {
 
     pub fn set_inhibit_hnsw(&mut self, v: bool) {
         self.inhibit_hnsw = v;
+    }
+
+    #[cfg(test)]
+    pub fn force_hnsw_build_for_test(&mut self) {
+        self.force_hnsw_build = true;
     }
 
     /// If the base HNSW is empty but the delta is not, promote delta→base so
@@ -1545,10 +1577,7 @@ impl SemanticIndex {
         // per-candidate allocation: stored emb is unit, so |emb-mu|^2 = 1 - 2(emb·mu) + |mu|^2
         // and the centered numerator is (q_c·emb) - (q_c·mu). Falls back to raw cosine when no
         // centroid is loaded or CHITTA_FLAT_SCAN_RAW=1 (A/B + rollback escape hatch).
-        let flat_max = std::env::var("CHITTA_FLAT_SCAN_MAX")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(FLAT_SCAN_MAX);
+        let flat_max = flat_scan_max();
         if flat_max > 0 && self.total_embedding_count() <= flat_max {
             // Default to the RAW turbovec arm: exact-cosine ranking parity with the
             // centered scalar arm on GOLDEN_SET v6 (gold ranks #1 either way) but SIMD-fast

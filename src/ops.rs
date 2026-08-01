@@ -82,6 +82,7 @@ pub enum Op {
     InvalidateTripletsBySourceFile(InvalidateTripletsBySourceFileOp),
     UpdateMemoryKind(UpdateMemoryKindOp),
     SymbolEvent(SymbolEventOp),
+    SupersedeTriplet(SupersedeTripletOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -136,6 +137,7 @@ pub const OP_CLOSE_REDERIVE: u8 = 64;
 pub const OP_INVALIDATE_TRIPLETS_BY_SOURCE_FILE: u8 = 65;
 pub const OP_UPDATE_MEMORY_KIND: u8 = 66;
 pub const OP_SYMBOL_EVENT: u8 = 67;
+pub const OP_SUPERSEDE_TRIPLET: u8 = 68;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -153,6 +155,18 @@ pub struct AddTripletOp {
 pub struct InvalidateTripletOp {
     pub triplet_id: u64,
     pub invalidated_at_ms: i64,
+}
+
+/// Bi-temporal belief revision: `old_id` superseded by `new_id`. Previously
+/// RAM-only (supersession_map is #[serde(skip)], persisted solely via the
+/// .sup.json snapshot sidecar), which violated THEORY.md invariant #1
+/// (state = f(op set)): segment-only replay silently lost every supersession.
+/// Now a first-class op so belief revision is durable and merge-replayable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupersedeTripletOp {
+    pub old_id: u64,
+    pub new_id: u64,
+    pub superseded_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -989,5 +1003,6 @@ pub fn op_timestamp(op: &Op) -> Option<i64> {
         Op::InvalidateTripletsBySourceFile(o) => nz(o.invalidated_at_ms),
         Op::UpdateMemoryKind(o) => nz(o.op_ts_ms),
         Op::SymbolEvent(o) => nz(o.timestamp_ms),
+        Op::SupersedeTriplet(o) => nz(o.superseded_at_ms),
     }
 }

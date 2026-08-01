@@ -516,7 +516,14 @@ impl TripletStore {
                 .filter(|e| {
                     let world_valid = (e.valid_from_ms == 0 || e.valid_from_ms <= world_ms)
                         && (e.valid_to_ms == 0 || world_ms < e.valid_to_ms);
-                    let not_superseded = !self.supersession_map.contains_key(&e.id);
+                    // Supersession excludes only once it has taken effect by world_ms —
+                    // an as-of query for an earlier time must still see the fact. Gating
+                    // on membership alone (the old behaviour) retroactively erased facts
+                    // from every past world-time. Mirrors query_believed_at's sup_at gate.
+                    let not_superseded = match self.supersession_map.get(&e.id) {
+                        Some(&(_, sup_at)) => sup_at > world_ms,
+                        None => true,
+                    };
                     world_valid && not_superseded
                 })
                 .collect(),
@@ -660,6 +667,47 @@ mod tests {
         // But was still valid at time 999
         let results = store.query_subject("chitta", 999);
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_query_as_of_supersession_is_time_gated() {
+        // Regression: query_as_of used to exclude any ever-superseded entry,
+        // retroactively erasing the fact from every past world-time. The gate
+        // must respect the supersession's own timestamp.
+        let mut store = TripletStore::new();
+        let old_id = store.add(
+            "daemon".into(),
+            "listens_on".into(),
+            "7432".into(),
+            1.0,
+            100, // valid_from
+            None,
+            None,
+        );
+        let new_id = store.add(
+            "daemon".into(),
+            "listens_on".into(),
+            "8000".into(),
+            1.0,
+            2000,
+            None,
+            None,
+        );
+        // Superseded at world-time 2000.
+        store.supersede(old_id, new_id, 2000);
+
+        // As of 1000 (before supersession) the old fact must still be visible.
+        let before = store.query_as_of("daemon", 1000);
+        assert!(
+            before.iter().any(|e| e.id == old_id),
+            "as-of before supersession must still see the fact"
+        );
+        // As of 3000 (after supersession) the old fact is gone.
+        let after = store.query_as_of("daemon", 3000);
+        assert!(
+            !after.iter().any(|e| e.id == old_id),
+            "as-of after supersession must exclude the fact"
+        );
     }
 
     #[test]
