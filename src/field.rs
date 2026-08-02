@@ -268,6 +268,11 @@ pub struct ChittaField {
     /// edges (x0.98, prune <0.05) and drain applies a 0.1 materialization floor
     /// to new co-retrieval pairs (single co-occurrences never become edges).
     pub(crate) plasticity_decay_enabled: std::sync::atomic::AtomicBool,
+    /// Factual-bridge recall leg gate. Default off; enabled via CHITTA_BRIDGE_LANE=1
+    /// at construction. When on, recall reserves a few top-k slots for df-gated
+    /// IDF atom-postings neighbours of the top dense hit (silent when the anchor
+    /// carries no atom with corpus df <= tau).
+    pub(crate) bridge_lane_enabled: std::sync::atomic::AtomicBool,
     pub(crate) memory_count: Arc<AtomicUsize>,
     pub(crate) pending_embed_count: Arc<AtomicUsize>,
     pub(crate) last_compact_ms: Arc<std::sync::atomic::AtomicI64>,
@@ -1398,6 +1403,9 @@ impl ChittaField {
             ),
             plasticity_decay_enabled: std::sync::atomic::AtomicBool::new(
                 std::env::var("CHITTA_PLASTICITY_DECAY").map(|v| v == "1").unwrap_or(false),
+            ),
+            bridge_lane_enabled: std::sync::atomic::AtomicBool::new(
+                std::env::var("CHITTA_BRIDGE_LANE").map(|v| v == "1").unwrap_or(false),
             ),
             memory_count: Arc::new(AtomicUsize::new(initial_memory_count)),
             pending_embed_count: Arc::new(AtomicUsize::new(init_pending)),

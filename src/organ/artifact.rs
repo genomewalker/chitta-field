@@ -1,6 +1,61 @@
 use crate::ids::{ArtifactId, MemoryId};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+// --- Identity-atom extraction (Rust port of bench/atoms.py, validated at
+// 116/140 bridge recovery + false-atom junk 4->1). An atom is a filesystem path
+// OR a stable id token (DOI, version, run-id), NOT a bare prose slash-word and
+// NOT a URL host. Tightened after junk_eyeball found the loose /[\w./-]{12,}
+// matched /misspecification, /contamination, //www.w3.org/2000/svg as if paths.
+fn kv_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"(?:input|output|out|log|path):\s*([^\s|,;]+)").unwrap())
+}
+fn abs_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"/[\w./\-]{12,}").unwrap())
+}
+fn urlish_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"^//|(?:^|/)(?:www\.|[\w-]+\.(?:org|com|net|io|gov|edu)/)").unwrap())
+}
+
+fn valid_abs(p: &str) -> bool {
+    if urlish_re().is_match(p) {
+        return false; // protocol-relative or URL host
+    }
+    let body = &p[1..]; // p is guaranteed to start with '/'
+    if body.contains('/') {
+        return true; // >=2 segments -> real path
+    }
+    // single segment: keep only with an id signal (dot/version/digit), e.g. a
+    // DOI 2024.11.18.624148 or file.ext; drop bare words (/misspecification).
+    // ceiling: a 2-segment plain-word jargon token (/derived/inference) still
+    // passes; rare, high-df -> low IDF weight. Tightening further dropped 24
+    // genuine-bridge recoveries (83%->66%), so not worth it.
+    body.contains('.') || body.chars().any(|c| c.is_ascii_digit())
+}
+
+/// Extract identity atoms (paths / stable ids) from memory content.
+pub fn extract_artifact_paths(content: &str) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for cap in kv_re().captures_iter(content) {
+        let p = &cap[1];
+        if p.len() >= 8 && p.contains('/') && !urlish_re().is_match(p) {
+            set.insert(p.to_string());
+        }
+    }
+    for m in abs_re().find_iter(content) {
+        let p = m.as_str();
+        if p.len() >= 12 && valid_abs(p) {
+            set.insert(p.to_string());
+        }
+    }
+    set.into_iter().collect()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactEntry {
@@ -109,6 +164,47 @@ impl ArtifactIndex {
         self.by_memory.get(&memory_id).cloned().unwrap_or_default()
     }
 
+    /// df-gated IDF postings join — the factual-bridge retrieval leg.
+    /// Given an anchor's atom paths, returns co-atom memories scored by the sum
+    /// of IDF weights ln(n_total/df) over shared atoms whose df <= tau. Atoms
+    /// above the gate (common paths) are dropped to prevent flooding; `exclude`
+    /// (the anchor) is removed; ZERO cosine. Returns empty when no gated atom
+    /// fires — silence is the anti-flood guarantee (only ~4% of memories carry
+    /// a gated atom). `by_path.get(p).len()` is the document frequency for free.
+    pub fn bridge_candidates(
+        &self,
+        anchor_paths: &[String],
+        n_total: usize,
+        tau: usize,
+        exclude: MemoryId,
+        k: usize,
+    ) -> Vec<(MemoryId, f32)> {
+        let mut scores: HashMap<MemoryId, f32> = HashMap::new();
+        for path in anchor_paths {
+            if let Some(entries) = self.by_path.get(path) {
+                let dfreq = entries.len();
+                if dfreq == 0 || dfreq > tau {
+                    continue;
+                }
+                let w = (n_total as f32 / dfreq as f32).ln();
+                for e in entries {
+                    if e.memory_id == exclude {
+                        continue;
+                    }
+                    *scores.entry(e.memory_id).or_insert(0.0) += w;
+                }
+            }
+        }
+        let mut v: Vec<(MemoryId, f32)> = scores.into_iter().collect();
+        v.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        v.truncate(k);
+        v
+    }
+
     pub fn len(&self) -> usize {
         self.by_path.len()
     }
@@ -159,5 +255,58 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(paths.contains(&"src/a.cpp".to_string()));
         assert!(paths.contains(&"src/b.cpp".to_string()));
+    }
+
+    // Mirrors bench/atoms.py __main__ gate: 6 real atoms kept, 4 false dropped.
+    #[test]
+    fn test_extractor_gate() {
+        let keep = [
+            "path: /maps/projects/fernandezguerra/apps/repos/mcaf/bam2mcaf.cpp",
+            "log: /finalize_tau.cpp",
+            "out: /2024.11.18.624148",
+            "input: /.claude/mind",
+            "path: /genopack/checksum.hpp",
+            "output: /projects/caeg/scratch/kbd606/tmp/pgsock",
+        ];
+        for s in keep {
+            assert!(!extract_artifact_paths(s).is_empty(), "wrongly dropped: {s}");
+        }
+        // bare prose slash-words and URL boilerplate must NOT become atoms
+        let drop = [
+            "the model /misspecification is severe",
+            "completeness /contamination duality",
+            "xmlns=//www.w3.org/2000/svg viewBox",
+            "see http://www.w3.org/2000/svg here",
+        ];
+        for s in drop {
+            assert!(extract_artifact_paths(s).is_empty(), "wrongly kept atom in: {s}");
+        }
+    }
+
+    // Anchor A shares a RARE path with buried partner B (df=2, fires) and a
+    // COMMON path with a crowd (df>tau, gated out). B must surface; the crowd
+    // must not flood. Zero cosine — pure postings join.
+    #[test]
+    fn test_bridge_recovers_buried_partner() {
+        let mut idx = ArtifactIndex::new();
+        let (a, b, tau, n) = (1u64, 2u64, 32usize, 1000usize);
+        idx.associate(a, 100, "/maps/repo/rare_bridge.rs", 1.0);
+        idx.associate(b, 100, "/maps/repo/rare_bridge.rs", 1.0);
+        // common path shared by A and 40 unrelated memories -> df=41 > tau
+        idx.associate(a, 200, "/.claude/mind", 1.0);
+        for m in 1000..1040u64 {
+            idx.associate(m, 200, "/.claude/mind", 1.0);
+        }
+        let paths = idx.paths_for_memory(a);
+        let cands = idx.bridge_candidates(&paths, n, tau, a, 10);
+        assert_eq!(cands.first().map(|c| c.0), Some(b), "B not surfaced first");
+        // none of the df>tau crowd leaked in (common path was gated)
+        assert!(cands.iter().all(|c| c.0 < 1000), "flood: gated crowd leaked");
+        // silence when the anchor has no gated atom
+        let mut idx2 = ArtifactIndex::new();
+        for m in 0..50u64 {
+            idx2.associate(m, 300, "/common/only", 1.0); // df=50 > tau
+        }
+        assert!(idx2.bridge_candidates(&idx2.paths_for_memory(0), n, tau, 0, 10).is_empty());
     }
 }

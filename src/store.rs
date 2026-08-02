@@ -1141,6 +1141,17 @@ impl ChittaField {
             authored_at_ms
         };
 
+        // Write-time identity-atom population: the FFI always passes an empty
+        // artifact_refs, so derive them from content (paths/DOIs/run-ids) to keep
+        // the bridge-lane postings index populated prospectively. Callers that do
+        // supply refs (tests) are left untouched. df-gated at recall, so common
+        // paths cost nothing there.
+        let artifact_refs = if artifact_refs.is_empty() {
+            self.derive_artifact_refs(content)
+        } else {
+            artifact_refs
+        };
+
         // Captured before `source_session` is moved into the op below; used by
         // the write-time densification hook (SameSession chain) at the tail.
         let densify_session = source_session.clone();
@@ -2774,6 +2785,158 @@ impl ChittaField {
             }
         }
 
+        // Factual-bridge recall leg (df-gated IDF atom-postings join). Reserves a
+        // few top-k slots for co-atom neighbours of the top dense hit that share a
+        // rare identity atom (df <= tau) — the multi-hop partner the dense pool
+        // buried. ZERO cosine in the ranking; A's atoms are used only as the join
+        // KEY (non-circular). Silent when the anchor carries no gated atom, so the
+        // dense result is untouched on the ~96% of queries that can't fire.
+        if self.bridge_lane_enabled.load(std::sync::atomic::Ordering::Relaxed)
+            && !hits.is_empty()
+            && k > 0
+        {
+            let anchor = hits[0].memory_id;
+            let anchor_paths = self.artifact_idx.read().paths_for_memory(anchor);
+            if !anchor_paths.is_empty() {
+                let n_total = self
+                    .memory_count
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .max(1);
+                let tau: usize = std::env::var("CHITTA_BRIDGE_TAU")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(32);
+                let reserve: usize = std::env::var("CHITTA_BRIDGE_RESERVE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(4)
+                    .min(k);
+                let cands = self.artifact_idx.read().bridge_candidates(
+                    &anchor_paths,
+                    n_total,
+                    tau,
+                    anchor,
+                    reserve * 4,
+                );
+                if !cands.is_empty() {
+                    // Score a bridge-injected memory into a well-formed RecallHit.
+                    // semantic_score = 0.0: it was surfaced by the postings join, not
+                    // cosine. Final ordering is positional (reserved slots), so the
+                    // low relevance score never re-sorts it above the dense head.
+                    let build_hit = |memory_id: MemoryId| -> Option<RecallHit> {
+                        let state = states.get(&memory_id)?;
+                        if state.deleted {
+                            return None;
+                        }
+                        let payload = payloads.get(&memory_id)?;
+                        let content_str =
+                            String::from_utf8(payload.content.clone()).unwrap_or_default();
+                        if content_str.trim().is_empty() {
+                            return None;
+                        }
+                        if payload.realm.starts_with("soul:")
+                            && realm.map(|r| !r.starts_with("soul:")).unwrap_or(true)
+                        {
+                            return None;
+                        }
+                        let ctx = ScoringContext {
+                            relevance_score: 0.0,
+                            recall_mode: RecallMode::Semantic,
+                            state,
+                            kind: &payload.kind,
+                            realm: &payload.realm,
+                            realm_reliability: learners
+                                .domain_reliability
+                                .reliability(&payload.realm),
+                            now_ms: now,
+                            query_valence,
+                            query_arousal,
+                            prediction_prob: None,
+                            surprise_role: None,
+                            has_open_debt: false,
+                            integration_weight: None,
+                            ack_score: ack_scores.get(&memory_id).copied().unwrap_or(0),
+                            max_query_idf: 0.0,
+                        };
+                        let (score, decomp) = pipeline.score(&ctx)?;
+                        let eff_strength = state.effective_strength(now);
+                        Some(RecallHit {
+                            memory_id,
+                            score,
+                            semantic_score: 0.0,
+                            ts_ms: payload.authored_at_ms,
+                            kind: payload.kind.clone(),
+                            realm: payload.realm.clone(),
+                            strength: eff_strength,
+                            confidence: state.confidence,
+                            access_count: state.access_count,
+                            content: content_str,
+                            semantic_weight: decomp.semantic_weight,
+                            status_mul: decomp.status_mul,
+                            epistemic_mul: decomp.epistemic_mul,
+                            strength_factor: decomp.strength_factor,
+                            affect_valence: state.affect_valence,
+                            affect_arousal: state.affect_arousal,
+                            actr_activation: decomp.actr_activation,
+                            surprise_boost: decomp.surprise_boost,
+                            arousal_boost: decomp.arousal_boost,
+                            mood_congruence: decomp.mood_congruence,
+                            frustration_boost: decomp.frustration_boost,
+                            interference_factor: decomp.interference_factor,
+                            spacing_boost: decomp.spacing_boost,
+                        })
+                    };
+                    // No-evict fusion. The dense top-k is the base. We only inject
+                    // GENUINELY-NEW bridges (co-atom partners the dense pool buried
+                    // past k) and pay for each by evicting a *weak* dense-tail hit —
+                    // never a dense hit that is itself a co-atom bridge (that hit is
+                    // reinforced by both signals; evicting it is the pure loss the
+                    // fixed-reserve version caused, e.g. a gold B already at dense
+                    // rank 7). Deduped: a bridge already in the dense top-k costs no
+                    // slot. Bounded by `reserve`.
+                    let cand_ids: std::collections::HashSet<MemoryId> =
+                        cands.iter().map(|(m, _)| *m).collect();
+                    let dense_topk: std::collections::HashSet<MemoryId> =
+                        hits.iter().take(k).map(|h| h.memory_id).collect();
+                    let mut new_bridge: Vec<RecallHit> = Vec::new();
+                    for (mid, _w) in &cands {
+                        if new_bridge.len() >= reserve {
+                            break;
+                        }
+                        if dense_topk.contains(mid) {
+                            continue; // already shown by dense — no slot needed
+                        }
+                        if let Some(h) = build_hit(*mid) {
+                            new_bridge.push(h);
+                        }
+                    }
+                    if !new_bridge.is_empty() {
+                        let mut kept: Vec<RecallHit> = hits.iter().take(k).cloned().collect();
+                        let need = new_bridge.len();
+                        let mut room = 0usize;
+                        // Pass 1: evict weakest dense-tail hits that are NOT co-atom
+                        // bridges (protects a present B, which shares the anchor atom).
+                        let mut i = kept.len();
+                        while room < need && i > 0 {
+                            i -= 1;
+                            if !cand_ids.contains(&kept[i].memory_id) {
+                                kept.remove(i);
+                                room += 1;
+                            }
+                        }
+                        // Pass 2: if the whole tail was co-atom bridges, drop plain
+                        // tail down to the reserve floor so a truly-new bridge can enter.
+                        while room < need && kept.len() > k.saturating_sub(reserve) {
+                            kept.pop();
+                            room += 1;
+                        }
+                        kept.extend(new_bridge.into_iter().take(room));
+                        hits = kept;
+                    }
+                }
+            }
+        }
+
         hits.truncate(k);
 
         let hit_ids: Vec<MemoryId> = hits.iter().map(|h| h.memory_id).collect();
@@ -3294,6 +3457,57 @@ impl ChittaField {
             .or_insert_with(|| normalized_path.to_string());
 
         Ok(id)
+    }
+
+    /// Derive artifact refs from content by extracting identity atoms and
+    /// upserting each as an artifact. Used at write time when the caller supplies
+    /// none. Non-fatal: a failed upsert just drops that atom.
+    fn derive_artifact_refs(&self, content: &[u8]) -> Vec<ArtifactRef> {
+        let text = String::from_utf8_lossy(content);
+        let mut refs = Vec::new();
+        for path in crate::organ::artifact::extract_artifact_paths(&text) {
+            if let Ok(artifact_id) = self.upsert_artifact(&path, None) {
+                refs.push(ArtifactRef {
+                    artifact_id,
+                    relation: crate::ops::ArtifactRelation::Mentioned,
+                    line_start: 0,
+                    line_end: 0,
+                });
+            }
+        }
+        refs
+    }
+
+    /// One-shot bootstrap: scan every stored payload, extract identity atoms, and
+    /// populate the artifact index (upsert + associate) for memories written
+    /// before write-time derivation existed. In-memory associations persist via
+    /// the next snapshot; upserts are WAL-logged. Returns (memories, associations).
+    pub fn backfill_artifact_refs(&self) -> (u64, u64) {
+        let ids: Vec<MemoryId> = self.payloads.read().keys().copied().collect();
+        let mut mems = 0u64;
+        let mut assoc = 0u64;
+        for mid in ids {
+            let content = match self.payloads.read().get(&mid) {
+                Some(p) => String::from_utf8_lossy(&p.content).into_owned(),
+                None => continue,
+            };
+            let paths = crate::organ::artifact::extract_artifact_paths(&content);
+            if paths.is_empty() {
+                continue;
+            }
+            let mut any = false;
+            for path in paths {
+                if let Ok(artifact_id) = self.upsert_artifact(&path, None) {
+                    self.artifact_idx.write().associate(mid, artifact_id, &path, 1.0);
+                    assoc += 1;
+                    any = true;
+                }
+            }
+            if any {
+                mems += 1;
+            }
+        }
+        (mems, assoc)
     }
 
     /// Recall memories within a time range [start_ms, end_ms].

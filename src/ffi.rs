@@ -155,6 +155,29 @@ pub extern "C" fn cf_chain_head(h: *const CfHandle, out: *mut u8) -> c_int {
     0
 }
 
+/// One-shot backfill of the artifact (bridge-lane) index from stored payloads.
+/// Writes memory-count to *out_mems and association-count to *out_assoc.
+/// Returns 0 on success, -1 on null handle.
+#[no_mangle]
+pub extern "C" fn cf_backfill_artifact_refs(
+    h: *const CfHandle,
+    out_mems: *mut u64,
+    out_assoc: *mut u64,
+) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let (mems, assoc) = handle.field.backfill_artifact_refs();
+    if !out_mems.is_null() {
+        unsafe { *out_mems = mems };
+    }
+    if !out_assoc.is_null() {
+        unsafe { *out_assoc = assoc };
+    }
+    0
+}
+
 /// Compiled store vector-space identity = hash(model_id, embed_dim, text_format_version).
 /// Handle-less: lets a running daemon probe a replacement binary's vector space (via the
 /// `format-id` subcommand) before execv'ing into it on self-update (PR4 gate).
