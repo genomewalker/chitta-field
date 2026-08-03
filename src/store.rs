@@ -8513,9 +8513,14 @@ impl ChittaField {
                 let _ = idx.save_embeddings_sidecar(&emb_path);
                 let _ = idx.save_binary_sidecar(&bin_path);
                 let _ = idx.save_centroid_sidecar(&mu_path);
-                let _ = idx.save_hnsw(&hnsw_path);
-                let _ = idx.save_delta_hnsw(&delta_path);
-                let _ = idx.save_realm_hnsw(&realm_hnsw_path);
+                // HNSW sidecars: skipped when CHITTA_NO_HNSW_SIDECAR=1. Below
+                // flat_scan_max the graph is never consulted, so re-serialising it
+                // each snapshot is dead I/O; the flat-scan path is unaffected.
+                if !crate::hnsw::skip_hnsw_sidecar() {
+                    let _ = idx.save_hnsw(&hnsw_path);
+                    let _ = idx.save_delta_hnsw(&delta_path);
+                    let _ = idx.save_realm_hnsw(&realm_hnsw_path);
+                }
                 self.idx_sidecars_saved_at
                     .store(idx_mutations, std::sync::atomic::Ordering::Relaxed);
             }

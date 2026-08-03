@@ -866,8 +866,13 @@ impl ChittaField {
                 let _ = semantic_idx.activate_mmap_embeddings(&snap_path.with_extension("emb"));
             }
             // .hnsw + .delta.hnsw: load both tiers; backfill handles WAL-replay additions.
-            let _ = semantic_idx.load_hnsw(&snap_path.with_extension("hnsw"));
-            let _ = semantic_idx.load_delta_hnsw(&snap_path.with_extension("delta.hnsw"));
+            // Skipped when CHITTA_NO_HNSW_SIDECAR=1: below flat_scan_max the flat scan
+            // serves every query, so loading the stale graph is dead RAM. rebuild_hnsw()
+            // self-heals lazily if the corpus ever crosses the cap.
+            if !crate::hnsw::skip_hnsw_sidecar() {
+                let _ = semantic_idx.load_hnsw(&snap_path.with_extension("hnsw"));
+                let _ = semantic_idx.load_delta_hnsw(&snap_path.with_extension("delta.hnsw"));
+            }
         }
         // Inhibit HNSW inserts during replay — binary Hamming takes over after normalize_all(),
         // so building the O(N log N) HNSW graph incrementally would waste time and RAM.

@@ -71,6 +71,22 @@ pub(crate) fn flat_scan_max() -> usize {
     })
 }
 
+// Skip the HNSW sidecar I/O (boot load + snapshot save). Below flat_scan_max the
+// exact scan serves every query, so a corpus that never exceeds the cap keeps a
+// stale on-disk graph that is loaded into RAM each boot and re-serialised each
+// snapshot yet never consulted. With this set the graph is neither loaded nor
+// saved; rebuild_hnsw() self-heals it lazily if a corpus ever crosses the cap.
+// Default ON since the honest-gold A/B (n=161, 128k store): load vs skip left every
+// recall stratum byte-identical (recall@k 0.969, single_hop 0.980, multihop 0.818) —
+// the graph is never consulted at flat-scan scale. Kill switch: CHITTA_NO_HNSW_SIDECAR=0.
+pub(crate) fn skip_hnsw_sidecar() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("CHITTA_NO_HNSW_SIDECAR").ok().as_deref() != Some("0")
+    })
+}
+
 // .emb mmap activation threshold (field.rs): below this the embeddings stay
 // in the heap, so scans never fault on a page whose backing file a
 // consolidation prune (or, multi-node, a peer's sidecar rewrite over NFS)
