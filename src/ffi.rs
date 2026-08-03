@@ -614,6 +614,49 @@ pub extern "C" fn cf_recall_semantic_ctx(
     }
 }
 
+/// Lane-0 atom bridge: given the recall anchor (dense-lead memory), write the
+/// saturating-IDF co-atom partner ids and their BM25-IDF weights into parallel
+/// out buffers, ranked by weight desc. Returns 0 on success; `written` <= cap.
+/// The caller fuses these as a first-class RRF lane alongside dense/keyword.
+#[no_mangle]
+pub extern "C" fn cf_bridge_lane(
+    h: *mut CfHandle,
+    anchor_memory_id: u64,
+    realm: *const c_char,
+    k: usize,
+    out_ids: *mut u64,
+    out_weights: *mut f32,
+    cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || out_ids.is_null() || out_weights.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let realm_str = if realm.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(realm).to_str() } {
+            Ok(s) => Some(s),
+            Err(e) => return handle.err(e),
+        }
+    };
+    let cands = handle
+        .field
+        .bridge_lane_scored(anchor_memory_id, realm_str, k);
+    let n = cands.len().min(cap);
+    for (i, (m, w)) in cands.into_iter().take(n).enumerate() {
+        unsafe {
+            *out_ids.add(i) = m;
+            *out_weights.add(i) = w;
+        }
+    }
+    unsafe {
+        *written = n;
+    }
+    handle.ok()
+}
+
 /// Field-RAG recall: Modern Hopfield / DAM relaxation over the HNSW candidate submatrix.
 /// query_text is used for RRF BM25 lane (pass "" to skip BM25).
 #[no_mangle]

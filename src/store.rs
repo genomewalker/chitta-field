@@ -294,13 +294,25 @@ fn stratify_recall_hits(
 /// Identifies families by `chitta.*.snapshot` mtime order; removes all sidecar
 /// extensions for each stale stem.
 /// Delete WAL segments fully dominated by the coverage vector (THEORY.md §4).
-/// Segment file names are `{instance:08x}_{first_seqno:012}.seg`. A segment is
-/// prunable iff it is NOT its instance's last segment (its end is then the
-/// next segment's first_seqno - 1) AND covered[instance] >= that end. An
-/// instance's open-ended last segment is never pruned. Returns deleted count.
+/// Segment file names are `{instance:08x}_{first_seqno:012}.seg`.
+///
+/// An interior segment (one with a later sibling from the same instance) is
+/// prunable iff covered[instance] >= its end (the next sibling's first_seqno-1).
+///
+/// The final segment of an instance is open-ended — its end can't be read from
+/// filenames — so it is pruned only for a DEAD instance (`inst != live`): that
+/// segment is closed forever and covered[inst] is its exact fold watermark
+/// (replay walks the whole segment and records its max seqno; log.rs coverage),
+/// so presence in `covered` proves full domination. The LIVE instance's tail
+/// may still grow and is never pruned. Absence from `covered` (e.g. a
+/// lineage-fenced foreign-vsid segment, never folded) also keeps the segment.
+/// Without this, a daemon whose every lifetime writes a single segment (one
+/// instance-id each) accumulates them unboundedly — windows(2) is empty so the
+/// interior rule alone never fires. Returns deleted count.
 fn prune_covered_segments(
     seg_dir: &std::path::Path,
     covered: &std::collections::BTreeMap<crate::ids::InstanceId, u64>,
+    live_instance: crate::ids::InstanceId,
 ) -> usize {
     let mut per_instance: std::collections::BTreeMap<u32, Vec<(u64, std::path::PathBuf)>> =
         std::collections::BTreeMap::new();
@@ -325,6 +337,25 @@ fn prune_covered_segments(
     let mut deleted = 0usize;
     for (inst, mut segs) in per_instance {
         segs.sort();
+        // Empty segments (size <= header, zero ops) of a DEAD instance hold no
+        // memories by construction — a daemon lifetime that opened a segment and
+        // appended nothing before exiting. Coverage is op-derived (log.rs records
+        // it per replayed op) so it can NEVER prove an empty segment; prune them
+        // directly by size. Excludes the live instance, whose freshly-opened
+        // segment is also header-sized (V3_HEADER_SIZE) until its first op.
+        if inst != live_instance {
+            segs.retain(|(_, path)| {
+                let empty = std::fs::metadata(path)
+                    .map(|m| m.len() <= crate::log::V3_HEADER_SIZE as u64)
+                    .unwrap_or(false);
+                if empty && std::fs::remove_file(path).is_ok() {
+                    deleted += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         let max_covered = covered.get(&inst).copied().unwrap_or(0);
         for w in segs.windows(2) {
             let (_, ref path) = w[0];
@@ -332,6 +363,17 @@ fn prune_covered_segments(
             let seg_end = next_first.saturating_sub(1);
             if max_covered >= seg_end && std::fs::remove_file(path).is_ok() {
                 deleted += 1;
+            }
+        }
+        // The instance's final (open-ended) segment: prune only for a dead
+        // instance present in `covered` (fully folded). Never the live tail.
+        if inst != live_instance {
+            if let Some((first, path)) = segs.last() {
+                if covered.get(&inst).map_or(false, |&c| c >= *first)
+                    && std::fs::remove_file(path).is_ok()
+                {
+                    deleted += 1;
+                }
             }
         }
     }
@@ -2530,6 +2572,54 @@ impl ChittaField {
         self.recall_semantic_ctx(query_embedding, k, realm, None, None, false)
     }
 
+    /// Lane-0 atom bridge as a first-class retrieval leg. Given the recall's
+    /// dense-lead anchor, return its saturating-IDF co-atom partners (id, weight)
+    /// so a caller (the C++ multi-lane RRF in tool_recall) can fuse them ALONGSIDE
+    /// dense/keyword/HDC — a keyword-absent partner then competes on the strength
+    /// of a rare shared atom instead of being drowned as a single-dense-lane hit.
+    /// Weight is the BM25 IDF of the rarest shared atom (already summed across
+    /// shared atoms by `bridge_candidates_saturating`). Silent (empty) when the
+    /// bridge is disabled, the anchor carries no atom, or nothing co-occurs.
+    pub fn bridge_lane_scored(
+        &self,
+        anchor: MemoryId,
+        realm: Option<&str>,
+        k: usize,
+    ) -> Vec<(MemoryId, f32)> {
+        // NOT gated by bridge_lane_enabled (that flag governs the in-Rust
+        // dense-lane tau bridge): this leg is a distinct C++ lane-0 feature,
+        // gated caller-side by CHITTA_BRIDGE_LANE0 so a single flag flips it.
+        let anchor_paths = self.artifact_idx.read().paths_for_memory(anchor);
+        if anchor_paths.is_empty() {
+            return Vec::new();
+        }
+        let n_total = self
+            .memory_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1);
+        let cands = self.artifact_idx.read().bridge_candidates_saturating(
+            &anchor_paths,
+            n_total,
+            anchor,
+            k,
+        );
+        let payloads = self.payloads.read();
+        cands
+            .into_iter()
+            .filter(|(m, _)| {
+                match payloads.get(m) {
+                    // Mirror build_hit's soul: bleed gate: a soul-realm memory only
+                    // surfaces into a soul-realm query.
+                    Some(p) => {
+                        !(p.realm.starts_with("soul:")
+                            && realm.map(|r| !r.starts_with("soul:")).unwrap_or(true))
+                    }
+                    None => false,
+                }
+            })
+            .collect()
+    }
+
     /// Semantic recall with affective context.
     ///
     /// `query_valence` / `query_arousal`: caller's current affect state.
@@ -2811,13 +2901,27 @@ impl ChittaField {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(4)
                     .min(k);
-                let cands = self.artifact_idx.read().bridge_candidates(
-                    &anchor_paths,
-                    n_total,
-                    tau,
-                    anchor,
-                    reserve * 4,
-                );
+                // Lane-0 (CHITTA_BRIDGE_LANE0): saturating-IDF bridge fused as a
+                // scored RRF peer instead of the positional reserve injection.
+                let lane0 = std::env::var("CHITTA_BRIDGE_LANE0")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                let cands = if lane0 {
+                    self.artifact_idx.read().bridge_candidates_saturating(
+                        &anchor_paths,
+                        n_total,
+                        anchor,
+                        k.saturating_mul(4).max(64),
+                    )
+                } else {
+                    self.artifact_idx.read().bridge_candidates(
+                        &anchor_paths,
+                        n_total,
+                        tau,
+                        anchor,
+                        reserve * 4,
+                    )
+                };
                 if !cands.is_empty() {
                     // Score a bridge-injected memory into a well-formed RecallHit.
                     // semantic_score = 0.0: it was surfaced by the postings join, not
@@ -2886,6 +2990,17 @@ impl ChittaField {
                             spacing_boost: decomp.spacing_boost,
                         })
                     };
+                    if lane0 {
+                        // Scored RRF peer: reciprocal-rank-fuse every saturating-IDF
+                        // co-atom candidate against the dense/keyword result so a
+                        // strong bridge competes on merit, not a reserved slot.
+                        let bridge_hits: Vec<RecallHit> =
+                            cands.iter().filter_map(|(m, _)| build_hit(*m)).collect();
+                        if !bridge_hits.is_empty() {
+                            let rrf_k = pipeline.config.rrf_k;
+                            hits = rrf_merge(std::mem::take(&mut hits), bridge_hits, k, rrf_k);
+                        }
+                    } else {
                     // No-evict fusion. The dense top-k is the base. We only inject
                     // GENUINELY-NEW bridges (co-atom partners the dense pool buried
                     // past k) and pay for each by evicting a *weak* dense-tail hit —
@@ -2932,6 +3047,7 @@ impl ChittaField {
                         }
                         kept.extend(new_bridge.into_iter().take(room));
                         hits = kept;
+                    }
                     }
                 }
             }
@@ -8582,7 +8698,7 @@ impl ChittaField {
         if last > *own { *own = last; }
 
         let seg_dir = self.data_dir.join("segments");
-        let deleted = prune_covered_segments(&seg_dir, &covered);
+        let deleted = prune_covered_segments(&seg_dir, &covered, self.instance_id);
         Ok(deleted)
     }
 
@@ -9666,34 +9782,65 @@ mod tests {
     }
 
     /// THEORY.md §4: prune only segments the coverage vector dominates; an
-    /// instance's open-ended last segment is never pruned.
+    /// instance's open-ended last segment is never pruned. Header-only (empty)
+    /// segments of a dead instance are prunable by size regardless of coverage.
     #[test]
     fn prune_covered_segments_respects_coverage_vector() {
         let tmp = TempDir::new().unwrap();
         let seg_dir = tmp.path().join("segments");
         std::fs::create_dir_all(&seg_dir).unwrap();
+        // Op-bearing segments must exceed the header size, else the empty-segment
+        // rule would reclaim them; write header + a byte of "op" payload.
+        let ops = vec![0u8; crate::log::V3_HEADER_SIZE + 1];
         for name in [
             "10000001_000000000001.seg",
             "10000001_000000000050.seg",
             "20000002_000000000001.seg",
         ] {
-            std::fs::write(seg_dir.join(name), b"x").unwrap();
+            std::fs::write(seg_dir.join(name), &ops).unwrap();
         }
+
+        // Instance 1 is the LIVE writer here: its open tail (…_50) is never pruned.
+        let live = 0x1000_0001u32;
 
         // Not covered far enough: nothing prunable.
         let mut covered = std::collections::BTreeMap::new();
         covered.insert(0x1000_0001u32, 10u64);
-        assert_eq!(prune_covered_segments(&seg_dir, &covered), 0);
+        assert_eq!(prune_covered_segments(&seg_dir, &covered, live), 0);
 
         // Covered through the first segment's end (next_first - 1 = 49):
-        // only instance 1's first segment goes; last segments stay.
+        // only instance 1's first segment goes; the live tail + the dead
+        // instance-2 segment (absent from `covered`) stay.
         covered.insert(0x1000_0001, 49);
-        assert_eq!(prune_covered_segments(&seg_dir, &covered), 1);
+        assert_eq!(prune_covered_segments(&seg_dir, &covered, live), 1);
         assert!(!seg_dir.join("10000001_000000000001.seg").exists());
         assert!(seg_dir.join("10000001_000000000050.seg").exists());
         assert!(
             seg_dir.join("20000002_000000000001.seg").exists(),
             "a foreign writer's segment must never be pruned without coverage"
+        );
+
+        // A DEAD instance's final segment IS prunable once it appears in the
+        // coverage vector (fully folded into the snapshot). This is the common
+        // one-segment-per-lifetime case the interior windows(2) rule can't reach.
+        covered.insert(0x2000_0002, 1);
+        assert_eq!(prune_covered_segments(&seg_dir, &covered, live), 1);
+        assert!(!seg_dir.join("20000002_000000000001.seg").exists());
+        // The live instance's tail still survives — never pruned even when covered.
+        assert!(seg_dir.join("10000001_000000000050.seg").exists());
+
+        // Header-only (empty) segments: a dead instance's empty segment is
+        // reclaimed WITHOUT any coverage entry (coverage is op-derived and can
+        // never prove it); the live instance's empty segment is preserved.
+        let empty = vec![0u8; crate::log::V3_HEADER_SIZE];
+        std::fs::write(seg_dir.join("30000003_000000000001.seg"), &empty).unwrap(); // dead, empty
+        std::fs::write(seg_dir.join("10000001_000000000999.seg"), &empty).unwrap(); // live, empty
+        let empty_cov = std::collections::BTreeMap::new(); // no coverage at all
+        assert_eq!(prune_covered_segments(&seg_dir, &empty_cov, live), 1);
+        assert!(!seg_dir.join("30000003_000000000001.seg").exists());
+        assert!(
+            seg_dir.join("10000001_000000000999.seg").exists(),
+            "the live instance's freshly-opened (header-only) segment must survive"
         );
     }
 

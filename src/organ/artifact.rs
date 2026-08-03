@@ -22,6 +22,45 @@ fn urlish_re() -> &'static Regex {
     R.get_or_init(|| Regex::new(r"^//|(?:^|/)(?:www\.|[\w-]+\.(?:org|com|net|io|gov|edu)/)").unwrap())
 }
 
+// --- grounded-entity atoms (env-gated experiment). CHITTA_BRIDGE_ATOMS:
+//   unset|paths -> paths only (shipped default, byte-identical)
+//   safe        -> + uuid/hash/accession (structurally unmistakable identities)
+//   all|code    -> + snake_case/CamelCase code symbols (df-gate does precision)
+// Entity classes are STRUCTURED tokens so they don't catch prose; the df gate in
+// bridge_candidates keeps only rare ones. Read once.
+fn atoms_mode() -> u8 {
+    static M: OnceLock<u8> = OnceLock::new();
+    *M.get_or_init(|| match std::env::var("CHITTA_BRIDGE_ATOMS").as_deref() {
+        Ok("safe") => 1,
+        Ok("all") | Ok("code") => 2,
+        _ => 0,
+    })
+}
+fn uuid_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b").unwrap())
+}
+fn hex_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\b[0-9a-f]{8,64}\b").unwrap())
+}
+fn acc_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\b(?:GC[AF]_\d{9}\.\d+|[A-Z]{2,6}\d{4,}(?:\.\d+)?)\b").unwrap())
+}
+fn snake_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+){1,}\b").unwrap())
+}
+fn camel_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\b[A-Z][a-z]+(?:[A-Z][a-z]+){1,}\b").unwrap())
+}
+// a hex run is an id only if it mixes a-f letters AND digits (else it's a word or a number)
+fn is_hash(t: &str) -> bool {
+    t.chars().any(|c| ('a'..='f').contains(&c)) && t.chars().any(|c| c.is_ascii_digit())
+}
+
 fn valid_abs(p: &str) -> bool {
     if urlish_re().is_match(p) {
         return false; // protocol-relative or URL host
@@ -52,6 +91,33 @@ pub fn extract_artifact_paths(content: &str) -> Vec<String> {
         let p = m.as_str();
         if p.len() >= 12 && valid_abs(p) {
             set.insert(p.to_string());
+        }
+    }
+    let mode = atoms_mode();
+    if mode >= 1 {
+        for m in uuid_re().find_iter(content) {
+            set.insert(m.as_str().to_string());
+        }
+        for m in hex_re().find_iter(content) {
+            let t = m.as_str();
+            if is_hash(t) {
+                set.insert(t.to_string());
+            }
+        }
+        for m in acc_re().find_iter(content) {
+            set.insert(m.as_str().to_string());
+        }
+    }
+    if mode >= 2 {
+        for m in snake_re().find_iter(content) {
+            if m.as_str().len() >= 8 {
+                set.insert(m.as_str().to_string());
+            }
+        }
+        for m in camel_re().find_iter(content) {
+            if m.as_str().len() >= 8 {
+                set.insert(m.as_str().to_string());
+            }
         }
     }
     set.into_iter().collect()
@@ -205,6 +271,50 @@ impl ArtifactIndex {
         v
     }
 
+    /// Saturating-IDF postings join for the lane-0 bridge (CHITTA_BRIDGE_LANE0).
+    /// Same co-atom join as `bridge_candidates` but replaces the hard df <= tau
+    /// gate with a smooth BM25 IDF `ln((N - df + 0.5)/(df + 0.5) + 1)`: common
+    /// atoms decay to ~0 weight instead of being excluded, so a shared path with
+    /// df=40 still contributes a little rather than nothing. Non-negative, bounded
+    /// by ln(N+1). ZERO cosine; `exclude` (the anchor) is dropped.
+    pub fn bridge_candidates_saturating(
+        &self,
+        anchor_paths: &[String],
+        n_total: usize,
+        exclude: MemoryId,
+        k: usize,
+    ) -> Vec<(MemoryId, f32)> {
+        let n = n_total as f32;
+        let mut scores: HashMap<MemoryId, f32> = HashMap::new();
+        for path in anchor_paths {
+            if let Some(entries) = self.by_path.get(path) {
+                let dfreq = entries.len();
+                if dfreq == 0 {
+                    continue;
+                }
+                let df = dfreq as f32;
+                let w = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                if w <= 0.0 {
+                    continue;
+                }
+                for e in entries {
+                    if e.memory_id == exclude {
+                        continue;
+                    }
+                    *scores.entry(e.memory_id).or_insert(0.0) += w;
+                }
+            }
+        }
+        let mut v: Vec<(MemoryId, f32)> = scores.into_iter().collect();
+        v.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        v.truncate(k);
+        v
+    }
+
     pub fn len(&self) -> usize {
         self.by_path.len()
     }
@@ -308,5 +418,28 @@ mod tests {
             idx2.associate(m, 300, "/common/only", 1.0); // df=50 > tau
         }
         assert!(idx2.bridge_candidates(&idx2.paths_for_memory(0), n, tau, 0, 10).is_empty());
+    }
+
+    // Lane-0 saturating IDF replaces the hard df>tau gate with a down-weight:
+    // the common-atom crowd is KEPT (no cliff) but ranks strictly below a
+    // rare-atom partner, and the anchor itself is excluded.
+    #[test]
+    fn test_saturating_idf_ranks_rare_over_common() {
+        let mut idx = ArtifactIndex::new();
+        let (a, b, n) = (1u64, 2u64, 1000usize);
+        idx.associate(a, 100, "/maps/repo/rare_bridge.rs", 1.0); // df=2
+        idx.associate(b, 100, "/maps/repo/rare_bridge.rs", 1.0);
+        idx.associate(a, 200, "/.claude/mind", 1.0); // common: df=41
+        for m in 1000..1040u64 {
+            idx.associate(m, 200, "/.claude/mind", 1.0);
+        }
+        let cands = idx.bridge_candidates_saturating(&idx.paths_for_memory(a), n, a, 100);
+        assert_eq!(cands.first().map(|c| c.0), Some(b), "rare-atom partner not first");
+        assert!(cands.iter().all(|c| c.0 != a), "anchor leaked into candidates");
+        // common crowd is retained (no hard gate) but strictly below the partner
+        let b_score = cands[0].1;
+        let crowd: Vec<f32> = cands.iter().filter(|c| c.0 >= 1000).map(|c| c.1).collect();
+        assert_eq!(crowd.len(), 40, "common crowd was gated instead of down-weighted");
+        assert!(crowd.iter().all(|&s| s < b_score), "common atom outweighed rare atom");
     }
 }
