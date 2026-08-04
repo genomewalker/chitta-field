@@ -431,7 +431,7 @@ const V1_HEADER_SIZE: usize = 16;
 /// V2 header: magic(8) + first_seqno(8) + chain_head(32) = 48
 const V2_HEADER_SIZE: usize = 48;
 /// V3 header: magic(8) + first_seqno(8) + chain_head(32) + vector_space_id(8) = 56
-const V3_HEADER_SIZE: usize = 56;
+pub(crate) const V3_HEADER_SIZE: usize = 56;
 
 #[allow(dead_code)] // Retained for V1 backward compatibility
 fn create_segment(path: &Path, first_seqno: u64) -> Result<File> {

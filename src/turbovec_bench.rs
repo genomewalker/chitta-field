@@ -108,7 +108,11 @@ fn turbovec_ab() {
     );
 
     // ── TurboQuant at 4 and 2 bits ──
-    for bits in [4usize, 2usize] {
+    // turbovec 0.9 accepts ONLY bit_width 2, 3, or 4 (ConstructError::BitWidthOutOfRange) —
+    // TurboQuant is an extreme-compression method by construction, so the "run it at 8 bits"
+    // control a review asked for is impossible: at 8 bits you are doing int8 scalar
+    // quantization, not TurboQuant. 3 is the untested middle rung.
+    for bits in [4usize, 3usize, 2usize] {
         let t0 = Instant::now();
         let mut tq = turbovec::TurboQuantIndex::new(dim, bits).expect("construct");
         tq.add(&flat);
