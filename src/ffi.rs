@@ -5306,6 +5306,35 @@ pub extern "C" fn cf_trim_realm_names(h: *mut CfHandle) -> i64 {
     handle.field.trim_realm_names() as i64
 }
 
+/// Bulk-remap realms per a JSON `{old_realm: new_realm}` object. `dry_run`
+/// computes the census without mutating; a real run mutates + forces a snapshot.
+/// Writes a JSON summary to `buf`. Returns 0 on success, -2 if buf too small, -1 on error.
+#[no_mangle]
+pub extern "C" fn cf_remap_realms(
+    h: *mut CfHandle,
+    mapping_json: *const c_char,
+    dry_run: bool,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    if h.is_null() || mapping_json.is_null() || buf.is_null() || written.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let map_str = match unsafe { CStr::from_ptr(mapping_json).to_str() } {
+        Ok(s) => s,
+        Err(e) => return handle.err(e),
+    };
+    let mapping: std::collections::HashMap<String, String> =
+        match serde_json::from_str(map_str) {
+            Ok(m) => m,
+            Err(e) => return handle.err(e),
+        };
+    let json_str = handle.field.remap_realms(&mapping, dry_run);
+    write_json_buf(&json_str, buf, buf_cap, written)
+}
+
 /// 4. Get single task by ID (JSON payload).
 /// Returns 0 on success, 1 if not found, -2 if buf too small, -1 on error.
 #[no_mangle]

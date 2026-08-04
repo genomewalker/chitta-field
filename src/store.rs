@@ -6726,6 +6726,79 @@ impl ChittaField {
         count
     }
 
+    /// Bulk-remap realms per an explicit `{old_realm -> new_realm}` mapping.
+    /// `dry_run` computes the move census without mutating. On a real run it
+    /// updates payload.realm + realm_members, then forces a full snapshot for
+    /// durability (cf_set_realm emits no WAL, so the snapshot is the only durable
+    /// record). Returns a JSON summary string.
+    pub fn remap_realms(
+        &self,
+        mapping: &std::collections::HashMap<String, String>,
+        dry_run: bool,
+    ) -> String {
+        let moves: Vec<(MemoryId, String, String)> = {
+            let payloads = self.payloads.read();
+            let states = self.states.read();
+            payloads
+                .iter()
+                .filter_map(|(mid, p)| {
+                    if states.get(mid).map(|s| s.deleted).unwrap_or(true) {
+                        return None;
+                    }
+                    match mapping.get(&p.realm) {
+                        Some(new_realm) if new_realm != &p.realm => {
+                            Some((*mid, p.realm.clone(), new_realm.clone()))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect()
+        };
+        let moved = moves.len();
+        let mut per_target: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (_, _, new_realm) in &moves {
+            *per_target.entry(new_realm.clone()).or_insert(0) += 1;
+        }
+
+        if !dry_run {
+            for (mid, old_realm, new_realm) in &moves {
+                if let Some(p) = self.payloads.write().get_mut(mid) {
+                    p.realm = new_realm.clone();
+                }
+                let mut rm = self.realm_members.write();
+                if let Some(set) = rm.get_mut(old_realm) {
+                    set.remove(mid);
+                    if set.is_empty() {
+                        rm.remove(old_realm);
+                    }
+                }
+                rm.entry(new_realm.clone()).or_default().insert(*mid);
+            }
+        }
+
+        let final_realms = self.realm_members.read().len();
+        let snapshot_ok = if !dry_run {
+            self.save_full_snapshot().is_ok()
+        } else {
+            false
+        };
+        let mut targets: Vec<(String, usize)> = per_target.into_iter().collect();
+        targets.sort_by(|a, b| b.1.cmp(&a.1));
+        let targets_json: Vec<serde_json::Value> = targets
+            .iter()
+            .map(|(t, c)| serde_json::json!({"realm": t, "count": c}))
+            .collect();
+        serde_json::json!({
+            "dry_run": dry_run,
+            "moved": moved,
+            "targets": targets_json,
+            "final_realms": final_realms,
+            "snapshot_ok": snapshot_ok,
+        })
+        .to_string()
+    }
+
     /// Save a spectral stats snapshot for temporal drift tracking.
     /// Writes `spectral_snapshot_{timestamp}.json` to the data dir.
     pub fn save_spectral_snapshot(&self) -> Result<String> {
