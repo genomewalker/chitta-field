@@ -237,14 +237,22 @@ pub struct ChittaField {
     /// rebuilt on load (no snapshot-format change, migration-free, rollback-safe).
     pub(crate) prov_key_idx: RwLock<HashMap<String, MemoryId>>,
     /// Correction keyed lane (capability #2, durable corrections with override).
-    /// Distinctive bigrams of a `[correction]` record's corrected-mistake phrase
-    /// -> the NEWEST correction id for that trigger (LATEST-WINS / SUPERSEDE).
-    /// Powers `correction_check`, a deterministic O(turn_tokens) exact-key probe
-    /// that reserves an injection slot for a correction whose mistake recurs in
-    /// a turn — replacing the fuzzy recall that loses corrections on cosine
-    /// similarity ~99% of the time. Derived, rebuilt on load (no snapshot-format
-    /// change, migration-free, rollback-safe — same discipline as prov_key_idx).
-    pub(crate) correction_key_idx: RwLock<HashMap<String, MemoryId>>,
+    /// Distinctive bigram of a `[correction]` record's corrected-mistake phrase
+    /// -> ALL live correction ids carrying that trigger (multi-valued). A single
+    /// latest-wins slot lost distinctive bigrams to newer corrections sharing a
+    /// domain-common word (`afdb_background`), so a record only fired on its rare
+    /// bigrams — observed live: a mistake restatement matching 3 of a record's
+    /// bigrams fired nothing. The set lets `correction_check` credit a record for
+    /// every trigger it owns; supersession is preserved by filtering deleted ids
+    /// and ordering newest-first at query time. Powers `correction_check`, a
+    /// deterministic O(turn_tokens) exact-key probe that reserves an injection
+    /// slot for a correction whose mistake recurs in a turn — replacing the fuzzy
+    /// recall that loses corrections on cosine similarity ~99% of the time.
+    /// Derived, rebuilt on load (no snapshot-format change, migration-free,
+    /// rollback-safe — same discipline as prov_key_idx).
+    /// ceiling: a bigram's id-vec is unbounded; bounded in practice by distinct
+    /// corrections sharing it; upgrade: cap to newest-N if a bigram ever explodes.
+    pub(crate) correction_key_idx: RwLock<HashMap<String, Vec<MemoryId>>>,
     /// Task-state keyed lane (capability #3, task hand-off across discontinuous
     /// sessions). Task slug (`task:<slug>`) -> the NEWEST live `[task]` record id
     /// for that task (LATEST-WINS / SUPERSEDE, since status evolves). Powers
@@ -1287,23 +1295,29 @@ impl ChittaField {
         };
         eprintln!("[chitta-field] prov_key_idx rebuilt: {} keyed provenance entries", prov_key_idx.len());
         // Rebuild the correction keyed lane from live [correction] payloads.
-        // Sorted ASCENDING by (created_at, id) + `insert` (overwrite) => the
-        // NEWEST record wins per trigger key, matching the live put_memory
-        // insert order exactly (LATEST-WINS / SUPERSEDE). Mirror-image of the
-        // provenance rebuild (which uses or_insert => earliest wins).
-        let correction_key_idx: HashMap<String, MemoryId> = {
+        // Multi-valued: each trigger key -> ALL live correction ids carrying it,
+        // in ASCENDING (created_at, id) order so newest is last. Pre-filter is
+        // case-insensitive `[correction` to admit the free-form header form
+        // `[CORRECTION to memory #… — topic]` (most real corrections) — mirroring
+        // the internal gate in parse_correction_keys; the old lowercase-exact
+        // `[correction]` filter silently dropped ~80% of corrections here.
+        let correction_key_idx: HashMap<String, Vec<MemoryId>> = {
             let mut live: Vec<_> = payloads
                 .iter()
                 .filter(|(id, p)| {
-                    p.content.starts_with(b"[correction]")
+                    let lead = p.content.get(..11).unwrap_or_default().to_ascii_lowercase();
+                    lead.starts_with(b"[correction")
                         && !states.get(id).map(|s| s.deleted).unwrap_or(false)
                 })
                 .collect();
             live.sort_by_key(|(id, p)| (p.created_at_ms, **id));
-            let mut idx: HashMap<String, MemoryId> = HashMap::new();
+            let mut idx: HashMap<String, Vec<MemoryId>> = HashMap::new();
             for (id, p) in live {
                 for ck in crate::store::parse_correction_keys(&p.content) {
-                    idx.insert(ck, *id);
+                    let v = idx.entry(ck).or_default();
+                    if !v.contains(id) {
+                        v.push(*id);
+                    }
                 }
             }
             idx

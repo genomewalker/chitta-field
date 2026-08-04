@@ -821,6 +821,22 @@ fn clean_correction_text(s: &str) -> String {
         .join(" ")
 }
 
+/// First double-quoted span (straight or unicode curly) with >= 2 whitespace
+/// tokens. In the dominant free-form correction header `[CORRECTION to memory
+/// #… ] … "<mistake>" was WRONG …`, the quoted claim IS the distinctive trigger
+/// the user restates. Keying the whole body instead floods the latest-wins index
+/// with dozens of low-value bigrams that newer corrections overwrite, so the
+/// mistake restatement stops firing (only incidental cause-clause phrasing
+/// survives) — observed live at 34k keyed triggers.
+fn first_quoted_span(text: &str) -> Option<String> {
+    let is_q = |c: char| c == '"' || c == '\u{201c}' || c == '\u{201d}';
+    let chars: Vec<char> = text.chars().collect();
+    let start = chars.iter().position(|&c| is_q(c))?;
+    let end = chars[start + 1..].iter().position(|&c| is_q(c))? + start + 1;
+    let span: String = chars[start + 1..end].iter().collect();
+    (span.split_whitespace().count() >= 2).then_some(span)
+}
+
 /// Order-preserving adjacent bigrams of normalized tokens, namespaced
 /// `correction:bg:<a>_<b>`. The bigram — not the unigram — is the trigger unit:
 /// a single word over-fires on unrelated turns, a two-word phrase from the
@@ -839,14 +855,20 @@ fn correction_bigram_keys(tokens: &[String]) -> Vec<String> {
 /// recurs in a turn the correction must FIRE (not compete on cosine and lose).
 /// Extracts the `NOT:`/`WRONG:` mistake line (falls back to the whole body for
 /// the free-form "User corrected me" form), normalizes it, and emits its
-/// distinctive bigrams as exact keys. Returns `[]` for non-`[correction]`
-/// content or a mistake too short to bigram.
+/// distinctive bigrams as exact keys. Returns `[]` for non-correction content
+/// or a mistake too short to bigram.
 pub(crate) fn parse_correction_keys(content: &[u8]) -> Vec<String> {
     let text = match std::str::from_utf8(content) {
         Ok(t) => t,
         Err(_) => return Vec::new(),
     };
-    if !text.starts_with("[correction]") {
+    // Accept every correction marker, case-insensitively: the canonical
+    // `[correction]` AND the free-form header `[CORRECTION to memory #… — topic]`.
+    // The old lowercase-exact gate keyed only ~20% of stored corrections (most
+    // lead with the uppercase header), silently disabling the deterministic lane
+    // for them. Match a leading `[correction` prefix in any case.
+    let lead = text.chars().take(11).collect::<String>().to_ascii_lowercase();
+    if !lead.starts_with("[correction") {
         return Vec::new();
     }
     let wrong = text
@@ -857,6 +879,10 @@ pub(crate) fn parse_correction_keys(content: &[u8]) -> Vec<String> {
                 .or_else(|| t.strip_prefix("WRONG:"))
                 .map(|s| s.to_string())
         })
+        // Free-form header form has no NOT:/WRONG: line; the quoted claim is the
+        // distinctive mistake trigger. Prefer it over the whole body so the
+        // latest-wins index isn't diluted by generic body bigrams.
+        .or_else(|| first_quoted_span(text))
         .unwrap_or_else(|| {
             text.trim_start_matches("[correction]").to_string()
         });
@@ -993,15 +1019,19 @@ impl ChittaField {
             return None;
         }
         // Count how many of the turn's DISTINCT bigrams map to each correction.
-        // The index is single-valued (latest-wins), so each key resolves to one
-        // correction id; a per-id count of 2 means two distinct trigger bigrams
-        // of that correction co-occur in the turn.
+        // The index is multi-valued: each key resolves to every correction that
+        // carries that trigger, so a record is credited for EACH of its bigrams
+        // present in the turn even when a newer correction shares one. Turn keys
+        // are deduped and each id appears once per key, so a per-id count of 2
+        // means two distinct trigger bigrams of that correction co-occur.
         let mut per_id: HashMap<MemoryId, usize> = HashMap::new();
         {
             let idx = self.correction_key_idx.read();
             for k in &keys {
-                if let Some(&id) = idx.get(k) {
-                    *per_id.entry(id).or_insert(0) += 1;
+                if let Some(ids) = idx.get(k) {
+                    for &id in ids {
+                        *per_id.entry(id).or_insert(0) += 1;
+                    }
                 }
             }
         }
@@ -1275,12 +1305,18 @@ impl ChittaField {
         }
         // Correction keyed lane (capability #2, durable corrections with
         // override). Index the mistake's distinctive bigrams -> this correction.
-        // `insert` (NOT `or_insert`): a newer correction sharing a trigger key
-        // SUPERSEDES the older one for that key (LATEST-WINS). Self-gated on the
-        // `[correction]` prefix inside parse_correction_keys, so no kind check —
-        // matches the load-time rebuild exactly.
+        // Multi-valued append (not overwrite): a bigram accumulates every
+        // correction that carries it, so no record loses a distinctive trigger to
+        // a newer correction sharing a domain-common word. Supersession is
+        // applied at query time (deleted-filter + newest-first). Self-gated on the
+        // case-insensitive `[correction` prefix inside parse_correction_keys, so
+        // no kind check — matches the load-time rebuild exactly.
         for ck in parse_correction_keys(content) {
-            self.correction_key_idx.write().insert(ck, memory_id);
+            let mut idx = self.correction_key_idx.write();
+            let v = idx.entry(ck).or_default();
+            if !v.contains(&memory_id) {
+                v.push(memory_id);
+            }
         }
         // Task-state keyed lane (capability #3, task hand-off). Index the task's
         // slug -> this record. `insert` (NOT `or_insert`): a newer status for the
@@ -11324,6 +11360,51 @@ mod tests {
         assert_ne!(hit.0, old_id, "rebuilt lane keeps the SUPERSEDING correction after reopen");
         assert!(hit.1.contains("ETXTBSY"), "rebuilt lane surfaces newest body");
         assert!(field.correction_check("totally unrelated question").is_none());
+    }
+
+    #[test]
+    fn correction_uppercase_header_form_is_keyed() {
+        // The free-form `[CORRECTION to memory #… — topic]` header (uppercase,
+        // extra words) is how most real corrections are stored. The old
+        // lowercase-exact gate rejected it, silently disabling the keyed lane.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let field = ChittaField::open(data_dir).unwrap();
+        let body = "[CORRECTION to memory #2411395996631171237 — reuse background] \
+                    realm:pan-barley. My earlier claim \"reuse has 0 AFDB background by \
+                    construction\" was WRONG. Cause: spine_member_col omits AFDB scaffold.";
+        let id = field
+            .put_memory("correction", "brahman", body.as_bytes(), &[], 0.9, 0.001, 0, vec![], None, None)
+            .unwrap()
+            .0;
+        let hit = field.correction_check("reuse has 0 AFDB background by construction");
+        assert!(hit.is_some(), "uppercase-header correction must fire on its mistake restatement");
+        assert_eq!(hit.unwrap().0, id, "fires the stored uppercase-header correction id");
+    }
+
+    #[test]
+    fn correction_multivalued_credits_shared_bigrams() {
+        // Older correction A's mistake shares 2 of its 3 bigrams with a NEWER
+        // correction B. Single-valued latest-wins would let B steal both keys, so
+        // A could never reach the 2-bigram threshold on its own restatement (only
+        // B — the wrong correction — would fire). The multi-valued index credits A
+        // for every bigram it owns, so A's restatement still surfaces A.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let field = ChittaField::open(data_dir).unwrap();
+        let put = |body: &str| field
+            .put_memory("correction", "cc-soul", body.as_bytes(), &[], 0.9, 0.001, 0, vec![], None, None)
+            .unwrap()
+            .0;
+        put("[correction] USE: quartz lattice mica\nNOT: alpha beta gamma delta");
+        let _newer = put("[correction] USE: other fix\nNOT: alpha beta gamma zeta");
+        let hit = field
+            .correction_check("alpha beta gamma delta")
+            .expect("A's restatement must fire despite B stealing shared bigrams");
+        assert!(hit.1.contains("quartz lattice mica"),
+                "multi-valued index must credit older A for its shared bigrams (single-valued drops it)");
     }
 
     /// Capability #3: task hand-off across discontinuous sessions. Proves the
