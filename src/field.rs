@@ -29,7 +29,7 @@ use crate::organ::integration::IntegrationKernel;
 use crate::organ::surprise_learning::SurpriseLearningStore;
 use crate::organ::wisdom_promotion::WisdomPromotionStore;
 use crate::organ::intervention::InterventionStore;
-use crate::organ::symbol_events::{SymbolEvent, SymbolEventKind, SymbolEventLog};
+use crate::organ::symbol_events::SymbolEventLog;
 use crate::scoring::learned::LearnedScoringModel;
 use crate::organ::pq::ProductQuantizer;
 use crate::organ::session::SessionRegistry;
@@ -1205,7 +1205,7 @@ impl ChittaField {
         // Build EventTape from snapshot, seed entity interner from triplets, synthesize
         // legacy events for existing memories, then rebuild CDAWG from the tape.
         // Use persisted EventTape from snapshot if available; otherwise synthesize from memories.
-        let mut event_tape = if !snap_event_tape.events.is_empty() {
+        let event_tape = if !snap_event_tape.events.is_empty() {
             snap_event_tape
         } else {
             let mut tape = crate::organ::event_tape::EventTape::new();

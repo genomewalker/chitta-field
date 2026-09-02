@@ -6408,7 +6408,7 @@ mod tests {
             let (h, _tmp) = open_tmp();
             let kind = CString::new("wisdom").unwrap();
             let realm = CString::new("test").unwrap();
-            let content = vec![b'x'; 100];
+            let content = [b'x'; 100];
             let embedding = vec![0.1f32; crate::ops::EMBED_DIM];
             let mut id: u64 = 0;
             let r = cf_put_memory(
@@ -7056,7 +7056,7 @@ mod tests {
             );
 
             // Wrong embedding size must fail
-            let bad_emb = vec![0.5f32; 3];
+            let bad_emb = [0.5f32; 3];
             assert_eq!(
                 cf_update_memory_content(
                     h,
@@ -9469,10 +9469,7 @@ pub extern "C" fn cf_resolve_contradiction(
     let reason = if reason_ptr.is_null() {
         "manual"
     } else {
-        match unsafe { CStr::from_ptr(reason_ptr) }.to_str() {
-            Ok(s) => s,
-            Err(_) => "manual",
-        }
+        unsafe { CStr::from_ptr(reason_ptr) }.to_str().unwrap_or("manual")
     };
 
     // Build a minimal ContradictionIndex with just the two memories' content
@@ -9975,6 +9972,8 @@ pub extern "C" fn cf_recall_analogy(h: *const CfHandle, json_in: *const c_char) 
     let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 100) as usize;
 
     // Copy the lane out first: every hypervector op below runs off the store locks.
+    // `meta` is id -> realm only; payload text is fetched per mode via
+    // `analogy_texts` once the result set has been cut down to `limit`.
     let (facts, meta, triplet_count) = handle.field.analogy_snapshot();
     let reply = |mode: &str, indexed: usize, results: Vec<serde_json::Value>| -> *mut c_char {
         let body = serde_json::json!({ "mode": mode, "indexed": indexed, "results": results });
@@ -10020,12 +10019,19 @@ pub extern "C" fn cf_recall_analogy(h: *const CfHandle, json_in: *const c_char) 
             let hits = idx.proportional(a, b, c, limit);
             let indexed = idx.table().len();
             drop(idx);
+            // `hits` is already cut to `limit`; fetch text for just those ids.
+            let ids: Vec<u64> = hits.iter().filter_map(|hit| hit.memory_id).collect();
+            let texts = handle.field.analogy_texts(&ids);
             let results = hits
                 .into_iter()
                 .map(|hit| {
-                    let (realm, text): (String, String) = hit
+                    let realm: String = hit
                         .memory_id
                         .and_then(|id| meta.get(&id).cloned())
+                        .unwrap_or_default();
+                    let text: String = hit
+                        .memory_id
+                        .and_then(|id| texts.get(&id).cloned())
                         .unwrap_or_default();
                     serde_json::json!({
                         "id": hit.memory_id.unwrap_or(0),
@@ -10063,27 +10069,40 @@ pub extern "C" fn cf_recall_analogy(h: *const CfHandle, json_in: *const c_char) 
             let mut exclude_realm = args["exclude_realm"].as_str().unwrap_or("").to_string();
             if exclude_realm.is_empty() && args["cross_realm"].as_bool().unwrap_or(false) {
                 exclude_realm = exclude
-                    .and_then(|id| meta.get(&id).map(|(r, _)| r.clone()))
+                    .and_then(|id| meta.get(&id).cloned())
                     .unwrap_or_default();
             }
             // Over-fetch before the realm filter so a scoped query still fills `limit`.
-            let results = idx
+            // Rank and realm-filter on ids alone, then fetch payload text for the
+            // <= `limit` survivors — the realm filter can discard most of the
+            // over-fetch, so fetching text before it would be wasted copying.
+            let ranked: Vec<(u64, f32)> = idx
                 .rank(&probe, exclude, limit.saturating_mul(8))
                 .into_iter()
-                .filter_map(|(id, score)| {
-                    let (r, text) = meta.get(&id).cloned().unwrap_or_default();
+                .filter(|(id, _)| {
+                    let r = meta.get(id).map(String::as_str).unwrap_or("");
                     if !realm.is_empty() && r != realm {
-                        return None;
+                        return false;
                     }
                     if !exclude_realm.is_empty() && r == exclude_realm {
-                        return None;
+                        return false;
                     }
-                    Some(serde_json::json!({ "id": id, "score": score, "realm": r, "text": text }))
+                    true
                 })
                 .take(limit)
                 .collect();
             let indexed = idx.len();
             drop(idx);
+            let ids: Vec<u64> = ranked.iter().map(|(id, _)| *id).collect();
+            let texts = handle.field.analogy_texts(&ids);
+            let results = ranked
+                .into_iter()
+                .map(|(id, score)| {
+                    let r = meta.get(&id).cloned().unwrap_or_default();
+                    let text = texts.get(&id).cloned().unwrap_or_default();
+                    serde_json::json!({ "id": id, "score": score, "realm": r, "text": text })
+                })
+                .collect();
             reply("structural", indexed, results)
         }
         other => json_null(format!("cf_recall_analogy: unknown mode '{other}'")),

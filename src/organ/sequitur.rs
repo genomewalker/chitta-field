@@ -60,7 +60,9 @@ impl SequiturRule {
         let out_a  = outcome_verb((self.sym_a >> 32) as u8 & 0xff);
         let tool_b = tape.tool_name((self.sym_b >> 40) as u16);
         let ent_b  = tape.entity_name((self.sym_b & 0xffff_ffff) as u32);
-        let out_b  = outcome_verb((self.sym_b >> 32) as u8 & 0xff);
+        // The consequent's own outcome verb is deliberately not part of the
+        // sentence: both branches below phrase the consequent as "tends to
+        // follow" and report the pair's outcome through `avg`.
         let avg    = self.avg_outcome_label();
 
         let ent_a_short = shorten_entity(ent_a);

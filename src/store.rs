@@ -9,7 +9,7 @@ use crate::ops::{
     UpdateResidualPQOp, UpdateSparseCodeOp, UpsertArtifactOp, UpsertCodeFileOp, UpsertSymbolOp,
 };
 use crate::organ::memory_kind::{edge_legal, MemoryKind};
-use crate::organ::provenance::{MemProvenance, WitnessKind};
+use crate::organ::provenance::WitnessKind;
 use crate::organ::pq::ProductQuantizer;
 use crate::organ::query_router::{DispatchKind, QueryRouter, RecallRequest};
 use crate::organ::reconciler::Reconciler;
@@ -492,7 +492,7 @@ fn prune_covered_segments(
         // instance present in `covered` (fully folded). Never the live tail.
         if inst != live_instance {
             if let Some((first, path)) = segs.last() {
-                if covered.get(&inst).map_or(false, |&c| c >= *first)
+                if covered.get(&inst).is_some_and(|&c| c >= *first)
                     && std::fs::remove_file(path).is_ok()
                 {
                     deleted += 1;
@@ -1303,6 +1303,21 @@ impl ChittaField {
         // instead of creating a new node. Only deduplicates within the same realm —
         // cross-realm near-matches must produce independent nodes to prevent silent
         // cross-realm reinforcement.
+        //
+        // CONSTRAINT — when this can fire. `embed_pending` is
+        // `embedding.is_empty() && content.len() >= MIN_EMBED_CHARS`, so this guard
+        // is FALSE (and the gate runs) in exactly two cases:
+        //   (a) the caller supplied a vector — tests, and any `cf_put_memory` caller
+        //       that passes one. This is the live path; see
+        //       `put_memory_write_time_dedup_collapses_supplied_near_duplicates`.
+        //   (b) content is shorter than MIN_EMBED_CHARS with no vector — then
+        //       `search` is handed an empty query, returns `vec![]` on the
+        //       `query.len() != EMBED_DIM` check (hnsw.rs), and nothing is collapsed.
+        // The production C++ path is neither: it passes no vector and long content,
+        // so it is embed_pending and skips this entirely. Near-duplicates from that
+        // path are collapsed later by the supersede pass in `backfill_embedding`,
+        // which is the first moment a vector exists. Do not delete this branch as
+        // "dead" — case (a) is exercised by the test named above.
         if !embed_pending {
             let (dedup_thresh, dedup_upper) = {
                 let cfg = &self.scoring_pipeline.read().config;
@@ -1489,7 +1504,7 @@ impl ChittaField {
         }
         let content_str = std::str::from_utf8(content).unwrap_or("").to_string();
         let observer_canonicals = self.observer.extract(
-            &content_str, memory_id, authored_at_ms, &mut *self.observer_state.write(),
+            &content_str, memory_id, authored_at_ms, &mut self.observer_state.write(),
         );
         let index_text = if observer_canonicals.is_empty() {
             extract_bm25_text(&content_str, self.filter_level())
@@ -2211,11 +2226,17 @@ impl ChittaField {
     /// triplet read lock starves every queued writer (parking_lot is
     /// writer-preferring; see the lock-order note in field.rs).
     ///
-    /// Returns (facts, source memory → (realm, text), live triplet count). The
-    /// count is the analogy index's staleness key.
+    /// Returns (facts, source memory → realm, live triplet count). The count is
+    /// the analogy index's staleness key.
+    ///
+    /// Realm only, deliberately: realm is what the caller filters on, and it is
+    /// a short, highly-repeated string. Payload *text* is fetched separately by
+    /// `analogy_texts` for the ranked subset alone — carrying every source
+    /// memory's full content through here cost ~17 MB per call at 33k memories,
+    /// all of it discarded except the handful of rows that survive ranking.
     pub fn analogy_snapshot(
         &self,
-    ) -> (Vec<crate::analogy::Fact>, std::collections::HashMap<MemoryId, (String, String)>, usize) {
+    ) -> (Vec<crate::analogy::Fact>, std::collections::HashMap<MemoryId, String>, usize) {
         let now = now_ms();
         let (facts, count) = {
             let ts = self.triplet_store.read();
@@ -2256,14 +2277,31 @@ impl ChittaField {
             let wanted: HashSet<MemoryId> = facts.iter().filter_map(|f| f.memory_id).collect();
             wanted
                 .iter()
-                .filter_map(|id| {
-                    payloads.get(id).map(|p| {
-                        (*id, (p.realm.clone(), String::from_utf8_lossy(&p.content).into_owned()))
-                    })
-                })
+                .filter_map(|id| payloads.get(id).map(|p| (*id, p.realm.clone())))
                 .collect()
         };
         (facts, meta, count)
+    }
+
+    /// Payload text for the ranked subset of an analogy result, keyed by id.
+    /// Companion to `analogy_snapshot`, which carries realms only.
+    ///
+    /// Takes `payloads` alone and holds it only for the copy — a different lock
+    /// from the triplet guard `analogy_snapshot` uses, and never held with it.
+    /// Call this AFTER ranking and realm-filtering, so the copy is bounded by
+    /// the result limit rather than by the size of the store.
+    pub fn analogy_texts(&self, ids: &[MemoryId]) -> std::collections::HashMap<MemoryId, String> {
+        if ids.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        let payloads = self.payloads.read();
+        ids.iter()
+            .filter_map(|id| {
+                payloads
+                    .get(id)
+                    .map(|p| (*id, String::from_utf8_lossy(&p.content).into_owned()))
+            })
+            .collect()
     }
 
     // ── Span Lane (verbatim transcript atoms) ──────────────────────────────────
@@ -2660,7 +2698,7 @@ impl ChittaField {
 
         {
             let mut edges = self.assoc_edges.write();
-            let list = edges.entry(src).or_insert_with(Vec::new);
+            let list = edges.entry(src).or_default();
             if let Some(existing) = list.iter_mut().find(|e| e.dst == dst && e.edge_type == edge_type) {
                 existing.weight = existing.weight.max(weight);
             } else {
@@ -4686,7 +4724,7 @@ impl ChittaField {
     /// for each rule whose probe_value > 0.4 AND refutation_ratio < 0.3 (safety gate).
     /// Returns JSON: {"queued": N, "skipped_refuted": M, "skipped_certain": L}
     pub fn queue_experiments(&self, k: usize) -> String {
-        use crate::organ::intervention_store::{InterventionKind, InterventionPolicy};
+        use crate::organ::intervention_store::InterventionKind;
         let probes = {
             let market = self.hypothesis_market.read();
             market.top_probes(k.max(1)).to_vec()
@@ -6000,10 +6038,12 @@ impl ChittaField {
             .get(&memory_id)
             .map(|p| p.realm.clone());
 
-        // Semantic dedup — the check that store.rs:1111 CANNOT run on the normal path.
-        // Every memory is written embed_pending with an empty vector, so the write-time
-        // dedup guard (`if !embed_pending`) is always false and near-duplicates accumulate
-        // unbounded. This is the first moment the vector exists; search runs BEFORE this
+        // Semantic dedup — the check that store.rs:1321 CANNOT run on the normal path.
+        // On the production path every memory is written embed_pending with an empty
+        // vector, so that write-time guard (`if !embed_pending`) is false and
+        // near-duplicates would otherwise accumulate unbounded. (It does still fire for
+        // callers that supply their own vector — see the CONSTRAINT note at that site.)
+        // This is the first moment the vector exists; search runs BEFORE this
         // memory's own vector is upserted, so k=1 returns the nearest OTHER memory.
         // A hit supersedes THIS (newer) memory rather than deleting it: reversible, keeps
         // provenance/triplet references, excluded from recall, and reinforces the original.
@@ -7076,7 +7116,7 @@ impl ChittaField {
         let content = serde_json::to_string_pretty(&wrapped)
             .map_err(|e| FieldError::Serialization(e.to_string()))?;
         std::fs::write(&path, content)
-            .map_err(|e| FieldError::Io(e))?;
+            .map_err(FieldError::Io)?;
         Ok(filename)
     }
 
@@ -8506,7 +8546,7 @@ impl ChittaField {
 
         if failed > 0 {
             let decay = 0.1 * failed as f32;
-            if let Some(mut state) = self.states.write().get_mut(&crate::ids::MemoryId::from(memory_id)) {
+            if let Some(state) = self.states.write().get_mut(&crate::ids::MemoryId::from(memory_id)) {
                 state.confidence = (state.confidence - decay).max(0.1);
             }
         }
@@ -9057,7 +9097,7 @@ impl ChittaField {
         std::fs::read_dir(&seg_dir)
             .map(|rd| rd
                 .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map_or(false, |x| x == "seg"))
+                .filter(|e| e.path().extension().is_some_and(|x| x == "seg"))
                 .count())
             .unwrap_or(0)
     }
@@ -9302,7 +9342,7 @@ impl ChittaField {
                 let harness = p.harness.as_deref()?;
                 let emb = idx
                     .get_embedding(*id)
-                    .or_else(|| (!p.embedding.is_empty()).then(|| p.embedding.as_slice()))?;
+                    .or_else(|| (!p.embedding.is_empty()).then_some(p.embedding.as_slice()))?;
                 Some((*id, emb, harness))
             })
             .collect();
@@ -9556,7 +9596,7 @@ impl ChittaField {
         };
 
         let pq = ProductQuantizer::train(&residuals, 20)
-            .map_err(|e| crate::error::FieldError::Manifest(e))?;
+            .map_err(crate::error::FieldError::Manifest)?;
 
         let codebook_bytes = bincode::serialize(&pq)
             .map_err(|e| crate::error::FieldError::Serialization(e.to_string()))?;
@@ -10014,6 +10054,83 @@ mod tests {
         assert!(bad_mul < 0.72, "disproven memory barely damped: {bad_mul}");
         // The whole effect stays inside [1-w, 1], a 1.43x spread at w=0.3.
         assert!(bad_mul >= 1.0 - w && good_mul <= 1.0);
+    }
+
+    /// Characterization: pins the write-time semantic dedup guard in put_memory.
+    ///
+    /// The guard is `if !embed_pending`, and `embed_pending` is
+    /// `embedding.is_empty() && content.len() >= MIN_EMBED_CHARS`. So the branch
+    /// is skipped on the production FFI path (C++ passes no vector, content is
+    /// long) but RUNS whenever a caller supplies an embedding — which every test
+    /// here does, and which `cf_put_memory` permits. It is therefore live code,
+    /// not dead code, and removing it would change write-time behavior for
+    /// embedding-supplying callers. This test fails if that is ever done.
+    #[test]
+    fn put_memory_write_time_dedup_collapses_supplied_near_duplicates() {
+        let tmp = TempDir::new().unwrap();
+        let field = ChittaField::open(tmp.path().join("data")).unwrap();
+
+        // Two vectors whose cosine lands inside [dedup_cosine_threshold,
+        // dedup_cosine_upper) — near-duplicate, but not an exact match.
+        let (thresh, upper) = {
+            let cfg = &field.scoring_pipeline.read().config;
+            (cfg.dedup_cosine_threshold, cfg.dedup_cosine_upper)
+        };
+        let mut a = vec![0.0f32; crate::ops::EMBED_DIM];
+        let mut b = vec![0.0f32; crate::ops::EMBED_DIM];
+        let target = (thresh + upper) / 2.0;
+        a[0] = 1.0;
+        b[0] = target;
+        b[1] = (1.0 - target * target).sqrt();
+
+        let (id_a, _) = field
+            .put_memory("wisdom", "dedup", b"the first near duplicate memory", &a,
+                        0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+        let (id_b, _) = field
+            .put_memory("wisdom", "dedup", b"the second near duplicate memory", &b,
+                        0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+        assert_eq!(
+            id_b, id_a,
+            "write-time dedup must collapse a supplied near-duplicate onto the original; \
+             if this fails the `if !embed_pending` branch in put_memory was removed"
+        );
+
+        // Cross-realm near-duplicates must stay independent (no silent
+        // cross-realm reinforcement).
+        let (id_c, _) = field
+            .put_memory("wisdom", "other-realm", b"the third near duplicate memory", &b,
+                        0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+        assert_ne!(id_c, id_a, "dedup must not cross realms");
+    }
+
+    /// Companion: on the production path (no supplied vector, content long
+    /// enough to embed) the write-time guard is skipped, so near-duplicates get
+    /// distinct ids at write time and are only collapsed later by the
+    /// backfill-time supersede pass in `backfill_embedding`.
+    #[test]
+    fn put_memory_without_embedding_defers_dedup_to_backfill() {
+        let tmp = TempDir::new().unwrap();
+        let field = ChittaField::open(tmp.path().join("data")).unwrap();
+        // Distinct bodies: identical content is collapsed earlier by the
+        // chunk-hash exact-duplicate check, which is a different mechanism.
+        let (id_a, _) = field
+            .put_memory("wisdom", "dedup", b"a sufficiently long memory body, variant one",
+                        &[], 0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+        let (id_b, _) = field
+            .put_memory("wisdom", "dedup", b"a sufficiently long memory body, variant two",
+                        &[], 0.9, 0.001, 0, vec![], None, None)
+            .unwrap();
+        assert_ne!(id_b, id_a, "no vector at write time means no write-time dedup");
+        for id in [id_a, id_b] {
+            assert!(
+                field.states.read().get(&id).map(|s| s.embed_pending).unwrap_or(false),
+                "production-path writes must be embed_pending"
+            );
+        }
     }
 
     #[test]

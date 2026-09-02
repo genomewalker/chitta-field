@@ -436,48 +436,6 @@ impl HnswGraph {
         neighbors_per_layer
     }
 
-    /// Serial apply: wire a pre-computed insert plan into the live graph.
-    /// Called after the parallel search phase in backfill_hnsw_delta_parallel.
-    pub(crate) fn apply_insert_plan(
-        &mut self,
-        id: MemoryId,
-        level: usize,
-        neighbors_per_layer: Vec<Vec<MemoryId>>,
-        embs: &EmbLookup<'_>,
-    ) {
-        let current_top = self.entry_point.map(|(_, l)| l).unwrap_or(0);
-        self.neighbors.insert(id, vec![Vec::new(); level + 1]);
-        if self.entry_point.is_none() {
-            self.entry_point = Some((id, level));
-            return;
-        }
-        for (layer, selected) in neighbors_per_layer.iter().enumerate() {
-            if layer > level.min(current_top) { break; }
-            if let Some(nn) = self.neighbors.get_mut(&id) {
-                if layer < nn.len() { nn[layer] = selected.clone(); }
-            }
-            let m_max = if layer == 0 { HNSW_M0 } else { HNSW_M };
-            for &nbr in selected {
-                let needs_shrink = if let Some(nl) = self.neighbors.get_mut(&nbr) {
-                    if layer < nl.len() { nl[layer].push(id); nl[layer].len() > m_max } else { false }
-                } else { false };
-                if needs_shrink {
-                    let shrunk = self.neighbors.get(&nbr).and_then(|nl| {
-                        nl.get(layer).and_then(|layer_list| {
-                            embs.get(nbr).map(|e| self.select_neighbors(e, layer_list, m_max, embs))
-                        })
-                    });
-                    if let (Some(s), Some(nl)) = (shrunk, self.neighbors.get_mut(&nbr)) {
-                        if layer < nl.len() { nl[layer] = s; }
-                    }
-                }
-            }
-        }
-        if level > current_top {
-            self.entry_point = Some((id, level));
-        }
-    }
-
     /// Fast apply of a pre-computed insert plan WITHOUT distance-based neighbor shrink.
     /// Wires the new node's forward edges (already ≤ M, selected in compute_insert_plan)
     /// and appends back-edges (neighbor → new), capped at 3×M so lists stay bounded.

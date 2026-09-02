@@ -193,10 +193,9 @@ impl OpLog {
             // appended here would be silently dropped on the next restart. A V1/V2/legacy
             // segment carries no stamp (None) and counts as same-lineage (matches replay()).
             let lineage_ok = segment_vector_space_id(last_path)
-                .map_or(true, |v| v == vector_space_id);
+                .is_none_or(|v| v == vector_space_id);
             if size < MAX_SEGMENT_SIZE && is_chained_segment(last_path) && lineage_ok {
                 let f = OpenOptions::new()
-                    .write(true)
                     .append(true)
                     .open(last_path)?;
                 return Ok(Self {

@@ -247,6 +247,12 @@ impl MemoryState {
     /// Accrue one outcome observation into the utility posterior. Weight is
     /// capped at 5 so a single report can move the posterior but not swamp it;
     /// a non-positive or non-finite weight is not an observation and is dropped.
+    // `!(weight > 0.0)` is the NaN-catching form and is deliberate: it is true for
+    // NaN, whereas the `weight <= 0.0` that clippy's refactor invites is false for
+    // NaN, which would let a NaN weight through and poison the posterior
+    // irrecoverably (α/β are persisted). The negation is the guard, not an
+    // oversight.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     pub fn record_outcome(&mut self, success: bool, weight: f32) {
         if !(weight > 0.0) {
             return;
