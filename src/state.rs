@@ -149,6 +149,19 @@ pub struct MemoryState {
     /// via `FullSnapshot::cw_refresh_ts` (V22) and hydrated on load.
     #[serde(skip)]
     pub last_cw_refresh_ms: i64,
+
+    /// Outcome utility posterior Beta(α, β): α accrues success weight, β failure
+    /// weight, both via `record_outcome`. Prior (1, 1) = untested. Access is not
+    /// value, so this is independent of `strength`/`access_count`.
+    /// Skipped for the same reason as `last_cw_refresh_ms` (frozen positional
+    /// bincode layout); persisted via `FullSnapshot::utility_posteriors` (V23
+    /// section) and hydrated on load. `sanitize()` restores the (1, 1) prior,
+    /// which is what makes the serde-skip zero-default and a snapshot written
+    /// before the section both read back as untested.
+    #[serde(skip)]
+    pub utility_alpha: f32,
+    #[serde(skip)]
+    pub utility_beta: f32,
 }
 
 fn default_true() -> bool { true }
@@ -184,6 +197,8 @@ impl MemoryState {
             staged: true,
             invalidated_by: None,
             last_cw_refresh_ms: 0,
+            utility_alpha: 1.0,
+            utility_beta: 1.0,
         }
     }
 
@@ -216,6 +231,34 @@ impl MemoryState {
         if !self.spacing_quality.is_finite() {
             self.spacing_quality = 0.0;
         }
+        // Posterior counts start at the (1, 1) prior and only accrue, so
+        // anything below 1 is either the serde-skip zero or corruption.
+        if !self.utility_alpha.is_finite() || self.utility_alpha < 1.0 {
+            self.utility_alpha = 1.0;
+        }
+        if !self.utility_beta.is_finite() || self.utility_beta < 1.0 {
+            self.utility_beta = 1.0;
+        }
+    }
+
+    /// Accrue one outcome observation into the utility posterior. Weight is
+    /// capped at 5 so a single report can move the posterior but not swamp it;
+    /// a non-positive or non-finite weight is not an observation and is dropped.
+    pub fn record_outcome(&mut self, success: bool, weight: f32) {
+        if !(weight > 0.0) {
+            return;
+        }
+        let w = weight.min(5.0);
+        if success {
+            self.utility_alpha += w;
+        } else {
+            self.utility_beta += w;
+        }
+    }
+
+    /// Posterior mean utility, α/(α+β). 0.5 at the untouched prior.
+    pub fn utility_mean(&self) -> f32 {
+        self.utility_alpha / (self.utility_alpha + self.utility_beta)
     }
 
     pub fn apply_delta(&mut self, delta: &StateDeltaOp, now_ms: i64) {

@@ -24,6 +24,129 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const RESERVOIR_SIZE: usize = 500;
 
+// ── Utility posteriors ───────────────────────────────────────────────────────
+// Access is not value: `strength`/`access_count` say a memory was retrieved,
+// not that retrieving it helped. `MemoryState::{utility_alpha, utility_beta}`
+// hold a Beta posterior fed by `record_outcome`, and recall can Thompson-sample
+// it as a score multiplier. Gated OFF by default — with the flag unset every
+// candidate's multiplier is exactly 1.0, so ranking is unchanged.
+
+/// Total pseudo-observations (α+β) below which θ is pinned to the neutral 0.5.
+/// Beta(1,1) is uniform, so sampling an untested memory injects pure noise into
+/// the ranking; 5 = three real observations past the (1,1) prior.
+const UTILITY_MIN_OBSERVATIONS: f32 = 5.0;
+
+pub(crate) struct UtilityRecallConfig {
+    enabled: bool,
+    weight: f32,
+    seed: Option<u64>,
+}
+
+/// Read once per process — this sits inside the recall scoring loop.
+fn utility_recall_config() -> &'static UtilityRecallConfig {
+    static CFG: std::sync::OnceLock<UtilityRecallConfig> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| UtilityRecallConfig {
+        enabled: std::env::var("CHITTA_UTILITY_RECALL").ok().as_deref() == Some("1"),
+        weight: std::env::var("CHITTA_UTILITY_WEIGHT")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|w| w.is_finite() && (0.0..=1.0).contains(w))
+            .unwrap_or(0.3),
+        seed: std::env::var("CHITTA_UTILITY_SEED").ok().and_then(|s| s.parse().ok()),
+    })
+}
+
+/// splitmix64 — deterministic from its seed, so tests assert exact draws.
+pub(crate) struct UtilityRng(u64);
+
+impl UtilityRng {
+    pub(crate) fn new(seed: u64) -> Self {
+        UtilityRng(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform on (0, 1) — open at both ends so `ln()` is always finite.
+    fn next_f64(&mut self) -> f64 {
+        ((self.next_u64() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    }
+
+    /// Standard normal, Box-Muller (one of the pair; the second is discarded).
+    fn next_normal(&mut self) -> f64 {
+        let u1 = self.next_f64();
+        let u2 = self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+
+    /// Gamma(shape, 1) by Marsaglia-Tsang. Valid for shape >= 1, which is all
+    /// this needs: posterior counts never drop below the (1, 1) prior.
+    fn next_gamma(&mut self, shape: f64) -> f64 {
+        let d = shape - 1.0 / 3.0;
+        let c = 1.0 / (9.0 * d).sqrt();
+        loop {
+            let x = self.next_normal();
+            let v = (1.0 + c * x).powi(3);
+            if v <= 0.0 {
+                continue;
+            }
+            let u = self.next_f64();
+            if u.ln() < 0.5 * x * x + d - d * v + d * v.ln() {
+                return d * v;
+            }
+        }
+    }
+}
+
+/// Thompson draw from Beta(alpha, beta) as the ratio of two Gammas, or the
+/// neutral 0.5 when the posterior is too thin to be evidence.
+pub(crate) fn thompson_theta(alpha: f32, beta: f32, rng: &mut UtilityRng) -> f32 {
+    if alpha + beta < UTILITY_MIN_OBSERVATIONS {
+        return 0.5;
+    }
+    let x = rng.next_gamma(alpha as f64);
+    let y = rng.next_gamma(beta as f64);
+    (x / (x + y)) as f32
+}
+
+/// One RNG per recall call. `CHITTA_UTILITY_SEED` pins it so an eval run is
+/// reproducible; otherwise it is seeded from the recall's own clock read plus a
+/// per-call counter, so two recalls in the same millisecond still differ.
+fn utility_rng(now_ms: i64) -> UtilityRng {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    match utility_recall_config().seed {
+        Some(s) => UtilityRng::new(s),
+        None => {
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            UtilityRng::new((now_ms as u64) ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        }
+    }
+}
+
+/// Score multiplier `(1 - w) + w·θ`. Every under-observed memory lands on the
+/// same neutral `1 - w/2`, so enabling the flag never reorders memories that
+/// have no outcome evidence — it only moves proven and disproven ones apart.
+#[inline]
+fn utility_multiplier_with(weight: f32, state: &MemoryState, rng: &mut UtilityRng) -> f32 {
+    (1.0 - weight) + weight * thompson_theta(state.utility_alpha, state.utility_beta, rng)
+}
+
+/// Exactly 1.0 when the flag is off, so `score * utility_multiplier(..)` is
+/// bit-identical to the pre-change score by default.
+#[inline]
+fn utility_multiplier(state: &MemoryState, rng: &mut UtilityRng) -> f32 {
+    let cfg = utility_recall_config();
+    if !cfg.enabled {
+        return 1.0;
+    }
+    utility_multiplier_with(cfg.weight, state, rng)
+}
+
 /// In-flight state for the deferred-batched-insert backfill (stage → plan → apply).
 /// Held in `ChittaField::backfill_plan_stage`. `staged_ids` = every memory durably
 /// staged (embed_pending cleared at apply); `plan_ids` ⊆ staged_ids = those needing a
@@ -2045,6 +2168,84 @@ impl ChittaField {
         Ok(())
     }
 
+    /// Record an outcome observation against a memory's utility posterior.
+    /// Orthogonal to ack/nack: ack counts *reported* usefulness into a scalar,
+    /// this counts *observed* success/failure into a Beta posterior that recall
+    /// can sample. Returns the updated (alpha, beta).
+    ///
+    /// One `states` write lock held across a hashmap lookup and one float add —
+    /// no separate read-then-write round trip, and never called while iterating
+    /// recall results (parking_lot is writer-preferring; a queued writer stalls
+    /// every later reader).
+    pub fn record_outcome(&self, memory_id: MemoryId, success: bool, weight: f32) -> Result<(f32, f32)> {
+        let mut states = self.states.write();
+        let state = states.get_mut(&memory_id).ok_or(FieldError::NotFound(memory_id))?;
+        state.record_outcome(success, weight);
+        Ok((state.utility_alpha, state.utility_beta))
+    }
+
+    // ── Analogy Lane (VSA over the triplet store) ──────────────────────────────
+
+    /// Copy the live triplet lane out for `crate::analogy`. Both guards are
+    /// dropped before the caller does any hypervector work — scoring under the
+    /// triplet read lock starves every queued writer (parking_lot is
+    /// writer-preferring; see the lock-order note in field.rs).
+    ///
+    /// Returns (facts, source memory → (realm, text), live triplet count). The
+    /// count is the analogy index's staleness key.
+    pub fn analogy_snapshot(
+        &self,
+    ) -> (Vec<crate::analogy::Fact>, std::collections::HashMap<MemoryId, (String, String)>, usize) {
+        let now = now_ms();
+        let (facts, count) = {
+            let ts = self.triplet_store.read();
+            let mut facts = Vec::with_capacity(ts.triplet_count());
+            // Every triplet has a subject, so subject-keyed enumeration is complete.
+            for subject in ts.all_subjects() {
+                for e in ts.query_subject(&subject, now) {
+                    facts.push(crate::analogy::Fact {
+                        subject: e.subject.clone(),
+                        predicate: e.predicate.clone(),
+                        object: e.object.clone(),
+                        memory_id: e.source_memory_id,
+                    });
+                }
+            }
+            (facts, ts.triplet_count())
+        };
+        let mut facts = facts;
+        let meta = {
+            let payloads = self.payloads.read();
+            // Most production triplets reach the lane through add_triplet's
+            // 3-argument form, which leaves source_memory_id unset (0 -> None):
+            // native_distiller.cpp and ingester.cpp instead encode the source as
+            // the SUBJECT, `add_triplet(std::to_string(mem_id), "has_flag", ...)`.
+            // Without recovering that, the structural index is empty on a live
+            // store even though the fact table is full. Only subjects that
+            // resolve to a real payload are accepted, so an entity that merely
+            // looks numeric is never mistaken for a memory.
+            for f in facts.iter_mut() {
+                if f.memory_id.is_none() {
+                    if let Ok(id) = f.subject.parse::<MemoryId>() {
+                        if payloads.contains_key(&id) {
+                            f.memory_id = Some(id);
+                        }
+                    }
+                }
+            }
+            let wanted: HashSet<MemoryId> = facts.iter().filter_map(|f| f.memory_id).collect();
+            wanted
+                .iter()
+                .filter_map(|id| {
+                    payloads.get(id).map(|p| {
+                        (*id, (p.realm.clone(), String::from_utf8_lossy(&p.content).into_owned()))
+                    })
+                })
+                .collect()
+        };
+        (facts, meta, count)
+    }
+
     // ── Span Lane (verbatim transcript atoms) ──────────────────────────────────
 
     /// Query the span lane. No embedding, no GPU, no LLM. `realm=None` is
@@ -2801,6 +3002,7 @@ impl ChittaField {
         let pipeline = self.scoring_pipeline.read();
         let ack_scores = self.ack_scores.read();
         let recall_prov = self.recall_provenance.read();
+        let mut util_rng = utility_rng(now);
 
         let mut hits: Vec<RecallHit> = semantic_hits
             .into_iter()
@@ -2856,6 +3058,9 @@ impl ChittaField {
                         score
                     }
                 };
+                // Outcome utility (flag-gated): did recalling this memory
+                // actually help? Multiplier is exactly 1.0 when disabled.
+                let score = score * utility_multiplier(state, &mut util_rng);
                 let eff_strength = state.effective_strength(now);
                 Some(RecallHit {
                     memory_id,
@@ -4836,6 +5041,7 @@ impl ChittaField {
         let learners = self.learners.read();
         let pipeline = self.scoring_pipeline.read();
         let ack_scores = self.ack_scores.read();
+        let mut util_rng = utility_rng(now);
 
         let mut hits: Vec<RecallHit> = keyword_hits
             .into_iter()
@@ -4877,6 +5083,7 @@ impl ChittaField {
                     max_query_idf,
                 };
                 let (score, decomp) = pipeline.score(&ctx)?;
+                let score = score * utility_multiplier(state, &mut util_rng);
                 let eff_strength = state.effective_strength(now);
                 Some(RecallHit {
                     memory_id: hit.memory_id,
@@ -8492,12 +8699,19 @@ impl ChittaField {
                 })
                 .collect()
         };
-        let (states, cw_refresh_ts) = {
+        let (states, cw_refresh_ts, utility_posteriors) = {
             let states_r = self.states.read();
             let cw: std::collections::HashMap<MemoryId, i64> = states_r
                 .iter()
                 .filter(|(_, st)| !st.deleted && st.last_cw_refresh_ms > 0)
                 .map(|(&id, st)| (id, st.last_cw_refresh_ms))
+                .collect();
+            // Only memories that actually carry an observation — an untouched
+            // (1, 1) prior is what a missing entry already means.
+            let util: std::collections::HashMap<MemoryId, (f32, f32)> = states_r
+                .iter()
+                .filter(|(_, st)| !st.deleted && (st.utility_alpha > 1.0 || st.utility_beta > 1.0))
+                .map(|(&id, st)| (id, (st.utility_alpha, st.utility_beta)))
                 .collect();
             // Compact out deleted memories — they must not appear in the snapshot
             // so that snapshot resurrection cannot undo a forget().
@@ -8506,7 +8720,7 @@ impl ChittaField {
                 .filter(|(_, st)| !st.deleted)
                 .map(|(id, st)| (*id, st.clone()))
                 .collect();
-            (live, cw)
+            (live, cw, util)
         };
         let assoc_edges = self.assoc_edges.read().clone();
         let artifacts = self.artifacts.read().clone();
@@ -8561,6 +8775,7 @@ impl ChittaField {
             predicate_store,
             recall_provenance,
             cw_refresh_ts,
+            utility_posteriors,
         };
         let path = self
             .data_dir
@@ -9682,6 +9897,131 @@ mod tests {
         field.forget(id).unwrap();
         let hits = field.span_query("auto_link_probe", Some("spantest"), 6);
         assert!(hits.is_empty(), "forgotten memory's atoms must be GC'd: {hits:?}");
+    }
+
+    // ── Utility posteriors ──────────────────────────────────────────────────
+
+    #[test]
+    fn record_outcome_accrues_and_caps_weight() {
+        let mut st = MemoryState::new(1, [0u8; 32], 0);
+        assert_eq!((st.utility_alpha, st.utility_beta), (1.0, 1.0));
+        assert_eq!(st.utility_mean(), 0.5);
+
+        st.record_outcome(true, 1.0);
+        st.record_outcome(true, 2.5);
+        st.record_outcome(false, 0.5);
+        assert_eq!((st.utility_alpha, st.utility_beta), (4.5, 1.5));
+
+        // Above the cap saturates at 5; non-positive and NaN are not observations.
+        st.record_outcome(true, 100.0);
+        assert_eq!(st.utility_alpha, 9.5);
+        st.record_outcome(false, 0.0);
+        st.record_outcome(false, -3.0);
+        st.record_outcome(false, f32::NAN);
+        assert_eq!(st.utility_beta, 1.5);
+    }
+
+    #[test]
+    fn thompson_theta_is_neutral_below_observation_floor() {
+        let mut rng = UtilityRng::new(0xC0FFEE);
+        // Untested prior and everything short of 3 real observations: exactly
+        // 0.5, no draw taken — an untested memory is neither boosted nor punished.
+        for (a, b) in [(1.0, 1.0), (3.0, 1.0), (1.0, 3.0), (2.0, 2.5)] {
+            assert_eq!(thompson_theta(a, b, &mut rng), 0.5, "alpha={a} beta={b}");
+        }
+        // At the floor a real draw happens, and it stays a probability.
+        for _ in 0..200 {
+            let t = thompson_theta(9.0, 1.0, &mut rng);
+            assert!(t > 0.0 && t < 1.0, "theta out of range: {t}");
+        }
+    }
+
+    #[test]
+    fn thompson_theta_is_deterministic_and_tracks_the_posterior() {
+        // Same seed → same draw, so an eval run is reproducible.
+        let a = thompson_theta(20.0, 5.0, &mut UtilityRng::new(7));
+        let b = thompson_theta(20.0, 5.0, &mut UtilityRng::new(7));
+        assert_eq!(a, b);
+
+        // A useful memory samples above a useless one on average.
+        let mut rng = UtilityRng::new(1234);
+        let good: f32 = (0..500).map(|_| thompson_theta(40.0, 2.0, &mut rng)).sum::<f32>() / 500.0;
+        let bad: f32 = (0..500).map(|_| thompson_theta(2.0, 40.0, &mut rng)).sum::<f32>() / 500.0;
+        assert!(good > 0.85, "good posterior mean too low: {good}");
+        assert!(bad < 0.15, "bad posterior mean too high: {bad}");
+    }
+
+    #[test]
+    fn utility_multiplier_is_identity_while_the_flag_is_off() {
+        // The default process env has CHITTA_UTILITY_RECALL unset, so every
+        // candidate multiplies by exactly 1.0 and recall ranking is unchanged.
+        assert!(!utility_recall_config().enabled);
+        let mut rng = UtilityRng::new(99);
+        let mut st = MemoryState::new(1, [0u8; 32], 0);
+        st.record_outcome(false, 5.0);
+        st.record_outcome(false, 5.0);
+        assert_eq!(utility_multiplier(&st, &mut rng), 1.0);
+        for score in [0.0f32, 0.371_23, 12.5, f32::MAX] {
+            assert_eq!(score * utility_multiplier(&st, &mut rng), score);
+        }
+    }
+
+    #[test]
+    fn utility_multiplier_with_weight_separates_proven_from_untested() {
+        let mut rng = UtilityRng::new(4242);
+        let w = 0.3f32;
+
+        // Untested and under-observed memories both land on the same neutral
+        // 1 - w/2, so turning the flag on cannot reorder them among themselves.
+        let untested = MemoryState::new(1, [0u8; 32], 0);
+        assert_eq!(utility_multiplier_with(w, &untested, &mut rng), 0.85);
+        let mut thin = MemoryState::new(2, [0u8; 32], 0);
+        thin.record_outcome(true, 2.0);
+        assert_eq!(utility_multiplier_with(w, &thin, &mut rng), 0.85);
+
+        let mut good = MemoryState::new(3, [0u8; 32], 0);
+        let mut bad = MemoryState::new(4, [0u8; 32], 0);
+        for _ in 0..10 {
+            good.record_outcome(true, 4.0);
+            bad.record_outcome(false, 4.0);
+        }
+        let mean = |st: &MemoryState, rng: &mut UtilityRng| {
+            (0..300).map(|_| utility_multiplier_with(w, st, rng)).sum::<f32>() / 300.0
+        };
+        let good_mul = mean(&good, &mut rng);
+        let bad_mul = mean(&bad, &mut rng);
+        assert!(good_mul > 0.98, "proven memory barely boosted: {good_mul}");
+        assert!(bad_mul < 0.72, "disproven memory barely damped: {bad_mul}");
+        // The whole effect stays inside [1-w, 1], a 1.43x spread at w=0.3.
+        assert!(bad_mul >= 1.0 - w && good_mul <= 1.0);
+    }
+
+    #[test]
+    fn record_outcome_rejects_unknown_ids_and_survives_snapshot_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let emb = vec![0.4f32; crate::ops::EMBED_DIM];
+
+        let id = {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            let (id, _) = field
+                .put_memory("wisdom", "test", b"outcome persist", &emb, 0.9, 0.001, 0, vec![], None, None)
+                .unwrap();
+            assert!(field.record_outcome(id + 9_999, true, 1.0).is_err());
+            assert_eq!(field.record_outcome(id, true, 2.0).unwrap(), (3.0, 1.0));
+            assert_eq!(field.record_outcome(id, false, 1.0).unwrap(), (3.0, 2.0));
+            field.save_full_snapshot().unwrap();
+            id
+        };
+
+        let field = ChittaField::open(data_dir).unwrap();
+        let states = field.states.read();
+        let s = states.get(&id).unwrap();
+        assert_eq!(
+            (s.utility_alpha, s.utility_beta),
+            (3.0, 2.0),
+            "utility posterior must survive a snapshot save/reopen cycle"
+        );
     }
 
     // ── Replay confluence (THEORY.md §2) ────────────────────────────────────

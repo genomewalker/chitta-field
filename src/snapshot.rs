@@ -316,6 +316,8 @@ impl LegacyMemoryStateV4 {
             staged: false,
             invalidated_by: None,
             last_cw_refresh_ms: 0,
+            utility_alpha: 1.0,
+            utility_beta: 1.0,
         }
     }
 }
@@ -373,6 +375,8 @@ impl LegacyMemoryStateV5 {
             staged: false,
             invalidated_by: None,
             last_cw_refresh_ms: 0,
+            utility_alpha: 1.0,
+            utility_beta: 1.0,
         }
     }
 }
@@ -435,6 +439,8 @@ impl LegacyMemoryStateV6 {
             staged: false,
             invalidated_by: None,
             last_cw_refresh_ms: 0,
+            utility_alpha: 1.0,
+            utility_beta: 1.0,
         }
     }
 }
@@ -498,6 +504,8 @@ impl LegacyMemoryStateV7 {
             staged: false,
             invalidated_by: None,
             last_cw_refresh_ms: 0,
+            utility_alpha: 1.0,
+            utility_beta: 1.0,
         }
     }
 }
@@ -667,6 +675,8 @@ impl LegacyMemoryStateV11 {
             staged: false,
             invalidated_by: None,
             last_cw_refresh_ms: 0,
+            utility_alpha: 1.0,
+            utility_beta: 1.0,
         }
     }
 }
@@ -781,6 +791,11 @@ pub struct FullSnapshot {
     /// ids (cross-context generality evidence; THEORY.md §6). Added with NO
     /// format migration — the sectioned container defaults missing sections.
     pub recall_provenance: HashMap<MemoryId, std::collections::BTreeSet<u32>>,
+    /// V23 section "utility_posteriors": memory → (utility_alpha, utility_beta).
+    /// Carried outside `states` because MemoryState's positional bincode layout
+    /// is frozen; hydrated into states on load. A missing section leaves every
+    /// posterior at the (1, 1) prior.
+    pub utility_posteriors: HashMap<MemoryId, (f32, f32)>,
 }
 
 /// V22 snapshot layout, frozen: the last monolithic-bincode format. Positional
@@ -842,6 +857,7 @@ impl LegacyFullSnapshotV22 {
             predicate_store:    self.predicate_store,
             cw_refresh_ts:      self.cw_refresh_ts,
             recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
         }
     }
 }
@@ -1221,6 +1237,7 @@ impl FullSnapshot {
             predicate_store:    PredicateStore::default(),
             cw_refresh_ts:      HashMap::new(),
             recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
         }
     }
 
@@ -1257,6 +1274,7 @@ impl FullSnapshot {
             write_section(&mut w, "predicate_store",    &self.predicate_store)?;
             write_section(&mut w, "cw_refresh_ts",      &self.cw_refresh_ts)?;
             write_section(&mut w, "recall_provenance",  &self.recall_provenance)?;
+            write_section(&mut w, "utility_posteriors", &self.utility_posteriors)?;
             w.flush()?;
             // fsync data+magic to disk before the rename commits the file, so a crash
             // can't leave a renamed-but-truncated snapshot whose magic still reads valid.
@@ -1403,6 +1421,15 @@ impl FullSnapshot {
                 st.last_cw_refresh_ms = *ts;
             }
         }
+        // V23 "utility_posteriors": hydrate after load_inner's sanitize(), which
+        // has already reset every state to the (1, 1) prior.
+        for (id, &(alpha, beta)) in &snap.utility_posteriors {
+            if let Some(st) = snap.states.get_mut(id) {
+                st.utility_alpha = alpha;
+                st.utility_beta = beta;
+                st.sanitize();
+            }
+        }
         Ok(snap)
     }
 
@@ -1464,6 +1491,7 @@ impl FullSnapshot {
                     "predicate_store"    => snap.predicate_store    = read_section(&mut body, n)?,
                     "cw_refresh_ts"      => snap.cw_refresh_ts      = read_section(&mut body, n)?,
                     "recall_provenance"  => snap.recall_provenance  = read_section(&mut body, n)?,
+                    "utility_posteriors" => snap.utility_posteriors = read_section(&mut body, n)?,
                     _ => {
                         eprintln!(
                             "[chitta-field] skipping unknown snapshot section '{}' ({} bytes)",
@@ -1522,6 +1550,7 @@ impl FullSnapshot {
                 predicate_store:    leg.predicate_store,
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             });
         }
 
@@ -1558,6 +1587,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             });
         }
 
@@ -1594,6 +1624,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             });
         }
 
@@ -1643,6 +1674,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             });
         }
 
@@ -1677,6 +1709,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1713,6 +1746,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1749,6 +1783,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1785,6 +1820,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1821,6 +1857,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1858,6 +1895,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1906,6 +1944,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             });
         }
 
@@ -1945,6 +1984,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             });
         }
 
@@ -1981,6 +2021,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             });
         }
 
@@ -2017,6 +2058,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             });
         }
 
@@ -2053,6 +2095,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             });
         }
 
@@ -2089,6 +2132,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             });
         }
 
@@ -2129,6 +2173,7 @@ impl FullSnapshot {
                 predicate_store:    PredicateStore::default(),
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
+            utility_posteriors: HashMap::new(),
             });
         }
 
@@ -2253,6 +2298,59 @@ mod tests {
         assert_eq!(loaded.ack_scores.get(&9), Some(&3));
         // Missing sections defaulted.
         assert!(loaded.states.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn utility_posteriors_roundtrip_and_hydrate_states() {
+        let path = scratch_path("utility-roundtrip");
+        let mut snap = FullSnapshot::empty(21);
+        let mut st = MemoryState::new(7, [0u8; 32], 1_000);
+        st.record_outcome(true, 3.0);
+        st.record_outcome(false, 1.0);
+        assert_eq!((st.utility_alpha, st.utility_beta), (4.0, 2.0));
+        snap.utility_posteriors.insert(7, (st.utility_alpha, st.utility_beta));
+        snap.states.insert(7, st);
+        // A memory with no observation is simply absent from the section.
+        snap.states.insert(8, MemoryState::new(8, [0u8; 32], 1_000));
+        snap.save(&path).unwrap();
+
+        let loaded = FullSnapshot::load(&path).unwrap();
+        assert_eq!(loaded.utility_posteriors.get(&7), Some(&(4.0, 2.0)));
+        let hydrated = &loaded.states[&7];
+        assert_eq!((hydrated.utility_alpha, hydrated.utility_beta), (4.0, 2.0));
+        let untouched = &loaded.states[&8];
+        assert_eq!((untouched.utility_alpha, untouched.utility_beta), (1.0, 1.0));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v23_snapshot_without_utility_section_loads_as_prior() {
+        let path = scratch_path("utility-compat");
+        // Hand-write a V23 container carrying only "states" — exactly what a
+        // pre-section writer produced.
+        let mut states: HashMap<MemoryId, MemoryState> = HashMap::new();
+        let mut st = MemoryState::new(3, [0u8; 32], 1_000);
+        st.record_outcome(true, 5.0);
+        states.insert(3, st);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&FULL_SNAPSHOT_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&4u64.to_le_bytes());
+        let name = b"states";
+        let body = bincode::serialize(&states).unwrap();
+        bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let loaded = FullSnapshot::load(&path).unwrap();
+        assert!(loaded.utility_posteriors.is_empty());
+        // `utility_alpha` is #[serde(skip)], so the written 6.0 is gone and
+        // sanitize() must have restored the (1, 1) prior — not 0.
+        let s = &loaded.states[&3];
+        assert_eq!((s.utility_alpha, s.utility_beta), (1.0, 1.0));
         let _ = std::fs::remove_file(&path);
     }
 

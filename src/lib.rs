@@ -1,3 +1,4 @@
+pub mod analogy;
 pub mod binary;
 pub mod contradiction;
 pub mod error;
