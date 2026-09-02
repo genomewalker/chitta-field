@@ -155,7 +155,10 @@ pub struct MemoryState {
     /// value, so this is independent of `strength`/`access_count`.
     /// Skipped for the same reason as `last_cw_refresh_ms` (frozen positional
     /// bincode layout); persisted via `FullSnapshot::utility_posteriors` (V23
-    /// section) and hydrated on load. `sanitize()` restores the (1, 1) prior,
+    /// section) and hydrated on load, with `Op::RecordOutcome` in the WAL
+    /// covering every observation made since that snapshot (without it a
+    /// restart between two periodic saves reverted α/β).
+    /// `sanitize()` restores the (1, 1) prior,
     /// which is what makes the serde-skip zero-default and a snapshot written
     /// before the section both read back as untested.
     #[serde(skip)]

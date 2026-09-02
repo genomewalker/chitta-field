@@ -2251,6 +2251,15 @@ pub(crate) fn apply_op(op: Op, ctx: ApplyCtx) {
                 state.tier = d.new_tier;
             }
         }
+        // Accrual, not assignment: the snapshot's `utility_posteriors` section
+        // restores (α, β) as of the snapshot, and only the WAL suffix the
+        // snapshot does not cover reaches here (see `covered_by_full` above),
+        // so each observation lands exactly once.
+        Op::RecordOutcome(r) => {
+            if let Some(state) = states.get_mut(&r.memory_id) {
+                state.record_outcome(r.success, r.weight);
+            }
+        }
         Op::TrainPQ(t) => {
             if let Ok(pq) = bincode::deserialize::<ProductQuantizer>(&t.codebook_bytes) {
                 cortical_idx.set_pq(pq);

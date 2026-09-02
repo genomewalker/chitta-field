@@ -70,6 +70,7 @@ use crate::ops::{
     OP_UPDATE_MEMORY_KIND,
     OP_SYMBOL_EVENT,
     OP_SUPERSEDE_TRIPLET,
+    OP_RECORD_OUTCOME,
 };
 
 fn op_type_byte(op: &Op) -> u8 {
@@ -143,6 +144,7 @@ fn op_type_byte(op: &Op) -> u8 {
         Op::UpdateMemoryKind(_) => OP_UPDATE_MEMORY_KIND,
         Op::SymbolEvent(_) => OP_SYMBOL_EVENT,
         Op::SupersedeTriplet(_) => OP_SUPERSEDE_TRIPLET,
+        Op::RecordOutcome(_) => OP_RECORD_OUTCOME,
     }
 }
 

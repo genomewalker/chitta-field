@@ -2173,11 +2173,31 @@ impl ChittaField {
     /// this counts *observed* success/failure into a Beta posterior that recall
     /// can sample. Returns the updated (alpha, beta).
     ///
-    /// One `states` write lock held across a hashmap lookup and one float add —
-    /// no separate read-then-write round trip, and never called while iterating
-    /// recall results (parking_lot is writer-preferring; a queued writer stalls
-    /// every later reader).
+    /// Durable: writes a `RecordOutcome` op to the WAL before mutating, so an
+    /// observation made between two periodic snapshots survives a restart
+    /// (it used to live only in RAM until the next `utility_posteriors`
+    /// section was written — a crash reverted α/β to the last snapshot).
+    ///
+    /// Existence is checked under a short read lock before the append so a
+    /// bad id never reaches the log; the accrual then happens under one
+    /// `states` write lock. Never called while iterating recall results
+    /// (parking_lot is writer-preferring; a queued writer stalls every later
+    /// reader).
     pub fn record_outcome(&self, memory_id: MemoryId, success: bool, weight: f32) -> Result<(f32, f32)> {
+        if !self.states.read().contains_key(&memory_id) {
+            return Err(FieldError::NotFound(memory_id));
+        }
+        // A non-observation (weight <= 0 or NaN) is dropped by
+        // MemoryState::record_outcome — don't spend a WAL record on it.
+        if weight > 0.0 {
+            let op = Op::RecordOutcome(crate::ops::RecordOutcomeOp {
+                memory_id,
+                success,
+                weight,
+                ts_ms: now_ms(),
+            });
+            self.log.write().append(&op)?;
+        }
         let mut states = self.states.write();
         let state = states.get_mut(&memory_id).ok_or(FieldError::NotFound(memory_id))?;
         state.record_outcome(success, weight);
@@ -10021,6 +10041,74 @@ mod tests {
             (s.utility_alpha, s.utility_beta),
             (3.0, 2.0),
             "utility posterior must survive a snapshot save/reopen cycle"
+        );
+    }
+
+    #[test]
+    fn record_outcome_survives_wal_only_replay() {
+        // Regression: outcomes were RAM-only until the next periodic snapshot
+        // wrote the V23 `utility_posteriors` section, so a restart in between
+        // reverted the posterior (observed α 4 → 3). With no snapshot at all,
+        // the reopen below is a pure WAL replay — it restores only if
+        // RecordOutcome is a real op.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let emb = vec![0.4f32; crate::ops::EMBED_DIM];
+
+        let id = {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            let (id, _) = field
+                .put_memory("wisdom", "test", b"outcome wal", &emb, 0.9, 0.001, 0, vec![], None, None)
+                .unwrap();
+            assert_eq!(field.record_outcome(id, true, 3.0).unwrap(), (4.0, 1.0));
+            assert_eq!(field.record_outcome(id, false, 2.0).unwrap(), (4.0, 3.0));
+            // Non-observations must not reach the WAL and must not move (α, β).
+            assert_eq!(field.record_outcome(id, true, 0.0).unwrap(), (4.0, 3.0));
+            assert_eq!(field.record_outcome(id, true, -1.0).unwrap(), (4.0, 3.0));
+            id
+        };
+
+        let field = ChittaField::open(data_dir).unwrap();
+        let states = field.states.read();
+        let s = states.get(&id).unwrap();
+        assert_eq!(
+            (s.utility_alpha, s.utility_beta),
+            (4.0, 3.0),
+            "utility posterior must survive a WAL-only replay"
+        );
+    }
+
+    #[test]
+    fn record_outcome_replay_does_not_double_count_snapshot_section() {
+        // Precedence: the V23 snapshot section carries (α, β) as of the
+        // snapshot, and replay applies only the WAL suffix the snapshot does
+        // not cover. Outcomes before the save must therefore be counted once
+        // (via the section) and outcomes after it once (via the WAL).
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let emb = vec![0.4f32; crate::ops::EMBED_DIM];
+
+        let id = {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            let (id, _) = field
+                .put_memory("wisdom", "test", b"outcome mixed", &emb, 0.9, 0.001, 0, vec![], None, None)
+                .unwrap();
+            field.record_outcome(id, true, 2.0).unwrap();
+            field.record_outcome(id, false, 1.0).unwrap();
+            field.save_full_snapshot().unwrap();
+            // Post-snapshot suffix: lives only in the WAL until the next save.
+            assert_eq!(field.record_outcome(id, true, 1.5).unwrap(), (4.5, 2.0));
+            assert_eq!(field.record_outcome(id, false, 0.5).unwrap(), (4.5, 2.5));
+            id
+        };
+
+        let field = ChittaField::open(data_dir).unwrap();
+        let states = field.states.read();
+        let s = states.get(&id).unwrap();
+        assert_eq!(
+            (s.utility_alpha, s.utility_beta),
+            (4.5, 2.5),
+            "snapshot-covered outcomes must not be replayed a second time"
         );
     }
 

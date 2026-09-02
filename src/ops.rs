@@ -83,6 +83,7 @@ pub enum Op {
     UpdateMemoryKind(UpdateMemoryKindOp),
     SymbolEvent(SymbolEventOp),
     SupersedeTriplet(SupersedeTripletOp),
+    RecordOutcome(RecordOutcomeOp),
 }
 
 pub const OP_SESSION_EVENT: u8 = 16;
@@ -138,6 +139,7 @@ pub const OP_INVALIDATE_TRIPLETS_BY_SOURCE_FILE: u8 = 65;
 pub const OP_UPDATE_MEMORY_KIND: u8 = 66;
 pub const OP_SYMBOL_EVENT: u8 = 67;
 pub const OP_SUPERSEDE_TRIPLET: u8 = 68;
+pub const OP_RECORD_OUTCOME: u8 = 69;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -167,6 +169,20 @@ pub struct SupersedeTripletOp {
     pub old_id: u64,
     pub new_id: u64,
     pub superseded_at_ms: i64,
+}
+
+/// One outcome observation accrued into a memory's Beta utility posterior.
+/// The op is the accrual itself (a `+= weight` on α or β), not the resulting
+/// (α, β) — replay of an uncovered suffix therefore composes with whatever the
+/// snapshot restored, and the op-set is order-insensitive (float addition of
+/// positive weights). `weight` is clamped at apply time by
+/// `MemoryState::record_outcome`, so a corrupt log cannot swamp a posterior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordOutcomeOp {
+    pub memory_id: MemoryId,
+    pub success: bool,
+    pub weight: f32,
+    pub ts_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1004,5 +1020,6 @@ pub fn op_timestamp(op: &Op) -> Option<i64> {
         Op::UpdateMemoryKind(o) => nz(o.op_ts_ms),
         Op::SymbolEvent(o) => nz(o.timestamp_ms),
         Op::SupersedeTriplet(o) => nz(o.superseded_at_ms),
+        Op::RecordOutcome(o) => nz(o.ts_ms),
     }
 }
